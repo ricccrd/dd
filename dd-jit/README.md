@@ -13,6 +13,9 @@ cargo test                  # bindings unit + doc tests
 On a non-macOS dev host (e.g. OrbStack Linux), `build.rs` drives clang/codesign through the `mac`
 bridge automatically; on a real Mac it runs them directly.
 
+> **What lives where, and why** is documented in [`docs/STRUCTURE.md`](../docs/STRUCTURE.md) — the
+> engine/frontend/OS-personality split and the cpu-interface contract that keeps `os/linux/` shared.
+
 ## The matrix: guest-OS × guest-ISA
 
 A *target* is a `(guest OS, guest ISA)` pair. Three are built today, all hosted on darwin/arm64:

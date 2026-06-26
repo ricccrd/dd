@@ -4,7 +4,7 @@
 // grouped by category. See docs/SYSCALLS.md for the per-syscall table.
 
 static void service(struct cpu *c) {
-    uint64_t nr = c->x[8], a0 = c->x[0], a1 = c->x[1], a2 = c->x[2], a3 = c->x[3], a4 = c->x[4], a5 = c->x[5];
+    uint64_t nr = G_NR(c), a0 = G_A0(c), a1 = G_A1(c), a2 = G_A2(c), a3 = G_A3(c), a4 = G_A4(c), a5 = G_A5(c);
     if (g_trace)
         fprintf(stderr, "[sys] %llu (%llx,%llx,%llx)\n", (unsigned long long)nr, (unsigned long long)a0,
                 (unsigned long long)a1, (unsigned long long)a2);
@@ -12,7 +12,7 @@ static void service(struct cpu *c) {
     // ===================== I/O — read/write/seek (+ eventfd/timerfd/signalfd fd redirection) =====================
     case 62: {
         off_t r = lseek((int)a0, (off_t)a1, (int)a2);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 63: {
@@ -23,7 +23,7 @@ static void service(struct cpu *c) {
             // drain one wake byte
             ssize_t pr = read(rfd, &b, 1);
             if (pr <= 0) {
-                c->x[0] = (uint64_t)(int64_t)(pr < 0 ? -errno : -EAGAIN);
+                G_RET(c) = (uint64_t)(int64_t)(pr < 0 ? -errno : -EAGAIN);
                 break;
             }
             int sig = 0;
@@ -39,7 +39,7 @@ static void service(struct cpu *c) {
                 *(uint32_t *)a1 = (uint32_t)sig;
             // ssi_signo
             }
-            c->x[0] = 128;
+            G_RET(c) = 128;
             break;
         }
         // inotify read -> struct inotify_event[]
@@ -49,7 +49,7 @@ static void service(struct cpu *c) {
             int nb = fcntl(rfd, F_GETFL) & O_NONBLOCK;
             int n = kevent(rfd, NULL, 0, kv, 32, nb ? &zero : NULL);
             if (n <= 0) {
-                c->x[0] = (uint64_t)(int64_t)(n < 0 ? -errno : -EAGAIN);
+                G_RET(c) = (uint64_t)(int64_t)(n < 0 ? -errno : -EAGAIN);
                 break;
             }
             uint8_t *out = (uint8_t *)a1;
@@ -72,7 +72,7 @@ static void service(struct cpu *c) {
                 *(uint32_t *)(out + off + 12) = 0;
                 off += 16;
             }
-            c->x[0] = (uint64_t)off;
+            G_RET(c) = (uint64_t)off;
             break;
         }
         // timerfd read -> drain timer, return count
@@ -82,16 +82,16 @@ static void service(struct cpu *c) {
             int nb = fcntl(rfd, F_GETFL) & O_NONBLOCK;
             int n = kevent(rfd, NULL, 0, &kv, 1, nb ? &zero : NULL);
             if (n <= 0) {
-                c->x[0] = (uint64_t)(int64_t)(n < 0 ? -errno : -EAGAIN);
+                G_RET(c) = (uint64_t)(int64_t)(n < 0 ? -errno : -EAGAIN);
                 break;
             // EAGAIN
             }
             if (a1 && a2 >= 8) *(uint64_t *)a1 = (uint64_t)kv.data;
-            c->x[0] = 8;
+            G_RET(c) = 8;
             break;
         }
         ssize_t r = read(rfd, (void *)a1, (size_t)a2);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 64: {
@@ -100,33 +100,33 @@ static void service(struct cpu *c) {
         if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) wfd = g_eventfd_peer[wfd] - 1;
         fd_evict(wfd);
         ssize_t r = write(wfd, (void *)a1, (size_t)a2);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 65: {
         ssize_t r = readv((int)a0, (void *)a1, (int)a2);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     // readv
     }
     case 66: {
         fd_evict((int)a0);
         ssize_t r = writev((int)a0, (void *)a1, (int)a2);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     // writev
     }
     case 67: {
         // pread64
         ssize_t r = pread((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 68: {
         fd_evict((int)a0);
         // pwrite64
         ssize_t r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // sendfile(out,in,off*,count)
@@ -147,7 +147,7 @@ static void service(struct cpu *c) {
             if (wr < n) break;
         }
         if (po) *po += tot;
-        c->x[0] = tot;
+        G_RET(c) = tot;
         break;
     }
     case 76:
@@ -165,17 +165,17 @@ static void service(struct cpu *c) {
             // splice off_in
             n = read(fin, sb, len);
         if (n <= 0) {
-            c->x[0] = n < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = n < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
         ssize_t w = (nr == 76 && a3) ? pwrite(fout, sb, n, *(off_t *)a3) : write(fout, sb, n);
         if (w < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         if (nr == 76 && a1) *(off_t *)a1 += w;
         if (nr == 76 && a3) *(off_t *)a3 += w;
-        c->x[0] = (uint64_t)w;
+        G_RET(c) = (uint64_t)w;
         break;
     }
 
@@ -184,34 +184,34 @@ static void service(struct cpu *c) {
     case 5:
     case 6:
     // setxattr/lsetxattr/fsetxattr -> ignore
-    case 7: c->x[0] = 0; break;
+    case 7: G_RET(c) = 0; break;
     case 8:
     case 9:
     // getxattr/... -> ENODATA (no such attr)
-    case 10: c->x[0] = (uint64_t)(-ENODATA); break;
+    case 10: G_RET(c) = (uint64_t)(-ENODATA); break;
     case 11:
     case 12:
     // listxattr/... -> empty list
-    case 13: c->x[0] = 0; break;
+    case 13: G_RET(c) = 0; break;
     case 14:
     case 15:
     // removexattr/... -> ok
-    case 16: c->x[0] = 0; break;
+    case 16: G_RET(c) = 0; break;
     case 17: {
         if (g_rootfs) {
             // getcwd -> the GUEST cwd (not the host path)
             size_t l = strlen(g_cwd);
             if (a0 && l + 1 <= a1) {
                 memcpy((void *)a0, g_cwd, l + 1);
-                c->x[0] = l + 1;
+                G_RET(c) = l + 1;
             } else
-                c->x[0] = (uint64_t)(-ERANGE);
+                G_RET(c) = (uint64_t)(-ERANGE);
             break;
         }
         if (getcwd((char *)a0, (size_t)a1))
-            c->x[0] = strlen((char *)a0) + 1;
+            G_RET(c) = strlen((char *)a0) + 1;
         else
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
         break;
     }
     case 23: {
@@ -219,7 +219,7 @@ static void service(struct cpu *c) {
         int r = dup((int)a0);
         // carry path
         if (r >= 0 && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024) strcpy(g_fdpath[r], g_fdpath[(int)a0]);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 24: {
@@ -227,7 +227,7 @@ static void service(struct cpu *c) {
         int r = dup2((int)a0, (int)a1);
         if (r >= 0 && (int)a1 >= 0 && (int)a1 < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
             strcpy(g_fdpath[(int)a1], g_fdpath[(int)a0]);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 25: {
@@ -237,7 +237,7 @@ static void service(struct cpu *c) {
         if (lcmd == 3) {
             int r = fcntl((int)a0, F_GETFL, 0);
             if (r < 0) {
-                c->x[0] = (uint64_t)(-errno);
+                G_RET(c) = (uint64_t)(-errno);
                 break;
             }
             // access mode identical
@@ -246,7 +246,7 @@ static void service(struct cpu *c) {
             if (r & 0x4) lf |= 0x800;
             // APPEND/NONBLOCK/ASYNC
             if (r & 0x40) lf |= 0x2000;
-            c->x[0] = (uint64_t)(unsigned)lf;
+            G_RET(c) = (uint64_t)(unsigned)lf;
             break;
         }
         // F_SETFL: Linux O_* -> macOS O_*
@@ -257,7 +257,7 @@ static void service(struct cpu *c) {
             // APPEND/NONBLOCK/ASYNC
             if (la & 0x2000) mf |= 0x40;
             int r = fcntl((int)a0, F_SETFL, mf);
-            c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
         // F_GETLK/SETLK/SETLKW: xlate struct flock + cmd
@@ -284,7 +284,7 @@ static void service(struct cpu *c) {
                 *(int64_t *)(lf + 16) = fl.l_len;
                 *(int32_t *)(lf + 24) = (int32_t)fl.l_pid;
             }
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
             break;
         }
         int mcmd = lcmd;
@@ -296,7 +296,7 @@ static void service(struct cpu *c) {
         else if (lcmd == 1030)
             mcmd = F_DUPFD_CLOEXEC;
         else if (lcmd == 1024 || lcmd == 1025 || lcmd == 1026 || lcmd == 1033 || lcmd == 1034) {
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         // lease/notify/seals: no-op
         }
@@ -304,7 +304,7 @@ static void service(struct cpu *c) {
         if (r >= 0 && (lcmd == 0 || lcmd == 1030) && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
             // F_DUPFD(_CLOEXEC)
             strcpy(g_fdpath[r], g_fdpath[(int)a0]);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // ioctl(fd, req, arg) -- Linux req# -> macOS
@@ -316,12 +316,12 @@ static void service(struct cpu *c) {
         case 0x5401: {
             struct termios t;
             if (tcgetattr(fd, &t) < 0) {
-                c->x[0] = (uint64_t)(-errno);
+                G_RET(c) = (uint64_t)(-errno);
                 break;
             // TCGETS
             }
             termios_m2l(&t, (uint8_t *)arg);
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         }
         case 0x5402:
@@ -331,20 +331,20 @@ static void service(struct cpu *c) {
             // TCSETS/W/F
             termios_l2m((const uint8_t *)arg, &t);
             int act = rq == 0x5402 ? TCSANOW : rq == 0x5403 ? TCSADRAIN : TCSAFLUSH;
-            c->x[0] = tcsetattr(fd, act, &t) < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = tcsetattr(fd, act, &t) < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
         case 0x802c542a: {
             struct termios t;
             if (tcgetattr(fd, &t) < 0) {
-                c->x[0] = (uint64_t)(-errno);
+                G_RET(c) = (uint64_t)(-errno);
                 break;
             // TCGETS2 (glibc aarch64 uses this)
             }
             termios_m2l(&t, (uint8_t *)arg);
             *(uint32_t *)((uint8_t *)arg + 36) = (uint32_t)cfgetispeed(&t);
             *(uint32_t *)((uint8_t *)arg + 40) = (uint32_t)cfgetospeed(&t);
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         }
         case 0x402c542b:
@@ -356,50 +356,50 @@ static void service(struct cpu *c) {
             cfsetispeed(&t, *(uint32_t *)((const uint8_t *)arg + 36));
             cfsetospeed(&t, *(uint32_t *)((const uint8_t *)arg + 40));
             int act = rq == 0x402c542b ? TCSANOW : rq == 0x402c542c ? TCSADRAIN : TCSAFLUSH;
-            c->x[0] = tcsetattr(fd, act, &t) < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = tcsetattr(fd, act, &t) < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
         case 0x5413:
-            c->x[0] = ioctl(fd, TIOCGWINSZ, arg) < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = ioctl(fd, TIOCGWINSZ, arg) < 0 ? (uint64_t)(-errno) : 0;
             // TIOCGWINSZ (struct same)
             break;
         // TIOCSWINSZ
-        case 0x5414: c->x[0] = ioctl(fd, TIOCSWINSZ, arg) < 0 ? (uint64_t)(-errno) : 0; break;
+        case 0x5414: G_RET(c) = ioctl(fd, TIOCSWINSZ, arg) < 0 ? (uint64_t)(-errno) : 0; break;
         case 0x80045430:
             if (arg && fd >= 0 && fd < 1024) *(uint32_t *)arg = (uint32_t)fd;
-            c->x[0] = 0;
+            G_RET(c) = 0;
             // TIOCGPTN -> pts# = master fd
             break;
         // TIOCSPTLCK (unlockpt done at open)
-        case 0x40045431: c->x[0] = 0; break;
+        case 0x40045431: G_RET(c) = 0; break;
         case 0x5421: {
             // FIONBIO
             int on = arg ? *(int *)arg : 0, fl = fcntl(fd, F_GETFL);
             fl = on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
-            c->x[0] = fcntl(fd, F_SETFL, fl) < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = fcntl(fd, F_SETFL, fl) < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
         // FIONREAD
-        case 0x541b: c->x[0] = ioctl(fd, FIONREAD, arg) < 0 ? (uint64_t)(-errno) : 0; break;
+        case 0x541b: G_RET(c) = ioctl(fd, FIONREAD, arg) < 0 ? (uint64_t)(-errno) : 0; break;
         // FIOCLEX
-        case 0x5451: c->x[0] = fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0; break;
+        case 0x5451: G_RET(c) = fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0; break;
         case 0x5450: {
             int fl = fcntl(fd, F_GETFD);
-            c->x[0] = fcntl(fd, F_SETFD, fl & ~FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = fcntl(fd, F_SETFD, fl & ~FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0;
             break;
         // FIONCLEX
         }
         case 0x540f:
             if (arg) *(int *)arg = (int)getpgrp();
-            c->x[0] = 0;
+            G_RET(c) = 0;
             // TIOCGPGRP
             break;
         // TIOCSPGRP
-        case 0x5410: c->x[0] = 0; break;
+        case 0x5410: G_RET(c) = 0; break;
         // TIOCSCTTY
-        case 0x540e: c->x[0] = 0; break;
+        case 0x540e: G_RET(c) = 0; break;
         // ENOTTY
-        default: c->x[0] = (uint64_t)(-25); break;
+        default: G_RET(c) = (uint64_t)(-25); break;
         }
         break;
     }
@@ -409,7 +409,7 @@ static void service(struct cpu *c) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             int r = mknodat(pfd, fin, (mode_t)a2, (dev_t)a3), e = errno;
@@ -421,7 +421,7 @@ static void service(struct cpu *c) {
                 ac_evict(hp);
             }
             close(pfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
@@ -431,7 +431,7 @@ static void service(struct cpu *c) {
             mc_evict(p);
             ac_evict(p);
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     // mkdirat(dirfd, path, mode) -- confined
@@ -440,7 +440,7 @@ static void service(struct cpu *c) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             int r = mkdirat(pfd, fin, (mode_t)a2), e = errno;
@@ -452,7 +452,7 @@ static void service(struct cpu *c) {
                 ac_evict(hp);
             }
             close(pfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
@@ -461,7 +461,7 @@ static void service(struct cpu *c) {
         mc_evict(p);
         // namespace change -> evict
         ac_evict(p);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     // unlinkat(dirfd, path, flags) -- confined
@@ -472,19 +472,19 @@ static void service(struct cpu *c) {
             abs_guest((int)a0, (const char *)a1, gp, sizeof gp);
             char host[4300];
             if (!overlay_resolve(gp, host, sizeof host, 1)) {
-                c->x[0] = (uint64_t)(-2);
+                G_RET(c) = (uint64_t)(-2);
                 break;
             // ENOENT
             }
             overlay_whiteout(gp);
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             // AT_REMOVEDIR: linux 0x200
@@ -498,7 +498,7 @@ static void service(struct cpu *c) {
                 rl_evict(hp);
             }
             close(pfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
@@ -507,7 +507,7 @@ static void service(struct cpu *c) {
         mc_evict(p);
         ac_evict(p);
         rl_evict(p);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     // symlinkat(target, newdirfd, linkpath)
@@ -519,17 +519,17 @@ static void service(struct cpu *c) {
             char fin[512];
             int pfd = jail_at((int)a1, (const char *)a2, fin, sizeof fin, 1);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             int r = symlinkat(target, pfd, fin), e = errno;
             close(pfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
         const char *p = atpath((int)a1, (const char *)a2, pb, sizeof pb);
-        c->x[0] = symlinkat(target, ATFD(a1), p) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = symlinkat(target, ATFD(a1), p) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     // linkat(odir,opath,ndir,npath,flags)
@@ -540,25 +540,25 @@ static void service(struct cpu *c) {
             char ofin[512], nfin[512];
             int opfd = jail_at((int)a0, (const char *)a1, ofin, sizeof ofin, 1);
             if (opfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)opfd;
+                G_RET(c) = (uint64_t)(int64_t)opfd;
                 break;
             }
             int npfd = jail_at((int)a2, (const char *)a3, nfin, sizeof nfin, 1);
             if (npfd < 0) {
                 close(opfd);
-                c->x[0] = (uint64_t)(int64_t)npfd;
+                G_RET(c) = (uint64_t)(int64_t)npfd;
                 break;
             }
             int r = linkat(opfd, ofin, npfd, nfin, fl), e = errno;
             close(opfd);
             close(npfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char ob[4200], nb[4200];
         const char *op = atpath((int)a0, (const char *)a1, ob, sizeof ob);
         const char *np = atpath((int)a2, (const char *)a3, nb, sizeof nb);
-        c->x[0] = linkat(ATFD(a0), op, ATFD(a2), np, fl) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = linkat(ATFD(a0), op, ATFD(a2), np, fl) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 38:
@@ -569,13 +569,13 @@ static void service(struct cpu *c) {
             char ofin[512], nfin[512];
             int opfd = jail_at((int)a0, (const char *)a1, ofin, sizeof ofin, 1);
             if (opfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)opfd;
+                G_RET(c) = (uint64_t)(int64_t)opfd;
                 break;
             }
             int npfd = jail_at((int)a2, (const char *)a3, nfin, sizeof nfin, 1);
             if (npfd < 0) {
                 close(opfd);
-                c->x[0] = (uint64_t)(int64_t)npfd;
+                G_RET(c) = (uint64_t)(int64_t)npfd;
                 break;
             }
             char dp[4200];
@@ -588,19 +588,19 @@ static void service(struct cpu *c) {
             int r = renameat(opfd, ofin, npfd, nfin), e = errno;
             close(opfd);
             close(npfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char ob[4200], nb[4200];
         const char *op = atpath((int)a0, (const char *)a1, ob, sizeof ob);
         const char *np = atpath((int)a2, (const char *)a3, nb, sizeof nb);
-        c->x[0] = renameat(ATFD(a0), op, ATFD(a2), np) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = renameat(ATFD(a0), op, ATFD(a2), np) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 40:
     case 39:
     // mount / umount2 / pivot_root -> ok
-    case 41: c->x[0] = 0; break;
+    case 41: G_RET(c) = 0; break;
     case 43:
     case 44: {
         uint8_t *b = (uint8_t *)(nr == 43 ? a1 : a1);
@@ -610,13 +610,13 @@ static void service(struct cpu *c) {
         *(uint64_t *)(b + 8) = 4096;
         *(uint64_t *)(b + 16) = 1u << 24;
         *(uint64_t *)(b + 24) = 1u << 23;
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 46: {
         int r = ftruncate((int)a0, (off_t)a1);
         fd_evict((int)a0);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     // ftruncate
     }
@@ -626,7 +626,7 @@ static void service(struct cpu *c) {
         off_t end = (off_t)(a2 + a3);
         if (fstat((int)a0, &s) == 0 && s.st_size < end && ftruncate((int)a0, end) < 0) {}
         fd_evict((int)a0);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 49: {
@@ -634,19 +634,19 @@ static void service(struct cpu *c) {
         // chdir (confined; tracks guest cwd)
         const char *p = atpath(-100, (const char *)a0, pb, sizeof pb);
         if (chdir(p) < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         if (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) {
             const char *g = p + g_rootfs_canon_len;
             snprintf(g_cwd, sizeof g_cwd, "%s", g[0] ? g : "/");
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 50: {
         if (fchdir((int)a0) < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         // fchdir (tracks guest cwd)
         }
@@ -655,11 +655,11 @@ static void service(struct cpu *c) {
             if (g_rootfs && !strncmp(g, g_rootfs_canon, g_rootfs_canon_len)) g += g_rootfs_canon_len;
             snprintf(g_cwd, sizeof g_cwd, "%s", g[0] ? g : "/");
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // fchmod(fd, mode)
-    case 52: c->x[0] = fchmod((int)a0, (mode_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 52: G_RET(c) = fchmod((int)a0, (mode_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     case 53:
     // fchmodat(dirfd,path,mode,flags) / fchmodat2
     case 452: {
@@ -667,7 +667,7 @@ static void service(struct cpu *c) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 0);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             int r = fchmodat(pfd, fin, (mode_t)a2, 0), e = errno;
@@ -678,14 +678,14 @@ static void service(struct cpu *c) {
                 mc_evict(hp);
             }
             close(pfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
         int r = fchmodat(ATFD(a0), p, (mode_t)a2, 0);
         if (r >= 0) mc_evict(p);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     // fchownat(dirfd,path,uid,gid,flags) -- best-effort (rootless)
@@ -694,24 +694,24 @@ static void service(struct cpu *c) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a4 & 0x100) ? 1 : 0);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             fchownat(pfd, fin, (uid_t)a2, (gid_t)a3, (a4 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
             close(pfd);
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         // EPERM on the host -> faked OK
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
         fchownat(ATFD(a0), p, (uid_t)a2, (gid_t)a3, 0);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 55: {
         fchown((int)a0, (uid_t)a1, (gid_t)a2);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     // fchown(fd,uid,gid) -- best-effort
     }
@@ -731,13 +731,13 @@ static void service(struct cpu *c) {
                         if (write(afd, g_auxv_data, g_auxv_len) < 0) {}
                         lseek(afd, 0, SEEK_SET);
                     }
-                    c->x[0] = afd < 0 ? (uint64_t)(-errno) : (uint64_t)afd;
+                    G_RET(c) = afd < 0 ? (uint64_t)(-errno) : (uint64_t)afd;
                     break;
                 }
                 // cpuinfo/meminfo/stat/mounts/uptime/loadavg/version
                 int pf = proc_open(rp);
                 if (pf != -2) {
-                    c->x[0] = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
+                    G_RET(c) = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
                     break;
                 }
             }
@@ -745,7 +745,7 @@ static void service(struct cpu *c) {
             if (rp && !strncmp(rp, "/sys/fs/cgroup/", 15)) {
                 int pf = proc_open(rp);
                 if (pf != -2) {
-                    c->x[0] = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
+                    G_RET(c) = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
                     break;
                 }
             }
@@ -760,7 +760,7 @@ static void service(struct cpu *c) {
                                                                : NULL;
                 if (hd) {
                     int d = open(hd, mf);
-                    c->x[0] = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
+                    G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
                     break;
                 }
             }
@@ -781,18 +781,18 @@ static void service(struct cpu *c) {
                     grantpt(m);
                     unlockpt(m);
                 }
-                c->x[0] = m < 0 ? (uint64_t)(-errno) : (uint64_t)m;
+                G_RET(c) = m < 0 ? (uint64_t)(-errno) : (uint64_t)m;
                 break;
             }
             if (rp && !strncmp(rp, "/dev/pts/", 9) && rp[9] >= '0' && rp[9] <= '9') {
                 char *sn = ptsname(atoi(rp + 9));
                 if (!sn) {
-                    c->x[0] = (uint64_t)(int64_t)(-2);
+                    G_RET(c) = (uint64_t)(int64_t)(-2);
                     break;
                 // ENOENT
                 }
                 int s = open(sn, mf);
-                c->x[0] = s < 0 ? (uint64_t)(-errno) : (uint64_t)s;
+                G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s;
                 break;
             }
         }
@@ -822,7 +822,7 @@ static void service(struct cpu *c) {
                 if (r < 1024) snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gp);
             // remember guest path for merged getdents
             }
-            c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
             break;
         }
         // TOCTOU-free per-component resolve in the jail
@@ -831,7 +831,7 @@ static void service(struct cpu *c) {
             // O_NOFOLLOW
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (lf & 0x20000) != 0);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             // fin is resolved -> O_NOFOLLOW safe
@@ -850,7 +850,7 @@ static void service(struct cpu *c) {
                     }
                 }
             }
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
             break;
         }
         char pb[4200];
@@ -865,7 +865,7 @@ static void service(struct cpu *c) {
                 ac_evict(p);
             }
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 57: {
@@ -883,14 +883,14 @@ static void service(struct cpu *c) {
         }
         int r = close(cf);
         fd_clear(cf);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     // close: -errno on fail
     }
     case 59: {
         int fds[2];
         if (pipe(fds) < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         // pipe2(fds, flags)
         }
@@ -905,7 +905,7 @@ static void service(struct cpu *c) {
         }
         ((int *)a0)[0] = fds[0];
         ((int *)a0)[1] = fds[1];
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // getdents64
@@ -954,7 +954,7 @@ static void service(struct cpu *c) {
             }
             // exhausted -> free the slot
             if (o == 0) oc[slot].fd = 0;
-            c->x[0] = (uint64_t)o;
+            G_RET(c) = (uint64_t)o;
             break;
         }
         static struct {
@@ -971,7 +971,7 @@ static void service(struct cpu *c) {
         if (!dir) {
             dir = fdopendir(dup(fd));
             if (!dir) {
-                c->x[0] = (uint64_t)(-errno);
+                G_RET(c) = (uint64_t)(-errno);
                 break;
             }
             if (ndirs < 64) {
@@ -1000,7 +1000,7 @@ static void service(struct cpu *c) {
             o += lr;
             pos = telldir(dir);
         }
-        c->x[0] = o;
+        G_RET(c) = o;
         break;
     }
     // readlinkat
@@ -1014,18 +1014,18 @@ static void service(struct cpu *c) {
             size_t l = strlen(rp);
             if (l > bs) l = bs;
             memcpy(buf, rp, l);
-            c->x[0] = l;
+            G_RET(c) = l;
         } else {
             char pb[4200];
             const char *rp = xlate(p, pb, sizeof pb);
             int rc, len;
             if (rl_lookup(rp, &rc, buf, bs, &len)) {
-                c->x[0] = rc < 0 ? (uint64_t)(int64_t)rc : (uint64_t)len;
+                G_RET(c) = rc < 0 ? (uint64_t)(int64_t)rc : (uint64_t)len;
                 break;
             }
             ssize_t r = readlink(rp, buf, bs);
             rl_store(rp, r < 0 ? -errno : (int)r, buf, r < 0 ? 0 : (int)r);
-            c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         }
         break;
     }
@@ -1037,7 +1037,7 @@ static void service(struct cpu *c) {
         {
             const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
             if (synth_stat(gp, (uint8_t *)a2)) {
-                c->x[0] = 0;
+                G_RET(c) = 0;
                 break;
             }
         // synthesized /proc or /sys file
@@ -1051,45 +1051,45 @@ static void service(struct cpu *c) {
                 mc_store(p, rc, &s);
             }
             if (rc == 0) fill_linux_stat((uint8_t *)a2, &s);
-            c->x[0] = (uint64_t)(int64_t)rc;
+            G_RET(c) = (uint64_t)(int64_t)rc;
             break;
         }
         // AT_EMPTY_PATH -> fstat(dfd)
         int r = (raw && !raw[0] && (a3 & 0x1000)) ? fstat((int)a0, &s)
                                                   : fstatat(ATFD(a0), p, &s, AT_SYMLINK_NOFOLLOW);
         if (r < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         fill_linux_stat((uint8_t *)a2, &s);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 80: {
         // fstat(fd, buf)
         struct stat s;
         if (fstat((int)a0, &s) < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         fill_linux_stat((uint8_t *)a1, &s);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 81:
         sync();
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // sync
         break;
     // fsync
-    case 82: c->x[0] = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 82: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
     // fdatasync -> fsync (no macOS fdatasync)
-    case 83: c->x[0] = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 83: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
     // utimensat(dirfd, path, times, flags)
     case 88: {
         struct timespec *ts = (struct timespec *)a2;
         if (!a1) {
-            c->x[0] = futimens((int)a0, ts) < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = futimens((int)a0, ts) < 0 ? (uint64_t)(-errno) : 0;
             break;
         // path NULL -> futimens(fd)
         }
@@ -1097,7 +1097,7 @@ static void service(struct cpu *c) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a3 & 0x100) ? 1 : 0);
             if (pfd < 0) {
-                c->x[0] = (uint64_t)(int64_t)pfd;
+                G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
             int r = utimensat(pfd, fin, ts, (a3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0), e = errno;
@@ -1109,20 +1109,20 @@ static void service(struct cpu *c) {
             // mtime changed
             }
             close(pfd);
-            c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
         int r = utimensat(ATFD(a0), p, ts, (a3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
         if (r >= 0) mc_evict(p);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     // umask -> old mask
-    case 166: c->x[0] = (uint64_t)umask((mode_t)a0); break;
+    case 166: G_RET(c) = (uint64_t)umask((mode_t)a0); break;
     // fadvise64 -- advisory no-op
-    case 223: c->x[0] = 0; break;
+    case 223: G_RET(c) = 0; break;
     // copy_file_range(fdin,offin*,fdout,offout*,len,flags)
     case 285: {
         int fdin = (int)a0, fdout = (int)a2;
@@ -1152,7 +1152,7 @@ static void service(struct cpu *c) {
         if (poi) *poi = oi;
         if (poo) *poo = oo;
         fd_evict(fdout);
-        c->x[0] = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
+        G_RET(c) = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
         break;
     }
     case 291: {
@@ -1178,7 +1178,7 @@ static void service(struct cpu *c) {
             rc = rr < 0 ? -errno : 0;
         }
         if (rc < 0) {
-            c->x[0] = (uint64_t)(int64_t)rc;
+            G_RET(c) = (uint64_t)(int64_t)rc;
             break;
         }
         uint8_t *d = (uint8_t *)a4;
@@ -1205,7 +1205,7 @@ static void service(struct cpu *c) {
         *(int64_t *)(d + 96) = s.st_ctime;
         // stx_mtime @112 (sec)
         *(int64_t *)(d + 112) = s.st_mtime;
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // openat2(dirfd, path, open_how*, size) -- glibc uses it; MUST confine
@@ -1230,11 +1230,11 @@ static void service(struct cpu *c) {
                 rc = r < 0 ? -errno : 0;
                 ac_store(p, rc);
             }
-            c->x[0] = (uint64_t)(int64_t)rc;
+            G_RET(c) = (uint64_t)(int64_t)rc;
             break;
         }
         int r = faccessat(ATFD(a0), p, (int)a2, 0);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
 
@@ -1243,7 +1243,7 @@ static void service(struct cpu *c) {
     // brk
     case 214: {
         if (a0 == 0) {
-            c->x[0] = brk_cur;
+            G_RET(c) = brk_cur;
             break;
         }
         if (a0 >= brk_lo && a0 <= brk_hi) {
@@ -1252,7 +1252,7 @@ static void service(struct cpu *c) {
                 uint64_t delta = a0 - brk_cur;
                 if (atomic_fetch_add(&g_mem_charged, delta) + delta > g_mem_max) {
                     atomic_fetch_sub(&g_mem_charged, delta);
-                    c->x[0] = brk_cur;
+                    G_RET(c) = brk_cur;
                     // over limit -> break unchanged (ENOMEM)
                     break;
                 }
@@ -1263,7 +1263,7 @@ static void service(struct cpu *c) {
             }
             brk_cur = a0;
         }
-        c->x[0] = brk_cur;
+        G_RET(c) = brk_cur;
         break;
     }
     case 215: {
@@ -1274,19 +1274,19 @@ static void service(struct cpu *c) {
             uint64_t cur = atomic_load(&g_mem_charged), d = (uint64_t)a1;
             atomic_fetch_sub(&g_mem_charged, d > cur ? cur : d);
         }
-        c->x[0] = (uint64_t)r;
+        G_RET(c) = (uint64_t)r;
         break;
     }
     case 216: {
         // mremap (copy+grow)
         void *r = mmap(0, (size_t)a2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (r == MAP_FAILED) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         size_t old = (size_t)a1, n = old < (size_t)a2 ? old : (size_t)a2;
         memcpy(r, (void *)a0, n);
-        c->x[0] = (uint64_t)r;
+        G_RET(c) = (uint64_t)r;
         break;
     }
     // mmap
@@ -1299,42 +1299,42 @@ static void service(struct cpu *c) {
                 // real memory.max counts RSS, not reservations)
                 g_mem_max) {
                 atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
-                c->x[0] = (uint64_t)(-ENOMEM);
+                G_RET(c) = (uint64_t)(-ENOMEM);
                 break;
             }
         }
         void *r = mmap((void *)a0, (size_t)a1, (int)a2, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
         // refund
         if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
-        c->x[0] = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // mprotect
-    case 226: c->x[0] = (uint64_t)mprotect((void *)a0, (size_t)a1, (int)a2); break;
+    case 226: G_RET(c) = (uint64_t)mprotect((void *)a0, (size_t)a1, (int)a2); break;
     case 228:
     case 229:
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // mlock/munlock (no-op)
         break;
     // Container-init compat: in the single-process model these are no-ops that return success so
     // entrypoints (mount /proc, unshare, drop caps, set hostname) proceed; the path-jail is the
     // real boundary, and a faked namespace grants no actual privilege (program still runs as our uid).
     // mincore -> unsupported (callers fall back)
-    case 232: c->x[0] = (uint64_t)(-ENOSYS); break;
+    case 232: G_RET(c) = (uint64_t)(-ENOSYS); break;
     case 233:
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // madvise
         break;
 
     // ===================== Process & scheduling — clone/exec/wait/ids/prctl/futex/caps/sched =====================
     case 90: {
         if (a1) memset((void *)a1, 0xff, 12);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     // capget -> all caps present
     }
     // capset -> ok
-    case 91: c->x[0] = 0; break;
+    case 91: G_RET(c) = 0; break;
     case 93:
         c->exited = 1;
         c->exit_code = (int)a0;
@@ -1350,20 +1350,20 @@ static void service(struct cpu *c) {
                     (unsigned long long)g_lse_n);
         _exit((int)a0);
     case 96:
-        c->x[0] = (uint64_t)getpid();
+        G_RET(c) = (uint64_t)getpid();
         // set_tid_address -> returns caller's TID (musl stores it; 0 -> a_crash())
         break;
     case 97:
     // unshare / setns -> ok (no real ns)
-    case 268: c->x[0] = 0; break;
+    case 268: G_RET(c) = 0; break;
     // futex
-    case 98: c->x[0] = (uint64_t)futex_op((int *)a0, (int)a1 & 0x7f, (int)a2, (struct timespec *)a3); break;
+    case 98: G_RET(c) = (uint64_t)futex_op((int *)a0, (int)a1 & 0x7f, (int)a2, (struct timespec *)a3); break;
     // set_robust_list
-    case 99: c->x[0] = 0; break;
+    case 99: G_RET(c) = 0; break;
     // syslog
-    case 116: c->x[0] = 0; break;
+    case 116: G_RET(c) = 0; break;
     // sched_setaffinity
-    case 122: c->x[0] = 0; break;
+    case 122: G_RET(c) = 0; break;
     case 123: {
         size_t n = (size_t)a1;
         // sched_getaffinity(pid,size,MASK=a2!)
@@ -1373,36 +1373,36 @@ static void service(struct cpu *c) {
             *(uint8_t *)a2 = 1;
         // cpu 0 set; mask is a2 not a1
         }
-        c->x[0] = n < 8 ? (uint64_t)n : 8;
+        G_RET(c) = n < 8 ? (uint64_t)n : 8;
         break;
     }
     // sched_yield
-    case 124: c->x[0] = 0; break;
+    case 124: G_RET(c) = 0; break;
     case 140:
         setpriority((int)a0, (int)a1, (int)a2);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // setpriority (best-effort)
         break;
     case 141: {
         errno = 0;
         // getpriority -> Linux raw (20-nice)
         int r = getpriority((int)a0, (int)a1);
-        c->x[0] = (r == -1 && errno) ? (uint64_t)(-errno) : (uint64_t)(20 - r);
+        G_RET(c) = (r == -1 && errno) ? (uint64_t)(-errno) : (uint64_t)(20 - r);
         break;
     }
     case 144:
     case 146:
     case 147:
     // setgid/setfsuid/setresuid/setresgid -> ok
-    case 149: c->x[0] = 0; break;
+    case 149: G_RET(c) = 0; break;
     // getpgid
-    case 145: c->x[0] = (uint64_t)getpgrp(); break;
+    case 145: G_RET(c) = (uint64_t)getpgrp(); break;
     case 148: {
         // getresuid(r,e,s)
         if (a0) *(uint32_t *)a0 = cuid();
         if (a1) *(uint32_t *)a1 = cuid();
         if (a2) *(uint32_t *)a2 = cuid();
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 150: {
@@ -1410,28 +1410,28 @@ static void service(struct cpu *c) {
         if (a0) *(uint32_t *)a0 = cgid();
         if (a1) *(uint32_t *)a1 = cgid();
         if (a2) *(uint32_t *)a2 = cgid();
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // setpgid
-    case 154: c->x[0] = setpgid((pid_t)a0, (pid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 154: G_RET(c) = setpgid((pid_t)a0, (pid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     // getpgid (bash job control)
-    case 155: c->x[0] = (uint64_t)getpgid((pid_t)a0); break;
+    case 155: G_RET(c) = (uint64_t)getpgid((pid_t)a0); break;
     // getsid
-    case 156: c->x[0] = (uint64_t)getsid((pid_t)a0); break;
+    case 156: G_RET(c) = (uint64_t)getsid((pid_t)a0); break;
     case 158: {
         if (g_gid >= 0) {
             if ((int)a0 >= 1 && a1) *(gid_t *)a1 = (gid_t)cgid();
-            c->x[0] = 1;
+            G_RET(c) = 1;
             break;
         // getgroups -> [container gid]
         }
         int r = getgroups((int)a0, (gid_t *)a1);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // setgroups (privileged; ignore)
-    case 159: c->x[0] = 0; break;
+    case 159: G_RET(c) = 0; break;
     // getrusage(who, *usage) -- a1 is the buffer, not a0!
     case 165: {
         struct rusage ru;
@@ -1457,7 +1457,7 @@ static void service(struct cpu *c) {
                 *(int64_t *)(d + 136) = ru.ru_nivcsw;
             }
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // prctl(option,...)
@@ -1475,31 +1475,31 @@ static void service(struct cpu *c) {
         case 53:
         case 55:
         // PDEATHSIG/DUMPABLE/NAME/SECCOMP/TIMERSLACK/THP/SPECCTRL...
-        case 59: c->x[0] = 0; break;
+        case 59: G_RET(c) = 0; break;
         // EINVAL -- so feature probes (e.g. magic "AUXV") fail as on Linux
-        default: c->x[0] = (uint64_t)(-22); break;
+        default: G_RET(c) = (uint64_t)(-22); break;
         }
         break;
     }
     // getpid (PID ns: init -> 1)
-    case 172: c->x[0] = (uint64_t)container_pid(); break;
+    case 172: G_RET(c) = (uint64_t)container_pid(); break;
     case 173:
-        c->x[0] = (container_pid() == 1) ? 0 : (uint64_t)getppid();
+        G_RET(c) = (container_pid() == 1) ? 0 : (uint64_t)getppid();
         // getppid (init's parent is 0 in the ns)
         break;
     case 174:
     // getuid/geteuid -> container uid (0=root by default)
-    case 175: c->x[0] = (uint64_t)cuid(); break;
+    case 175: G_RET(c) = (uint64_t)cuid(); break;
     case 176:
     // getgid/getegid
-    case 177: c->x[0] = (uint64_t)cgid(); break;
+    case 177: G_RET(c) = (uint64_t)cgid(); break;
     // gettid
-    case 178: c->x[0] = (uint64_t)container_pid(); break;
+    case 178: G_RET(c) = (uint64_t)container_pid(); break;
     // clone(flags,stack,ptid,tls,ctid)
     case 220: {
         // CLONE_THREAD: stack arg IS the top
         if (a0 & 0x10000) {
-            c->x[0] = (uint64_t)spawn_thread(c, a0, a1, a3, a2, a4);
+            G_RET(c) = (uint64_t)spawn_thread(c, a0, a1, a3, a2, a4);
             break;
         }
         // fork/vfork: COW copy; child continues
@@ -1507,7 +1507,7 @@ static void service(struct cpu *c) {
         // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
         if (pid == 0) c->ssp = 0;
         // parent: pid, child: 0
-        c->x[0] = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
+        G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }
     // execve(path, argv, envp)
@@ -1517,7 +1517,7 @@ static void service(struct cpu *c) {
             // follow symlink rootfs-relative (busybox applets)
             xresolve_exec((const char *)a0, pb, sizeof pb);
         if (access(p, F_OK) != 0) {
-            c->x[0] = (uint64_t)(-2);
+            G_RET(c) = (uint64_t)(-2);
             break;
         // ENOENT
         }
@@ -1572,7 +1572,7 @@ static void service(struct cpu *c) {
                 // load the interpreter, not the script
                 p = xresolve_exec(sh_interp, shpb, sizeof shpb);
                 if (access(p, F_OK) != 0) {
-                    c->x[0] = (uint64_t)(-2);
+                    G_RET(c) = (uint64_t)(-2);
                     break;
                 }
                 for (int i = 0; i <= ni; i++)
@@ -1618,7 +1618,7 @@ static void service(struct cpu *c) {
         int st = 0;
         pid_t r = wait4((pid_t)(int)a0, &st, (int)a2, (struct rusage *)a3);
         if (r < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         // WIFSIGNALED: macOS termsig -> Linux
@@ -1628,7 +1628,7 @@ static void service(struct cpu *c) {
         else if ((st & 0xff) == 0x7f)
             st = (st & ~0xff00) | ((sig_m2l((st >> 8) & 0xff) & 0xff) << 8);
         if (a1) *(int *)a1 = st;
-        c->x[0] = (uint64_t)r;
+        G_RET(c) = (uint64_t)r;
         break;
     }
     case 261: {
@@ -1639,7 +1639,7 @@ static void service(struct cpu *c) {
             o[0] = ((int)a1 == 3) ? (8ull << 20) : ~0ull;
             o[1] = ~0ull;
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // clone3(clone_args*, size)
@@ -1648,13 +1648,13 @@ static void service(struct cpu *c) {
         uint64_t flags = ca[0];
         // CLONE_THREAD: sp = stack + stack_size
         if (flags & 0x10000) {
-            c->x[0] = (uint64_t)spawn_thread(c, flags, ca[5] + ca[6], ca[7], ca[3], ca[2]);
+            G_RET(c) = (uint64_t)spawn_thread(c, flags, ca[5] + ca[6], ca[7], ca[3], ca[2]);
             break;
         }
         pid_t pid = fork();
         // §B: same -- child drops the inherited shadow
         if (pid == 0) c->ssp = 0;
-        c->x[0] = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
+        G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }
 
@@ -1663,20 +1663,20 @@ static void service(struct cpu *c) {
     case 129:
         if ((int)a0 == container_pid() || (int)a0 <= 0) {
             raise_guest_signal(c, (int)a1);
-            c->x[0] = 0;
+            G_RET(c) = 0;
         // self / pgrp (PID-ns aware)
         }
         else
-            c->x[0] = kill((pid_t)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = kill((pid_t)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
         break;
     case 130:
         raise_guest_signal(c, (int)a1);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // tkill(tid,sig)
         break;
     case 131:
         raise_guest_signal(c, (int)a2);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // tgkill(tgid,tid,sig)
         break;
     // sigaltstack(new, old)
@@ -1692,14 +1692,14 @@ static void service(struct cpu *c) {
             c->alt_flags = *(uint32_t *)(a0 + 8);
             c->alt_size = *(uint64_t *)(a0 + 16);
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // rt_sigaction(sig, *act, *old)
     case 134: {
         int sig = (int)a0;
         if (sig < 1 || sig > 64) {
-            c->x[0] = (uint64_t)(-22);
+            G_RET(c) = (uint64_t)(-22);
             break;
         }
         if (a2) {
@@ -1732,7 +1732,7 @@ static void service(struct cpu *c) {
                 }
             }
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // rt_sigprocmask(how, *set, *old)
@@ -1750,7 +1750,7 @@ static void service(struct cpu *c) {
                 c->sigmask = set;
         // SIG_SETMASK
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // rt_sigpending(set, sigsetsize)
@@ -1760,7 +1760,7 @@ static void service(struct cpu *c) {
             // 1<<N -> sigset_t bit N-1
             if (p & (1ull << s)) out |= (1ull << (s - 1));
         if (a0) *(uint64_t *)a0 = out;
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 139:
@@ -1773,7 +1773,7 @@ static void service(struct cpu *c) {
     // =====================
     case 101:
         nanosleep((const struct timespec *)a0, (struct timespec *)a1);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // nanosleep
         break;
     case 113: {
@@ -1799,7 +1799,7 @@ static void service(struct cpu *c) {
             g[0] = ts.tv_sec;
             g[1] = ts.tv_nsec;
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 114: {
@@ -1807,17 +1807,17 @@ static void service(struct cpu *c) {
             *(uint64_t *)a1 = 0;
             *(uint64_t *)(a1 + 8) = 1;
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     // clock_getres -> 1ns
     }
     case 115:
         nanosleep((const struct timespec *)a2, (struct timespec *)a3);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // clock_nanosleep
         break;
     // times
-    case 153: c->x[0] = 0; break;
+    case 153: G_RET(c) = 0; break;
     case 169: {
         struct timeval tv;
         gettimeofday(&tv, 0);
@@ -1827,7 +1827,7 @@ static void service(struct cpu *c) {
             g[0] = tv.tv_sec;
             g[1] = tv.tv_usec;
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
 
@@ -1844,7 +1844,7 @@ static void service(struct cpu *c) {
                 g_lo_port[r] = 0;
             }
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 199: {
@@ -1855,7 +1855,7 @@ static void service(struct cpu *c) {
             ((int *)a3)[0] = sv[0];
             ((int *)a3)[1] = sv[1];
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     // bind -- port-map: bind the published host port
@@ -1869,7 +1869,7 @@ static void service(struct cpu *c) {
             char up[200];
             lo_path(p, up, sizeof up);
             if (lo_swap((int)a0) < 0) {
-                c->x[0] = (uint64_t)(-errno);
+                G_RET(c) = (uint64_t)(-errno);
                 break;
             }
             unlink(up);
@@ -1879,7 +1879,7 @@ static void service(struct cpu *c) {
             snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) g_lo_port[(int)a0] = p ? p : 1;
-            c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
         if (g_nportmap && sa && a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET) {
@@ -1892,14 +1892,14 @@ static void service(struct cpu *c) {
                 memcpy(buf, sa, L);
                 // publish on :H instead of :C (port @2)
                 *(uint16_t *)(buf + 2) = htons(hp);
-                c->x[0] = bind((int)a0, (struct sockaddr *)buf, L) < 0 ? (uint64_t)(-errno) : 0;
+                G_RET(c) = bind((int)a0, (struct sockaddr *)buf, L) < 0 ? (uint64_t)(-errno) : 0;
                 break;
             }
         }
-        c->x[0] = bind((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = bind((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 201: c->x[0] = listen((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 201: G_RET(c) = listen((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     case 202:
     case 242: {
         int lfd = (int)a0;
@@ -1922,7 +1922,7 @@ static void service(struct cpu *c) {
             }
         // peer = 127.0.0.1:lport
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // connect
@@ -1935,7 +1935,7 @@ static void service(struct cpu *c) {
             char up[200];
             lo_path(p, up, sizeof up);
             if (lo_swap((int)a0) < 0) {
-                c->x[0] = (uint64_t)(-errno);
+                G_RET(c) = (uint64_t)(-errno);
                 break;
             }
             struct sockaddr_un un;
@@ -1944,10 +1944,10 @@ static void service(struct cpu *c) {
             snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0 || errno == EINPROGRESS) g_lo_port[(int)a0] = p ? p : 1;
-            c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
-        c->x[0] = connect((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = connect((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 204: {
@@ -1955,14 +1955,14 @@ static void service(struct cpu *c) {
         int fd = (int)a0;
         if (fd >= 0 && fd < 1024 && g_lo_port[fd]) {
             fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         }
         int r = getsockname(fd, (void *)a1, (socklen_t *)a2);
         if (r == 0 && g_nportmap && a1 && fd >= 0 && fd < 1024 && g_fd_cport[fd])
             // app sees the port it asked for (port @2)
             *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 205: {
@@ -1970,20 +1970,20 @@ static void service(struct cpu *c) {
         int fd = (int)a0;
         if (fd >= 0 && fd < 1024 && g_lo_port[fd]) {
             fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         }
-        c->x[0] = getpeername(fd, (void *)a1, (socklen_t *)a2) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = getpeername(fd, (void *)a1, (socklen_t *)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 206: {
         ssize_t r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), (void *)a4, (socklen_t)a5);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 207: {
         ssize_t r = recvfrom((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), (void *)a4, (socklen_t *)a5);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // setsockopt(fd, level, optname, val, len)
@@ -1993,7 +1993,7 @@ static void service(struct cpu *c) {
             lvl = SOL_SOCKET;
             opt = so_opt_l2m((int)a2);
             if (opt < 0) {
-                c->x[0] = 0;
+                G_RET(c) = 0;
                 break;
             }
         // translate SOL_SOCKET; ignore unknown
@@ -2001,7 +2001,7 @@ static void service(struct cpu *c) {
         int r = setsockopt((int)a0, lvl, opt, (void *)a3,
                            // other levels (TCP/IP) pass through (TCP_NODELAY matches)
                            (socklen_t)a4);
-        c->x[0] = r < 0 ? 0 : 0;
+        G_RET(c) = r < 0 ? 0 : 0;
         (void)r;
         // never fail the guest on an unsupported option
         break;
@@ -2014,17 +2014,17 @@ static void service(struct cpu *c) {
             opt = so_opt_l2m((int)a2);
             if (opt < 0) {
                 if (a4 && *(socklen_t *)a4 >= 4 && a3) *(int *)a3 = 0;
-                c->x[0] = 0;
+                G_RET(c) = 0;
                 break;
             }
         // unknown -> report 0
         }
         int r = getsockopt((int)a0, lvl, opt, (void *)a3, (socklen_t *)a4);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 210:
-        c->x[0] = shutdown((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = shutdown((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
         // shutdown(fd, how) -- SHUT_RD/WR/RDWR match
         break;
     case 211:
@@ -2049,7 +2049,7 @@ static void service(struct cpu *c) {
             *(uint64_t *)(g + 40) = mh.msg_controllen;
             *(uint32_t *)(g + 48) = (uint32_t)mh.msg_flags;
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 269:
@@ -2087,7 +2087,7 @@ static void service(struct cpu *c) {
             }
             done++;
         }
-        c->x[0] = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
+        G_RET(c) = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
         break;
     }
 
@@ -2096,7 +2096,7 @@ static void service(struct cpu *c) {
     case 19: {
         int fds[2];
         if (pipe(fds) < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         if (a1 & 0x80000) {
@@ -2116,7 +2116,7 @@ static void service(struct cpu *c) {
             if (write(fds[1], &v, 8) < 0) {}
         // initval: read() returns it (else blocks)
         }
-        c->x[0] = (uint64_t)fds[0];
+        G_RET(c) = (uint64_t)fds[0];
         break;
     }
     case 20: {
@@ -2124,7 +2124,7 @@ static void service(struct cpu *c) {
         int r = kqueue();
         // EPOLL_CLOEXEC
         if (r >= 0 && (a0 & 0x80000)) fcntl(r, F_SETFD, FD_CLOEXEC);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // epoll_ctl(epfd, op, fd, event) -> kevent
@@ -2157,7 +2157,7 @@ static void service(struct cpu *c) {
         for (int i = 0; i < n; i++)
             // per-filter so DEL of an absent one is ignored
             kevent((int)a0, &kv[i], 1, NULL, 0, NULL);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // epoll_pwait(epfd, events, max, timeout_ms, sigmask)
@@ -2174,7 +2174,7 @@ static void service(struct cpu *c) {
         }
         int r = kevent((int)a0, NULL, 0, kv, maxev, tp);
         if (r < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         uint8_t *out = (uint8_t *)a1;
@@ -2187,7 +2187,7 @@ static void service(struct cpu *c) {
             *(uint32_t *)(out + i * 12) = ev;
             memcpy(out + i * 12 + 4, &kv[i].udata, 8);
         }
-        c->x[0] = (uint64_t)r;
+        G_RET(c) = (uint64_t)r;
         break;
     }
     case 26: {
@@ -2198,7 +2198,7 @@ static void service(struct cpu *c) {
             if (a0 & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
             if (a0 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // inotify_add_watch(fd, path, mask) -- kqueue EVFILT_VNODE
@@ -2208,7 +2208,7 @@ static void service(struct cpu *c) {
         const char *p = atpath(-100, (const char *)a1, pb, sizeof pb);
         int wfd = open(p, O_EVTONLY);
         if (wfd < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         struct kevent kv;
@@ -2217,10 +2217,10 @@ static void service(struct cpu *c) {
         if (kevent((int)a0, &kv, 1, NULL, 0, NULL) < 0) {
             int e = errno;
             close(wfd);
-            c->x[0] = (uint64_t)(-(int64_t)e);
+            G_RET(c) = (uint64_t)(-(int64_t)e);
             break;
         }
-        c->x[0] = (uint64_t)wfd;
+        G_RET(c) = (uint64_t)wfd;
         break;
     // watch descriptor = the watched fd
     }
@@ -2230,7 +2230,7 @@ static void service(struct cpu *c) {
         EV_SET(&kv, (int)a1, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
         kevent((int)a0, &kv, 1, NULL, 0, NULL);
         close((int)a1);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 73: {
@@ -2239,7 +2239,7 @@ static void service(struct cpu *c) {
         struct timespec *ts = (void *)a2;
         int tmo = ts ? (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000) : -1;
         int r = poll(fds, (nfds_t)a1, tmo);
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // signalfd4(fd, mask, sizemask, flags)
@@ -2249,7 +2249,7 @@ static void service(struct cpu *c) {
         for (int s = 1; s < 64; s++)
             if (lm & (1ull << (s - 1))) pm |= (1ull << s);
         if (g_sigfd_pipe[0] < 0 && pipe(g_sigfd_pipe) < 0) {
-            c->x[0] = (uint64_t)(-errno);
+            G_RET(c) = (uint64_t)(-errno);
             break;
         }
         g_sigfd_mask |= pm;
@@ -2266,7 +2266,7 @@ static void service(struct cpu *c) {
         if (a3 & 0x80000) fcntl(g_sigfd_pipe[0], F_SETFD, FD_CLOEXEC);
         // SFD_NONBLOCK
         if (a3 & 0x800) fcntl(g_sigfd_pipe[0], F_SETFL, O_NONBLOCK);
-        c->x[0] = (uint64_t)g_sigfd_pipe[0];
+        G_RET(c) = (uint64_t)g_sigfd_pipe[0];
         break;
     }
     case 85: {
@@ -2277,7 +2277,7 @@ static void service(struct cpu *c) {
             if (a1 & 1) fcntl(r, F_SETFL, O_NONBLOCK);
         // TFD_NONBLOCK=1
         }
-        c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // timerfd_settime(fd, flags, new, old)
@@ -2297,19 +2297,19 @@ static void service(struct cpu *c) {
         if (period_ns <= 0) {
             EV_SET(&kv, 1, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
             kevent((int)a0, &kv, 1, NULL, 0, NULL);
-            c->x[0] = 0;
+            G_RET(c) = 0;
             break;
         // disarm
         }
         // no interval -> one-shot
         uint16_t fl = EV_ADD | ((iv_s || iv_n) ? 0 : EV_ONESHOT);
         EV_SET(&kv, 1, EVFILT_TIMER, fl, NOTE_NSECONDS, period_ns, NULL);
-        c->x[0] = kevent((int)a0, &kv, 1, NULL, 0, NULL) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = kevent((int)a0, &kv, 1, NULL, 0, NULL) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 87: {
         if (a1) memset((void *)a1, 0, 32);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     // timerfd_gettime -> best-effort 0
     }
@@ -2324,7 +2324,7 @@ static void service(struct cpu *c) {
         strcpy(u + 130, "6.1.0");
         strcpy(u + 195, "#1 jit");
         strcpy(u + 260, "aarch64");
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     case 161: {
@@ -2335,23 +2335,23 @@ static void service(struct cpu *c) {
             g_hostname[n] = 0;
         // sethostname (UTS ns)
         }
-        c->x[0] = 0;
+        G_RET(c) = 0;
         break;
     }
     // setdomainname -> ignore
-    case 162: c->x[0] = 0; break;
+    case 162: G_RET(c) = 0; break;
     case 179:
         memset((void *)a0, 0, 112);
-        c->x[0] = 0;
+        G_RET(c) = 0;
         // sysinfo
         break;
     case 278:
         arc4random_buf((void *)a0, (size_t)a1);
-        c->x[0] = a1;
+        G_RET(c) = a1;
         // getrandom
         break;
     case 293:
-        c->x[0] = (uint64_t)(-ENOSYS);
+        G_RET(c) = (uint64_t)(-ENOSYS);
         // rseq -> ENOSYS (glibc falls back)
         break;
 
@@ -2359,15 +2359,15 @@ static void service(struct cpu *c) {
     default:
         fprintf(stderr, "[jit] unhandled syscall %llu (a0=%llx a1=%llx) at pc=%llx\n", (unsigned long long)nr,
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)c->pc);
-        c->x[0] = (uint64_t)(-ENOSYS);
+        G_RET(c) = (uint64_t)(-ENOSYS);
         // ENOSYS, keep going so we can see what's next
         break;
     }
-    // Boundary errno translation: every case sets c->x[0] to a host(macOS) errno on error
+    // Boundary errno translation: every case sets G_RET(c) to a host(macOS) errno on error
     // (-errno, saved e, helper returns, or a macOS E* constant). Map to the Linux errno the guest
     // expects. Skip redirect (sigreturn restored an already-Linux x0 from the signal frame).
     if (!c->redirect) {
-        int64_t rv = (int64_t)c->x[0];
-        if (rv < 0 && rv >= -4095) c->x[0] = (uint64_t)(-(int64_t)m2l_errno((int)(-rv)));
+        int64_t rv = (int64_t)G_RET(c);
+        if (rv < 0 && rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-rv)));
     }
 }
