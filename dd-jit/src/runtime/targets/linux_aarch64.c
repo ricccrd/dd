@@ -35,6 +35,7 @@
 
 #include "../include/cpu_aarch64.h"
 #include "../frontend/aarch64/abi.h"   // the cpu interface os/linux/ is written against
+#include "../frontend/aarch64/fill_stat.c" // the per-arch struct-stat layout os/linux/ fills
 
 // container/ns config state + parsers (early globals)
 #include "../os/linux/container/state.c"
