@@ -47,8 +47,9 @@ fn main() {
         .collect::<Vec<_>>().join("   "));
 
     let ctx = Ctx::discover();
-    let (mut pass, mut fail, mut skip, mut busy_ms) = (0u32, 0u32, 0u32, 0u128);
+    let (mut pass, mut fail, mut skip, mut xfail, mut xpass, mut busy_ms) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u128);
     let mut failures: Vec<String> = Vec::new();
+    let mut xpasses: Vec<String> = Vec::new();
     let mut slowest: Vec<(u128, String)> = Vec::new();
     let wall = Instant::now();
 
@@ -68,6 +69,9 @@ fn main() {
                         print!("  \x1b[32m✓\x1b[0m {} \x1b[90m{ms}ms\x1b[0m", e.label()); }
                     Status::Fail(m) => { fail += 1; busy_ms += ms; print!("  \x1b[31m✗ {} {ms}ms\x1b[0m", e.label());
                         failures.push(format!("{}/{} [{}]: {}", g.name, c.name, e.label(), m)); }
+                    Status::Xfail(_) => { xfail += 1; busy_ms += ms; print!("  \x1b[33mx {}\x1b[0m", e.label()); }
+                    Status::Xpass => { xpass += 1; busy_ms += ms; print!("  \x1b[35m✓! {}\x1b[0m", e.label());
+                        xpasses.push(format!("{}/{} [{}]", g.name, c.name, e.label())); }
                 }
             }
             println!();
@@ -81,8 +85,11 @@ fn main() {
         let top: Vec<String> = slowest.iter().take(3).map(|(ms, n)| format!("{n} {ms}ms")).collect();
         println!("\x1b[90mslowest: {}\x1b[0m", top.join(", "));
     }
+    for x in &xpasses { println!("\x1b[35m✓!\x1b[0m {x} — XPASS (known failure now passes; remove the .xfail marker)"); }
     let color = if fail > 0 { "31" } else { "32" };
-    println!("\x1b[1;{color}m{pass} passed\x1b[0m  {fail} failed  \x1b[90m{skip} skipped   {busy_ms}ms run, {}ms wall\x1b[0m",
+    let xf = if xfail > 0 { format!("  \x1b[33m{xfail} xfail\x1b[0m") } else { String::new() };
+    let xp = if xpass > 0 { format!("  \x1b[35m{xpass} xpass\x1b[0m") } else { String::new() };
+    println!("\x1b[1;{color}m{pass} passed\x1b[0m  {fail} failed{xf}{xp}  \x1b[90m{skip} skipped   {busy_ms}ms run, {}ms wall\x1b[0m",
         wall.elapsed().as_millis());
-    std::process::exit(if fail > 0 { 1 } else { 0 });
+    std::process::exit(if fail > 0 { 1 } else { 0 });   // xfail/xpass don't fail the suite
 }

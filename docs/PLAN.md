@@ -25,6 +25,10 @@ binaries) and `dd-daemon` (Docker Engine API). This file is the **work list only
    memoization. Constraint: do not use dead-register §B scratch (unsafe); don't drop the §B gsp check.
 
 ## Bugs found by the test harness
+- **jit86 (x86-64) translator/service bugs (xfail in dd-tests)** — surfaced by running the aarch64 test
+  programs on the x86 engine via the cross-compiler: `math`/`floatmath` (float/libm codegen → crash),
+  `heap` (malloc churn → crash), `threads`/`atomics` (hang). Plus the known `base32` (NEON) and
+  `sha256sum`. The aarch64 engine passes all; these are jit86-specific.
 - **jitdarwin: adrp/`__cstring` literal not relocated under the segment slide** — a guest that reads a
   string literal (via adrp) gets zeros; stack/SP-relative data works. (Found by dd-tests darwin group.)
 - **ELF loader resolves the executable in the overlay UPPER only, not through lowers** — running a

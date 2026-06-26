@@ -38,7 +38,7 @@ impl Engine {
     /// Whether this engine's JIT binary was built (by dd-jit's build.rs).
     pub fn available(self) -> bool { ddjit::available(self.jit()) }
     /// Whether guest binaries for this target can be compiled locally (only linux/aarch64 via native gcc).
-    pub fn can_compile(self) -> bool { matches!(self, Engine::LinuxAarch64) }
+    pub fn can_compile(self) -> bool { matches!(self, Engine::LinuxAarch64 | Engine::LinuxX86_64) }
 }
 
 /// How a case's guest binary is obtained for a given engine.
@@ -71,6 +71,9 @@ pub struct Case {
     pub lowers: Vec<String>,
     pub mem_max: u64,
     pub engines: Vec<Engine>,
+    /// Engines where this case is a KNOWN failure (jit86 translator/service bugs under debugging) — a
+    /// fail there is reported `xfail`, not a regression.
+    pub xfail: Vec<Engine>,
     pub checks: Vec<Check>,
 }
 
@@ -82,12 +85,12 @@ pub fn group(name: &'static str, cases: Vec<Case>) -> Group { Group { name, case
 // ---- ergonomic builders ----
 fn base(name: &'static str, bin: Bin) -> Case {
     let engines = match &bin {
-        Bin::Source(_) => vec![Engine::LinuxAarch64], // no x86 cross-compiler -> aarch64 only
+        Bin::Source(_) => vec![Engine::LinuxAarch64, Engine::LinuxX86_64], // same source, both Linux engines
         Bin::DarwinSource(_) => vec![Engine::DarwinAarch64],
         Bin::Fixture(fx) => fx.iter().map(|(e, _)| *e).collect(),
         Bin::InRootfs => vec![Engine::LinuxAarch64], // container rootfs fixtures are aarch64 today
     };
-    Case { name, bin, args: vec![], rootfs: None, lowers: vec![], mem_max: 0, engines, checks: vec![] }
+    Case { name, bin, args: vec![], rootfs: None, lowers: vec![], mem_max: 0, engines, xfail: vec![], checks: vec![] }
 }
 /// A case whose guest is compiled from a Linux/aarch64 C source under `guests/`.
 pub fn src(name: &'static str, source: &'static str) -> Case { base(name, Bin::Source(source)) }
@@ -114,10 +117,21 @@ impl Case {
     pub fn out(mut self, s: &'static str) -> Self { self.checks.push(Check::Out(s)); self }
     pub fn has(mut self, s: &'static str) -> Self { self.checks.push(Check::OutHas(s)); self }
     pub fn oracle(mut self) -> Self { self.checks.push(Check::Oracle); self }
+    /// Mark this case a KNOWN failure on the given engines (jit86 bugs under debugging): a fail there
+    /// is reported `xfail` (not a regression); an unexpected pass is reported `XPASS`.
+    pub fn xfail(mut self, e: &[Engine]) -> Self { self.xfail = e.to_vec(); self }
 }
 
 /// Result of running one case on one engine.
-pub enum Status { Pass, Fail(String), Skip(String) }
+pub enum Status {
+    Pass,
+    Fail(String),
+    Skip(String),
+    /// A KNOWN failure (the case is `.xfail()`-marked here) — tracked, not a regression.
+    Xfail(String),
+    /// An xfail-marked case that unexpectedly PASSED — the bug may be fixed; un-mark it.
+    Xpass,
+}
 
 /// Shared paths/config for a run.
 pub struct Ctx {
@@ -151,21 +165,28 @@ impl Ctx {
     }
 }
 
-/// Compile a guest C source for aarch64 (native gcc -static-pie). Cached by mtime. Returns the path.
-fn compile_aarch64(ctx: &Ctx, source: &str) -> Result<String, String> {
+/// Compile a guest C source for a Linux engine. aarch64 = native gcc, x86_64 = the cross compiler; both
+/// static-PIE, cached by mtime under cache/<arch>/. The same source runs on both engines (the point —
+/// it makes the engine matrix dense). Returns the binary path.
+fn compile(ctx: &Ctx, source: &str, e: Engine) -> Result<String, String> {
     let src = ctx.guests.join(source);
-    let out = ctx.cache.join("aarch64").join(source.trim_end_matches(".c"));
+    let out = ctx.cache.join(e.arch()).join(source.trim_end_matches(".c"));
+    std::fs::create_dir_all(out.parent().unwrap()).ok();
     let needs = !out.exists()
         || std::fs::metadata(&src).and_then(|m| m.modified()).ok()
             >= std::fs::metadata(&out).and_then(|m| m.modified()).ok();
     if needs {
-        // Link libm (float guests) + libsqlite3/libdl (real-software guests); static, unused libs are
-        // not pulled, so simple guests are unaffected.
-        let o = Command::new("gcc")
-            .args(["-O2", "-static-pie", "-pthread"])
-            .arg("-o").arg(&out).arg(&src).args(["-lsqlite3", "-lm", "-ldl"]).output()
-            .map_err(|e| format!("gcc spawn: {e}"))?;
-        if !o.status.success() { return Err(format!("compile {source}: {}", String::from_utf8_lossy(&o.stderr).trim())); }
+        // aarch64: native gcc + libsqlite3/libdl (real-software guests). x86_64: the cross compiler,
+        // libm only (no x86 libsqlite3 on the dev host). Static, unused libs aren't pulled.
+        let (cc, libs): (&str, &[&str]) = match e {
+            Engine::LinuxAarch64 => ("gcc", &["-lsqlite3", "-lm", "-ldl"]),
+            Engine::LinuxX86_64 => ("x86_64-linux-gnu-gcc", &["-lm"]),
+            _ => return Err(format!("{} is not a compilable Linux target", e.label())),
+        };
+        let o = Command::new(cc).args(["-O2", "-static-pie", "-pthread"])
+            .arg("-o").arg(&out).arg(&src).args(libs).output()
+            .map_err(|err| format!("{cc} spawn: {err}"))?;
+        if !o.status.success() { return Err(format!("compile {source} [{}]: {}", e.arch(), String::from_utf8_lossy(&o.stderr).trim())); }
     }
     Ok(out.to_string_lossy().into_owned())
 }
@@ -173,7 +194,7 @@ fn compile_aarch64(ctx: &Ctx, source: &str) -> Result<String, String> {
 /// Provision the guest binary path for a case on an engine. `Ok(None)` = skip (no guest for this arch).
 fn provision(ctx: &Ctx, c: &Case, e: Engine) -> Result<Option<String>, String> {
     match &c.bin {
-        Bin::Source(s) if e.can_compile() => compile_aarch64(ctx, s).map(Some),
+        Bin::Source(s) if e.can_compile() => compile(ctx, s, e).map(Some),
         Bin::Source(_) => Ok(None),
         Bin::DarwinSource(s) if e == Engine::DarwinAarch64 => compile_darwin(ctx, s).map(Some),
         Bin::DarwinSource(_) => Ok(None),
@@ -225,7 +246,15 @@ pub fn run(ctx: &Ctx, c: &Case, e: Engine) -> Status {
         _ => std::iter::once(guest.clone()).chain(c.args.iter().cloned()).collect(),
     };
     let (prog, args) = match cfg.command(e.jit()) { Some(x) => x, None => return Status::Skip("no command".into()) };
-    let out = match Command::new(&prog).args(&args).output() { Ok(o) => o, Err(err) => return Status::Fail(format!("spawn: {err}")) };
+    // Wrap in `timeout` so a hung/looping guest can't block the matrix (the x86 JIT can mistranslate
+    // into an infinite loop). 124 = timed out.
+    let out = match Command::new("timeout").arg("25").arg(&prog).args(&args).output() {
+        Ok(o) => o,
+        Err(err) => return Status::Fail(format!("spawn: {err}")),
+    };
+    // a known failure on this engine is reported xfail, not a regression
+    let fail = |msg: String| if c.xfail.contains(&e) { Status::Xfail(msg) } else { Status::Fail(msg) };
+    if out.status.code() == Some(124) { return fail(format!("timeout (>25s) [{}]", e.label())); }
     if std::env::var("DD_DEBUG").is_ok() {
         eprintln!("\n[dbg] {} {:?}\n[dbg] out={:?}\n[dbg] err={:?}\n[dbg] code={:?}", prog, args,
             String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr), out.status.code());
@@ -234,19 +263,22 @@ pub fn run(ctx: &Ctx, c: &Case, e: Engine) -> Status {
     let stdout = strip_noise(&out.stdout);
     let code = out.status.code().unwrap_or(-1);
     for chk in &c.checks {
-        if let Err(msg) = eval(chk, &stdout, code, &guest, &c.args) { return Status::Fail(msg); }
+        if let Err(msg) = eval(chk, &stdout, code, &guest, &c.args, e) { return fail(msg); }
     }
-    Status::Pass
+    if c.xfail.contains(&e) { Status::Xpass } else { Status::Pass }
 }
 
-fn eval(chk: &Check, stdout: &str, code: i32, guest: &str, args: &[String]) -> Result<(), String> {
+fn eval(chk: &Check, stdout: &str, code: i32, guest: &str, args: &[String], e: Engine) -> Result<(), String> {
     match chk {
         Check::Exit(want) => (code == *want).then_some(()).ok_or_else(|| format!("exit {code} != {want}")),
         Check::Out(want) => (stdout == *want).then_some(()).ok_or_else(|| format!("stdout {:?} != {:?}", stdout, want)),
         Check::OutHas(sub) => stdout.contains(sub).then_some(()).ok_or_else(|| format!("stdout {:?} lacks {:?}", stdout, sub)),
         Check::Oracle => {
-            // native run of the same aarch64 guest on the host = ground truth.
-            let o = Command::new(guest).args(args).output().map_err(|e| format!("oracle spawn: {e}"))?;
+            // native ground truth: aarch64 runs directly; x86_64 runs under qemu-user.
+            let o = match e {
+                Engine::LinuxX86_64 => Command::new("timeout").arg("25").arg("qemu-x86_64").arg(guest).args(args).output(),
+                _ => Command::new("timeout").arg("25").arg(guest).args(args).output(),
+            }.map_err(|err| format!("oracle spawn: {err}"))?;
             let (eo, ec) = (strip_noise(&o.stdout), o.status.code().unwrap_or(-1));
             if eo != stdout || ec != code { Err(format!("oracle mismatch (jit {code}/{stdout:?} vs native {ec}/{eo:?})")) } else { Ok(()) }
         }
