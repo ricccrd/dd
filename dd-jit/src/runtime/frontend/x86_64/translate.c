@@ -1435,6 +1435,41 @@ static void *translate_block(uint64_t gpc) {
                         emit32(0x1E624000u | (s << 5) | vd); // FCVT Sd, Dn (double->single)
                     else
                         emit32(0x1E22C000u | (s << 5) | vd); // FCVT Dd, Sn (single->double)
+                } else if (op == 0xC2) { // cmpps/pd/ss/sd: FP compare with predicate imm -> all-1s/0 mask
+                    int packed = !I.repne && !I.rep;
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        if (packed)
+                            e_ldr_q(16, 17, 0);
+                        else if (I.repne)
+                            e_ldr_d(16, 17);
+                        else
+                            e_ldr_s(16, 17);
+                        s = 16;
+                    }
+                    int pred = (int)I.imm & 7;
+                    // sz bit (bit22): packed 66 / scalar F2 -> double, else single
+                    uint32_t szb = (packed ? I.p66 : I.repne) ? 0x00400000u : 0;
+                    uint32_t EQ = (packed ? 0x4E20E400u : 0x5E20E400u) | szb;  // FCMEQ
+                    uint32_t GE = (packed ? 0x6E20E400u : 0x7E20E400u) | szb;  // FCMGE
+                    uint32_t GT = (packed ? 0x6EA0E400u : 0x7EA0E400u) | szb;  // FCMGT
+                    uint32_t ANDb = packed ? 0x4E201C00u : 0x0E201C00u;        // AND Vd.16b/8b
+                    uint32_t NOTb = packed ? 0x6E205800u : 0x2E205800u;        // NOT (MVN) Vd.16b/8b
+                    if (pred == 3 || pred == 7) {                              // UNORD/ORD: ordered(a)&ordered(b)
+                        emit32(EQ | (vd << 16) | (vd << 5) | 17);              // v17 = a==a (ordered a)
+                        emit32(EQ | (s << 16) | (s << 5) | vd);                // vd  = b==b (ordered b)
+                        emit32(ANDb | (17 << 16) | (vd << 5) | vd);            // vd  = ORD
+                        if (pred == 3)
+                            emit32(NOTb | (vd << 5) | vd);                     // UNORD = ~ORD
+                    } else {
+                        int swap = (pred == 1 || pred == 2);                   // LT/LE: a<b == b>a -> swap
+                        int n = swap ? s : vd, m = swap ? vd : s;
+                        uint32_t fc = (pred == 0 || pred == 4) ? EQ : (pred == 1 || pred == 6) ? GT : GE;
+                        emit32(fc | (m << 16) | (n << 5) | vd);                // FCMxx vd, n, m
+                        if (pred == 4)
+                            emit32(NOTb | (vd << 5) | vd);                     // NEQ = ~EQ
+                    }
                 } else if (op == 0x2E || op == 0x2F) {       // ucomisd/comisd (66=double, none=single) -> FCMP + flags
                     int s = vm;
                     if (I.is_mem) {
