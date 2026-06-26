@@ -834,6 +834,24 @@ static void *translate_block(uint64_t gpc) {
                 int bycl = (op == 0xD2 || op == 0xD3), by1 = (op == 0xD0 || op == 0xD1);
                 if (k != 0 && k != 1 && k != 4 && k != 5 && k != 7) { report_unimpl(gpc, &I); break; } // RCL/RCR defer
                 int raw = rm_load(&I, next, w, &mem);
+                if ((k == 0 || k == 1) && w < 4) {            // 8/16-bit ROL/ROR -- rotate WITHIN the operand width
+                    int width = 8 * w;                        // (a 64-bit ROR would wrap the wrong bits, e.g. rolw $8)
+                    e_uxt(16, raw, w);                        // x16 = zero-extended operand (low `width` bits)
+                    e_bfi(16, 16, width, width, 0);           // replicate v -> [2w-1:w] (16-bit: now 32 bits = v|v)
+                    if (w == 1) e_bfi(16, 16, 16, 16, 0);     // byte: replicate the pair again -> 4 copies fill 32 bits
+                    if (bycl) {                               // count = CL masked to the operand width
+                        e_movconst(19, width - 1); e_rrr(A_AND, 20, RCX, 19, 0, 0);            // x20 = CL & (width-1)
+                        if (k == 0) { e_movconst(19, width); e_rrr(A_SUB, 20, 19, 20, 0, 0);   // ROL by n == ROR by (width-n)
+                                      e_movconst(19, width - 1); e_rrr(A_AND, 20, 20, 19, 0, 0); }
+                        e_shv(S_RORV, 16, 16, 20, 0);         // 32-bit RORV of the replicated value -> low `width` bits correct
+                    } else {
+                        int ce = (((int)(I.imm) % width) + width) % width;
+                        int rr = (k == 1) ? ce : (width - ce) % width;
+                        if (rr) e_ror_i(16, 16, rr, 0);       // 32-bit ROR; low `width` bits are the answer
+                    }
+                    rm_store(&I, w, 16);                      // stores low w bytes; x86 rotates leave SF/ZF unchanged -> no flag save
+                    gpc = next; continue;
+                }
                 int ssf = (w >= 4) ? sf : 1;                // operate 64-bit on extended byte/word
                 // bring the operand into x16, zero/sign-extended for w<4
                 if (w < 4) { if (k == 5) e_uxt(16, raw, w); else if (k == 7) e_sxt(16, raw, w); else e_mov_rr(16, raw, 0); }
@@ -1573,6 +1591,18 @@ static uint8_t g_sock_stream[1024];        // fd -> 1 if AF_INET SOCK_STREAM (on
 static int g_eventfd_peer[1024];           // eventfd(read-end) -> pipe write-end + 1 (0 = not an eventfd)
 static uint8_t g_timerfd[1024];            // fd is a timerfd (kqueue + EVFILT_TIMER) -> read() drains it
 static uint8_t g_inotify[1024];            // fd is an inotify (kqueue + EVFILT_VNODE watches) -> read() drains it
+// ---- port-map (docker -p H:C): bind(:C) actually binds host :H; getsockname reports :C back ----
+static struct { uint16_t cport, hport; } g_portmap[32];
+static int g_nportmap = 0;
+static uint16_t g_fd_cport[1024];          // fd -> the container port it bound (for getsockname)
+static uint16_t pm_host(uint16_t cp) { for (int i = 0; i < g_nportmap; i++) if (g_portmap[i].cport == cp) return g_portmap[i].hport; return cp; }
+static void parse_publish(const char *s) {  // "H:C,H:C,..." (docker -p order: host:container)
+    while (s && *s && g_nportmap < 32) {
+        int h = atoi(s); const char *colon = strchr(s, ':'); if (!colon) break;
+        int cc = atoi(colon + 1); if (h > 0 && cc > 0) { g_portmap[g_nportmap].cport = (uint16_t)cc; g_portmap[g_nportmap].hport = (uint16_t)h; g_nportmap++; }
+        const char *comma = strchr(s, ','); if (!comma) break; s = comma + 1;
+    }
+}
 // ---- signalfd: a self-pipe poked by a host signal handler (guest reads signalfd_siginfo) ----
 // Linux x86-64 signo == Linux aarch64 signo (generic), but macOS differs -> translate at the boundary.
 static int g_sigfd_pipe[2] = {-1, -1};     // signalfd self-pipe (write end poked from host_sigh)
@@ -1586,6 +1616,74 @@ static void host_sigh(int sig) {
     int ls = sig_m2l(sig);                                                             // host(macOS) signo -> Linux
     __atomic_or_fetch(&g_pending, 1ull << ls, __ATOMIC_SEQ_CST);
     if ((g_sigfd_mask & (1ull << ls)) && g_sigfd_pipe[1] >= 0) { char b = (char)ls; if (write(g_sigfd_pipe[1], &b, 1) < 0) {} }  // wake signalfd/epoll
+}
+// ---- guest signal delivery: build a Linux x86-64 rt_sigframe and redirect to the handler ----
+static struct { uint64_t handler, flags, mask; } g_sigact[65];   // per-signal disposition (mask in sigset_t convention)
+#define SIGRETURN_PC 0xFFFFFFFFFFF0ull               // sentinel return address: handler ret -> sigreturn
+// x86-64 sigcontext gregs index -> guest cpu->r[] index (r8..r15,rdi,rsi,rbp,rbx,rdx,rax,rcx,rsp; then rip,eflags)
+static const int GREG2R[16] = {8,9,10,11,12,13,14,15, 7,6,5,3,2,0,1,4};   // gregs[0..15]
+static uint64_t nzcv_to_eflags(uint64_t nz) {
+    uint64_t f = 0x2;                                                      // bit1 reserved (always 1)
+    if (!((nz >> 29) & 1)) f |= 1u << 0;   if ((nz >> 30) & 1) f |= 1u << 6;   // CF (stored inverted), ZF
+    if ((nz >> 31) & 1) f |= 1u << 7;      if ((nz >> 28) & 1) f |= 1u << 11;  // SF, OF
+    return f;
+}
+static uint64_t eflags_to_nzcv(uint64_t f) {
+    uint64_t nz = 0;
+    if (!(f & 1)) nz |= 1u << 29;          if (f & (1u << 6)) nz |= 1u << 30;  // CF (invert), ZF
+    if (f & (1u << 7)) nz |= 1u << 31;     if (f & (1u << 11)) nz |= 1u << 28; // SF, OF
+    return nz;
+}
+static void build_signal_frame(struct cpu *c, int sig) {
+    uint64_t sp = (c->r[4] - 2048) & ~15ull;                               // 16-aligned frame base; uc lives here
+    uint64_t uc = sp, mc = uc + 40, info = uc + 512, xs = uc + 768;        // ucontext / mcontext(gregs) / siginfo / xmm save
+    memset((void *)sp, 0, 2048);
+    for (int i = 0; i < 16; i++) *(uint64_t *)(mc + i * 8) = c->r[GREG2R[i]];   // gregs[0..15]
+    *(uint64_t *)(mc + 16 * 8) = c->rip;                                   // gregs[16] = RIP
+    *(uint64_t *)(mc + 17 * 8) = nzcv_to_eflags(c->nzcv);                  // gregs[17] = EFL
+    *(uint64_t *)(uc + 296) = c->sigmask;                                  // uc_sigmask (restored on sigreturn)
+    memcpy((void *)xs, c->v, sizeof c->v);                                 // preserve guest xmm across the handler
+    *(int *)(info + 0) = sig;                                              // siginfo.si_signo
+    uint64_t rsp = sp - 8; *(uint64_t *)rsp = SIGRETURN_PC;                // pushed return address
+    c->r[7] = (uint64_t)sig; c->r[6] = info; c->r[2] = uc;                 // handler(signo, siginfo*, ucontext*) in rdi,rsi,rdx
+    c->r[4] = rsp; c->rip = g_sigact[sig].handler;
+    c->sigmask |= g_sigact[sig].mask;
+    if (!(g_sigact[sig].flags & 0x40000000)) c->sigmask |= (1ull << (sig - 1));  // SA_NODEFER off -> block this signal
+    if (g_trace) fprintf(stderr, "[sig] deliver %d handler=%llx rsp=%llx\n", sig, (unsigned long long)c->rip, (unsigned long long)rsp);
+}
+static void do_sigreturn(struct cpu *c) {
+    uint64_t uc = c->r[4], mc = uc + 40, xs = uc + 768;                    // after the handler's ret, rsp == uc
+    for (int i = 0; i < 16; i++) c->r[GREG2R[i]] = *(uint64_t *)(mc + i * 8);
+    c->rip  = *(uint64_t *)(mc + 16 * 8);
+    c->nzcv = eflags_to_nzcv(*(uint64_t *)(mc + 17 * 8));
+    c->sigmask = *(uint64_t *)(uc + 296);
+    memcpy(c->v, (void *)xs, sizeof c->v);
+}
+static void maybe_deliver_signal(struct cpu *c) {
+    uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
+    for (int sig = 1; sig <= 64; sig++) {
+        uint64_t bit = 1ull << sig;
+        if (!(p & bit) || (c->sigmask & (1ull << (sig - 1)))) continue;    // pending and not blocked
+        uint64_t h = g_sigact[sig].handler;
+        if (h <= 1) { __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST); continue; }   // SIG_DFL/IGN: host already acted
+        if (__atomic_fetch_and(&g_pending, ~bit, __ATOMIC_SEQ_CST) & bit) { build_signal_frame(c, sig); return; }
+    }
+}
+// A signal aimed at our own process (raise/abort/kill self): deliver through our machinery
+// (host signals into a MAP_JIT thread are fragile) -- custom handler -> pending; else default action.
+static void raise_guest_signal(struct cpu *c, int sig) {
+    if (sig < 1 || sig > 64) return;
+    uint64_t h = g_sigact[sig].handler;
+    if (h > 1) { __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST); return; }   // custom handler
+    if (h == 1) return;                                                                    // SIG_IGN
+    if (c && (c->sigmask & (1ull << (sig - 1)))) {                                          // blocked -> pending (signalfd/unblock)
+        __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+        if ((g_sigfd_mask & (1ull << sig)) && g_sigfd_pipe[1] >= 0) { char b = (char)sig; if (write(g_sigfd_pipe[1], &b, 1) < 0) {} }
+        return;
+    }
+    if (sig == 17 || sig == 18 || sig == 23 || sig == 28) return;                          // SIGCHLD/CONT/URG/WINCH: ignore
+    signal(sig_l2m(sig), SIG_DFL); raise(sig_l2m(sig));                                     // default: die by the signal (host signo)
+    c->exited = 1; c->exit_code = 128 + sig;                                               // fallback
 }
 static int lo_on(void) { return g_netns[0] != 0; }
 static int lo_is(const uint8_t *sa, socklen_t l) { return sa && l >= 8 && *(uint16_t *)sa == AF_INET && sa[4] == 127; }
@@ -1626,8 +1724,92 @@ static void add_vol(const char *spec) {            // "guestpath:hostdir"
     size_t gl = strlen(g_vols[g_nvols].guest); while (gl > 1 && g_vols[g_nvols].guest[gl - 1] == '/') g_vols[g_nvols].guest[--gl] = 0;
     g_vols[g_nvols].glen = gl; snprintf(g_vols[g_nvols].host, sizeof g_vols[g_nvols].host, "%s", hc); g_nvols++;
 }
+// ---- Overlay (OCI image layers): --rootfs is the writable UPPER; --lower dirs are read-only,
+// searched top->down when a path isn't in the upper. A .wh.NAME whiteout hides a lower entry;
+// copy-up brings a lower file into the upper on write. Off entirely when g_nlower==0. ----
+struct olayer { char root[1024]; size_t rlen; };
+static struct olayer g_lower[8]; static int g_nlower = 0;     // [0] = highest-priority lower (searched first)
+static char g_ovldir[1024][256];                              // dir-fd -> its GUEST path (for merged getdents); "" = not overlay
+static int g_ovlcur[1024];                                    // dir-fd -> merged-listing cursor (entries already emitted)
+static void add_lower(const char *dir) {
+    if (g_nlower >= 8 || !dir || !dir[0]) return;
+    char rc[1024]; if (!realpath(dir, rc)) snprintf(rc, sizeof rc, "%s", dir);
+    snprintf(g_lower[g_nlower].root, sizeof g_lower[g_nlower].root, "%s", rc);
+    g_lower[g_nlower].rlen = strlen(rc); g_nlower++;
+}
+// One layer's host path for an absolute guest path, following symlinks LAYER-relative (like xresolve).
+static void layer_path(const char *root, const char *guest, char *buf, size_t n, int follow) {
+    char cpath[1024]; snprintf(cpath, sizeof cpath, "%s", guest);
+    if (follow) for (int i = 0; i < 40; i++) {
+        char h[4200]; snprintf(h, sizeof h, "%s%s", root, cpath);
+        char lk[1024]; ssize_t k = readlink(h, lk, sizeof lk - 1); if (k < 0) break; lk[k] = 0;
+        if (lk[0] == '/') snprintf(cpath, sizeof cpath, "%s", lk);
+        else { char *sl = strrchr(cpath, '/'); int d = sl ? (int)(sl - cpath) : 0;
+               char tmp[1024]; snprintf(tmp, sizeof tmp, "%.*s/%s", d, cpath, lk); snprintf(cpath, sizeof cpath, "%s", tmp); }
+    }
+    snprintf(buf, n, "%s%s", root, cpath);
+}
+static void wh_path(const char *root, const char *guest, char *buf, size_t n) {   // host path of the .wh.NAME marker
+    char par[1024]; snprintf(par, sizeof par, "%s", guest); char *sl = strrchr(par, '/');
+    char base[256]; snprintf(base, sizeof base, "%s", sl ? sl + 1 : par); if (sl) *sl = 0;
+    snprintf(buf, n, "%s%s/.wh.%s", root, par, base);
+}
+static int wh_exists(const char *root, const char *guest) { char h[4300]; wh_path(root, guest, h, sizeof h); struct stat st; return lstat(h, &st) == 0; }
+// READ resolve: topmost layer that has `guest`. Returns 1 + host on hit; 0 (+ upper path) if absent/whiteout-hidden.
+static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollow) {
+    char up[4300]; layer_path(g_rootfs, guest, up, sizeof up, !nofollow); struct stat st;
+    if (lstat(up, &st) == 0) { snprintf(host, hn, "%s", up); return 1; }                  // upper shadows lowers
+    if (wh_exists(g_rootfs, guest)) { snprintf(host, hn, "%s", up); return 0; }            // deleted in upper
+    for (int i = 0; i < g_nlower; i++) {
+        char lp[4300]; layer_path(g_lower[i].root, guest, lp, sizeof lp, !nofollow);
+        if (lstat(lp, &st) == 0) { snprintf(host, hn, "%s", lp); return 1; }
+        if (wh_exists(g_lower[i].root, guest)) { snprintf(host, hn, "%s", up); return 0; }
+    }
+    snprintf(host, hn, "%s", up); return 0;                                               // absent -> upper path (ENOENT / O_CREAT)
+}
+// Copy-up: bring a lower file into the UPPER so it can be modified; returns the upper host path.
+static void overlay_copyup(const char *guest, char *host, size_t hn) {
+    layer_path(g_rootfs, guest, host, hn, 1); struct stat st;
+    if (lstat(host, &st) == 0) return;                                                    // already writable in upper
+    if (wh_exists(g_rootfs, guest)) { char wh[4300]; wh_path(g_rootfs, guest, wh, sizeof wh); unlink(wh); return; }  // recreate
+    char src[4300]; int have = 0;
+    for (int i = 0; i < g_nlower && !have; i++) { layer_path(g_lower[i].root, guest, src, sizeof src, 1);
+        if (lstat(src, &st) == 0 && S_ISREG(st.st_mode)) have = 1;
+        else if (wh_exists(g_lower[i].root, guest)) break; }
+    if (!have) return;                                                                    // new file -> upper path as-is
+    char dir[4300]; snprintf(dir, sizeof dir, "%s", host); char *sl = strrchr(dir, '/'); size_t rl = strlen(g_rootfs);
+    if (sl) { *sl = 0; for (char *q = dir + rl + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(dir, 0755); *q = '/'; } mkdir(dir, 0755); }
+    int in = open(src, O_RDONLY), out = open(host, O_CREAT | O_WRONLY | O_TRUNC, st.st_mode & 0777);
+    if (in >= 0 && out >= 0) { char b[1 << 16]; ssize_t r; while ((r = read(in, b, sizeof b)) > 0) if (write(out, b, r) < 0) break; }
+    if (in >= 0) close(in); if (out >= 0) close(out);
+}
+static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, int max) {  // merged listing (upper first)
+    static char seen[2048][256]; int ns = 0, nout = 0;
+    for (int L = -1; L < g_nlower && nout < max; L++) {
+        const char *root = (L < 0) ? g_rootfs : g_lower[L].root;
+        char host[4300]; layer_path(root, gdir, host, sizeof host, 1);
+        DIR *d = opendir(host); if (!d) continue; struct dirent *e;
+        while ((e = readdir(d)) && nout < max) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            int wh = !strncmp(e->d_name, ".wh.", 4); const char *name = wh ? e->d_name + 4 : e->d_name;
+            int dup = 0; for (int i = 0; i < ns; i++) if (!strcmp(seen[i], name)) { dup = 1; break; }
+            if (dup) continue; if (ns < 2048) snprintf(seen[ns++], 256, "%s", name);       // higher layer already decided this name
+            if (!wh) { snprintf(names[nout], 256, "%s", name); types[nout] = e->d_type; nout++; }  // whiteout -> hide
+        }
+        closedir(d);
+    }
+    return nout;
+}
+static void overlay_whiteout(const char *guest) {                                          // delete: drop upper copy + .wh marker
+    char up[4300]; layer_path(g_rootfs, guest, up, sizeof up, 1); remove(up);
+    char wh[4300]; wh_path(g_rootfs, guest, wh, sizeof wh);
+    char dir[4300]; snprintf(dir, sizeof dir, "%s", wh); char *s2 = strrchr(dir, '/'); size_t rl = strlen(g_rootfs);
+    if (s2) { *s2 = 0; for (char *q = dir + rl + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(dir, 0755); *q = '/'; } mkdir(dir, 0755); }
+    int fd = open(wh, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);
+}
 static const char *xlate(const char *p, char *buf, size_t n) {
     if (p && p[0] == '/') { const char *rel; const char *root = vol_root(p, &rel);
+                            if (root == g_rootfs && g_nlower) { overlay_resolve(p, buf, n, 1); return buf; }  // overlay (nofollow)
                             if (root) { snprintf(buf, n, "%s%s", root, rel); return buf; } }
     return p;
 }
@@ -1635,6 +1817,7 @@ static const char *xresolve(const char *p, char *buf, size_t n) {
     if (!p || p[0] != '/') return p;
     const char *rel0; const char *root = vol_root(p, &rel0);
     if (!root) return p;
+    if (root == g_rootfs && g_nlower) { overlay_resolve(p, buf, n, 0); return buf; }       // overlay (follow symlinks)
     char cpath[1024]; snprintf(cpath, sizeof cpath, "%s", rel0);
     for (int i = 0; i < 40; i++) {
         char h[4200]; snprintf(h, sizeof h, "%s%s", root, cpath);
@@ -1734,21 +1917,32 @@ static void service(struct cpu *c) {
     case 20: ret = (uint64_t)writev((int)a0, (void *)a1, (int)a2); break;             // writev
     case 17: { ssize_t r = pread((int)a0, (void *)a1, (size_t)a2, (off_t)a3); ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; } // pread64
     case 18: { ssize_t r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3); ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }// pwrite64
-    case 257: { char pb[4200]; const char *p = atpath((const char *)a1, pb, sizeof pb);   // openat
+    case 257: { const char *raw = (const char *)a1; char pb[4200]; const char *p;        // openat
                 int lf = (int)a2, mf = lf & 0x3;
                 if (lf & 0x40) mf |= O_CREAT;   if (lf & 0x80) mf |= O_EXCL;
                 if (lf & 0x200) mf |= O_TRUNC;  if (lf & 0x400) mf |= O_APPEND;
                 if (lf & 0x800) mf |= O_NONBLOCK; if (lf & 0x10000) mf |= O_DIRECTORY;
                 if (lf & 0x80000) mf |= O_CLOEXEC;
+                if (g_nlower && raw && raw[0] == '/') {                                    // OVERLAY: write copies-up, read resolves across layers
+                    char host[4300]; if ((mf & 3) != O_RDONLY || (lf & 0x40)) overlay_copyup(raw, host, sizeof host); else overlay_resolve(raw, host, sizeof host, 0);
+                    snprintf(pb, sizeof pb, "%s", host); p = pb;
+                } else p = atpath(raw, pb, sizeof pb);
                 int r = openat(ATFD(a0), p, mf, (mode_t)a3);
+                if (r >= 0 && r < 1024 && g_nlower && raw && raw[0] == '/') { snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", raw); g_ovlcur[r] = 0; }  // guest path + cursor for merged getdents
                 ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }
-    case 2: { char pb[4200]; const char *p = atpath((const char *)a0, pb, sizeof pb);     // open
+    case 2: { const char *raw = (const char *)a0; char pb[4200]; const char *p;           // open
               int lf = (int)a1, mf = lf & 0x3;
               if (lf & 0x40) mf |= O_CREAT; if (lf & 0x200) mf |= O_TRUNC;
-              int r = open(p, mf, (mode_t)a2); ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }
+              if (g_nlower && raw && raw[0] == '/') {                                       // OVERLAY
+                  char host[4300]; if ((mf & 3) != O_RDONLY || (lf & 0x40)) overlay_copyup(raw, host, sizeof host); else overlay_resolve(raw, host, sizeof host, 0);
+                  snprintf(pb, sizeof pb, "%s", host); p = pb;
+              } else p = atpath(raw, pb, sizeof pb);
+              int r = open(p, mf, (mode_t)a2);
+              if (r >= 0 && r < 1024 && g_nlower && raw && raw[0] == '/') { snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", raw); g_ovlcur[r] = 0; }
+              ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }
     case 3:  { int cf = (int)a0;                                                     // close (reap eventfd peer / timerfd / inotify / loopback state)
         if (cf >= 0 && cf < 1024) { if (g_eventfd_peer[cf]) { close(g_eventfd_peer[cf] - 1); g_eventfd_peer[cf] = 0; }
-                                    g_timerfd[cf] = 0; g_inotify[cf] = 0; g_lo_port[cf] = 0; g_sock_stream[cf] = 0; }
+                                    g_timerfd[cf] = 0; g_inotify[cf] = 0; g_lo_port[cf] = 0; g_sock_stream[cf] = 0; g_fd_cport[cf] = 0; g_ovldir[cf][0] = 0; }
         ret = (uint64_t)close(cf); break; }
     case 8:  ret = (uint64_t)lseek((int)a0, (off_t)a1, (int)a2); break;               // lseek
     case 9:  {                                                                        // mmap
@@ -1850,7 +2044,9 @@ static void service(struct cpu *c) {
                     size_t l = strlen(rp); if (l > a3) l = (size_t)a3; memcpy((void *)a2, rp, l); ret = l; break; }
                 ssize_t r = readlink(p, (char *)a2, (size_t)a3); ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }
     // ---- filesystem mutation (all path args go through the rootfs jail) ----
-    case 87: { char pb[4200]; const char *p = xlate((const char *)a0, pb, sizeof pb); ret = unlink(p) < 0 ? (uint64_t)(-errno) : 0; break; }          // unlink
+    case 87: { const char *raw = (const char *)a0;                                        // unlink
+               if (g_nlower && raw && raw[0] == '/') { overlay_whiteout(raw); ret = 0; break; }   // OVERLAY: drop upper + .wh marker
+               char pb[4200]; const char *p = xlate(raw, pb, sizeof pb); ret = unlink(p) < 0 ? (uint64_t)(-errno) : 0; break; }
     case 84: { char pb[4200]; const char *p = xlate((const char *)a0, pb, sizeof pb); ret = rmdir(p) < 0 ? (uint64_t)(-errno) : 0; break; }           // rmdir
     case 83: { char pb[4200]; const char *p = xlate((const char *)a0, pb, sizeof pb); ret = mkdir(p, (mode_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; } // mkdir
     case 82: { char pb[4200], pb2[4200]; const char *o = xlate((const char *)a0, pb, sizeof pb); char b2[4200]; const char *n = xlate((const char *)a1, b2, sizeof b2); (void)pb2; ret = rename(o, n) < 0 ? (uint64_t)(-errno) : 0; break; } // rename
@@ -1865,7 +2061,9 @@ static void service(struct cpu *c) {
     case 76: { char pb[4200]; const char *p = xlate((const char *)a0, pb, sizeof pb); ret = truncate(p, (off_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; } // truncate
     case 77: ret = ftruncate((int)a0, (off_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;                                                                    // ftruncate
     case 161: { char pb[4200]; const char *p = xlate((const char *)a0, pb, sizeof pb); (void)p; ret = 0; break; }                                        // chroot: jail already confines; no-op
-    case 263: { char pb[4200]; const char *p = atpath((const char *)a1, pb, sizeof pb); ret = ((a2 & 0x200) ? rmdir(p) : unlink(p)) < 0 ? (uint64_t)(-errno) : 0; break; }  // unlinkat (AT_REMOVEDIR=0x200)
+    case 263: { const char *raw = (const char *)a1;                                       // unlinkat (AT_REMOVEDIR=0x200)
+                if (g_nlower && raw && raw[0] == '/') { overlay_whiteout(raw); ret = 0; break; }   // OVERLAY whiteout
+                char pb[4200]; const char *p = atpath(raw, pb, sizeof pb); ret = ((a2 & 0x200) ? rmdir(p) : unlink(p)) < 0 ? (uint64_t)(-errno) : 0; break; }
     case 258: { char pb[4200]; const char *p = atpath((const char *)a1, pb, sizeof pb); ret = mkdir(p, (mode_t)a2) < 0 ? (uint64_t)(-errno) : 0; break; } // mkdirat
     case 264: case 316: { char pb[4200], b2[4200];                                                                                                       // renameat / renameat2
                 int od = (nr == 316) ? (int)a0 : (int)a0, nd = (nr == 316) ? (int)a2 : (int)a2;
@@ -1900,11 +2098,14 @@ static void service(struct cpu *c) {
         char chk[4200]; const char *rp = xlate(gp, chk, sizeof chk);
         if (access(rp, F_OK) != 0) { ret = (uint64_t)(-errno); break; }
         int gc = 0; while (gargv && gargv[gc]) gc++;
-        char **hv = (char **)malloc((gc + 6 + g_nvols * 2) * sizeof *hv); int n = 0;
+        char **hv = (char **)malloc((gc + 6 + g_nvols * 2 + g_nportmap * 2 + g_nlower * 2) * sizeof *hv); int n = 0;
         hv[n++] = (char *)g_self_path;
         if (g_rootfs) { hv[n++] = (char *)"--rootfs"; hv[n++] = (char *)g_rootfs; }
         for (int vi = 0; vi < g_nvols; vi++) { static char vspec[32][1300]; snprintf(vspec[vi], sizeof vspec[vi], "%s:%s", g_vols[vi].guest, g_vols[vi].host);
                                                hv[n++] = (char *)"--vol"; hv[n++] = vspec[vi]; }
+        for (int pi = 0; pi < g_nportmap; pi++) { static char pspec[32][16]; snprintf(pspec[pi], sizeof pspec[pi], "%u:%u", g_portmap[pi].hport, g_portmap[pi].cport);
+                                                  hv[n++] = (char *)"-p"; hv[n++] = pspec[pi]; }
+        for (int li = 0; li < g_nlower; li++) { hv[n++] = (char *)"--lower"; hv[n++] = g_lower[li].root; }
         hv[n++] = (char *)gp;
         for (int i = 1; i < gc; i++) hv[n++] = gargv[i];
         hv[n] = NULL;
@@ -1970,7 +2171,9 @@ static void service(struct cpu *c) {
     case 24: ret = (uint64_t)sched_yield(); break;                                    // sched_yield
     case 124: ret = (uint64_t)getsid((pid_t)a0); break;                              // getsid
     case 100: { struct tms t; clock_t r = times(&t); if (a0) memcpy((void *)a0, &t, sizeof t); ret = (uint64_t)r; break; }  // times
-    case 200: ret = kill((pid_t)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;     // tkill -> kill (single-threaded model)
+    case 62:  if ((int)a0 == getpid() || (int)a0 <= 0) { raise_guest_signal(c, (int)a1); ret = 0; }  // kill: self/pgrp -> guest delivery
+              else ret = kill((pid_t)a0, sig_l2m((int)a1)) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 200: raise_guest_signal(c, (int)a1); ret = 0; break;                         // tkill(tid,sig) -> self (single-threaded model)
     case 293: { int fds[2]; if (pipe(fds) < 0) { ret = (uint64_t)(-errno); break; }   // pipe2
                 if ((int)a1 & 0x800) { fcntl(fds[0], F_SETFL, O_NONBLOCK); fcntl(fds[1], F_SETFL, O_NONBLOCK); }
                 if ((int)a1 & 0x80000) { fcntl(fds[0], F_SETFD, FD_CLOEXEC); fcntl(fds[1], F_SETFD, FD_CLOEXEC); }
@@ -1992,7 +2195,7 @@ static void service(struct cpu *c) {
     case 72: { int r = fcntl((int)a0, (int)a1, a2); ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }  // fcntl
     case 32: ret = (uint64_t)dup((int)a0); break;                                      // dup
     case 33: ret = (uint64_t)dup2((int)a0, (int)a1); break;                            // dup2
-    case 234: ret = (uint64_t)kill((pid_t)a0, (int)a2); break;                         // tgkill(tgid,tid,sig) -> kill(pid,sig)
+    case 234: raise_guest_signal(c, (int)a2); ret = 0; break;                         // tgkill(tgid,tid,sig) -> self (single-threaded model)
     case 292: { int r = dup2((int)a0, (int)a1); if (r >= 0 && (a2 & 0x80000)) fcntl((int)a1, F_SETFD, FD_CLOEXEC);
                ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }                // dup3 (O_CLOEXEC=0x80000)
     case 21: { char pb[4200]; const char *p = atpath((const char *)a0, pb, sizeof pb);  // access
@@ -2001,8 +2204,26 @@ static void service(struct cpu *c) {
                 int r = faccessat(ATFD(a0), p, (int)a2, 0); ret = r < 0 ? (uint64_t)(-errno) : 0; break; }
     case 22: { int fds[2]; if (pipe(fds) < 0) { ret = (uint64_t)(-errno); break; }     // pipe
                ((int *)a0)[0] = fds[0]; ((int *)a0)[1] = fds[1]; ret = 0; break; }
-    case 13: ret = 0; break;                                                          // rt_sigaction (stub)
-    case 14: ret = 0; break;                                                          // rt_sigprocmask (stub)
+    case 13: {                                                  // rt_sigaction(sig, *act, *old) -- x86-64 sigaction: handler@0,flags@8,restorer@16,mask@24
+        int sig = (int)a0; if (sig < 1 || sig > 64) { ret = (uint64_t)(-22); break; }
+        if (a2) { *(uint64_t *)(a2 + 0) = g_sigact[sig].handler; *(uint64_t *)(a2 + 8) = g_sigact[sig].flags; *(uint64_t *)(a2 + 24) = g_sigact[sig].mask; }
+        if (a1) { uint64_t h = *(uint64_t *)(a1 + 0);
+            g_sigact[sig].handler = h; g_sigact[sig].flags = *(uint64_t *)(a1 + 8); g_sigact[sig].mask = *(uint64_t *)(a1 + 24);
+            if (sig != 9 && sig != 19) { int ms = sig_l2m(sig);                       // SIGKILL/SIGSTOP can't be caught
+                if (h == 0) signal(ms, SIG_DFL);
+                else if (h == 1) signal(ms, SIG_IGN);
+                else if (!sig_is_sync(sig)) { struct sigaction sa; memset(&sa, 0, sizeof sa);  // async: host flags pending, dispatcher delivers
+                    sa.sa_handler = host_sigh; sigfillset(&sa.sa_mask); sigaction(ms, &sa, NULL); } } }
+        ret = 0; break; }
+    case 14: {                                                  // rt_sigprocmask(how, *set, *old)
+        if (a2) *(uint64_t *)a2 = c->sigmask;
+        if (a1) { uint64_t set = *(uint64_t *)a1;
+            if (a0 == 0) c->sigmask |= set; else if (a0 == 1) c->sigmask &= ~set; else c->sigmask = set; }  // BLOCK/UNBLOCK/SETMASK
+        ret = 0; break; }
+    case 15: do_sigreturn(c); c->redirect = 1; break;                                 // rt_sigreturn (restorer path)
+    case 127: { uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST), out = 0;  // rt_sigpending
+                for (int s = 1; s <= 64; s++) if (p & (1ull << s)) out |= (1ull << (s - 1));
+                if (a0) *(uint64_t *)a0 = out; ret = 0; break; }
     case 105: case 106: case 113: case 114: case 117: case 119: ret = 0; break;       // setuid/setgid/setreuid/setregid/setresuid/setresgid -> ok
     case 39: ret = (uint64_t)getpid(); break;                                         // getpid
     case 102: case 104: case 107: case 108: ret = 0; break;     // getuid/getgid/geteuid/getegid -> container root (docker model)
@@ -2017,6 +2238,19 @@ static void service(struct cpu *c) {
     case 186: ret = (uint64_t)getpid(); break;                                        // gettid
     case 202: ret = 0; break;                                                         // futex (stub: single-thread)
     case 217: { // getdents64
+        int gfd = (int)a0;
+        if (g_nlower && gfd >= 0 && gfd < 1024 && g_ovldir[gfd][0]) {   // OVERLAY: merged listing across layers
+            static char onames[2048][256]; static uint8_t otypes[2048];
+            int ocnt = overlay_readdir(g_ovldir[gfd], onames, otypes, 2048);   // stable order; persistent per-fd cursor
+            int cur = g_ovlcur[gfd]; uint8_t *out = (uint8_t *)a1; size_t o = 0;
+            while (cur < ocnt) { size_t nl = strlen(onames[cur]), lr = (19 + nl + 1 + 7) & ~7ull;
+                if (o + lr > (size_t)a2) break; uint8_t *ld = out + o;
+                *(uint64_t *)(ld + 0) = (uint64_t)(cur + 1); *(uint64_t *)(ld + 8) = o + lr;
+                *(uint16_t *)(ld + 16) = (uint16_t)lr; *(ld + 18) = otypes[cur];
+                memcpy(ld + 19, onames[cur], nl); ld[19 + nl] = 0; o += lr; cur++; }
+            g_ovlcur[gfd] = cur;                                       // remember progress; returns 0 when exhausted -> EOF
+            ret = o; break;
+        }
         static struct { int fd; DIR *d; } dirs[64]; static int ndirs;
         int fd = (int)a0; DIR *dir = NULL;
         for (int i = 0; i < ndirs; i++) if (dirs[i].fd == fd) { dir = dirs[i].d; break; }
@@ -2070,6 +2304,10 @@ static void service(struct cpu *c) {
                    int r = bind((int)a0, (struct sockaddr *)&un, sizeof un); if (r == 0) g_lo_port[(int)a0] = p ? p : 1;
                    ret = r < 0 ? (uint64_t)(-errno) : 0; break; }
                struct sockaddr_storage ss; socklen_t l = l2d_sa((void *)a1, (socklen_t)a2, &ss);
+               if (g_nportmap && sa && a2 >= 8 && *(uint16_t *)sa == AF_INET) {         // docker -p: bind the published host port :H
+                   uint16_t cp = ntohs(*(uint16_t *)(sa + 2));
+                   if ((int)a0 >= 0 && (int)a0 < 1024) g_fd_cport[(int)a0] = cp;        // remember :C for getsockname
+                   if (l) ((struct sockaddr_in *)&ss)->sin_port = htons(pm_host(cp)); }
                ret = bind((int)a0, l ? (struct sockaddr *)&ss : (void *)a1, l ? l : (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0; break; }
     case 42: { uint8_t *sa = (uint8_t *)a1;                                            // connect
                if (lo_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] && lo_is(sa, (socklen_t)a2)) {  // private loopback
@@ -2095,6 +2333,8 @@ static void service(struct cpu *c) {
                int r = (nr == 51 ? getsockname : getpeername)(fd, (struct sockaddr *)&ss, &sl);
                if (r < 0) { ret = (uint64_t)(-errno); break; }
                if (a1 && a2) { socklen_t gl = *(socklen_t *)a2; d2l_sa((struct sockaddr *)&ss, (void *)a1, gl, (socklen_t *)a2); }
+               if (nr == 51 && g_nportmap && a1 && fd >= 0 && fd < 1024 && g_fd_cport[fd])
+                   *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]);            // report the :C the app asked for (port @2)
                ret = 0; break; }
     case 44: { struct sockaddr_storage ss; socklen_t l = a4 ? l2d_sa((void *)a4, (socklen_t)a5, &ss) : 0;  // sendto
                ssize_t r = sendto((int)a0, (void *)a1, (size_t)a2, (int)a3, l ? (struct sockaddr *)&ss : (void *)a4, l); ret = r < 0 ? (uint64_t)(-errno) : (uint64_t)r; break; }
@@ -2204,6 +2444,8 @@ static uint64_t g_prevpc, g_curpc;   // debug: track block transitions for fault
 static void run_guest(struct cpu *c) {
     pthread_setspecific(g_cpu_key, c);
     while (!c->exited) {
+        if (c->rip == SIGRETURN_PC) do_sigreturn(c);                 // handler returned -> restore interrupted context
+        if (g_pending) maybe_deliver_signal(c);                      // async signal pending -> redirect to guest handler
         g_prevpc = g_curpc; g_curpc = c->rip; g_disp_n++;
         if (g_trace && g_tracecap && g_disp_n > g_tracecap) {   // bound trace output for runaway guests
             fprintf(stderr, "[jit86] trace cap %llu blocks reached -> stop\n", (unsigned long long)g_tracecap);
@@ -2446,6 +2688,10 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     { const char *vs = getenv("JIT86_VOL");        // bind-mount volumes (env path; bridge usually can't pass env, so --vol too)
       if (vs && vs[0]) { char tmp[2048]; snprintf(tmp, sizeof tmp, "%s", vs); char *sv;
         for (char *t = strtok_r(tmp, ",", &sv); t; t = strtok_r(NULL, ",", &sv)) add_vol(t); } }
+    { const char *pub = getenv("JIT86_PUBLISH"); if (pub && pub[0] && !g_nportmap) parse_publish(pub); }  // docker -p (inherit across exec)
+    { const char *ls = getenv("JIT86_LOWER");      // overlay lower layers (inherit across exec)
+      if (ls && ls[0] && !g_nlower) { char tmp[4096]; snprintf(tmp, sizeof tmp, "%s", ls); char *sv;
+        for (char *t = strtok_r(tmp, ",", &sv); t; t = strtok_r(NULL, ",", &sv)) add_lower(t); } }
     if (g_rootfs) chdir(g_rootfs);   // container model: guest cwd "/" maps to the rootfs root
     const char *prog = argv[0];
 
@@ -2511,9 +2757,12 @@ int main(int argc, char **argv) {
     while (ai + 1 < argc) {                                  // --rootfs DIR / --vol guest:host (repeatable)
         if (strcmp(argv[ai], "--rootfs") == 0) { rootfs = argv[ai + 1]; ai += 2; }
         else if (strcmp(argv[ai], "--vol") == 0) { add_vol(argv[ai + 1]); ai += 2; }
+        else if (strcmp(argv[ai], "--publish") == 0 || strcmp(argv[ai], "-p") == 0) {   // docker -p H:C (port-map)
+            parse_publish(argv[ai + 1]); setenv("JIT86_PUBLISH", argv[ai + 1], 1); ai += 2; }
+        else if (strcmp(argv[ai], "--lower") == 0) { add_lower(argv[ai + 1]); ai += 2; }  // overlay read-only layer
         else break;
     }
-    if (ai >= argc) { fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... <x86-64-elf> [args...]\n", argv[0]); return 2; }
+    if (ai >= argc) { fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]); return 2; }
     return jit86_run(rootfs, argc - ai, argv + ai);
 }
 #endif

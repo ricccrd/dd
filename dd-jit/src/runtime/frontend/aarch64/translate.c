@@ -870,6 +870,15 @@ static void *translate_block(uint64_t gpc) {
             continue;
         }
 
+        // pointer authentication (ubuntu 24.04 -mbranch-protection): we don't enforce PAC, and signing
+        // x30 on the PAC-capable host would corrupt the §B shadow-stack return match (it expects an
+        // UNSIGNED guest x30) -> wild branch to a signed address. Neutralize PAC (hardening, not
+        // semantics): paci*/auti* hints -> nop (x30 stays unsigned); retaa/retab -> a plain x30 ret.
+        // paciasp/autiasp/paci?z/... -> nop
+        if ((in & 0xFFFFFF1Fu) == 0xD503231Fu) { emit32(0xD503201Fu); gpc += 4; continue; }
+        // retaa/retab -> shadow ret (x30)
+        if ((in & 0xFFFFFBFFu) == 0xD65F0BFFu) { emit_shadow_ret(); break; }
+
         // everything else: verbatim,
         int mask = gpr_field_mask(in);
         if (uses_x18(in, mask))
