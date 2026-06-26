@@ -1245,6 +1245,23 @@ static void *translate_block(uint64_t gpc) {
                     for (int i = 0; i < 4; i++)
                         e_ins_s(17, i, s, (im >> (2 * i)) & 3); // build in v17
                     e_vmov(vd, 17);
+                } else if (op == 0x70 && (I.rep || I.repne)) { // pshufhw(F3=high) / pshuflw(F2=low): shuffle 4 words
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    unsigned im = (unsigned)I.imm;
+                    int hi = I.rep;     // F3 shuffles the HIGH 4 words, F2 the LOW 4
+                    e_vmov(17, s);      // v17 = src (the un-shuffled half is preserved)
+                    for (int i = 0; i < 4; i++) {
+                        int dlane = hi ? 4 + i : i;
+                        int slane = (hi ? 4 : 0) + (int)((im >> (2 * i)) & 3);
+                        // INS v17.H[dlane], s.H[slane]
+                        emit32(0x6E000400u | ((((unsigned)dlane << 2) | 2u) << 16) | (((unsigned)slane << 1) << 11) |
+                               (s << 5) | 17);
+                    }
+                    e_vmov(vd, 17);
                 } else if (op == 0xEF) { // pxor
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
@@ -1435,6 +1452,18 @@ static void *translate_block(uint64_t gpc) {
                         emit32(0x1E624000u | (s << 5) | vd); // FCVT Sd, Dn (double->single)
                     else
                         emit32(0x1E22C000u | (s << 5) | vd); // FCVT Dd, Sn (single->double)
+                } else if (op == 0xC4) { // pinsrw: insert low 16 bits of r/m16 into xmm H-lane (imm8 & 7)
+                    int lane = (int)I.imm & 7;
+                    int src;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_load(2, 16, 17); // w16 = [addr] (16-bit)
+                        src = 16;
+                    } else {
+                        src = I.rm_reg; // guest GPR mapped to host reg
+                    }
+                    // INS vd.H[lane], Wsrc  (imm5 = lane<<2 | 0b10 selects H)
+                    emit32(0x4E001C00u | ((((unsigned)lane << 2) | 2u) << 16) | (src << 5) | vd);
                 } else if (op == 0xC2) { // cmpps/pd/ss/sd: FP compare with predicate imm -> all-1s/0 mask
                     int packed = !I.repne && !I.rep;
                     int s = vm;
