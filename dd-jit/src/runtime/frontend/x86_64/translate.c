@@ -1313,6 +1313,16 @@ static void *translate_block(uint64_t gpc) {
                                  : op == 0xFA ? 0x6EA08400u
                                               : 0x6EE08400u;
                     e_v3(b, vd, vd, s);
+                } else if (op == 0x14 || op == 0x15) { // unpckl/hp{s,d}: interleave float lanes -> ZIP1/ZIP2
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    int hi = (op == 0x15);   // unpckh* -> ZIP2
+                    int sz = I.p66 ? 3 : 2;  // 66=pd (64-bit lanes, .2d); none=ps (32-bit lanes, .4s)
+                    uint32_t b = (hi ? 0x4E007800u : 0x4E003800u) | ((uint32_t)sz << 22);
+                    e_v3(b, vd, vd, s);
                 } else if (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x6C || op == 0x68 || op == 0x69 ||
                            op == 0x6A || op == 0x6D) { // punpck l/h bw/wd/dq/qdq -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
