@@ -53,6 +53,14 @@ the reference). A frontend whose guest uses different numbers (x86-64) maps them
   the remaining dedup (next section).
 - **darwin/aarch64 (jitdarwin)** is a minimal POC, whole-imported under `os/darwin/`.
 
+## Dedup — foundation complete
+
+The cpu-interface SEAM is built and verified:
+- `os/linux/service.c` is fully cpu-agnostic (the `G_NR/A0..A5/RET/PC/SP/TLS/SHADOW_RESET` contract; 0
+  raw register/field references) — the shared Linux syscall layer.
+- `frontend/aarch64/abi.h` + `frontend/x86_64/abi.h` implement the contract for each guest.
+- `frontend/x86_64/sysmap.h` maps x86 syscall numbers -> the canonical (aarch64) numbers.
+
 ## Finishing the dedup (the concrete remaining work)
 
 To make x86-64 *use* the shared `os/linux/` instead of its copy, the x86 frontend must supply:
