@@ -1380,27 +1380,47 @@ static void *translate_block(uint64_t gpc) {
                     emit32(fop | (I.rexW ? 0x80000000u : 0) | (I.repne ? 0x00400000u : 0) | (s << 5) | I.reg);
                 } else if (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x5D || op == 0x5F ||
                            op == 0x51) {
+                    // add/mul/sub/div/min/max/sqrt. Prefix selects width: F2=scalar double, F3=scalar
+                    // single, 66=PACKED double (.2d), none=PACKED single (.4s).
+                    int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (I.repne)
+                        if (packed)
+                            e_ldr_q(16, 17, 0);
+                        else if (I.repne)
                             e_ldr_d(16, 17);
                         else
                             e_ldr_s(16, 17);
                         s = 16;
                     }
-                    uint32_t ty = I.repne ? 0x00400000u : 0; // F2=double, F3=single
-                    uint32_t b = op == 0x58   ? 0x1E202800u
-                                 : op == 0x59 ? 0x1E200800u
-                                 : op == 0x5C ? 0x1E203800u
-                                 : op == 0x5E ? 0x1E201800u
-                                 : op == 0x5D ? 0x1E205800u
-                                 : op == 0x5F ? 0x1E204800u
-                                              : 0x1E21C000u;
-                    if (op == 0x51)
-                        emit32(b | ty | (s << 5) | vd); // FSQRT vd, s
-                    else
-                        emit32(b | ty | (s << 16) | (vd << 5) | vd); // FADD/FMUL/FSUB/FDIV/FMIN/FMAX vd,vd,s
+                    if (packed) { // vector FP: 66 -> .2d (sz bit), none -> .4s
+                        uint32_t d = I.p66 ? 0x00400000u : 0;
+                        uint32_t b = op == 0x58   ? 0x4E20D400u  // FADD
+                                     : op == 0x59 ? 0x6E20DC00u  // FMUL
+                                     : op == 0x5C ? 0x4EA0D400u  // FSUB
+                                     : op == 0x5E ? 0x6E20FC00u  // FDIV
+                                     : op == 0x5D ? 0x4EA0F400u  // FMIN
+                                     : op == 0x5F ? 0x4E20F400u  // FMAX
+                                                  : 0x6EA1F800u; // FSQRT (2-reg)
+                        if (op == 0x51)
+                            emit32(b | d | (s << 5) | vd); // FSQRT vd.T, s.T
+                        else
+                            emit32(b | d | (s << 16) | (vd << 5) | vd); // op vd.T, vd.T, s.T
+                    } else { // scalar FP: F2=double, F3=single
+                        uint32_t ty = I.repne ? 0x00400000u : 0;
+                        uint32_t b = op == 0x58   ? 0x1E202800u
+                                     : op == 0x59 ? 0x1E200800u
+                                     : op == 0x5C ? 0x1E203800u
+                                     : op == 0x5E ? 0x1E201800u
+                                     : op == 0x5D ? 0x1E205800u
+                                     : op == 0x5F ? 0x1E204800u
+                                                  : 0x1E21C000u;
+                        if (op == 0x51)
+                            emit32(b | ty | (s << 5) | vd); // FSQRT sd/ss, s
+                        else
+                            emit32(b | ty | (s << 16) | (vd << 5) | vd); // FADD/.../FMAX sd/ss
+                    }
                 } else if (op == 0x5A) {                             // cvtsd2ss(F2) / cvtss2sd(F3)
                     int s = vm;
                     if (I.is_mem) {
