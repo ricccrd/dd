@@ -24,6 +24,15 @@ binaries) and `dd-daemon` (Docker Engine API). This file is the **work list only
    per-block spill — the main remaining overhead), monomorphic-comparator inlining, purity-gate
    memoization. Constraint: do not use dead-register §B scratch (unsafe); don't drop the §B gsp check.
 
+## Bugs found by the test harness
+- **ELF loader resolves the executable in the overlay UPPER only, not through lowers** — running a
+  program from an image given purely as `--lower` (empty upper) fails with "open: No such file". The
+  program loader needs to go through `overlay_resolve` like the syscall paths do.
+- **Relative symlink in the jail mis-resolves as "Symbolic link loop"** — alpine's
+  `/etc/os-release -> ../usr/lib/os-release` fails to read through the JIT (`cat /etc/os-release` →
+  symlink loop), though the target exists. Breaks tools that read os-release. In the overlay/jail
+  symlink-follow (`layer_follow`). (Found by dd-tests sandbox/jail group.)
+
 ## Remaining JIT gaps
 - **ET_EXEC loader** (non-PIE static) — platform-blocked by macOS `__PAGEZERO`; needs a fixed-vaddr map.
 - **IPC namespace** — SysV/POSIX shm/sem/msg per IPC-ns.

@@ -146,8 +146,8 @@ fn compile_aarch64(ctx: &Ctx, source: &str) -> Result<String, String> {
             >= std::fs::metadata(&out).and_then(|m| m.modified()).ok();
     if needs {
         let o = Command::new("gcc")
-            .args(["-O2", "-static-pie", "-pthread", "-o"])
-            .arg(&out).arg(&src).output()
+            .args(["-O2", "-static-pie", "-pthread"])
+            .arg("-o").arg(&out).arg(&src).arg("-lm").output()   // -lm: float guests link libm
             .map_err(|e| format!("gcc spawn: {e}"))?;
         if !o.status.success() { return Err(format!("compile {source}: {}", String::from_utf8_lossy(&o.stderr).trim())); }
     }
@@ -188,6 +188,10 @@ pub fn run(ctx: &Ctx, c: &Case, e: Engine) -> Status {
     };
     let (prog, args) = match cfg.command(e.jit()) { Some(x) => x, None => return Status::Skip("no command".into()) };
     let out = match Command::new(&prog).args(&args).output() { Ok(o) => o, Err(err) => return Status::Fail(format!("spawn: {err}")) };
+    if std::env::var("DD_DEBUG").is_ok() {
+        eprintln!("\n[dbg] {} {:?}\n[dbg] out={:?}\n[dbg] err={:?}\n[dbg] code={:?}", prog, args,
+            String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr), out.status.code());
+    }
 
     let stdout = strip_noise(&out.stdout);
     let code = out.status.code().unwrap_or(-1);
