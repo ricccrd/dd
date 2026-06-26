@@ -31,7 +31,7 @@ fn sh(name: &'static str, cmd: &'static str) -> Case {
 fn compat() -> Group {
     group("compat", vec![
         src("hello", "hello.c").exit(42).out("hi\n"),
-        src("math", "math.c").oracle().xfail(&[Engine::LinuxX86_64]),
+        src("math", "math.c").oracle(),
         src("strings", "strings.c").oracle(),
         src("bitops", "bitops.c").oracle(),          // popcount/clz/ctz/bswap
         src("varargs", "varargs.c").oracle(),         // stdarg + snprintf formats
@@ -39,14 +39,14 @@ fn compat() -> Group {
         src("recursion", "recursion.c").oracle(),     // fib(30) + ackermann (§B depth gate)
         src("fnptr", "fnptr.c").oracle(),             // function pointers -> IBTC / inline cache
         src("jumptable", "jumptable.c").oracle(),     // dense switch -> jump table
-        src("floatmath", "floatmath.c").oracle().xfail(&[Engine::LinuxX86_64]), // libm; jit86 float bug
+        src("floatmath", "floatmath.c").oracle(),
     ])
 }
 
 /// libc-heavy paths.
 fn libc() -> Group {
     group("libc", vec![
-        src("heap", "heap.c").oracle().xfail(&[Engine::LinuxX86_64]), // jit86 crash
+        src("heap", "heap.c").oracle(),
         src("qsort", "qsort.c").oracle(),
         src("files", "files.c").out("files n=7 data=payload\n"),
         src("statfile", "statfile.c").oracle(),       // open/write/stat/access/unlink
@@ -58,8 +58,8 @@ fn libc() -> Group {
 /// Threads, signals, syscalls.
 fn system() -> Group {
     group("system", vec![
-        src("threads", "threads.c").out("threads sum=800000\n").xfail(&[Engine::LinuxX86_64]), // jit86 hang
-        src("atomics", "atomics.c").out("atomic v=1000000\n").xfail(&[Engine::LinuxX86_64]),   // jit86 hang
+        src("threads", "threads.c").out("threads sum=800000\n").xfail(&[Engine::LinuxX86_64]), // jit86: no thread support yet (clone CLONE_VM=ENOSYS, futex stub)
+        src("atomics", "atomics.c").out("atomic v=1000000\n").xfail(&[Engine::LinuxX86_64]),   // jit86: no thread support yet (clone CLONE_VM=ENOSYS, futex stub)
         src("signals", "signals.c").out("signal got=12\n"),       // SIGUSR2 = 12
         src("sysinfo", "sysinfo.c").has("sys=Linux pid_ok=1"),    // uname + getpid
     ])
