@@ -159,9 +159,11 @@ fn compile_aarch64(ctx: &Ctx, source: &str) -> Result<String, String> {
         || std::fs::metadata(&src).and_then(|m| m.modified()).ok()
             >= std::fs::metadata(&out).and_then(|m| m.modified()).ok();
     if needs {
+        // Link libm (float guests) + libsqlite3/libdl (real-software guests); static, unused libs are
+        // not pulled, so simple guests are unaffected.
         let o = Command::new("gcc")
             .args(["-O2", "-static-pie", "-pthread"])
-            .arg("-o").arg(&out).arg(&src).arg("-lm").output()   // -lm: float guests link libm
+            .arg("-o").arg(&out).arg(&src).args(["-lsqlite3", "-lm", "-ldl"]).output()
             .map_err(|e| format!("gcc spawn: {e}"))?;
         if !o.status.success() { return Err(format!("compile {source}: {}", String::from_utf8_lossy(&o.stderr).trim())); }
     }

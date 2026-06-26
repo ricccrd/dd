@@ -10,7 +10,16 @@ use crate::{darwin_src, fixture, group, in_rootfs, src, Case, Engine, Group};
 
 /// Every group, in display order.
 pub fn all() -> Vec<Group> {
-    vec![compat(), libc(), system(), perf(), busybox(), container(), sandbox(), x86(), darwin()]
+    vec![compat(), libc(), system(), realsw(), perf(), busybox(), container(), sandbox(), x86(), darwin()]
+}
+
+/// Real software — the actual upstream engines, static-linked, doing real work. The acid test that the
+/// runtime handles production code (file I/O, mmap, fsync, locking, libc breadth), not just microbench.
+fn realsw() -> Group {
+    group("realsw", vec![
+        // SQLite 3: WAL, a 5000-row transaction, then an aggregate query. Diffed against a native run.
+        src("sqlite", "sqlite.c").arg("/tmp/dd_sqlite_test.db").oracle(),
+    ])
 }
 
 /// Run `sh -c <cmd>` inside the alpine rootfs (the workhorse for container/busybox/sandbox cases).
