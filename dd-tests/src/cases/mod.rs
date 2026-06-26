@@ -6,11 +6,11 @@
 //! `in_rootfs(name, img, a)` run a program already inside an image's rootfs (container behaviour).
 //! `fixture(name, &[(e,p)])` run a prebuilt binary on engine `e` (the only way to exercise x86-64 now).
 
-use crate::{fixture, group, in_rootfs, src, Case, Engine, Group};
+use crate::{darwin_src, fixture, group, in_rootfs, src, Case, Engine, Group};
 
 /// Every group, in display order.
 pub fn all() -> Vec<Group> {
-    vec![compat(), libc(), system(), perf(), busybox(), container(), sandbox(), x86()]
+    vec![compat(), libc(), system(), perf(), busybox(), container(), sandbox(), x86(), darwin()]
 }
 
 /// Run `sh -c <cmd>` inside the alpine rootfs (the workhorse for container/busybox/sandbox cases).
@@ -118,13 +118,21 @@ fn sandbox() -> Group {
     ])
 }
 
+/// macOS guest — native Mach-O binaries through the jitdarwin engine (no VM). Built via the mac
+/// toolchain; golden-checked (can't run a Mach-O natively on a linux dev host for an oracle).
+fn darwin() -> Group {
+    group("darwin", vec![
+        darwin_src("hello", "hello.c").exit(42).out("hi\n"),   // write(1,"hi\n") + exit(42) via BSD svc
+    ])
+}
+
 /// x86-64 guest — prebuilt glibc fixtures through the jit86 engine.
 fn x86() -> Group {
     group("x86", vec![
-        fixture("hello", &[(Engine::X86_64, "guests/x86/hello_x86")]).exit(42).out("hi\n"),
-        fixture("glibc", &[(Engine::X86_64, "guests/x86/g_x64")]).has("glibc ok"),
-        fixture("glibc-min", &[(Engine::X86_64, "guests/x86/gw")]).has("glibc-min ok"),
-        fixture("ctest", &[(Engine::X86_64, "guests/x86/ctest_x64")]).exit(7),
-        fixture("hx", &[(Engine::X86_64, "guests/x86/hx")]).has("42"),
+        fixture("hello", &[(Engine::LinuxX86_64, "guests/x86/hello_x86")]).exit(42).out("hi\n"),
+        fixture("glibc", &[(Engine::LinuxX86_64, "guests/x86/g_x64")]).has("glibc ok"),
+        fixture("glibc-min", &[(Engine::LinuxX86_64, "guests/x86/gw")]).has("glibc-min ok"),
+        fixture("ctest", &[(Engine::LinuxX86_64, "guests/x86/ctest_x64")]).exit(7),
+        fixture("hx", &[(Engine::LinuxX86_64, "guests/x86/hx")]).has("42"),
     ])
 }

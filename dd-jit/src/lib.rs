@@ -10,7 +10,7 @@
 //! let mut cfg = SpawnConfig::new("/work", "/images/alpine/rootfs");
 //! cfg.hostname = Some("box".into());
 //! cfg.argv = vec!["/bin/sh".into(), "-c".into(), "echo hi".into()];
-//! if let Some((prog, args)) = cfg.command(Guest::Aarch64) {
+//! if let Some((prog, args)) = cfg.command(Guest::LinuxAarch64) {
 //!     // std::process::Command::new(prog).args(args).spawn()...
 //!     let _ = (prog, args);
 //! }
@@ -18,25 +18,42 @@
 
 use std::path::Path;
 
-/// A guest CPU architecture the JIT can run. Each maps to a binary built by `build.rs`.
+/// A guest target = (OS personality, ISA) the JIT can run. Each maps to one binary built by `build.rs`
+/// from `targets/<target>.c`. The OS axis is `linux` (jit / jit86) or `darwin` (jitdarwin — native
+/// macOS Mach-O containers); the ISA axis is `aarch64` or `x86_64`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Guest { Aarch64, X86_64 }
+pub enum Guest { LinuxAarch64, LinuxX86_64, DarwinAarch64 }
 
 impl Guest {
-    /// Parse a guest arch from common spellings (e.g. an OCI image's `Architecture`).
-    pub fn from_str(s: &str) -> Option<Guest> {
-        match s.to_ascii_lowercase().as_str() {
-            "aarch64" | "arm64" | "arm64/v8" => Some(Guest::Aarch64),
-            "x86_64" | "amd64" | "x86-64" => Some(Guest::X86_64),
+    pub const ALL: [Guest; 3] = [Guest::LinuxAarch64, Guest::LinuxX86_64, Guest::DarwinAarch64];
+
+    /// Guest OS personality: `"linux"` or `"darwin"`.
+    pub fn os(self) -> &'static str { match self { Guest::DarwinAarch64 => "darwin", _ => "linux" } }
+    /// Guest instruction set: `"aarch64"` or `"x86_64"`.
+    pub fn arch(self) -> &'static str { match self { Guest::LinuxX86_64 => "x86_64", _ => "aarch64" } }
+    /// The build-target name, matching `build.rs` and `targets/<target>.c`.
+    pub fn target(self) -> &'static str {
+        match self { Guest::LinuxAarch64 => "linux_aarch64", Guest::LinuxX86_64 => "linux_x86_64", Guest::DarwinAarch64 => "darwin_aarch64" }
+    }
+
+    /// Pick a target from an OS + arch (e.g. detected from a binary's magic / an image's metadata).
+    pub fn detect(os: &str, arch: &str) -> Option<Guest> {
+        match (os, arch.to_ascii_lowercase().as_str()) {
+            ("linux", "aarch64" | "arm64" | "arm64/v8") => Some(Guest::LinuxAarch64),
+            ("linux", "x86_64" | "amd64" | "x86-64") => Some(Guest::LinuxX86_64),
+            ("darwin", "aarch64" | "arm64") => Some(Guest::DarwinAarch64),
             _ => None,
         }
     }
-    pub fn as_str(self) -> &'static str { match self { Guest::Aarch64 => "aarch64", Guest::X86_64 => "x86_64" } }
 
-    /// Absolute path to the JIT binary for this guest, or `None` if `build.rs` couldn't build it
-    /// (missing toolchain / `mac` bridge). The path is baked in at compile time.
+    /// Absolute path to the JIT binary, or `None` if `build.rs` couldn't build it (missing toolchain /
+    /// `mac` bridge). Baked in at compile time.
     pub fn jit_path(self) -> Option<&'static str> {
-        let p = match self { Guest::Aarch64 => env!("DDJIT_AARCH64"), Guest::X86_64 => env!("DDJIT_X86_64") };
+        let p = match self {
+            Guest::LinuxAarch64 => env!("DDJIT_LINUX_AARCH64"),
+            Guest::LinuxX86_64 => env!("DDJIT_LINUX_X86_64"),
+            Guest::DarwinAarch64 => env!("DDJIT_DARWIN_AARCH64"),
+        };
         if p.is_empty() { None } else { Some(p) }
     }
 }
@@ -93,34 +110,42 @@ impl SpawnConfig {
         SpawnConfig { work_dir: work_dir.into(), rootfs: rootfs.into(), ..Default::default() }
     }
 
-    /// The `bash -lc` script that launches the container in the given guest's JIT (env prefix + JIT
-    /// flags + `--rootfs` + argv). Returns `None` if that guest's binary wasn't built.
+    /// The `bash -lc` script that launches the container in the given guest's JIT. The flag/env contract
+    /// differs per guest OS — linux (jit/jit86) takes the full container flag set + `DDVOL`/`DD_NETNS`
+    /// env; darwin (jitdarwin) takes `--rootfs` + `--volume HOST:CONT`. Returns `None` if not built.
     pub fn script(&self, guest: Guest) -> Option<String> {
         let jit = guest.jit_path()?;
-        let mut env = String::new();
-        if !self.volumes.is_empty() {
-            let v = self.volumes.iter().map(|v| format!("{}:{}", v.container, v.host)).collect::<Vec<_>>().join(",");
-            env += &format!("DDVOL={} ", shq(&v));
-        }
-        if let Some(ns) = &self.netns { env += &format!("DD_NETNS={} ", shq(ns)); }
-        for (k, val) in &self.env { env += &format!("{}={} ", k, shq(val)); }
-
-        let mut f = String::new();
-        if let Some(h) = &self.hostname { if !h.is_empty() { f += &format!("--hostname {} ", shq(h)); } }
-        if self.mem_max > 0 { f += &format!("--mem-max {} ", self.mem_max); }
-        if self.pids_max > 0 { f += &format!("--pids-max {} ", self.pids_max); }
-        if let Some(u) = self.uid { f += &format!("--uid {} ", u); }
-        if let Some(g) = self.gid { f += &format!("--gid {} ", g); }
-        for l in &self.lowers { f += &format!("--lower {} ", shq(l)); }
-        if !self.publish.is_empty() {
-            let p = self.publish.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>().join(",");
-            f += &format!("--publish {} ", shq(&p));
-        }
-        // A bare static-PIE guest needs no rootfs; omit the flag so it runs un-jailed.
-        if !self.rootfs.is_empty() { f += &format!("--rootfs {} ", shq(&self.rootfs)); }
         let cd = if self.work_dir.is_empty() { String::new() } else { format!("cd {} && ", shq(&self.work_dir)) };
         let argv = self.argv.iter().map(|a| shq(a)).collect::<Vec<_>>().join(" ");
-        Some(format!("{cd}{env}{jit} {f}{argv}"))
+        let body = if guest.os() == "darwin" {
+            let mut f = String::from("-q ");
+            if !self.rootfs.is_empty() { f += &format!("--rootfs {} ", shq(&self.rootfs)); }
+            for v in &self.volumes { f += &format!("--volume {}:{} ", shq(&v.host), shq(&v.container)); } // docker order: HOST:CONT
+            format!("{jit} {f}{argv}")
+        } else {
+            let mut env = String::new();
+            if !self.volumes.is_empty() {
+                let v = self.volumes.iter().map(|v| format!("{}:{}", v.container, v.host)).collect::<Vec<_>>().join(",");
+                env += &format!("DDVOL={} ", shq(&v));
+            }
+            if let Some(ns) = &self.netns { env += &format!("DD_NETNS={} ", shq(ns)); }
+            for (k, val) in &self.env { env += &format!("{}={} ", k, shq(val)); }
+            let mut f = String::new();
+            if let Some(h) = &self.hostname { if !h.is_empty() { f += &format!("--hostname {} ", shq(h)); } }
+            if self.mem_max > 0 { f += &format!("--mem-max {} ", self.mem_max); }
+            if self.pids_max > 0 { f += &format!("--pids-max {} ", self.pids_max); }
+            if let Some(u) = self.uid { f += &format!("--uid {} ", u); }
+            if let Some(g) = self.gid { f += &format!("--gid {} ", g); }
+            for l in &self.lowers { f += &format!("--lower {} ", shq(l)); }
+            if !self.publish.is_empty() {
+                let p = self.publish.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>().join(",");
+                f += &format!("--publish {} ", shq(&p));
+            }
+            // A bare static-PIE guest needs no rootfs; omit the flag so it runs un-jailed.
+            if !self.rootfs.is_empty() { f += &format!("--rootfs {} ", shq(&self.rootfs)); }
+            format!("{env}{jit} {f}{argv}")
+        };
+        Some(format!("{cd}{body}"))
     }
 
     /// (program, args) to spawn the container. On macOS runs `bash -lc <script>`; on a non-macOS dev
@@ -144,13 +169,16 @@ pub fn available(guest: Guest) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn guest_parse() {
-        assert_eq!(Guest::from_str("amd64"), Some(Guest::X86_64));
-        assert_eq!(Guest::from_str("arm64"), Some(Guest::Aarch64));
-        assert_eq!(Guest::from_str("riscv"), None);
+    fn guest_detect() {
+        assert_eq!(Guest::detect("linux", "amd64"), Some(Guest::LinuxX86_64));
+        assert_eq!(Guest::detect("linux", "arm64"), Some(Guest::LinuxAarch64));
+        assert_eq!(Guest::detect("darwin", "aarch64"), Some(Guest::DarwinAarch64));
+        assert_eq!(Guest::detect("plan9", "aarch64"), None);
+        assert_eq!(Guest::DarwinAarch64.os(), "darwin");
+        assert_eq!(Guest::LinuxX86_64.arch(), "x86_64");
     }
     #[test]
-    fn script_has_flags() {
+    fn linux_script_has_full_flags() {
         // jit_path may be empty in a host without the toolchain; script() returns None then. Guard.
         let mut c = SpawnConfig::new("/work", "img/upper");
         c.lowers = vec!["img/l0".into()];
@@ -159,10 +187,20 @@ mod tests {
         c.publish = vec![PortMap { host: 18080, container: 80 }];
         c.volumes = vec![Volume { container: "/data".into(), host: "/h".into() }];
         c.argv = vec!["/bin/sh".into()];
-        if let Some(s) = c.script(Guest::Aarch64) {
+        if let Some(s) = c.script(Guest::LinuxAarch64) {
             assert!(s.contains("--rootfs 'img/upper'") && s.contains("--lower 'img/l0'"));
             assert!(s.contains("--hostname 'box'") && s.contains("--mem-max 268435456"));
             assert!(s.contains("--publish '18080:80'") && s.contains("DDVOL='/data:/h'"));
+        }
+    }
+    #[test]
+    fn darwin_script_uses_rootfs_volume() {
+        let mut c = SpawnConfig::new("", "/jail");
+        c.volumes = vec![Volume { container: "/data".into(), host: "/h".into() }];
+        c.argv = vec!["/bin/app".into()];
+        if let Some(s) = c.script(Guest::DarwinAarch64) {
+            assert!(s.contains("--rootfs '/jail'") && s.contains("--volume '/h':'/data'"));
+            assert!(!s.contains("--mem-max") && !s.contains("DDVOL")); // darwin contract is leaner
         }
     }
 }

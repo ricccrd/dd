@@ -9,7 +9,12 @@ use dd_tests::{cases, run, Ctx, Engine, Status};
 use std::time::Instant;
 
 fn parse_engine(s: &str) -> Option<Engine> {
-    match s { "aarch64" | "arm64" => Some(Engine::Aarch64), "x86_64" | "amd64" => Some(Engine::X86_64), _ => None }
+    match s {
+        "linux/aarch64" | "aarch64" | "arm64" => Some(Engine::LinuxAarch64),
+        "linux/x86_64" | "x86_64" | "amd64" => Some(Engine::LinuxX86_64),
+        "darwin/aarch64" | "darwin" | "macos" => Some(Engine::DarwinAarch64),
+        _ => None,
+    }
 }
 
 fn main() {
@@ -31,14 +36,14 @@ fn main() {
         let mut n = 0;
         for g in cases::all() {
             println!("{}", g.name);
-            for c in &g.cases { n += 1; println!("  {:<16} [{}]", c.name, c.engines.iter().map(|e| e.arch()).collect::<Vec<_>>().join(",")); }
+            for c in &g.cases { n += 1; println!("  {:<16} [{}]", c.name, c.engines.iter().map(|e| e.label()).collect::<Vec<_>>().join(",")); }
         }
         println!("\n{n} cases in {} groups", cases::all().len());
         return;
     }
 
     eprintln!("engines: {}", Engine::ALL.iter()
-        .map(|e| format!("{} {}", e.arch(), if e.available() { "✓" } else { "✗(not built)" }))
+        .map(|e| format!("{} {}", e.label(), if e.available() { "✓" } else { "✗(not built)" }))
         .collect::<Vec<_>>().join("   "));
 
     let ctx = Ctx::discover();
@@ -58,11 +63,11 @@ fn main() {
                 let st = run(&ctx, c, e);
                 let ms = t0.elapsed().as_millis();
                 match st {
-                    Status::Skip(_) => { skip += 1; print!("  \x1b[90m· {}\x1b[0m", e.arch()); }
-                    Status::Pass => { pass += 1; busy_ms += ms; slowest.push((ms, format!("{}/{} [{}]", g.name, c.name, e.arch())));
-                        print!("  \x1b[32m✓\x1b[0m {} \x1b[90m{ms}ms\x1b[0m", e.arch()); }
-                    Status::Fail(m) => { fail += 1; busy_ms += ms; print!("  \x1b[31m✗ {} {ms}ms\x1b[0m", e.arch());
-                        failures.push(format!("{}/{} [{}]: {}", g.name, c.name, e.arch(), m)); }
+                    Status::Skip(_) => { skip += 1; print!("  \x1b[90m· {}\x1b[0m", e.label()); }
+                    Status::Pass => { pass += 1; busy_ms += ms; slowest.push((ms, format!("{}/{} [{}]", g.name, c.name, e.label())));
+                        print!("  \x1b[32m✓\x1b[0m {} \x1b[90m{ms}ms\x1b[0m", e.label()); }
+                    Status::Fail(m) => { fail += 1; busy_ms += ms; print!("  \x1b[31m✗ {} {ms}ms\x1b[0m", e.label());
+                        failures.push(format!("{}/{} [{}]: {}", g.name, c.name, e.label(), m)); }
                 }
             }
             println!();

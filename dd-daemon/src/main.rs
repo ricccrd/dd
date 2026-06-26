@@ -51,9 +51,9 @@ async fn main() {
     let mut inner = Inner::default();
     inner.images = discover_images(&images_dir);
     eprintln!("[dd-daemon] images={} -> {} image(s): {}", images_dir, inner.images.len(),
-        inner.images.iter().map(|i| format!("{}({})", i.name, i.arch.as_str())).collect::<Vec<_>>().join(", "));
-    for g in [Guest::Aarch64, Guest::X86_64] {
-        eprintln!("[dd-daemon] JIT {}: {}", g.as_str(), if ddjit::available(g) { "ready" } else { "NOT BUILT" });
+        inner.images.iter().map(|i| format!("{}({})", i.name, i.arch.target())).collect::<Vec<_>>().join(", "));
+    for g in Guest::ALL {
+        eprintln!("[dd-daemon] JIT {}: {}", g.target(), if ddjit::available(g) { "ready" } else { "NOT BUILT" });
     }
     let app = App { inner: Arc::new(Mutex::new(inner)), images_dir };
 
@@ -114,7 +114,7 @@ async fn info(State(a): State<App>) -> Json<Value> {
 async fn images_json(State(a): State<App>) -> Json<Value> {
     let imgs: Vec<Value> = a.inner.lock().await.images.iter().map(|i| json!({
         "Id": format!("sha256:{}", fake_id(&i.name)), "RepoTags": [format!("{}:latest", i.name)],
-        "Architecture": i.arch.as_str(), "Created": 0, "Size": 0})).collect();
+        "Architecture": i.arch.target(), "Created": 0, "Size": 0})).collect();
     Json(json!(imgs))
 }
 #[derive(Deserialize)]
@@ -211,7 +211,7 @@ fn no_such(id: &str) -> Response {
 
 /// Translate the container into a typed [`SpawnConfig`] and run it in the matching guest's JIT.
 async fn run_in_jit(c: &Container) -> (Vec<u8>, Vec<u8>, i64) {
-    let guest = c.arch.unwrap_or(Guest::Aarch64);
+    let guest = c.arch.unwrap_or(Guest::LinuxAarch64);
     let mut cfg = SpawnConfig::new(String::new(), c.rootfs.clone()); // absolute paths -> no work_dir cd
     cfg.argv = c.cmd.clone();
     cfg.hostname = (!c.hostname.is_empty()).then(|| c.hostname.clone());
@@ -224,7 +224,7 @@ async fn run_in_jit(c: &Container) -> (Vec<u8>, Vec<u8>, i64) {
 
     let (prog, args) = match cfg.command(guest) {
         Some(x) => x,
-        None => return (vec![], format!("no JIT built for guest arch {}\n", guest.as_str()).into_bytes(), 127),
+        None => return (vec![], format!("no JIT built for guest arch {}\n", guest.target()).into_bytes(), 127),
     };
     match tokio::process::Command::new(prog).args(args).output().await {
         Ok(o) => (o.stdout, o.stderr, o.status.code().unwrap_or(-1) as i64),
@@ -241,21 +241,28 @@ fn discover_images(images_dir: &str) -> Vec<Image> {
         if !rootfs.is_dir() { continue; }
         let raw = e.path().file_name().and_then(|s| s.to_str()).unwrap_or("img").to_string();
         let name = raw.trim_end_matches("-bundle").split("__").next().unwrap_or("img").rsplit('_').next().unwrap_or("img").to_string();
-        let arch = detect_arch(&rootfs).unwrap_or(Guest::Aarch64);
+        let arch = detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64);
         out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd: vec!["/bin/sh".into()] });
     }
     out
 }
 
-/// Read the ELF e_machine of a likely executable in the rootfs to pick the guest arch.
+/// Probe a likely executable in the rootfs and pick the guest target from its binary magic:
+/// ELF -> linux (e_machine = aarch64/x86_64), Mach-O 64 -> darwin (cputype = arm64).
 fn detect_arch(rootfs: &std::path::Path) -> Option<Guest> {
-    for probe in ["bin/busybox", "bin/sh", "bin/true", "usr/bin/coreutils"] {
+    for probe in ["bin/busybox", "bin/sh", "bin/true", "usr/bin/coreutils", "usr/lib/dyld"] {
         let p = rootfs.join(probe);
         if let Ok(b) = std::fs::read(&p) {
             if b.len() > 19 && &b[0..4] == b"\x7fELF" {
-                return match u16::from_le_bytes([b[18], b[19]]) {  // e_machine
-                    0xB7 => Some(Guest::Aarch64),
-                    0x3E => Some(Guest::X86_64),
+                return match u16::from_le_bytes([b[18], b[19]]) {  // ELF e_machine
+                    0xB7 => Some(Guest::LinuxAarch64),
+                    0x3E => Some(Guest::LinuxX86_64),
+                    _ => None,
+                };
+            }
+            if b.len() > 7 && b[0..4] == [0xCF, 0xFA, 0xED, 0xFE] {   // MH_MAGIC_64 (little-endian)
+                return match u32::from_le_bytes([b[4], b[5], b[6], b[7]]) {  // cputype
+                    0x0100000C => Some(Guest::DarwinAarch64),   // CPU_TYPE_ARM64
                     _ => None,
                 };
             }

@@ -18,24 +18,35 @@ use std::process::Command;
 
 pub mod cases;
 
-/// A JIT engine = a guest architecture the runtime can execute.
+/// A JIT engine = one guest target (OS × ISA) the runtime can execute.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Engine { Aarch64, X86_64 }
+pub enum Engine { LinuxAarch64, LinuxX86_64, DarwinAarch64 }
 
 impl Engine {
-    pub const ALL: [Engine; 2] = [Engine::Aarch64, Engine::X86_64];
-    pub fn arch(self) -> &'static str { match self { Engine::Aarch64 => "aarch64", Engine::X86_64 => "x86_64" } }
-    pub fn jit(self) -> ddjit::Guest { match self { Engine::Aarch64 => ddjit::Guest::Aarch64, Engine::X86_64 => ddjit::Guest::X86_64 } }
+    pub const ALL: [Engine; 3] = [Engine::LinuxAarch64, Engine::LinuxX86_64, Engine::DarwinAarch64];
+    pub fn jit(self) -> ddjit::Guest {
+        match self {
+            Engine::LinuxAarch64 => ddjit::Guest::LinuxAarch64,
+            Engine::LinuxX86_64 => ddjit::Guest::LinuxX86_64,
+            Engine::DarwinAarch64 => ddjit::Guest::DarwinAarch64,
+        }
+    }
+    pub fn os(self) -> &'static str { self.jit().os() }
+    pub fn arch(self) -> &'static str { self.jit().arch() }
+    /// Display label that disambiguates same-ISA targets (e.g. linux/aarch64 vs darwin/aarch64).
+    pub fn label(self) -> String { format!("{}/{}", self.os(), self.arch()) }
     /// Whether this engine's JIT binary was built (by dd-jit's build.rs).
     pub fn available(self) -> bool { ddjit::available(self.jit()) }
-    /// Whether guest binaries for this arch can be produced locally (compiled or by prebuilt fixture).
-    pub fn can_compile(self) -> bool { self == Engine::Aarch64 } // native gcc on the aarch64 dev host
+    /// Whether guest binaries for this target can be compiled locally (only linux/aarch64 via native gcc).
+    pub fn can_compile(self) -> bool { matches!(self, Engine::LinuxAarch64) }
 }
 
 /// How a case's guest binary is obtained for a given engine.
 pub enum Bin {
-    /// Compile this C source (under `guests/`). Only arches with a local toolchain (aarch64).
+    /// Compile a Linux/aarch64 C source under `guests/` (native gcc -static-pie).
     Source(&'static str),
+    /// Compile a macOS/aarch64 Mach-O C source under `guests/darwin/` (mac clang).
+    DarwinSource(&'static str),
     /// Prebuilt fixture binaries, one per engine that has one.
     Fixture(&'static [(Engine, &'static str)]),
     /// The guest program is already inside the rootfs; `args[0]` names it (e.g. `/bin/sh`).
@@ -71,14 +82,17 @@ pub fn group(name: &'static str, cases: Vec<Case>) -> Group { Group { name, case
 // ---- ergonomic builders ----
 fn base(name: &'static str, bin: Bin) -> Case {
     let engines = match &bin {
-        Bin::Source(_) => vec![Engine::Aarch64], // no x86 cross-compiler -> aarch64 only
+        Bin::Source(_) => vec![Engine::LinuxAarch64], // no x86 cross-compiler -> aarch64 only
+        Bin::DarwinSource(_) => vec![Engine::DarwinAarch64],
         Bin::Fixture(fx) => fx.iter().map(|(e, _)| *e).collect(),
-        Bin::InRootfs => vec![Engine::Aarch64], // container rootfs fixtures are aarch64 today
+        Bin::InRootfs => vec![Engine::LinuxAarch64], // container rootfs fixtures are aarch64 today
     };
     Case { name, bin, args: vec![], rootfs: None, lowers: vec![], mem_max: 0, engines, checks: vec![] }
 }
-/// A case whose guest is compiled from a C source under `guests/` (aarch64).
+/// A case whose guest is compiled from a Linux/aarch64 C source under `guests/`.
 pub fn src(name: &'static str, source: &'static str) -> Case { base(name, Bin::Source(source)) }
+/// A case whose guest is compiled from a macOS/aarch64 Mach-O C source under `guests/darwin/`.
+pub fn darwin_src(name: &'static str, source: &'static str) -> Case { base(name, Bin::DarwinSource(source)) }
 /// A case whose guest is a prebuilt fixture, per engine.
 pub fn fixture(name: &'static str, fx: &'static [(Engine, &'static str)]) -> Case { base(name, Bin::Fixture(fx)) }
 /// A case that runs a program already inside the rootfs (e.g. busybox); `a` is the full argv.
@@ -157,11 +171,33 @@ fn compile_aarch64(ctx: &Ctx, source: &str) -> Result<String, String> {
 /// Provision the guest binary path for a case on an engine. `Ok(None)` = skip (no guest for this arch).
 fn provision(ctx: &Ctx, c: &Case, e: Engine) -> Result<Option<String>, String> {
     match &c.bin {
-        Bin::Source(s) if e == Engine::Aarch64 => compile_aarch64(ctx, s).map(Some),
+        Bin::Source(s) if e.can_compile() => compile_aarch64(ctx, s).map(Some),
         Bin::Source(_) => Ok(None),
+        Bin::DarwinSource(s) if e == Engine::DarwinAarch64 => compile_darwin(ctx, s).map(Some),
+        Bin::DarwinSource(_) => Ok(None),
         Bin::Fixture(fx) => Ok(fx.iter().find(|(fe, _)| *fe == e).map(|(_, p)| resolve(ctx, p))),
         Bin::InRootfs => Ok(Some(String::new())), // nothing to build; argv[0] is in-rootfs
     }
+}
+
+/// Compile a static macOS/arm64 Mach-O guest from `guests/darwin/<source>` via the mac toolchain.
+/// (Darwin guests use a different syscall ABI than linux, so they're their own sources; checked golden
+/// since they can't run natively on a linux dev host for an oracle.)
+fn compile_darwin(ctx: &Ctx, source: &str) -> Result<String, String> {
+    let src = ctx.guests.join("darwin").join(source);
+    let out = ctx.cache.join("darwin").join(source.trim_end_matches(".c"));
+    std::fs::create_dir_all(out.parent().unwrap()).ok();
+    let fresh = std::fs::metadata(&out).and_then(|m| m.modified()).ok()
+        >= std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+    if !out.exists() || !fresh {
+        let script = format!("clang -arch arm64 -nostartfiles -e _start -o '{}' '{}' -lSystem",
+            out.display(), src.display());
+        let o = if cfg!(target_os = "macos") { Command::new("bash").arg("-lc").arg(&script).output() }
+                else { Command::new("mac").arg("bash").arg("-lc").arg(&script).output() }
+            .map_err(|e| format!("mac clang spawn: {e}"))?;
+        if !o.status.success() { return Err(format!("compile darwin/{source}: {}", String::from_utf8_lossy(&o.stderr).trim())); }
+    }
+    Ok(out.to_string_lossy().into_owned())
 }
 fn resolve(ctx: &Ctx, p: &str) -> String {
     if p.starts_with('/') { p.into() } else { ctx.repo.parent().unwrap().join("poc").join(p).to_string_lossy().into_owned() }
@@ -170,14 +206,14 @@ fn resolve(ctx: &Ctx, p: &str) -> String {
 /// Run one case on one engine and evaluate its checks.
 pub fn run(ctx: &Ctx, c: &Case, e: Engine) -> Status {
     if !c.engines.contains(&e) { return Status::Skip("n/a for engine".into()); }
-    if !e.available() { return Status::Skip(format!("{} JIT not built", e.arch())); }
+    if !e.available() { return Status::Skip(format!("{} JIT not built", e.label())); }
     let guest = match provision(ctx, c, e) {
         Ok(Some(g)) => g,
-        Ok(None) => return Status::Skip(format!("no {} guest", e.arch())),
+        Ok(None) => return Status::Skip(format!("no {} guest", e.label())),
         Err(err) => return Status::Fail(err),
     };
     let rootfs = c.rootfs.and_then(|r| ctx.rootfs_path(r, e));
-    if c.rootfs.is_some() && rootfs.is_none() { return Status::Skip(format!("no {} rootfs", e.arch())); }
+    if c.rootfs.is_some() && rootfs.is_none() { return Status::Skip(format!("no {} rootfs", e.label())); }
 
     let mut cfg = ddjit::SpawnConfig::new(String::new(), rootfs.unwrap_or_default());
     cfg.lowers = c.lowers.clone();

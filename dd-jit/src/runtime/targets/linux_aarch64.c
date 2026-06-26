@@ -33,20 +33,20 @@
 #include <sys/resource.h>
 #include <stdatomic.h>
 
-#include "include/cpu_aarch64.h"
+#include "../include/cpu_aarch64.h"
 
-#include "os/linux/container/state.c"   // container/ns config state + parsers (early globals)
-#include "jit/cache.c"                  // code cache + block map + chaining
-#include "jit/emit_arm64.c"             // aarch64 host emitters + IBTC/IC
-#include "frontend/aarch64/translate.c" // transliterate + mangle + §B + LSE + depth-gate
-#include "os/linux/thread.c"            // clone/futex/threads (declares run_guest)
-#include "os/linux/signal.c"            // signal delivery
-#include "os/linux/container/vfs.c"     // path jail + overlay + /proc synth
-#include "os/linux/container/netns.c"   // termios + NET-ns loopback
-#include "os/linux/fscache.c"           // ELF fwd-decls + FS-metadata cache
-#include "os/linux/service.c"           // the syscall layer (service())
-#include "jit/dispatch.c"               // host trampoline + run_guest
-#include "os/linux/elf.c"               // ELF loader + initial stack
+#include "../os/linux/container/state.c"   // container/ns config state + parsers (early globals)
+#include "../jit/cache.c"                  // code cache + block map + chaining
+#include "../jit/emit_arm64.c"             // aarch64 host emitters + IBTC/IC
+#include "../frontend/aarch64/translate.c" // transliterate + mangle + §B + LSE + depth-gate
+#include "../os/linux/thread.c"            // clone/futex/threads (declares run_guest)
+#include "../os/linux/signal.c"            // signal delivery
+#include "../os/linux/container/vfs.c"     // path jail + overlay + /proc synth
+#include "../os/linux/container/netns.c"   // termios + NET-ns loopback
+#include "../os/linux/fscache.c"           // ELF fwd-decls + FS-metadata cache
+#include "../os/linux/service.c"           // the syscall layer (service())
+#include "../jit/dispatch.c"               // host trampoline + run_guest
+#include "../os/linux/elf.c"               // ELF loader + initial stack
 
 // ---- library entry (Rust binding) + main() ----
 // ---------------- library entry (Rust bindings call this) ----------------
