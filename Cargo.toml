@@ -1,6 +1,6 @@
 # dd — VM-less Linux container runtime on macOS. Cargo workspace.
-#   dd-jit    : the JIT runtime (C, both guest arches) + its Rust bindings; build.rs compiles the C.
-#   dd-daemon : the Docker-Engine-API daemon (depends on dd-jit).   [added next]
+#   dd-jit    : the JIT runtime (C, both guest arches) + Rust bindings; build.rs compiles the C.
+#   dd-daemon : the Docker-Engine-API daemon (depends on dd-jit).
 [workspace]
 resolver = "2"
-members = ["dd-jit"]
+members = ["dd-jit", "dd-daemon"]
