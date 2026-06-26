@@ -21,3 +21,9 @@
 #define G_A4(c) ((c)->x[4])
 #define G_A5(c) ((c)->x[5])
 #define G_RET(c) ((c)->x[0])
+
+// PC / SP / TLS / §B shadow-stack reset — the remaining per-arch cpu state os/linux touches.
+#define G_PC(c) ((c)->pc)
+#define G_SP(c) ((c)->sp)
+#define G_TLS(c) ((c)->tls)
+#define G_SHADOW_RESET(c) ((c)->ssp = 0) // reset the §B shadow stack (fork/exec); no-op on engines without it

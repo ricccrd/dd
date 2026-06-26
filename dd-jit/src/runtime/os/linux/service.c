@@ -1505,7 +1505,7 @@ static void service(struct cpu *c) {
         // fork/vfork: COW copy; child continues
         pid_t pid = fork();
         // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
-        if (pid == 0) c->ssp = 0;
+        if (pid == 0) G_SHADOW_RESET(c);
         // parent: pid, child: 0
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
@@ -1599,16 +1599,16 @@ static void service(struct cpu *c) {
         g_npend = 0;
         memset(g_ibtc, 0, sizeof g_ibtc);
         // execve: drop IBTC + §B shadow (old image)
-        c->ssp = 0;
+        G_SHADOW_RESET(c);
         uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         brk_lo = brk_cur = (uint64_t)heap;
         brk_hi = brk_lo + (256u << 20);
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
         memset(c->x, 0, sizeof c->x);
         c->nzcv = 0;
-        c->tls = 0;
-        c->sp = sp;
-        c->pc = jump;
+        G_TLS(c) = 0;
+        G_SP(c) = sp;
+        G_PC(c) = jump;
         // jump to new program; don't advance pc
         c->redirect = 1;
         break;
@@ -1653,7 +1653,7 @@ static void service(struct cpu *c) {
         }
         pid_t pid = fork();
         // §B: same -- child drops the inherited shadow
-        if (pid == 0) c->ssp = 0;
+        if (pid == 0) G_SHADOW_RESET(c);
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }
@@ -2358,7 +2358,7 @@ static void service(struct cpu *c) {
     // ===================== unhandled =====================
     default:
         fprintf(stderr, "[jit] unhandled syscall %llu (a0=%llx a1=%llx) at pc=%llx\n", (unsigned long long)nr,
-                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)c->pc);
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)G_PC(c));
         G_RET(c) = (uint64_t)(-ENOSYS);
         // ENOSYS, keep going so we can see what's next
         break;
