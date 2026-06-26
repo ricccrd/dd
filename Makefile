@@ -1,10 +1,12 @@
 # dd workspace.
-.PHONY: all jit fmt sync-jit86 test clean
+.PHONY: all jit fmt sync-jit86 test test-ci clean
 all: jit
 jit:            ## build + codesign both guest-arch JITs (via cargo build.rs) + the crates
 	cargo build --release
-test:
-	cargo test
+test: jit       ## run the engine × case matrix (grouped report); FILTER=name ENGINE=x86_64 to narrow
+	cargo run -q -p dd-tests -- $(if $(ENGINE),-e $(ENGINE)) $(FILTER)
+test-ci: jit    ## the cargo-test path (one matrix test; for CI)
+	cargo test -p dd-tests
 fmt:            ## clang-format the decomposed C (skips the whole-imported jit86.c)
 	mac bash -lc "cd '$(CURDIR)/dd-jit/src/runtime' && find jit os frontend/aarch64 include hal ddjit_aarch64.c -name '*.c' -o -name '*.h' | xargs clang-format -i"
 sync-jit86:     ## pull the latest improved jit86 from the poc tree

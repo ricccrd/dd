@@ -116,9 +116,11 @@ impl SpawnConfig {
             let p = self.publish.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>().join(",");
             f += &format!("--publish {} ", shq(&p));
         }
+        // A bare static-PIE guest needs no rootfs; omit the flag so it runs un-jailed.
+        if !self.rootfs.is_empty() { f += &format!("--rootfs {} ", shq(&self.rootfs)); }
         let cd = if self.work_dir.is_empty() { String::new() } else { format!("cd {} && ", shq(&self.work_dir)) };
         let argv = self.argv.iter().map(|a| shq(a)).collect::<Vec<_>>().join(" ");
-        Some(format!("{cd}{env}{jit} {f}--rootfs {} {argv}", shq(&self.rootfs)))
+        Some(format!("{cd}{env}{jit} {f}{argv}"))
     }
 
     /// (program, args) to spawn the container. On macOS runs `bash -lc <script>`; on a non-macOS dev

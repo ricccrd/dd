@@ -95,6 +95,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dd-tests"
+version = "0.1.0"
+dependencies = [
+ "ddjit",
+]
+
+[[package]]
 name = "ddjit"
 version = "0.1.0"
 

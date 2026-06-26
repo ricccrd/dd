@@ -1,0 +1,18 @@
+[package]
+name = "dd-tests"
+version = "0.1.0"
+edition = "2021"
+description = "dd engine test harness — declarative groups of guest tests, run across every JIT engine."
+
+# The harness is a runner binary (great DX: grouped/colored output, filtering, summary). The same
+# matrix is also exposed to `cargo test` via tests/suite.rs.
+[[bin]]
+name = "dd-tests"
+path = "src/main.rs"
+
+[lib]
+name = "dd_tests"
+path = "src/lib.rs"
+
+[dependencies]
+ddjit = { path = "../dd-jit" }

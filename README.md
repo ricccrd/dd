@@ -15,7 +15,7 @@ docker run -p 8080:80 -m 256m alpine sh -c 'echo hi from $(hostname)'
 
 ## Workspace
 
-A Cargo workspace with two members:
+A Cargo workspace with three members:
 
 - **`dd-jit/`** — the JIT runtime (C, under `src/runtime/`) **plus its Rust bindings**. `build.rs`
   compiles and codesigns **one JIT binary per guest architecture** (`aarch64`, `x86_64`); `src/lib.rs`
@@ -25,6 +25,31 @@ A Cargo workspace with two members:
   [`dd-jit/README.md`](dd-jit/README.md).
 - **`dd-daemon/`** — the Docker Engine API daemon. Depends on `dd-jit`; detects each image's guest
   architecture from its ELF, picks the matching JIT, and launches it via `SpawnConfig`.
+- **`dd-tests/`** — a declarative test harness. Cases are grouped (`compat`, `system`, `container`,
+  `x86`) and run across **every engine**; a runner prints a grouped report. See [Testing](#testing).
+
+## Testing
+
+```sh
+make test                       # the engine × case matrix, grouped report
+make test ENGINE=x86_64         # one engine
+make test FILTER=container      # one group / cases matching a name
+cargo run -p dd-tests -- --list # list groups + cases
+make test-ci                    # the cargo-test path (CI)
+```
+
+Cases are declared in `dd-tests/src/cases/`. A case is a guest program + assertions:
+
+```rust
+src("hello", "hello.c").exit(42).out("hi\n"),          // compile guests/hello.c, run on aarch64
+src("math",  "math.c").oracle(),                        // diff stdout+exit vs a native run
+in_rootfs("id-root", "alpine", &["/bin/sh","-c","id -u"]).out("0\n"),   // container behaviour
+fixture("glibc", &[(Engine::X86_64, "guests/x86/g_x64")]).has("glibc ok"), // prebuilt x86 binary
+```
+
+aarch64 guests are compiled on the fly (`gcc -static-pie`) and can be diffed against a native oracle;
+x86-64 guests come from prebuilt fixtures (no local cross-compiler). Each case runs on every engine it
+has a guest for; the rest are reported as skipped.
 
 ## Status
 
