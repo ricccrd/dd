@@ -17,9 +17,11 @@ static void service(struct cpu *c) {
     }
     case 63: {
         int rfd = (int)a0;
-        if (rfd >= 0 && rfd == g_sigfd_read) { // signalfd read -> struct signalfd_siginfo
+        // signalfd read -> struct signalfd_siginfo
+        if (rfd >= 0 && rfd == g_sigfd_read) {
             char b;
-            ssize_t pr = read(rfd, &b, 1); // drain one wake byte
+            // drain one wake byte
+            ssize_t pr = read(rfd, &b, 1);
             if (pr <= 0) {
                 c->x[0] = (uint64_t)(int64_t)(pr < 0 ? -errno : -EAGAIN);
                 break;
@@ -35,11 +37,13 @@ static void service(struct cpu *c) {
             if (a1 && a2 >= 128) {
                 memset((void *)a1, 0, 128);
                 *(uint32_t *)a1 = (uint32_t)sig;
-            } // ssi_signo
+            // ssi_signo
+            }
             c->x[0] = 128;
             break;
         }
-        if (rfd >= 0 && rfd < 1024 && g_inotify[rfd]) { // inotify read -> struct inotify_event[]
+        // inotify read -> struct inotify_event[]
+        if (rfd >= 0 && rfd < 1024 && g_inotify[rfd]) {
             struct kevent kv[32];
             struct timespec zero = {0, 0};
             int nb = fcntl(rfd, F_GETFL) & O_NONBLOCK;
@@ -52,20 +56,27 @@ static void service(struct cpu *c) {
             size_t off = 0;
             for (int i = 0; i < n && off + 16 <= a2; i++) {
                 uint32_t f = kv[i].fflags, m = 0;
-                if (f & (NOTE_WRITE | NOTE_EXTEND)) m |= 0x2;   // IN_MODIFY
-                if (f & NOTE_ATTRIB) m |= 0x4;                  // IN_ATTRIB
-                if (f & NOTE_DELETE) m |= 0x400;                // IN_DELETE_SELF
-                if (f & NOTE_RENAME) m |= 0x800;                // IN_MOVE_SELF
-                *(int32_t *)(out + off) = (int32_t)kv[i].ident; // wd
+                // IN_MODIFY
+                if (f & (NOTE_WRITE | NOTE_EXTEND)) m |= 0x2;
+                // IN_ATTRIB
+                if (f & NOTE_ATTRIB) m |= 0x4;
+                // IN_DELETE_SELF
+                if (f & NOTE_DELETE) m |= 0x400;
+                // IN_MOVE_SELF
+                if (f & NOTE_RENAME) m |= 0x800;
+                // wd
+                *(int32_t *)(out + off) = (int32_t)kv[i].ident;
                 *(uint32_t *)(out + off + 4) = m;
                 *(uint32_t *)(out + off + 8) = 0;
-                *(uint32_t *)(out + off + 12) = 0; // mask,cookie,len
+                // mask,cookie,len
+                *(uint32_t *)(out + off + 12) = 0;
                 off += 16;
             }
             c->x[0] = (uint64_t)off;
             break;
         }
-        if (rfd >= 0 && rfd < 1024 && g_timerfd[rfd]) { // timerfd read -> drain timer, return count
+        // timerfd read -> drain timer, return count
+        if (rfd >= 0 && rfd < 1024 && g_timerfd[rfd]) {
             struct kevent kv;
             struct timespec zero = {0, 0};
             int nb = fcntl(rfd, F_GETFL) & O_NONBLOCK;
@@ -73,7 +84,8 @@ static void service(struct cpu *c) {
             if (n <= 0) {
                 c->x[0] = (uint64_t)(int64_t)(n < 0 ? -errno : -EAGAIN);
                 break;
-            } // EAGAIN
+            // EAGAIN
+            }
             if (a1 && a2 >= 8) *(uint64_t *)a1 = (uint64_t)kv.data;
             c->x[0] = 8;
             break;
@@ -84,7 +96,8 @@ static void service(struct cpu *c) {
     }
     case 64: {
         int wfd = (int)a0;
-        if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) wfd = g_eventfd_peer[wfd] - 1; // eventfd -> pipe
+        // eventfd -> pipe
+        if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) wfd = g_eventfd_peer[wfd] - 1;
         fd_evict(wfd);
         ssize_t r = write(wfd, (void *)a1, (size_t)a2);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -94,25 +107,30 @@ static void service(struct cpu *c) {
         ssize_t r = readv((int)a0, (void *)a1, (int)a2);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
-    } // readv
+    // readv
+    }
     case 66: {
         fd_evict((int)a0);
         ssize_t r = writev((int)a0, (void *)a1, (int)a2);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
-    } // writev
+    // writev
+    }
     case 67: {
-        ssize_t r = pread((int)a0, (void *)a1, (size_t)a2, (off_t)a3); // pread64
+        // pread64
+        ssize_t r = pread((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 68: {
         fd_evict((int)a0);
-        ssize_t r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3); // pwrite64
+        // pwrite64
+        ssize_t r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 71: { // sendfile(out,in,off*,count)
+    // sendfile(out,in,off*,count)
+    case 71: {
         int outfd = (int)a0, infd = (int)a1;
         off_t *po = (off_t *)a2;
         size_t cnt = (size_t)a3;
@@ -133,7 +151,8 @@ static void service(struct cpu *c) {
         break;
     }
     case 76:
-    case 77: { // splice(fd_in,off_in,fd_out,off_out,len,fl) / tee -> emulate
+    // splice(fd_in,off_in,fd_out,off_out,len,fl) / tee -> emulate
+    case 77: {
         int fin = (int)a0, fout = (int)a2;
         size_t len = (size_t)a4;
         if (len > 65536) len = 65536;
@@ -143,7 +162,8 @@ static void service(struct cpu *c) {
         if (nr == 76 && a1)
             n = pread(fin, sb, len, *(off_t *)a1);
         else
-            n = read(fin, sb, len); // splice off_in
+            // splice off_in
+            n = read(fin, sb, len);
         if (n <= 0) {
             c->x[0] = n < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -163,19 +183,24 @@ static void service(struct cpu *c) {
     // =====================
     case 5:
     case 6:
-    case 7: c->x[0] = 0; break; // setxattr/lsetxattr/fsetxattr -> ignore
+    // setxattr/lsetxattr/fsetxattr -> ignore
+    case 7: c->x[0] = 0; break;
     case 8:
     case 9:
-    case 10: c->x[0] = (uint64_t)(-ENODATA); break; // getxattr/... -> ENODATA (no such attr)
+    // getxattr/... -> ENODATA (no such attr)
+    case 10: c->x[0] = (uint64_t)(-ENODATA); break;
     case 11:
     case 12:
-    case 13: c->x[0] = 0; break; // listxattr/... -> empty list
+    // listxattr/... -> empty list
+    case 13: c->x[0] = 0; break;
     case 14:
     case 15:
-    case 16: c->x[0] = 0; break; // removexattr/... -> ok
+    // removexattr/... -> ok
+    case 16: c->x[0] = 0; break;
     case 17: {
         if (g_rootfs) {
-            size_t l = strlen(g_cwd); // getcwd -> the GUEST cwd (not the host path)
+            // getcwd -> the GUEST cwd (not the host path)
+            size_t l = strlen(g_cwd);
             if (a0 && l + 1 <= a1) {
                 memcpy((void *)a0, g_cwd, l + 1);
                 c->x[0] = l + 1;
@@ -190,55 +215,69 @@ static void service(struct cpu *c) {
         break;
     }
     case 23: {
-        int r = dup((int)a0);                                                                             // dup
-        if (r >= 0 && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024) strcpy(g_fdpath[r], g_fdpath[(int)a0]); // carry path
+        // dup
+        int r = dup((int)a0);
+        // carry path
+        if (r >= 0 && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024) strcpy(g_fdpath[r], g_fdpath[(int)a0]);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 24: {
-        int r = dup2((int)a0, (int)a1); // dup3(old,new,flags)
+        // dup3(old,new,flags)
+        int r = dup2((int)a0, (int)a1);
         if (r >= 0 && (int)a1 >= 0 && (int)a1 < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
             strcpy(g_fdpath[(int)a1], g_fdpath[(int)a0]);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 25: {
-        int lcmd = (int)a1; // fcntl -- Linux cmd# -> macOS (they diverge!)
-        if (lcmd == 3) {    // F_GETFL: macOS O_* -> Linux O_*
+        // fcntl -- Linux cmd# -> macOS (they diverge!)
+        int lcmd = (int)a1;
+        // F_GETFL: macOS O_* -> Linux O_*
+        if (lcmd == 3) {
             int r = fcntl((int)a0, F_GETFL, 0);
             if (r < 0) {
                 c->x[0] = (uint64_t)(-errno);
                 break;
             }
-            int lf = r & 0x3; // access mode identical
+            // access mode identical
+            int lf = r & 0x3;
             if (r & 0x8) lf |= 0x400;
             if (r & 0x4) lf |= 0x800;
-            if (r & 0x40) lf |= 0x2000; // APPEND/NONBLOCK/ASYNC
+            // APPEND/NONBLOCK/ASYNC
+            if (r & 0x40) lf |= 0x2000;
             c->x[0] = (uint64_t)(unsigned)lf;
             break;
         }
-        if (lcmd == 4) { // F_SETFL: Linux O_* -> macOS O_*
+        // F_SETFL: Linux O_* -> macOS O_*
+        if (lcmd == 4) {
             int la = (int)a2, mf = 0;
             if (la & 0x400) mf |= 0x8;
             if (la & 0x800) mf |= 0x4;
-            if (la & 0x2000) mf |= 0x40; // APPEND/NONBLOCK/ASYNC
+            // APPEND/NONBLOCK/ASYNC
+            if (la & 0x2000) mf |= 0x40;
             int r = fcntl((int)a0, F_SETFL, mf);
             c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
-        if (lcmd == 5 || lcmd == 6 || lcmd == 7) { // F_GETLK/SETLK/SETLKW: xlate struct flock + cmd
-            int mc = lcmd == 5 ? F_GETLK : lcmd == 6 ? F_SETLK : F_SETLKW; // macOS F_GETLK=7,SETLK=8,SETLKW=9
+        // F_GETLK/SETLK/SETLKW: xlate struct flock + cmd
+        if (lcmd == 5 || lcmd == 6 || lcmd == 7) {
+            // macOS F_GETLK=7,SETLK=8,SETLKW=9
+            int mc = lcmd == 5 ? F_GETLK : lcmd == 6 ? F_SETLK : F_SETLKW;
             uint8_t *lf = (uint8_t *)a2;
             struct flock fl;
-            memset(&fl, 0, sizeof fl); // Linux flock: type/whence/pad/start@8/len@16/pid@24
+            // Linux flock: type/whence/pad/start@8/len@16/pid@24
+            memset(&fl, 0, sizeof fl);
             short lt = *(short *)(lf + 0);
-            fl.l_type = lt == 0 ? F_RDLCK : lt == 1 ? F_WRLCK : F_UNLCK; // Linux RDLCK=0,WRLCK=1,UNLCK=2 -> macOS
+            // Linux RDLCK=0,WRLCK=1,UNLCK=2 -> macOS
+            fl.l_type = lt == 0 ? F_RDLCK : lt == 1 ? F_WRLCK : F_UNLCK;
             fl.l_whence = *(short *)(lf + 2);
             fl.l_start = *(int64_t *)(lf + 8);
             fl.l_len = *(int64_t *)(lf + 16);
             fl.l_pid = *(int32_t *)(lf + 24);
             int r = fcntl((int)a0, mc, &fl), e = errno;
-            if (r >= 0 && lcmd == 5) { // F_GETLK writes the conflicting lock back
+            // F_GETLK writes the conflicting lock back
+            if (r >= 0 && lcmd == 5) {
                 *(short *)(lf + 0) = fl.l_type == F_RDLCK ? 0 : fl.l_type == F_WRLCK ? 1 : 2;
                 *(short *)(lf + 2) = fl.l_whence;
                 *(int64_t *)(lf + 8) = fl.l_start;
@@ -252,20 +291,24 @@ static void service(struct cpu *c) {
         if (lcmd == 8)
             mcmd = F_SETOWN;
         else if (lcmd == 9)
-            mcmd = F_GETOWN; // owner cmds also swapped on macOS
+            // owner cmds also swapped on macOS
+            mcmd = F_GETOWN;
         else if (lcmd == 1030)
             mcmd = F_DUPFD_CLOEXEC;
         else if (lcmd == 1024 || lcmd == 1025 || lcmd == 1026 || lcmd == 1033 || lcmd == 1034) {
             c->x[0] = 0;
             break;
-        } // lease/notify/seals: no-op
+        // lease/notify/seals: no-op
+        }
         int r = fcntl((int)a0, mcmd, a2);
         if (r >= 0 && (lcmd == 0 || lcmd == 1030) && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
-            strcpy(g_fdpath[r], g_fdpath[(int)a0]); // F_DUPFD(_CLOEXEC)
+            // F_DUPFD(_CLOEXEC)
+            strcpy(g_fdpath[r], g_fdpath[(int)a0]);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 29: { // ioctl(fd, req, arg) -- Linux req# -> macOS
+    // ioctl(fd, req, arg) -- Linux req# -> macOS
+    case 29: {
         int fd = (int)a0;
         unsigned long rq = (unsigned long)a1;
         void *arg = (void *)a2;
@@ -275,7 +318,8 @@ static void service(struct cpu *c) {
             if (tcgetattr(fd, &t) < 0) {
                 c->x[0] = (uint64_t)(-errno);
                 break;
-            } // TCGETS
+            // TCGETS
+            }
             termios_m2l(&t, (uint8_t *)arg);
             c->x[0] = 0;
             break;
@@ -284,7 +328,8 @@ static void service(struct cpu *c) {
         case 0x5403:
         case 0x5404: {
             struct termios t;
-            termios_l2m((const uint8_t *)arg, &t); // TCSETS/W/F
+            // TCSETS/W/F
+            termios_l2m((const uint8_t *)arg, &t);
             int act = rq == 0x5402 ? TCSANOW : rq == 0x5403 ? TCSADRAIN : TCSAFLUSH;
             c->x[0] = tcsetattr(fd, act, &t) < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -294,7 +339,8 @@ static void service(struct cpu *c) {
             if (tcgetattr(fd, &t) < 0) {
                 c->x[0] = (uint64_t)(-errno);
                 break;
-            } // TCGETS2 (glibc aarch64 uses this)
+            // TCGETS2 (glibc aarch64 uses this)
+            }
             termios_m2l(&t, (uint8_t *)arg);
             *(uint32_t *)((uint8_t *)arg + 36) = (uint32_t)cfgetispeed(&t);
             *(uint32_t *)((uint8_t *)arg + 40) = (uint32_t)cfgetospeed(&t);
@@ -305,7 +351,8 @@ static void service(struct cpu *c) {
         case 0x402c542c:
         case 0x402c542d: {
             struct termios t;
-            termios_l2m((const uint8_t *)arg, &t); // TCSETS2/W2/F2
+            // TCSETS2/W2/F2
+            termios_l2m((const uint8_t *)arg, &t);
             cfsetispeed(&t, *(uint32_t *)((const uint8_t *)arg + 36));
             cfsetospeed(&t, *(uint32_t *)((const uint8_t *)arg + 40));
             int act = rq == 0x402c542b ? TCSANOW : rq == 0x402c542c ? TCSADRAIN : TCSAFLUSH;
@@ -314,37 +361,50 @@ static void service(struct cpu *c) {
         }
         case 0x5413:
             c->x[0] = ioctl(fd, TIOCGWINSZ, arg) < 0 ? (uint64_t)(-errno) : 0;
-            break; // TIOCGWINSZ (struct same)
-        case 0x5414: c->x[0] = ioctl(fd, TIOCSWINSZ, arg) < 0 ? (uint64_t)(-errno) : 0; break; // TIOCSWINSZ
+            // TIOCGWINSZ (struct same)
+            break;
+        // TIOCSWINSZ
+        case 0x5414: c->x[0] = ioctl(fd, TIOCSWINSZ, arg) < 0 ? (uint64_t)(-errno) : 0; break;
         case 0x80045430:
             if (arg && fd >= 0 && fd < 1024) *(uint32_t *)arg = (uint32_t)fd;
             c->x[0] = 0;
-            break;                           // TIOCGPTN -> pts# = master fd
-        case 0x40045431: c->x[0] = 0; break; // TIOCSPTLCK (unlockpt done at open)
+            // TIOCGPTN -> pts# = master fd
+            break;
+        // TIOCSPTLCK (unlockpt done at open)
+        case 0x40045431: c->x[0] = 0; break;
         case 0x5421: {
-            int on = arg ? *(int *)arg : 0, fl = fcntl(fd, F_GETFL); // FIONBIO
+            // FIONBIO
+            int on = arg ? *(int *)arg : 0, fl = fcntl(fd, F_GETFL);
             fl = on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
             c->x[0] = fcntl(fd, F_SETFL, fl) < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
-        case 0x541b: c->x[0] = ioctl(fd, FIONREAD, arg) < 0 ? (uint64_t)(-errno) : 0; break;       // FIONREAD
-        case 0x5451: c->x[0] = fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0; break; // FIOCLEX
+        // FIONREAD
+        case 0x541b: c->x[0] = ioctl(fd, FIONREAD, arg) < 0 ? (uint64_t)(-errno) : 0; break;
+        // FIOCLEX
+        case 0x5451: c->x[0] = fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0; break;
         case 0x5450: {
             int fl = fcntl(fd, F_GETFD);
             c->x[0] = fcntl(fd, F_SETFD, fl & ~FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0;
             break;
-        } // FIONCLEX
+        // FIONCLEX
+        }
         case 0x540f:
             if (arg) *(int *)arg = (int)getpgrp();
             c->x[0] = 0;
-            break;                                 // TIOCGPGRP
-        case 0x5410: c->x[0] = 0; break;           // TIOCSPGRP
-        case 0x540e: c->x[0] = 0; break;           // TIOCSCTTY
-        default: c->x[0] = (uint64_t)(-25); break; // ENOTTY
+            // TIOCGPGRP
+            break;
+        // TIOCSPGRP
+        case 0x5410: c->x[0] = 0; break;
+        // TIOCSCTTY
+        case 0x540e: c->x[0] = 0; break;
+        // ENOTTY
+        default: c->x[0] = (uint64_t)(-25); break;
         }
         break;
     }
-    case 33: { // mknodat(dirfd, path, mode, dev)
+    // mknodat(dirfd, path, mode, dev)
+    case 33: {
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
@@ -374,7 +434,8 @@ static void service(struct cpu *c) {
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 34: { // mkdirat(dirfd, path, mode) -- confined
+    // mkdirat(dirfd, path, mode) -- confined
+    case 34: {
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
@@ -398,19 +459,23 @@ static void service(struct cpu *c) {
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
         int r = mkdirat(ATFD(a0), p, (mode_t)a2);
         mc_evict(p);
-        ac_evict(p); // namespace change -> evict
+        // namespace change -> evict
+        ac_evict(p);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 35: {                      // unlinkat(dirfd, path, flags) -- confined
-        if (g_rootfs && g_nlower) { // OVERLAY: whiteout (hides lower) + drop the upper copy
+    // unlinkat(dirfd, path, flags) -- confined
+    case 35: {
+        // OVERLAY: whiteout (hides lower) + drop the upper copy
+        if (g_rootfs && g_nlower) {
             char gp[4200];
             abs_guest((int)a0, (const char *)a1, gp, sizeof gp);
             char host[4300];
             if (!overlay_resolve(gp, host, sizeof host, 1)) {
                 c->x[0] = (uint64_t)(-2);
                 break;
-            } // ENOENT
+            // ENOENT
+            }
             overlay_whiteout(gp);
             c->x[0] = 0;
             break;
@@ -422,7 +487,8 @@ static void service(struct cpu *c) {
                 c->x[0] = (uint64_t)(int64_t)pfd;
                 break;
             }
-            int r = unlinkat(pfd, fin, (a2 & 0x200) ? AT_REMOVEDIR : 0), e = errno; // AT_REMOVEDIR: linux 0x200
+            // AT_REMOVEDIR: linux 0x200
+            int r = unlinkat(pfd, fin, (a2 & 0x200) ? AT_REMOVEDIR : 0), e = errno;
             char dp[4200];
             if (r >= 0 && fcntl(pfd, F_GETPATH, dp) == 0) {
                 char hp[4400];
@@ -444,9 +510,11 @@ static void service(struct cpu *c) {
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 36: { // symlinkat(target, newdirfd, linkpath)
+    // symlinkat(target, newdirfd, linkpath)
+    case 36: {
         const char *target =
-            (const char *)a0; // target is the link CONTENT (unresolved); follow-time confinement guards it
+            // target is the link CONTENT (unresolved); follow-time confinement guards it
+            (const char *)a0;
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a1, (const char *)a2, fin, sizeof fin, 1);
@@ -464,10 +532,12 @@ static void service(struct cpu *c) {
         c->x[0] = symlinkat(target, ATFD(a1), p) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 37: { // linkat(odir,opath,ndir,npath,flags)
+    // linkat(odir,opath,ndir,npath,flags)
+    case 37: {
         int fl = (a4 & 0x400) ? AT_SYMLINK_FOLLOW : 0;
         if (g_rootfs) {
-            char ofin[512], nfin[512]; // both ends confined via TOCTOU-free resolver
+            // both ends confined via TOCTOU-free resolver
+            char ofin[512], nfin[512];
             int opfd = jail_at((int)a0, (const char *)a1, ofin, sizeof ofin, 1);
             if (opfd < 0) {
                 c->x[0] = (uint64_t)(int64_t)opfd;
@@ -492,9 +562,11 @@ static void service(struct cpu *c) {
         break;
     }
     case 38:
-    case 276: { // renameat / renameat2 (flags ignored)
+    // renameat / renameat2 (flags ignored)
+    case 276: {
         if (g_rootfs) {
-            char ofin[512], nfin[512]; // both ends confined (TOCTOU-free)
+            // both ends confined (TOCTOU-free)
+            char ofin[512], nfin[512];
             int opfd = jail_at((int)a0, (const char *)a1, ofin, sizeof ofin, 1);
             if (opfd < 0) {
                 c->x[0] = (uint64_t)(int64_t)opfd;
@@ -527,11 +599,13 @@ static void service(struct cpu *c) {
     }
     case 40:
     case 39:
-    case 41: c->x[0] = 0; break; // mount / umount2 / pivot_root -> ok
+    // mount / umount2 / pivot_root -> ok
+    case 41: c->x[0] = 0; break;
     case 43:
     case 44: {
         uint8_t *b = (uint8_t *)(nr == 43 ? a1 : a1);
-        memset(b, 0, 120); // statfs/fstatfs
+        // statfs/fstatfs
+        memset(b, 0, 120);
         *(uint64_t *)(b + 0) = 0x01021994;
         *(uint64_t *)(b + 8) = 4096;
         *(uint64_t *)(b + 16) = 1u << 24;
@@ -544,10 +618,12 @@ static void service(struct cpu *c) {
         fd_evict((int)a0);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
-    } // ftruncate
+    // ftruncate
+    }
     case 47: {
         struct stat s;
-        off_t end = (off_t)(a2 + a3); // fallocate(fd,mode,offset,len): extend (no shrink)
+        // fallocate(fd,mode,offset,len): extend (no shrink)
+        off_t end = (off_t)(a2 + a3);
         if (fstat((int)a0, &s) == 0 && s.st_size < end && ftruncate((int)a0, end) < 0) {}
         fd_evict((int)a0);
         c->x[0] = 0;
@@ -555,7 +631,8 @@ static void service(struct cpu *c) {
     }
     case 49: {
         char pb[4200];
-        const char *p = atpath(-100, (const char *)a0, pb, sizeof pb); // chdir (confined; tracks guest cwd)
+        // chdir (confined; tracks guest cwd)
+        const char *p = atpath(-100, (const char *)a0, pb, sizeof pb);
         if (chdir(p) < 0) {
             c->x[0] = (uint64_t)(-errno);
             break;
@@ -571,7 +648,8 @@ static void service(struct cpu *c) {
         if (fchdir((int)a0) < 0) {
             c->x[0] = (uint64_t)(-errno);
             break;
-        } // fchdir (tracks guest cwd)
+        // fchdir (tracks guest cwd)
+        }
         if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0]) {
             const char *g = g_fdpath[(int)a0];
             if (g_rootfs && !strncmp(g, g_rootfs_canon, g_rootfs_canon_len)) g += g_rootfs_canon_len;
@@ -580,9 +658,11 @@ static void service(struct cpu *c) {
         c->x[0] = 0;
         break;
     }
-    case 52: c->x[0] = fchmod((int)a0, (mode_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // fchmod(fd, mode)
+    // fchmod(fd, mode)
+    case 52: c->x[0] = fchmod((int)a0, (mode_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     case 53:
-    case 452: { // fchmodat(dirfd,path,mode,flags) / fchmodat2
+    // fchmodat(dirfd,path,mode,flags) / fchmodat2
+    case 452: {
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 0);
@@ -608,7 +688,8 @@ static void service(struct cpu *c) {
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 54: { // fchownat(dirfd,path,uid,gid,flags) -- best-effort (rootless)
+    // fchownat(dirfd,path,uid,gid,flags) -- best-effort (rootless)
+    case 54: {
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a4 & 0x100) ? 1 : 0);
@@ -620,7 +701,8 @@ static void service(struct cpu *c) {
             close(pfd);
             c->x[0] = 0;
             break;
-        } // EPERM on the host -> faked OK
+        // EPERM on the host -> faked OK
+        }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
         fchownat(ATFD(a0), p, (uid_t)a2, (gid_t)a3, 0);
@@ -631,13 +713,17 @@ static void service(struct cpu *c) {
         fchown((int)a0, (uid_t)a1, (gid_t)a2);
         c->x[0] = 0;
         break;
-    } // fchown(fd,uid,gid) -- best-effort
+    // fchown(fd,uid,gid) -- best-effort
+    }
     case 56: {
-        int lf = (int)a2, mf = lf & 0x3; // openat -- Linux O_* -> macOS O_* (they differ!)
+        // openat -- Linux O_* -> macOS O_* (they differ!)
+        int lf = (int)a2, mf = lf & 0x3;
         {
-            const char *rp = (const char *)a1; // synthesize /proc/* (macOS has no /proc)
+            // synthesize /proc/* (macOS has no /proc)
+            const char *rp = (const char *)a1;
             if (rp && !strncmp(rp, "/proc/", 6)) {
-                if (strstr(rp, "/auxv")) { // /proc/[self|pid]/auxv (rustix/libc read it)
+                // /proc/[self|pid]/auxv (rustix/libc read it)
+                if (strstr(rp, "/auxv")) {
                     char tn[] = "/tmp/.ddauxvXXXXXX";
                     int afd = mkstemp(tn);
                     if (afd >= 0) {
@@ -648,20 +734,23 @@ static void service(struct cpu *c) {
                     c->x[0] = afd < 0 ? (uint64_t)(-errno) : (uint64_t)afd;
                     break;
                 }
-                int pf = proc_open(rp); // cpuinfo/meminfo/stat/mounts/uptime/loadavg/version
-                if (pf != -2) {
-                    c->x[0] = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
-                    break;
-                }
-            }
-            if (rp && !strncmp(rp, "/sys/fs/cgroup/", 15)) { // cgroup v2 limit files (JVM/Go self-size on these)
+                // cpuinfo/meminfo/stat/mounts/uptime/loadavg/version
                 int pf = proc_open(rp);
                 if (pf != -2) {
                     c->x[0] = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
                     break;
                 }
             }
-            if (rp && !strncmp(rp, "/dev/", 5)) { // device nodes -> host devices (rootfs has no real /dev)
+            // cgroup v2 limit files (JVM/Go self-size on these)
+            if (rp && !strncmp(rp, "/sys/fs/cgroup/", 15)) {
+                int pf = proc_open(rp);
+                if (pf != -2) {
+                    c->x[0] = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
+                    break;
+                }
+            }
+            // device nodes -> host devices (rootfs has no real /dev)
+            if (rp && !strncmp(rp, "/dev/", 5)) {
                 const char *hd = !strcmp(rp, "/dev/null")      ? "/dev/null"
                                  : !strcmp(rp, "/dev/zero")    ? "/dev/zero"
                                  : !strcmp(rp, "/dev/full")    ? "/dev/null"
@@ -684,7 +773,8 @@ static void service(struct cpu *c) {
         if (lf & 0x10000) mf |= O_DIRECTORY;
         if (lf & 0x80000) mf |= O_CLOEXEC;
         {
-            const char *rp = (const char *)a1; // pty: /dev/ptmx -> posix_openpt; /dev/pts/N -> slave
+            // pty: /dev/ptmx -> posix_openpt; /dev/pts/N -> slave
+            const char *rp = (const char *)a1;
             if (rp && !strcmp(rp, "/dev/ptmx")) {
                 int m = posix_openpt(O_RDWR | O_NOCTTY);
                 if (m >= 0) {
@@ -699,19 +789,23 @@ static void service(struct cpu *c) {
                 if (!sn) {
                     c->x[0] = (uint64_t)(int64_t)(-2);
                     break;
-                } // ENOENT
+                // ENOENT
+                }
                 int s = open(sn, mf);
                 c->x[0] = s < 0 ? (uint64_t)(-errno) : (uint64_t)s;
                 break;
             }
         }
-        if (g_rootfs && g_nlower) { // OVERLAY: resolve across layers (upper shadows lowers)
+        // OVERLAY: resolve across layers (upper shadows lowers)
+        if (g_rootfs && g_nlower) {
             char gp[4200];
             abs_guest((int)a0, (const char *)a1, gp, sizeof gp);
             char host[4300];
-            int isw = (lf & 3) || (lf & 0x40); // O_WRONLY/O_RDWR/O_CREAT -> write
+            // O_WRONLY/O_RDWR/O_CREAT -> write
+            int isw = (lf & 3) || (lf & 0x40);
             if (isw)
-                overlay_copyup(gp, host, sizeof host); // copy-up the lower file (or upper path to create)
+                // copy-up the lower file (or upper path to create)
+                overlay_copyup(gp, host, sizeof host);
             else
                 overlay_resolve(gp, host, sizeof host, (lf & 0x20000) != 0);
             int r = open(host, mf | ((lf & 0x20000) ? O_NOFOLLOW : 0), (mode_t)a3);
@@ -726,23 +820,28 @@ static void service(struct cpu *c) {
                     }
                 }
                 if (r < 1024) snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gp);
-            } // remember guest path for merged getdents
+            // remember guest path for merged getdents
+            }
             c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
             break;
         }
-        if (g_rootfs) { // TOCTOU-free per-component resolve in the jail
+        // TOCTOU-free per-component resolve in the jail
+        if (g_rootfs) {
             char fin[512];
-            int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (lf & 0x20000) != 0); // O_NOFOLLOW
+            // O_NOFOLLOW
+            int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (lf & 0x20000) != 0);
             if (pfd < 0) {
                 c->x[0] = (uint64_t)(int64_t)pfd;
                 break;
             }
-            int r = openat(pfd, fin, mf | O_NOFOLLOW, (mode_t)a3); // fin is resolved -> O_NOFOLLOW safe
+            // fin is resolved -> O_NOFOLLOW safe
+            int r = openat(pfd, fin, mf | O_NOFOLLOW, (mode_t)a3);
             int e = errno;
             close(pfd);
             if (r >= 0) {
                 char gp[4200];
-                if (fcntl(r, F_GETPATH, gp) == 0) { // canonical host path for tracking
+                // canonical host path for tracking
+                if (fcntl(r, F_GETPATH, gp) == 0) {
                     fd_setpath(r, gp);
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                         mc_evict(gp);
@@ -755,7 +854,8 @@ static void service(struct cpu *c) {
             break;
         }
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb); // no jail
+        // no jail
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
         int r = openat(ATFD(a0), p, mf, (mode_t)a3);
         if (r >= 0) {
             fd_setpath(r, p);
@@ -779,18 +879,21 @@ static void service(struct cpu *c) {
             g_ovldir[cf][0] = 0;
             g_lo_port[cf] = 0;
             g_sock_stream[cf] = 0;
-        } // reap eventfd peer / timerfd / overlay dir / loopback
+        // reap eventfd peer / timerfd / overlay dir / loopback
+        }
         int r = close(cf);
         fd_clear(cf);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
-    } // close: -errno on fail
+    // close: -errno on fail
+    }
     case 59: {
         int fds[2];
         if (pipe(fds) < 0) {
             c->x[0] = (uint64_t)(-errno);
             break;
-        } // pipe2(fds, flags)
+        // pipe2(fds, flags)
+        }
         int fl = (int)a1;
         if (fl & 0x80000) {
             fcntl(fds[0], F_SETFD, FD_CLOEXEC);
@@ -805,9 +908,11 @@ static void service(struct cpu *c) {
         c->x[0] = 0;
         break;
     }
-    case 61: { // getdents64
+    // getdents64
+    case 61: {
         int fd = (int)a0;
-        if (g_nlower && fd >= 0 && fd < 1024 && g_ovldir[fd][0]) { // OVERLAY: merged listing across layers
+        // OVERLAY: merged listing across layers
+        if (g_nlower && fd >= 0 && fd < 1024 && g_ovldir[fd][0]) {
             static struct {
                 int fd;
                 int n, pos;
@@ -847,7 +952,8 @@ static void service(struct cpu *c) {
                 o += lr;
                 oc[slot].pos++;
             }
-            if (o == 0) oc[slot].fd = 0; // exhausted -> free the slot
+            // exhausted -> free the slot
+            if (o == 0) oc[slot].fd = 0;
             c->x[0] = (uint64_t)o;
             break;
         }
@@ -897,7 +1003,8 @@ static void service(struct cpu *c) {
         c->x[0] = o;
         break;
     }
-    case 78: { // readlinkat
+    // readlinkat
+    case 78: {
         const char *p = (const char *)a1;
         char *buf = (char *)a2;
         size_t bs = (size_t)a3;
@@ -924,7 +1031,8 @@ static void service(struct cpu *c) {
     }
     case 79: {
         struct stat s;
-        char pb[4200]; // newfstatat(dfd, path, buf, flags)
+        // newfstatat(dfd, path, buf, flags)
+        char pb[4200];
         const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb);
         {
             const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
@@ -932,8 +1040,10 @@ static void service(struct cpu *c) {
                 c->x[0] = 0;
                 break;
             }
-        }                                     // synthesized /proc or /sys file
-        if (raw && raw[0] && !(a3 & 0x100)) { // cacheable: named path, follow
+        // synthesized /proc or /sys file
+        }
+        // cacheable: named path, follow
+        if (raw && raw[0] && !(a3 & 0x100)) {
             int rc;
             if (!mc_lookup(p, &rc, &s)) {
                 int r = fstatat(ATFD(a0), p, &s, 0);
@@ -944,7 +1054,8 @@ static void service(struct cpu *c) {
             c->x[0] = (uint64_t)(int64_t)rc;
             break;
         }
-        int r = (raw && !raw[0] && (a3 & 0x1000)) ? fstat((int)a0, &s) // AT_EMPTY_PATH -> fstat(dfd)
+        // AT_EMPTY_PATH -> fstat(dfd)
+        int r = (raw && !raw[0] && (a3 & 0x1000)) ? fstat((int)a0, &s)
                                                   : fstatat(ATFD(a0), p, &s, AT_SYMLINK_NOFOLLOW);
         if (r < 0) {
             c->x[0] = (uint64_t)(-errno);
@@ -955,7 +1066,8 @@ static void service(struct cpu *c) {
         break;
     }
     case 80: {
-        struct stat s; // fstat(fd, buf)
+        // fstat(fd, buf)
+        struct stat s;
         if (fstat((int)a0, &s) < 0) {
             c->x[0] = (uint64_t)(-errno);
             break;
@@ -967,15 +1079,20 @@ static void service(struct cpu *c) {
     case 81:
         sync();
         c->x[0] = 0;
-        break;                                                             // sync
-    case 82: c->x[0] = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break; // fsync
-    case 83: c->x[0] = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break; // fdatasync -> fsync (no macOS fdatasync)
-    case 88: {                                                             // utimensat(dirfd, path, times, flags)
+        // sync
+        break;
+    // fsync
+    case 82: c->x[0] = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
+    // fdatasync -> fsync (no macOS fdatasync)
+    case 83: c->x[0] = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
+    // utimensat(dirfd, path, times, flags)
+    case 88: {
         struct timespec *ts = (struct timespec *)a2;
         if (!a1) {
             c->x[0] = futimens((int)a0, ts) < 0 ? (uint64_t)(-errno) : 0;
             break;
-        } // path NULL -> futimens(fd)
+        // path NULL -> futimens(fd)
+        }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a3 & 0x100) ? 1 : 0);
@@ -989,7 +1106,8 @@ static void service(struct cpu *c) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
-            } // mtime changed
+            // mtime changed
+            }
             close(pfd);
             c->x[0] = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
@@ -1001,9 +1119,12 @@ static void service(struct cpu *c) {
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 166: c->x[0] = (uint64_t)umask((mode_t)a0); break; // umask -> old mask
-    case 223: c->x[0] = 0; break;                           // fadvise64 -- advisory no-op
-    case 285: {                                             // copy_file_range(fdin,offin*,fdout,offout*,len,flags)
+    // umask -> old mask
+    case 166: c->x[0] = (uint64_t)umask((mode_t)a0); break;
+    // fadvise64 -- advisory no-op
+    case 223: c->x[0] = 0; break;
+    // copy_file_range(fdin,offin*,fdout,offout*,len,flags)
+    case 285: {
         int fdin = (int)a0, fdout = (int)a2;
         size_t len = (size_t)a4, done = 0;
         int err = 0;
@@ -1036,14 +1157,17 @@ static void service(struct cpu *c) {
     }
     case 291: {
         struct stat s;
-        char pb[4200]; // statx(dfd, path, flags, mask, buf)
+        // statx(dfd, path, flags, mask, buf)
+        char pb[4200];
         const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb);
         int rc, empty = (raw && !raw[0] && (a2 & 0x1000));
         const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
         if (synth_stat_raw(gp, &s)) {
             rc = 0;
-        }                                   // synth /proc or /sys -> fill from s below
-        else if (raw && raw[0] && !empty) { // cacheable
+        // synth /proc or /sys -> fill from s below
+        }
+        // cacheable
+        else if (raw && raw[0] && !empty) {
             if (!mc_lookup(p, &rc, &s)) {
                 int rr = fstatat(ATFD(a0), p, &s, 0);
                 rc = rr < 0 ? -errno : 0;
@@ -1058,32 +1182,48 @@ static void service(struct cpu *c) {
             break;
         }
         uint8_t *d = (uint8_t *)a4;
-        memset(d, 0, 256); // struct statx (correct offsets)
+        // struct statx (correct offsets)
+        memset(d, 0, 256);
         *(uint32_t *)(d + 0) = 0x17ff;
-        *(uint32_t *)(d + 4) = 4096;                         // stx_mask (BTIME|basic), stx_blksize
-        *(uint32_t *)(d + 16) = s.st_nlink ? s.st_nlink : 1; // stx_nlink @16
+        // stx_mask (BTIME|basic), stx_blksize
+        *(uint32_t *)(d + 4) = 4096;
+        // stx_nlink @16
+        *(uint32_t *)(d + 16) = s.st_nlink ? s.st_nlink : 1;
         *(uint32_t *)(d + 20) = s.st_uid;
-        *(uint32_t *)(d + 24) = s.st_gid;              // stx_uid@20 stx_gid@24
-        *(uint16_t *)(d + 28) = (uint16_t)s.st_mode;   // stx_mode @28  <-- was @36 (the bug)
-        *(uint64_t *)(d + 32) = s.st_ino;              // stx_ino @32
-        *(uint64_t *)(d + 40) = (uint64_t)s.st_size;   // stx_size @40
-        *(uint64_t *)(d + 48) = (uint64_t)s.st_blocks; // stx_blocks @48
+        // stx_uid@20 stx_gid@24
+        *(uint32_t *)(d + 24) = s.st_gid;
+        // stx_mode @28  <-- was @36 (the bug)
+        *(uint16_t *)(d + 28) = (uint16_t)s.st_mode;
+        // stx_ino @32
+        *(uint64_t *)(d + 32) = s.st_ino;
+        // stx_size @40
+        *(uint64_t *)(d + 40) = (uint64_t)s.st_size;
+        // stx_blocks @48
+        *(uint64_t *)(d + 48) = (uint64_t)s.st_blocks;
         *(int64_t *)(d + 64) = s.st_atime;
-        *(int64_t *)(d + 96) = s.st_ctime;  // stx_atime@64 stx_ctime@96
-        *(int64_t *)(d + 112) = s.st_mtime; // stx_mtime @112 (sec)
+        // stx_atime@64 stx_ctime@96
+        *(int64_t *)(d + 96) = s.st_ctime;
+        // stx_mtime @112 (sec)
+        *(int64_t *)(d + 112) = s.st_mtime;
         c->x[0] = 0;
         break;
     }
-    case 437: {                         // openat2(dirfd, path, open_how*, size) -- glibc uses it; MUST confine
-        uint64_t *how = (uint64_t *)a2; //   open_how { u64 flags; u64 mode; u64 resolve; }
+    // openat2(dirfd, path, open_how*, size) -- glibc uses it; MUST confine
+    case 437: {
+        //   open_how { u64 flags; u64 mode; u64 resolve; }
+        uint64_t *how = (uint64_t *)a2;
         a2 = how ? how[0] : 0;
-        a3 = how ? how[1] : 0; // -> openat(dirfd, path, flags, mode); resolve flags ignored (jail confines)
+        // -> openat(dirfd, path, flags, mode); resolve flags ignored (jail confines)
+        a3 = how ? how[1] : 0;
     } /* fall through to openat */
-    case 439: // faccessat2(dirfd,path,mode,flags) -- glibc access() uses it; same path/confinement, flags ignored
+    // faccessat2(dirfd,path,mode,flags) -- glibc access() uses it; same path/confinement, flags ignored
+    case 439:
     case 48: {
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb); // faccessat
-        if (a2 == 0 && p) {                                               // F_OK existence check: cacheable
+        // faccessat
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        // F_OK existence check: cacheable
+        if (a2 == 0 && p) {
             int rc;
             if (!ac_lookup(p, &rc)) {
                 int r = faccessat(ATFD(a0), p, 0, 0);
@@ -1100,20 +1240,24 @@ static void service(struct cpu *c) {
 
     // ===================== Memory — mmap/brk/mprotect/madvise (anon charged against cgroup memory.max)
     // =====================
-    case 214: { // brk
+    // brk
+    case 214: {
         if (a0 == 0) {
             c->x[0] = brk_cur;
             break;
         }
         if (a0 >= brk_lo && a0 <= brk_hi) {
-            if (g_mem_max && a0 > brk_cur) { // heap growth -> charge cgroup memory.max
+            // heap growth -> charge cgroup memory.max
+            if (g_mem_max && a0 > brk_cur) {
                 uint64_t delta = a0 - brk_cur;
                 if (atomic_fetch_add(&g_mem_charged, delta) + delta > g_mem_max) {
                     atomic_fetch_sub(&g_mem_charged, delta);
                     c->x[0] = brk_cur;
-                    break; // over limit -> break unchanged (ENOMEM)
+                    // over limit -> break unchanged (ENOMEM)
+                    break;
                 }
-            } else if (g_mem_max && a0 < brk_cur) { // shrink -> uncharge
+            // shrink -> uncharge
+            } else if (g_mem_max && a0 < brk_cur) {
                 uint64_t delta = brk_cur - a0, cur = atomic_load(&g_mem_charged);
                 atomic_fetch_sub(&g_mem_charged, delta > cur ? cur : delta);
             }
@@ -1123,16 +1267,19 @@ static void service(struct cpu *c) {
         break;
     }
     case 215: {
-        int r = munmap((void *)a0, (size_t)a1); // munmap
+        // munmap
+        int r = munmap((void *)a0, (size_t)a1);
         if (r == 0 && g_mem_max) {
-            uint64_t cur = atomic_load(&g_mem_charged), d = (uint64_t)a1; // uncharge (clamp >=0)
+            // uncharge (clamp >=0)
+            uint64_t cur = atomic_load(&g_mem_charged), d = (uint64_t)a1;
             atomic_fetch_sub(&g_mem_charged, d > cur ? cur : d);
         }
         c->x[0] = (uint64_t)r;
         break;
     }
     case 216: {
-        void *r = mmap(0, (size_t)a2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); // mremap (copy+grow)
+        // mremap (copy+grow)
+        void *r = mmap(0, (size_t)a2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (r == MAP_FAILED) {
             c->x[0] = (uint64_t)(-errno);
             break;
@@ -1142,46 +1289,59 @@ static void service(struct cpu *c) {
         c->x[0] = (uint64_t)r;
         break;
     }
-    case 222: {                                                  // mmap
-        int charge = g_mem_max && (a3 & 0x20) && !(a3 & 0x4000); // charge anon, but NOT MAP_NORESERVE
-        if (charge) { //   (libc reserves huge virtual arenas it never commits;
+    // mmap
+    case 222: {
+        // charge anon, but NOT MAP_NORESERVE
+        int charge = g_mem_max && (a3 & 0x20) && !(a3 & 0x4000);
+        //   (libc reserves huge virtual arenas it never commits;
+        if (charge) {
             if (atomic_fetch_add(&g_mem_charged, (uint64_t)a1) + (uint64_t)a1 >
-                g_mem_max) { // real memory.max counts RSS, not reservations)
+                // real memory.max counts RSS, not reservations)
+                g_mem_max) {
                 atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
                 c->x[0] = (uint64_t)(-ENOMEM);
                 break;
             }
         }
         void *r = mmap((void *)a0, (size_t)a1, (int)a2, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
-        if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1); // refund
+        // refund
+        if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
         c->x[0] = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 226: c->x[0] = (uint64_t)mprotect((void *)a0, (size_t)a1, (int)a2); break; // mprotect
+    // mprotect
+    case 226: c->x[0] = (uint64_t)mprotect((void *)a0, (size_t)a1, (int)a2); break;
     case 228:
     case 229:
         c->x[0] = 0;
-        break; // mlock/munlock (no-op)
+        // mlock/munlock (no-op)
+        break;
     // Container-init compat: in the single-process model these are no-ops that return success so
     // entrypoints (mount /proc, unshare, drop caps, set hostname) proceed; the path-jail is the
     // real boundary, and a faked namespace grants no actual privilege (program still runs as our uid).
-    case 232: c->x[0] = (uint64_t)(-ENOSYS); break; // mincore -> unsupported (callers fall back)
+    // mincore -> unsupported (callers fall back)
+    case 232: c->x[0] = (uint64_t)(-ENOSYS); break;
     case 233:
         c->x[0] = 0;
-        break; // madvise
+        // madvise
+        break;
 
     // ===================== Process & scheduling — clone/exec/wait/ids/prctl/futex/caps/sched =====================
     case 90: {
         if (a1) memset((void *)a1, 0xff, 12);
         c->x[0] = 0;
         break;
-    }                            // capget -> all caps present
-    case 91: c->x[0] = 0; break; // capset -> ok
+    // capget -> all caps present
+    }
+    // capset -> ok
+    case 91: c->x[0] = 0; break;
     case 93:
         c->exited = 1;
         c->exit_code = (int)a0;
-        break; // exit: end THIS thread
-    case 94:   // exit_group: end the whole process
+        // exit: end THIS thread
+        break;
+    // exit_group: end the whole process
+    case 94:
         if (getenv("PROF"))
             fprintf(stderr,
                     "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu\n",
@@ -1191,79 +1351,103 @@ static void service(struct cpu *c) {
         _exit((int)a0);
     case 96:
         c->x[0] = (uint64_t)getpid();
-        break; // set_tid_address -> returns caller's TID (musl stores it; 0 -> a_crash())
+        // set_tid_address -> returns caller's TID (musl stores it; 0 -> a_crash())
+        break;
     case 97:
-    case 268: c->x[0] = 0; break; // unshare / setns -> ok (no real ns)
-    case 98: c->x[0] = (uint64_t)futex_op((int *)a0, (int)a1 & 0x7f, (int)a2, (struct timespec *)a3); break; // futex
-    case 99: c->x[0] = 0; break;  // set_robust_list
-    case 116: c->x[0] = 0; break; // syslog
-    case 122: c->x[0] = 0; break; // sched_setaffinity
+    // unshare / setns -> ok (no real ns)
+    case 268: c->x[0] = 0; break;
+    // futex
+    case 98: c->x[0] = (uint64_t)futex_op((int *)a0, (int)a1 & 0x7f, (int)a2, (struct timespec *)a3); break;
+    // set_robust_list
+    case 99: c->x[0] = 0; break;
+    // syslog
+    case 116: c->x[0] = 0; break;
+    // sched_setaffinity
+    case 122: c->x[0] = 0; break;
     case 123: {
         size_t n = (size_t)a1;
-        if (n > 128) n = 128; // sched_getaffinity(pid,size,MASK=a2!)
+        // sched_getaffinity(pid,size,MASK=a2!)
+        if (n > 128) n = 128;
         if (a2 && n) {
             memset((void *)a2, 0, n);
             *(uint8_t *)a2 = 1;
-        } // cpu 0 set; mask is a2 not a1
+        // cpu 0 set; mask is a2 not a1
+        }
         c->x[0] = n < 8 ? (uint64_t)n : 8;
         break;
     }
-    case 124: c->x[0] = 0; break; // sched_yield
+    // sched_yield
+    case 124: c->x[0] = 0; break;
     case 140:
         setpriority((int)a0, (int)a1, (int)a2);
         c->x[0] = 0;
-        break; // setpriority (best-effort)
+        // setpriority (best-effort)
+        break;
     case 141: {
         errno = 0;
-        int r = getpriority((int)a0, (int)a1); // getpriority -> Linux raw (20-nice)
+        // getpriority -> Linux raw (20-nice)
+        int r = getpriority((int)a0, (int)a1);
         c->x[0] = (r == -1 && errno) ? (uint64_t)(-errno) : (uint64_t)(20 - r);
         break;
     }
     case 144:
     case 146:
     case 147:
-    case 149: c->x[0] = 0; break;                   // setgid/setfsuid/setresuid/setresgid -> ok
-    case 145: c->x[0] = (uint64_t)getpgrp(); break; // getpgid
+    // setgid/setfsuid/setresuid/setresgid -> ok
+    case 149: c->x[0] = 0; break;
+    // getpgid
+    case 145: c->x[0] = (uint64_t)getpgrp(); break;
     case 148: {
-        if (a0) *(uint32_t *)a0 = cuid(); // getresuid(r,e,s)
+        // getresuid(r,e,s)
+        if (a0) *(uint32_t *)a0 = cuid();
         if (a1) *(uint32_t *)a1 = cuid();
         if (a2) *(uint32_t *)a2 = cuid();
         c->x[0] = 0;
         break;
     }
     case 150: {
-        if (a0) *(uint32_t *)a0 = cgid(); // getresgid(r,e,s)
+        // getresgid(r,e,s)
+        if (a0) *(uint32_t *)a0 = cgid();
         if (a1) *(uint32_t *)a1 = cgid();
         if (a2) *(uint32_t *)a2 = cgid();
         c->x[0] = 0;
         break;
     }
-    case 154: c->x[0] = setpgid((pid_t)a0, (pid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setpgid
-    case 155: c->x[0] = (uint64_t)getpgid((pid_t)a0); break;                               // getpgid (bash job control)
-    case 156: c->x[0] = (uint64_t)getsid((pid_t)a0); break;                                // getsid
+    // setpgid
+    case 154: c->x[0] = setpgid((pid_t)a0, (pid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    // getpgid (bash job control)
+    case 155: c->x[0] = (uint64_t)getpgid((pid_t)a0); break;
+    // getsid
+    case 156: c->x[0] = (uint64_t)getsid((pid_t)a0); break;
     case 158: {
         if (g_gid >= 0) {
             if ((int)a0 >= 1 && a1) *(gid_t *)a1 = (gid_t)cgid();
             c->x[0] = 1;
             break;
-        } // getgroups -> [container gid]
+        // getgroups -> [container gid]
+        }
         int r = getgroups((int)a0, (gid_t *)a1);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 159: c->x[0] = 0; break; // setgroups (privileged; ignore)
-    case 165: {                   // getrusage(who, *usage) -- a1 is the buffer, not a0!
+    // setgroups (privileged; ignore)
+    case 159: c->x[0] = 0; break;
+    // getrusage(who, *usage) -- a1 is the buffer, not a0!
+    case 165: {
         struct rusage ru;
-        int who = ((int)a0 == -1) ? RUSAGE_CHILDREN : RUSAGE_SELF; // Linux RUSAGE_THREAD(1) -> SELF
+        // Linux RUSAGE_THREAD(1) -> SELF
+        int who = ((int)a0 == -1) ? RUSAGE_CHILDREN : RUSAGE_SELF;
         if (a1) {
             uint8_t *d = (uint8_t *)a1;
-            memset(d, 0, 144); // Linux struct rusage layout (18 longs)
+            // Linux struct rusage layout (18 longs)
+            memset(d, 0, 144);
             if (getrusage(who, &ru) == 0) {
                 *(int64_t *)(d + 0) = ru.ru_utime.tv_sec;
                 *(int64_t *)(d + 8) = ru.ru_utime.tv_usec;
                 *(int64_t *)(d + 16) = ru.ru_stime.tv_sec;
                 *(int64_t *)(d + 24) = ru.ru_stime.tv_usec;
-                *(int64_t *)(d + 32) = ru.ru_maxrss / 1024; // macOS bytes -> Linux KB
+                // macOS bytes -> Linux KB
+                *(int64_t *)(d + 32) = ru.ru_maxrss / 1024;
                 *(int64_t *)(d + 64) = ru.ru_minflt;
                 *(int64_t *)(d + 72) = ru.ru_majflt;
                 *(int64_t *)(d + 88) = ru.ru_inblock;
@@ -1276,8 +1460,10 @@ static void service(struct cpu *c) {
         c->x[0] = 0;
         break;
     }
-    case 167: {            // prctl(option,...)
-        switch ((int)a0) { // 0 for known no-ops; EINVAL for unknown (kernel does)
+    // prctl(option,...)
+    case 167: {
+        // 0 for known no-ops; EINVAL for unknown (kernel does)
+        switch ((int)a0) {
         case 1:
         case 3:
         case 4:
@@ -1288,38 +1474,53 @@ static void service(struct cpu *c) {
         case 38:
         case 53:
         case 55:
-        case 59: c->x[0] = 0; break;               // PDEATHSIG/DUMPABLE/NAME/SECCOMP/TIMERSLACK/THP/SPECCTRL...
-        default: c->x[0] = (uint64_t)(-22); break; // EINVAL -- so feature probes (e.g. magic "AUXV") fail as on Linux
+        // PDEATHSIG/DUMPABLE/NAME/SECCOMP/TIMERSLACK/THP/SPECCTRL...
+        case 59: c->x[0] = 0; break;
+        // EINVAL -- so feature probes (e.g. magic "AUXV") fail as on Linux
+        default: c->x[0] = (uint64_t)(-22); break;
         }
         break;
     }
-    case 172: c->x[0] = (uint64_t)container_pid(); break; // getpid (PID ns: init -> 1)
+    // getpid (PID ns: init -> 1)
+    case 172: c->x[0] = (uint64_t)container_pid(); break;
     case 173:
         c->x[0] = (container_pid() == 1) ? 0 : (uint64_t)getppid();
-        break; // getppid (init's parent is 0 in the ns)
+        // getppid (init's parent is 0 in the ns)
+        break;
     case 174:
-    case 175: c->x[0] = (uint64_t)cuid(); break; // getuid/geteuid -> container uid (0=root by default)
+    // getuid/geteuid -> container uid (0=root by default)
+    case 175: c->x[0] = (uint64_t)cuid(); break;
     case 176:
-    case 177: c->x[0] = (uint64_t)cgid(); break;          // getgid/getegid
-    case 178: c->x[0] = (uint64_t)container_pid(); break; // gettid
-    case 220: {                                           // clone(flags,stack,ptid,tls,ctid)
-        if (a0 & 0x10000) {                               // CLONE_THREAD: stack arg IS the top
+    // getgid/getegid
+    case 177: c->x[0] = (uint64_t)cgid(); break;
+    // gettid
+    case 178: c->x[0] = (uint64_t)container_pid(); break;
+    // clone(flags,stack,ptid,tls,ctid)
+    case 220: {
+        // CLONE_THREAD: stack arg IS the top
+        if (a0 & 0x10000) {
             c->x[0] = (uint64_t)spawn_thread(c, a0, a1, a3, a2, a4);
             break;
         }
-        pid_t pid = fork();       // fork/vfork: COW copy; child continues
-        if (pid == 0) c->ssp = 0; // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
-        c->x[0] = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid; // parent: pid, child: 0
+        // fork/vfork: COW copy; child continues
+        pid_t pid = fork();
+        // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
+        if (pid == 0) c->ssp = 0;
+        // parent: pid, child: 0
+        c->x[0] = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }
-    case 221: { // execve(path, argv, envp)
+    // execve(path, argv, envp)
+    case 221: {
         char pb[4200];
         const char *p =
-            xresolve_exec((const char *)a0, pb, sizeof pb); // follow symlink rootfs-relative (busybox applets)
+            // follow symlink rootfs-relative (busybox applets)
+            xresolve_exec((const char *)a0, pb, sizeof pb);
         if (access(p, F_OK) != 0) {
             c->x[0] = (uint64_t)(-2);
             break;
-        } // ENOENT
+        // ENOENT
+        }
         char *argv[256];
         int ac = 0;
         uint64_t *gv = (uint64_t *)a1;
@@ -1328,7 +1529,8 @@ static void service(struct cpu *c) {
             ac++;
         }
         argv[ac] = NULL;
-        char sh_interp[256], sh_arg[256], shpb[4200]; // shebang: exec the #! interpreter instead
+        // shebang: exec the #! interpreter instead
+        char sh_interp[256], sh_arg[256], shpb[4200];
         {
             int sfd = open(p, O_RDONLY);
             char hdr[258];
@@ -1340,7 +1542,8 @@ static void service(struct cpu *c) {
                 if (nl) *nl = 0;
                 char *s = hdr + 2;
                 while (*s == ' ' || *s == '\t')
-                    s++; // interpreter path
+                    // interpreter path
+                    s++;
                 char *e = s;
                 while (*e && *e != ' ' && *e != '\t')
                     e++;
@@ -1355,16 +1558,19 @@ static void service(struct cpu *c) {
                 snprintf(sh_interp, sizeof sh_interp, "%s", s);
                 char *na[258];
                 int ni = 0;
-                na[ni++] = sh_interp; // [interp, (optarg), scriptpath, args...]
+                // [interp, (optarg), scriptpath, args...]
+                na[ni++] = sh_interp;
                 if (arg) {
                     snprintf(sh_arg, sizeof sh_arg, "%s", arg);
                     na[ni++] = sh_arg;
                 }
-                na[ni++] = (char *)a0; // the guest script path (interp re-opens it)
+                // the guest script path (interp re-opens it)
+                na[ni++] = (char *)a0;
                 for (int i = 1; i < ac && ni < 256; i++)
                     na[ni++] = argv[i];
                 na[ni] = NULL;
-                p = xresolve_exec(sh_interp, shpb, sizeof shpb); // load the interpreter, not the script
+                // load the interpreter, not the script
+                p = xresolve_exec(sh_interp, shpb, sizeof shpb);
                 if (access(p, F_OK) != 0) {
                     c->x[0] = (uint64_t)(-2);
                     break;
@@ -1380,7 +1586,8 @@ static void service(struct cpu *c) {
         char interp[256];
         if (elf_interp(p, interp, sizeof interp) == 0) {
             char ib[4200];
-            const char *ih = xresolve_exec(interp, ib, sizeof ib); // follow+confine ld.so symlink
+            // follow+confine ld.so symlink
+            const char *ih = xresolve_exec(interp, ib, sizeof ib);
             struct loaded li;
             load_elf(ih, &li);
             jump = li.entry;
@@ -1388,9 +1595,11 @@ static void service(struct cpu *c) {
         }
         g_cp = g_cache;
         memset(g_map, 0, sizeof g_map);
-        g_npend = 0; // flush old translations
+        // flush old translations
+        g_npend = 0;
         memset(g_ibtc, 0, sizeof g_ibtc);
-        c->ssp = 0; // execve: drop IBTC + §B shadow (old image)
+        // execve: drop IBTC + §B shadow (old image)
+        c->ssp = 0;
         uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         brk_lo = brk_cur = (uint64_t)heap;
         brk_hi = brk_lo + (256u << 20);
@@ -1400,19 +1609,23 @@ static void service(struct cpu *c) {
         c->tls = 0;
         c->sp = sp;
         c->pc = jump;
-        c->redirect = 1; // jump to new program; don't advance pc
+        // jump to new program; don't advance pc
+        c->redirect = 1;
         break;
     }
-    case 260: { // wait4(pid, *status, opts, *rusage)
+    // wait4(pid, *status, opts, *rusage)
+    case 260: {
         int st = 0;
         pid_t r = wait4((pid_t)(int)a0, &st, (int)a2, (struct rusage *)a3);
         if (r < 0) {
             c->x[0] = (uint64_t)(-errno);
             break;
         }
-        if ((st & 0x7f) != 0 && (st & 0x7f) != 0x7f) // WIFSIGNALED: macOS termsig -> Linux
+        // WIFSIGNALED: macOS termsig -> Linux
+        if ((st & 0x7f) != 0 && (st & 0x7f) != 0x7f)
             st = (st & ~0x7f) | (sig_m2l(st & 0x7f) & 0x7f);
-        else if ((st & 0xff) == 0x7f) // WIFSTOPPED: macOS stopsig -> Linux
+        // WIFSTOPPED: macOS stopsig -> Linux
+        else if ((st & 0xff) == 0x7f)
             st = (st & ~0xff00) | ((sig_m2l((st >> 8) & 0xff) & 0xff) << 8);
         if (a1) *(int *)a1 = st;
         c->x[0] = (uint64_t)r;
@@ -1420,46 +1633,57 @@ static void service(struct cpu *c) {
     }
     case 261: {
         if (a3) {
-            uint64_t *o = (uint64_t *)a3;                 // prlimit64(pid,res,new,OLD): old=a3!
-            o[0] = ((int)a1 == 3) ? (8ull << 20) : ~0ull; // RLIMIT_STACK=8MB, else unlimited
+            // prlimit64(pid,res,new,OLD): old=a3!
+            uint64_t *o = (uint64_t *)a3;
+            // RLIMIT_STACK=8MB, else unlimited
+            o[0] = ((int)a1 == 3) ? (8ull << 20) : ~0ull;
             o[1] = ~0ull;
         }
         c->x[0] = 0;
         break;
     }
-    case 435: { // clone3(clone_args*, size)
+    // clone3(clone_args*, size)
+    case 435: {
         uint64_t *ca = (uint64_t *)a0;
         uint64_t flags = ca[0];
-        if (flags & 0x10000) { // CLONE_THREAD: sp = stack + stack_size
+        // CLONE_THREAD: sp = stack + stack_size
+        if (flags & 0x10000) {
             c->x[0] = (uint64_t)spawn_thread(c, flags, ca[5] + ca[6], ca[7], ca[3], ca[2]);
             break;
         }
         pid_t pid = fork();
-        if (pid == 0) c->ssp = 0; // §B: same -- child drops the inherited shadow
+        // §B: same -- child drops the inherited shadow
+        if (pid == 0) c->ssp = 0;
         c->x[0] = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }
 
     // ===================== Signals — Linux signal numbers -> macOS; kill/sigaction/sigreturn =====================
-    case 129: // kill(pid,sig)
+    // kill(pid,sig)
+    case 129:
         if ((int)a0 == container_pid() || (int)a0 <= 0) {
             raise_guest_signal(c, (int)a1);
             c->x[0] = 0;
-        } // self / pgrp (PID-ns aware)
+        // self / pgrp (PID-ns aware)
+        }
         else
             c->x[0] = kill((pid_t)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
         break;
     case 130:
         raise_guest_signal(c, (int)a1);
         c->x[0] = 0;
-        break; // tkill(tid,sig)
+        // tkill(tid,sig)
+        break;
     case 131:
         raise_guest_signal(c, (int)a2);
         c->x[0] = 0;
-        break;  // tgkill(tgid,tid,sig)
-    case 132: { // sigaltstack(new, old)
+        // tgkill(tgid,tid,sig)
+        break;
+    // sigaltstack(new, old)
+    case 132: {
         if (a1) {
-            *(uint64_t *)(a1 + 0) = c->alt_sp; // report current (or SS_DISABLE=2 if none)
+            // report current (or SS_DISABLE=2 if none)
+            *(uint64_t *)(a1 + 0) = c->alt_sp;
             *(uint32_t *)(a1 + 8) = c->alt_sp ? c->alt_flags : 2;
             *(uint64_t *)(a1 + 16) = c->alt_size;
         }
@@ -1471,7 +1695,8 @@ static void service(struct cpu *c) {
         c->x[0] = 0;
         break;
     }
-    case 134: { // rt_sigaction(sig, *act, *old)
+    // rt_sigaction(sig, *act, *old)
+    case 134: {
         int sig = (int)a0;
         if (sig < 1 || sig > 64) {
             c->x[0] = (uint64_t)(-22);
@@ -1481,19 +1706,24 @@ static void service(struct cpu *c) {
             *(uint64_t *)(a2 + 0) = g_sigact[sig].handler;
             *(uint64_t *)(a2 + 8) = g_sigact[sig].flags;
             *(uint64_t *)(a2 + 16) = g_sigact[sig].mask;
-        } // aarch64: handler,flags,mask
+        // aarch64: handler,flags,mask
+        }
         if (a1) {
             uint64_t h = *(uint64_t *)(a1 + 0);
             g_sigact[sig].handler = h;
             g_sigact[sig].flags = *(uint64_t *)(a1 + 8);
             g_sigact[sig].mask = *(uint64_t *)(a1 + 16);
-            if (sig != 9 && sig != 19) { // can't touch SIGKILL/SIGSTOP (Linux nums)
-                int ms = sig_l2m(sig);   // host(macOS) signo to install on
+            // can't touch SIGKILL/SIGSTOP (Linux nums)
+            if (sig != 9 && sig != 19) {
+                // host(macOS) signo to install on
+                int ms = sig_l2m(sig);
                 if (h == 0)
                     signal(ms, SIG_DFL);
                 else if (h == 1)
-                    signal(ms, SIG_IGN);      // honor SIG_IGN (e.g. SIGPIPE)
-                else if (!sig_is_sync(sig)) { // async: flag pending, deliver in dispatcher
+                    // honor SIG_IGN (e.g. SIGPIPE)
+                    signal(ms, SIG_IGN);
+                // async: flag pending, deliver in dispatcher
+                else if (!sig_is_sync(sig)) {
                     struct sigaction sa;
                     memset(&sa, 0, sizeof sa);
                     sa.sa_handler = host_sigh;
@@ -1505,24 +1735,30 @@ static void service(struct cpu *c) {
         c->x[0] = 0;
         break;
     }
-    case 135: { // rt_sigprocmask(how, *set, *old)
+    // rt_sigprocmask(how, *set, *old)
+    case 135: {
         if (a2) *(uint64_t *)a2 = c->sigmask;
         if (a1) {
             uint64_t set = *(uint64_t *)a1;
             if (a0 == 0)
-                c->sigmask |= set; // SIG_BLOCK
+                // SIG_BLOCK
+                c->sigmask |= set;
             else if (a0 == 1)
-                c->sigmask &= ~set; // SIG_UNBLOCK
+                // SIG_UNBLOCK
+                c->sigmask &= ~set;
             else
                 c->sigmask = set;
-        } // SIG_SETMASK
+        // SIG_SETMASK
+        }
         c->x[0] = 0;
         break;
     }
-    case 136: { // rt_sigpending(set, sigsetsize)
+    // rt_sigpending(set, sigsetsize)
+    case 136: {
         uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST), out = 0;
         for (int s = 1; s <= 64; s++)
-            if (p & (1ull << s)) out |= (1ull << (s - 1)); // 1<<N -> sigset_t bit N-1
+            // 1<<N -> sigset_t bit N-1
+            if (p & (1ull << s)) out |= (1ull << (s - 1));
         if (a0) *(uint64_t *)a0 = out;
         c->x[0] = 0;
         break;
@@ -1530,22 +1766,27 @@ static void service(struct cpu *c) {
     case 139:
         do_sigreturn(c);
         c->redirect = 1;
-        break; // rt_sigreturn (restorer path)
+        // rt_sigreturn (restorer path)
+        break;
 
     // ===================== Time — clock_gettime/nanosleep/gettimeofday (Linux clock-id translation)
     // =====================
     case 101:
         nanosleep((const struct timespec *)a0, (struct timespec *)a1);
         c->x[0] = 0;
-        break; // nanosleep
+        // nanosleep
+        break;
     case 113: {
-        clockid_t mc; // clock_gettime -- Linux clockid -> macOS
+        // clock_gettime -- Linux clockid -> macOS
+        clockid_t mc;
         switch ((int)a0) {
         case 0:
-        case 5: mc = CLOCK_REALTIME; break; // REALTIME(_COARSE)
+        // REALTIME(_COARSE)
+        case 5: mc = CLOCK_REALTIME; break;
         case 1:
         case 6:
-        case 7: mc = CLOCK_MONOTONIC; break; // MONOTONIC(_COARSE)/BOOTTIME
+        // MONOTONIC(_COARSE)/BOOTTIME
+        case 7: mc = CLOCK_MONOTONIC; break;
         case 2: mc = CLOCK_PROCESS_CPUTIME_ID; break;
         case 3: mc = CLOCK_THREAD_CPUTIME_ID; break;
         case 4: mc = CLOCK_MONOTONIC_RAW; break;
@@ -1568,16 +1809,20 @@ static void service(struct cpu *c) {
         }
         c->x[0] = 0;
         break;
-    } // clock_getres -> 1ns
+    // clock_getres -> 1ns
+    }
     case 115:
         nanosleep((const struct timespec *)a2, (struct timespec *)a3);
         c->x[0] = 0;
-        break;                    // clock_nanosleep
-    case 153: c->x[0] = 0; break; // times
+        // clock_nanosleep
+        break;
+    // times
+    case 153: c->x[0] = 0; break;
     case 169: {
         struct timeval tv;
         gettimeofday(&tv, 0);
-        uint64_t *g = (uint64_t *)a0; // gettimeofday
+        // gettimeofday
+        uint64_t *g = (uint64_t *)a0;
         if (g) {
             g[0] = tv.tv_sec;
             g[1] = tv.tv_usec;
@@ -1589,7 +1834,8 @@ static void service(struct cpu *c) {
     // ===================== Network — sockets; port-map (-p) + NET-ns private loopback =====================
     case 198: {
         int ty = (int)a1;
-        int r = socket((int)a0, ty & 0xf, (int)a2); // socket
+        // socket
+        int r = socket((int)a0, ty & 0xf, (int)a2);
         if (r >= 0) {
             if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
@@ -1603,7 +1849,8 @@ static void service(struct cpu *c) {
     }
     case 199: {
         int sv[2];
-        int r = socketpair((int)a0, (int)a1 & 0xf, (int)a2, sv); // socketpair
+        // socketpair
+        int r = socketpair((int)a0, (int)a1 & 0xf, (int)a2, sv);
         if (r == 0) {
             ((int *)a3)[0] = sv[0];
             ((int *)a3)[1] = sv[1];
@@ -1611,10 +1858,13 @@ static void service(struct cpu *c) {
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 200: {                      // bind -- port-map: bind the published host port
-        uint8_t *sa = (uint8_t *)a1; // GUEST Linux sockaddr_in: family@0(u16 LE), port@2(BE)
+    // bind -- port-map: bind the published host port
+    case 200: {
+        // GUEST Linux sockaddr_in: family@0(u16 LE), port@2(BE)
+        uint8_t *sa = (uint8_t *)a1;
         if (lo_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
-            lo_is(sa, (socklen_t)a2)) { // private loopback
+            // private loopback
+            lo_is(sa, (socklen_t)a2)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
             lo_path(p, up, sizeof up);
@@ -1634,12 +1884,14 @@ static void service(struct cpu *c) {
         }
         if (g_nportmap && sa && a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET) {
             uint16_t cp = ntohs(*(uint16_t *)(sa + 2)), hp = pm_host(cp);
-            if ((int)a0 >= 0 && (int)a0 < 1024) g_fd_cport[(int)a0] = cp; // remember for getsockname
+            // remember for getsockname
+            if ((int)a0 >= 0 && (int)a0 < 1024) g_fd_cport[(int)a0] = cp;
             if (hp != cp) {
                 uint8_t buf[128];
                 socklen_t L = a2 < 128 ? (socklen_t)a2 : 128;
                 memcpy(buf, sa, L);
-                *(uint16_t *)(buf + 2) = htons(hp); // publish on :H instead of :C (port @2)
+                // publish on :H instead of :C (port @2)
+                *(uint16_t *)(buf + 2) = htons(hp);
                 c->x[0] = bind((int)a0, (struct sockaddr *)buf, L) < 0 ? (uint64_t)(-errno) : 0;
                 break;
             }
@@ -1651,9 +1903,11 @@ static void service(struct cpu *c) {
     case 202:
     case 242: {
         int lfd = (int)a0;
-        int pl = (lfd >= 0 && lfd < 1024) ? g_lo_port[lfd] : 0; // accept / accept4
+        // accept / accept4
+        int pl = (lfd >= 0 && lfd < 1024) ? g_lo_port[lfd] : 0;
         int r = pl ? accept(lfd, NULL, NULL)
-                   : accept(lfd, (void *)a1, (socklen_t *)a2); // private-lo: don't expose unix peer
+                   // private-lo: don't expose unix peer
+                   : accept(lfd, (void *)a1, (socklen_t *)a2);
         if (r >= 0) {
             if (nr == 242) {
                 if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
@@ -1666,14 +1920,17 @@ static void service(struct cpu *c) {
                 }
                 fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, pl);
             }
-        } // peer = 127.0.0.1:lport
+        // peer = 127.0.0.1:lport
+        }
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 203: { // connect
+    // connect
+    case 203: {
         uint8_t *sa = (uint8_t *)a1;
         if (lo_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
-            lo_is(sa, (socklen_t)a2)) { // private loopback
+            // private loopback
+            lo_is(sa, (socklen_t)a2)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
             lo_path(p, up, sizeof up);
@@ -1694,7 +1951,8 @@ static void service(struct cpu *c) {
         break;
     }
     case 204: {
-        int fd = (int)a0; // getsockname
+        // getsockname
+        int fd = (int)a0;
         if (fd >= 0 && fd < 1024 && g_lo_port[fd]) {
             fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
             c->x[0] = 0;
@@ -1702,12 +1960,14 @@ static void service(struct cpu *c) {
         }
         int r = getsockname(fd, (void *)a1, (socklen_t *)a2);
         if (r == 0 && g_nportmap && a1 && fd >= 0 && fd < 1024 && g_fd_cport[fd])
-            *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]); // app sees the port it asked for (port @2)
+            // app sees the port it asked for (port @2)
+            *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 205: {
-        int fd = (int)a0; // getpeername
+        // getpeername
+        int fd = (int)a0;
         if (fd >= 0 && fd < 1024 && g_lo_port[fd]) {
             fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
             c->x[0] = 0;
@@ -1726,7 +1986,8 @@ static void service(struct cpu *c) {
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 208: { // setsockopt(fd, level, optname, val, len)
+    // setsockopt(fd, level, optname, val, len)
+    case 208: {
         int lvl = (int)a1, opt = (int)a2;
         if (lvl == 1) {
             lvl = SOL_SOCKET;
@@ -1735,14 +1996,18 @@ static void service(struct cpu *c) {
                 c->x[0] = 0;
                 break;
             }
-        } // translate SOL_SOCKET; ignore unknown
+        // translate SOL_SOCKET; ignore unknown
+        }
         int r = setsockopt((int)a0, lvl, opt, (void *)a3,
-                           (socklen_t)a4); // other levels (TCP/IP) pass through (TCP_NODELAY matches)
+                           // other levels (TCP/IP) pass through (TCP_NODELAY matches)
+                           (socklen_t)a4);
         c->x[0] = r < 0 ? 0 : 0;
         (void)r;
-        break; // never fail the guest on an unsupported option
+        // never fail the guest on an unsupported option
+        break;
     }
-    case 209: { // getsockopt(fd, level, optname, val, len)
+    // getsockopt(fd, level, optname, val, len)
+    case 209: {
         int lvl = (int)a1, opt = (int)a2;
         if (lvl == 1) {
             lvl = SOL_SOCKET;
@@ -1752,19 +2017,23 @@ static void service(struct cpu *c) {
                 c->x[0] = 0;
                 break;
             }
-        } // unknown -> report 0
+        // unknown -> report 0
+        }
         int r = getsockopt((int)a0, lvl, opt, (void *)a3, (socklen_t *)a4);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 210:
         c->x[0] = shutdown((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
-        break; // shutdown(fd, how) -- SHUT_RD/WR/RDWR match
+        // shutdown(fd, how) -- SHUT_RD/WR/RDWR match
+        break;
     case 211:
-    case 212: { // sendmsg/recvmsg -- translate Linux msghdr -> macOS
+    // sendmsg/recvmsg -- translate Linux msghdr -> macOS
+    case 212: {
         uint8_t *g = (uint8_t *)a1;
         struct msghdr mh;
-        memset(&mh, 0, sizeof mh); // Linux: iovlen/controllen are 8-byte; macOS 4
+        // Linux: iovlen/controllen are 8-byte; macOS 4
+        memset(&mh, 0, sizeof mh);
         mh.msg_name = (void *)*(uint64_t *)(g + 0);
         mh.msg_namelen = *(uint32_t *)(g + 8);
         mh.msg_iov = (void *)*(uint64_t *)(g + 16);
@@ -1775,7 +2044,8 @@ static void service(struct cpu *c) {
         ssize_t r =
             (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         if (nr == 212 && r >= 0) {
-            *(uint32_t *)(g + 8) = mh.msg_namelen; // recvmsg writes back name/control len + flags
+            // recvmsg writes back name/control len + flags
+            *(uint32_t *)(g + 8) = mh.msg_namelen;
             *(uint64_t *)(g + 40) = mh.msg_controllen;
             *(uint32_t *)(g + 48) = (uint32_t)mh.msg_flags;
         }
@@ -1783,10 +2053,12 @@ static void service(struct cpu *c) {
         break;
     }
     case 269:
-    case 243: { // sendmmsg/recvmmsg(fd, mmsghdr[], vlen, flags, [timeout])
+    // sendmmsg/recvmmsg(fd, mmsghdr[], vlen, flags, [timeout])
+    case 243: {
         uint8_t *vec = (uint8_t *)a1;
         unsigned vlen = (unsigned)a2;
-        int done = 0, err = 0; // mmsghdr = msghdr(56) + msg_len(4) + pad
+        // mmsghdr = msghdr(56) + msg_len(4) + pad
+        int done = 0, err = 0;
         for (unsigned i = 0; i < vlen; i++) {
             uint8_t *g = vec + (size_t)i * 64;
             struct msghdr mh;
@@ -1799,13 +2071,15 @@ static void service(struct cpu *c) {
             mh.msg_controllen = (socklen_t) * (uint64_t *)(g + 40);
             mh.msg_flags = *(uint32_t *)(g + 48);
             int rf = (int)a3;
-            if (nr == 243 && i > 0) rf |= 0x40; // after the first, don't block (MSG_WAITFORONE-ish)
+            // after the first, don't block (MSG_WAITFORONE-ish)
+            if (nr == 243 && i > 0) rf |= 0x40;
             ssize_t r = (nr == 269) ? sendmsg((int)a0, &mh, msgflags_l2m(rf)) : recvmsg((int)a0, &mh, msgflags_l2m(rf));
             if (r < 0) {
                 err = errno;
                 break;
             }
-            *(uint32_t *)(g + 56) = (uint32_t)r; // msg_len
+            // msg_len
+            *(uint32_t *)(g + 56) = (uint32_t)r;
             if (nr == 243) {
                 *(uint32_t *)(g + 8) = mh.msg_namelen;
                 *(uint64_t *)(g + 40) = mh.msg_controllen;
@@ -1818,7 +2092,8 @@ static void service(struct cpu *c) {
     }
 
     // ===================== Event loop — epoll/eventfd/timerfd/signalfd/inotify (macOS kqueue) =====================
-    case 19: { // eventfd2(initval, flags) -> pipe
+    // eventfd2(initval, flags) -> pipe
+    case 19: {
         int fds[2];
         if (pipe(fds) < 0) {
             c->x[0] = (uint64_t)(-errno);
@@ -1827,52 +2102,66 @@ static void service(struct cpu *c) {
         if (a1 & 0x80000) {
             fcntl(fds[0], F_SETFD, FD_CLOEXEC);
             fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-        } // EFD_CLOEXEC
+        // EFD_CLOEXEC
+        }
         if (a1 & 0x800) {
             fcntl(fds[0], F_SETFL, O_NONBLOCK);
             fcntl(fds[1], F_SETFL, O_NONBLOCK);
-        }                                                                        // EFD_NONBLOCK
-        if (fds[0] < 1024 && fds[1] < 1024) g_eventfd_peer[fds[0]] = fds[1] + 1; // writes to the eventfd go to fds[1]
+        // EFD_NONBLOCK
+        }
+        // writes to the eventfd go to fds[1]
+        if (fds[0] < 1024 && fds[1] < 1024) g_eventfd_peer[fds[0]] = fds[1] + 1;
         if (a0 > 0) {
             uint64_t v = a0;
             if (write(fds[1], &v, 8) < 0) {}
-        } // initval: read() returns it (else blocks)
+        // initval: read() returns it (else blocks)
+        }
         c->x[0] = (uint64_t)fds[0];
         break;
     }
     case 20: {
-        int r = kqueue();                                            // epoll_create1(flags) -> kqueue
-        if (r >= 0 && (a0 & 0x80000)) fcntl(r, F_SETFD, FD_CLOEXEC); // EPOLL_CLOEXEC
+        // epoll_create1(flags) -> kqueue
+        int r = kqueue();
+        // EPOLL_CLOEXEC
+        if (r >= 0 && (a0 & 0x80000)) fcntl(r, F_SETFD, FD_CLOEXEC);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 21: { // epoll_ctl(epfd, op, fd, event) -> kevent
+    // epoll_ctl(epfd, op, fd, event) -> kevent
+    case 21: {
         int op = (int)a1, fd = (int)a2;
         uint32_t ev = 0;
         uint64_t data = (uint64_t)(unsigned)fd;
         if (a3) {
             ev = *(uint32_t *)a3;
             memcpy(&data, (void *)(a3 + 4), 8);
-        } // struct epoll_event {u32 events; u64 data} packed
+        // struct epoll_event {u32 events; u64 data} packed
+        }
         struct kevent kv[2];
         int n = 0;
-        uint16_t base = (op == 2) ? EV_DELETE : EV_ADD; // op: 1=ADD 2=DEL 3=MOD
+        // op: 1=ADD 2=DEL 3=MOD
+        uint16_t base = (op == 2) ? EV_DELETE : EV_ADD;
         uint16_t xf =
-            (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0)); // EPOLLET/ONESHOT
+            // EPOLLET/ONESHOT
+            (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0));
         if (op == 2 || (ev & 0x1)) {
             EV_SET(&kv[n], fd, EVFILT_READ, base | xf, 0, 0, (void *)data);
             n++;
-        } // EPOLLIN
+        // EPOLLIN
+        }
         if (op == 2 || (ev & 0x4)) {
             EV_SET(&kv[n], fd, EVFILT_WRITE, base | xf, 0, 0, (void *)data);
             n++;
-        } // EPOLLOUT
+        // EPOLLOUT
+        }
         for (int i = 0; i < n; i++)
-            kevent((int)a0, &kv[i], 1, NULL, 0, NULL); // per-filter so DEL of an absent one is ignored
+            // per-filter so DEL of an absent one is ignored
+            kevent((int)a0, &kv[i], 1, NULL, 0, NULL);
         c->x[0] = 0;
         break;
     }
-    case 22: { // epoll_pwait(epfd, events, max, timeout_ms, sigmask)
+    // epoll_pwait(epfd, events, max, timeout_ms, sigmask)
+    case 22: {
         int maxev = (int)a2;
         if (maxev > 256) maxev = 256;
         if (maxev < 0) maxev = 0;
@@ -1891,8 +2180,10 @@ static void service(struct cpu *c) {
         uint8_t *out = (uint8_t *)a1;
         for (int i = 0; i < r; i++) {
             uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
-            if (kv[i].flags & EV_EOF) ev |= 0x10u;  // EPOLLHUP
-            if (kv[i].flags & EV_ERROR) ev |= 0x8u; // EPOLLERR
+            // EPOLLHUP
+            if (kv[i].flags & EV_EOF) ev |= 0x10u;
+            // EPOLLERR
+            if (kv[i].flags & EV_ERROR) ev |= 0x8u;
             *(uint32_t *)(out + i * 12) = ev;
             memcpy(out + i * 12 + 4, &kv[i].udata, 8);
         }
@@ -1900,7 +2191,8 @@ static void service(struct cpu *c) {
         break;
     }
     case 26: {
-        int r = kqueue(); // inotify_init1(flags) -> kqueue
+        // inotify_init1(flags) -> kqueue
+        int r = kqueue();
         if (r >= 0) {
             if (r < 1024) g_inotify[r] = 1;
             if (a0 & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
@@ -1909,9 +2201,11 @@ static void service(struct cpu *c) {
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 27: { // inotify_add_watch(fd, path, mask) -- kqueue EVFILT_VNODE
+    // inotify_add_watch(fd, path, mask) -- kqueue EVFILT_VNODE
+    case 27: {
         char pb[4200];
-        const char *p = atpath(-100, (const char *)a1, pb, sizeof pb); // confined (realpath gate)
+        // confined (realpath gate)
+        const char *p = atpath(-100, (const char *)a1, pb, sizeof pb);
         int wfd = open(p, O_EVTONLY);
         if (wfd < 0) {
             c->x[0] = (uint64_t)(-errno);
@@ -1928,10 +2222,12 @@ static void service(struct cpu *c) {
         }
         c->x[0] = (uint64_t)wfd;
         break;
-    } // watch descriptor = the watched fd
+    // watch descriptor = the watched fd
+    }
     case 28: {
         struct kevent kv;
-        EV_SET(&kv, (int)a1, EVFILT_VNODE, EV_DELETE, 0, 0, NULL); // inotify_rm_watch(fd, wd)
+        // inotify_rm_watch(fd, wd)
+        EV_SET(&kv, (int)a1, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
         kevent((int)a0, &kv, 1, NULL, 0, NULL);
         close((int)a1);
         c->x[0] = 0;
@@ -1939,14 +2235,17 @@ static void service(struct cpu *c) {
     }
     case 73: {
         struct pollfd *fds = (void *)a0;
-        struct timespec *ts = (void *)a2; // ppoll -> poll
+        // ppoll -> poll
+        struct timespec *ts = (void *)a2;
         int tmo = ts ? (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000) : -1;
         int r = poll(fds, (nfds_t)a1, tmo);
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 74: {                                          // signalfd4(fd, mask, sizemask, flags)
-        uint64_t lm = a1 ? *(uint64_t *)a1 : 0, pm = 0; // sigset bit (signo-1) -> g_pending bit signo
+    // signalfd4(fd, mask, sizemask, flags)
+    case 74: {
+        // sigset bit (signo-1) -> g_pending bit signo
+        uint64_t lm = a1 ? *(uint64_t *)a1 : 0, pm = 0;
         for (int s = 1; s < 64; s++)
             if (lm & (1ull << (s - 1))) pm |= (1ull << s);
         if (g_sigfd_pipe[0] < 0 && pipe(g_sigfd_pipe) < 0) {
@@ -1956,27 +2255,33 @@ static void service(struct cpu *c) {
         g_sigfd_mask |= pm;
         g_sigfd_read = g_sigfd_pipe[0];
         for (int s = 1; s < 64; s++)
-            if ((pm & (1ull << s)) && !sig_is_sync(s)) { // make sure the host delivers them
+            // make sure the host delivers them
+            if ((pm & (1ull << s)) && !sig_is_sync(s)) {
                 struct sigaction sa;
                 memset(&sa, 0, sizeof sa);
                 sa.sa_handler = host_sigh;
                 sigaction(sig_l2m(s), &sa, NULL);
             }
-        if (a3 & 0x80000) fcntl(g_sigfd_pipe[0], F_SETFD, FD_CLOEXEC); // SFD_CLOEXEC
-        if (a3 & 0x800) fcntl(g_sigfd_pipe[0], F_SETFL, O_NONBLOCK);   // SFD_NONBLOCK
+        // SFD_CLOEXEC
+        if (a3 & 0x80000) fcntl(g_sigfd_pipe[0], F_SETFD, FD_CLOEXEC);
+        // SFD_NONBLOCK
+        if (a3 & 0x800) fcntl(g_sigfd_pipe[0], F_SETFL, O_NONBLOCK);
         c->x[0] = (uint64_t)g_sigfd_pipe[0];
         break;
     }
     case 85: {
-        int r = kqueue(); // timerfd_create(clockid, flags) -> kqueue
+        // timerfd_create(clockid, flags) -> kqueue
+        int r = kqueue();
         if (r >= 0) {
             if (r < 1024) g_timerfd[r] = 1;
             if (a1 & 1) fcntl(r, F_SETFL, O_NONBLOCK);
-        } // TFD_NONBLOCK=1
+        // TFD_NONBLOCK=1
+        }
         c->x[0] = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 86: { // timerfd_settime(fd, flags, new, old)
+    // timerfd_settime(fd, flags, new, old)
+    case 86: {
         struct kevent kv;
         uint64_t iv_s = 0, iv_n = 0, vl_s = 0, vl_n = 0;
         if (a2) {
@@ -1985,15 +2290,19 @@ static void service(struct cpu *c) {
             memcpy(&vl_s, (void *)(a2 + 16), 8);
             memcpy(&vl_n, (void *)(a2 + 24), 8);
         }
-        int64_t period_ns = (iv_s || iv_n) ? (int64_t)(iv_s * 1000000000ull + iv_n)  // periodic uses it_interval
-                                           : (int64_t)(vl_s * 1000000000ull + vl_n); // one-shot uses it_value
+        // periodic uses it_interval
+        int64_t period_ns = (iv_s || iv_n) ? (int64_t)(iv_s * 1000000000ull + iv_n)
+                                           // one-shot uses it_value
+                                           : (int64_t)(vl_s * 1000000000ull + vl_n);
         if (period_ns <= 0) {
             EV_SET(&kv, 1, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
             kevent((int)a0, &kv, 1, NULL, 0, NULL);
             c->x[0] = 0;
             break;
-        }                                                         // disarm
-        uint16_t fl = EV_ADD | ((iv_s || iv_n) ? 0 : EV_ONESHOT); // no interval -> one-shot
+        // disarm
+        }
+        // no interval -> one-shot
+        uint16_t fl = EV_ADD | ((iv_s || iv_n) ? 0 : EV_ONESHOT);
         EV_SET(&kv, 1, EVFILT_TIMER, fl, NOTE_NSECONDS, period_ns, NULL);
         c->x[0] = kevent((int)a0, &kv, 1, NULL, 0, NULL) < 0 ? (uint64_t)(-errno) : 0;
         break;
@@ -2002,12 +2311,14 @@ static void service(struct cpu *c) {
         if (a1) memset((void *)a1, 0, 32);
         c->x[0] = 0;
         break;
-    } // timerfd_gettime -> best-effort 0
+    // timerfd_gettime -> best-effort 0
+    }
 
     // ===================== Misc — uname/sysinfo/getrandom/hostname =====================
     case 160: {
         char *u = (char *)a0;
-        memset(u, 0, 6 * 65); // uname
+        // uname
+        memset(u, 0, 6 * 65);
         strcpy(u, "Linux");
         strcpy(u + 65, g_hostname[0] ? g_hostname : "jit");
         strcpy(u + 130, "6.1.0");
@@ -2022,29 +2333,35 @@ static void service(struct cpu *c) {
         if (n > 0) {
             memcpy(g_hostname, (void *)a0, n);
             g_hostname[n] = 0;
-        } // sethostname (UTS ns)
+        // sethostname (UTS ns)
+        }
         c->x[0] = 0;
         break;
     }
-    case 162: c->x[0] = 0; break; // setdomainname -> ignore
+    // setdomainname -> ignore
+    case 162: c->x[0] = 0; break;
     case 179:
         memset((void *)a0, 0, 112);
         c->x[0] = 0;
-        break; // sysinfo
+        // sysinfo
+        break;
     case 278:
         arc4random_buf((void *)a0, (size_t)a1);
         c->x[0] = a1;
-        break; // getrandom
+        // getrandom
+        break;
     case 293:
         c->x[0] = (uint64_t)(-ENOSYS);
-        break; // rseq -> ENOSYS (glibc falls back)
+        // rseq -> ENOSYS (glibc falls back)
+        break;
 
     // ===================== unhandled =====================
     default:
         fprintf(stderr, "[jit] unhandled syscall %llu (a0=%llx a1=%llx) at pc=%llx\n", (unsigned long long)nr,
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)c->pc);
         c->x[0] = (uint64_t)(-ENOSYS);
-        break; // ENOSYS, keep going so we can see what's next
+        // ENOSYS, keep going so we can see what's next
+        break;
     }
     // Boundary errno translation: every case sets c->x[0] to a host(macOS) errno on error
     // (-errno, saved e, helper returns, or a macOS E* constant). Map to the Linux errno the guest

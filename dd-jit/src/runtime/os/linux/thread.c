@@ -1,10 +1,12 @@
 // dd/runtime/os/linux -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
 // ---------------- syscalls ----------------
-static uint64_t brk_lo, brk_cur, brk_hi; // brk arena
+// brk arena
+static uint64_t brk_lo, brk_cur, brk_hi;
 
 // ---------------- threads & futex ----------------
-static void run_guest(struct cpu *c); // fwd: thread trampoline runs the dispatcher
+// fwd: thread trampoline runs the dispatcher
+static void run_guest(struct cpu *c);
 
 // One global wait queue. Coarse but correct: a waker takes the lock, so it can't
 // slip between a waiter's value-check and its wait. Waiters re-check their own
@@ -12,12 +14,14 @@ static void run_guest(struct cpu *c); // fwd: thread trampoline runs the dispatc
 static pthread_mutex_t g_futex_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_futex_c = PTHREAD_COND_INITIALIZER;
 static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
-    if (op == 0 || op == 9) { // FUTEX_WAIT / WAIT_BITSET: sleep while *uaddr == val
+    // FUTEX_WAIT / WAIT_BITSET: sleep while *uaddr == val
+    if (op == 0 || op == 9) {
         pthread_mutex_lock(&g_futex_m);
         if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
             pthread_mutex_unlock(&g_futex_m);
             return -EAGAIN;
-        } // EAGAIN
+        // EAGAIN
+        }
         if (ts) {
             struct timespec abs;
             clock_gettime(CLOCK_REALTIME, &abs);
@@ -33,17 +37,21 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
         pthread_mutex_unlock(&g_futex_m);
         return 0;
     }
-    if (op == 1 || op == 10) { // FUTEX_WAKE / WAKE_BITSET: wake up to `val` waiters
+    // FUTEX_WAKE / WAKE_BITSET: wake up to `val` waiters
+    if (op == 1 || op == 10) {
         pthread_mutex_lock(&g_futex_m);
-        pthread_cond_broadcast(&g_futex_c); // they re-check their own addr
+        // they re-check their own addr
+        pthread_cond_broadcast(&g_futex_c);
         pthread_mutex_unlock(&g_futex_m);
         return val;
     }
-    return 0; // other ops: pretend success
+    // other ops: pretend success
+    return 0;
 }
 static void futex_wake_addr(uint64_t uaddr) {
     if (!uaddr) return;
-    *(int *)uaddr = 0; // CLONE_CHILD_CLEARTID: zero then wake joiners
+    // CLONE_CHILD_CLEARTID: zero then wake joiners
+    *(int *)uaddr = 0;
     pthread_mutex_lock(&g_futex_m);
     pthread_cond_broadcast(&g_futex_c);
     pthread_mutex_unlock(&g_futex_m);
@@ -52,37 +60,50 @@ static void futex_wake_addr(uint64_t uaddr) {
 static volatile int g_next_tid = 1000;
 static void *thread_trampoline(void *p) {
     struct cpu *child = (struct cpu *)p;
-    run_guest(child);                 // sets its own TSD, runs to thread exit
-    atomic_fetch_sub(&g_pids_cur, 1); // cgroup pids: task ended
-    futex_wake_addr(child->ctid);     // pthread_join waits on this
+    // sets its own TSD, runs to thread exit
+    run_guest(child);
+    // cgroup pids: task ended
+    atomic_fetch_sub(&g_pids_cur, 1);
+    // pthread_join waits on this
+    futex_wake_addr(child->ctid);
     free(child);
     return NULL;
 }
 // Spawn a guest thread sharing this address space. stack_top is the initial sp.
 static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, uint64_t tls, uint64_t ptid,
                         uint64_t ctid) {
-    if (g_pids_max && atomic_load(&g_pids_cur) >= g_pids_max) return -EAGAIN; // cgroup pids.max
+    // cgroup pids.max
+    if (g_pids_max && atomic_load(&g_pids_cur) >= g_pids_max) return -EAGAIN;
     struct cpu *child = malloc(sizeof *child);
-    if (!child) return -12; // ENOMEM
+    // ENOMEM
+    if (!child) return -12;
     *child = *parent;
-    child->x[0] = 0; // child sees clone return 0
+    // child sees clone return 0
+    child->x[0] = 0;
     child->sp = stack_top;
-    child->pc = parent->pc + 4; // resume just after the clone svc
-    child->ssp = 0;             // §B: child starts with an EMPTY shadow stack (no parent frames)
+    // resume just after the clone svc
+    child->pc = parent->pc + 4;
+    // §B: child starts with an EMPTY shadow stack (no parent frames)
+    child->ssp = 0;
     child->exited = 0;
     child->redirect = 0;
-    if (flags & 0x00080000) child->tls = tls; // CLONE_SETTLS
+    // CLONE_SETTLS
+    if (flags & 0x00080000) child->tls = tls;
     int tid = __sync_add_and_fetch(&g_next_tid, 1);
-    if ((flags & 0x00100000) && ptid) *(int *)ptid = tid; // CLONE_PARENT_SETTID
-    if ((flags & 0x01000000) && ctid) *(int *)ctid = tid; // CLONE_CHILD_SETTID
-    child->ctid = (flags & 0x00200000) ? ctid : 0;        // CLONE_CHILD_CLEARTID
+    // CLONE_PARENT_SETTID
+    if ((flags & 0x00100000) && ptid) *(int *)ptid = tid;
+    // CLONE_CHILD_SETTID
+    if ((flags & 0x01000000) && ctid) *(int *)ctid = tid;
+    // CLONE_CHILD_CLEARTID
+    child->ctid = (flags & 0x00200000) ? ctid : 0;
     g_threaded = 1;
     pthread_t th;
     if (pthread_create(&th, NULL, thread_trampoline, child) != 0) {
         free(child);
         return -EAGAIN;
     }
-    atomic_fetch_add(&g_pids_cur, 1); // cgroup pids: task created
+    // cgroup pids: task created
+    atomic_fetch_add(&g_pids_cur, 1);
     pthread_detach(th);
     return tid;
 }

@@ -3,9 +3,11 @@
 
 // ---- rootfs path rewriting (ported from mac_elf.c) ----
 static const char *g_rootfs = NULL;
-static char g_cwd[4200] = "/"; // guest CWD (within the rootfs) -- AT_FDCWD resolution + getcwd
+// guest CWD (within the rootfs) -- AT_FDCWD resolution + getcwd
+static char g_cwd[4200] = "/";
 static uint8_t g_auxv_data[1024];
-static int g_auxv_len; // serialized auxv for /proc/self/auxv
+// serialized auxv for /proc/self/auxv
+static int g_auxv_len;
 // Sandbox: normalize a guest absolute path -- drop '.', collapse '//', and clamp '..' at the
 // ROOT so a translated path can never escape the rootfs ("/../../etc" -> "/etc"). Without this,
 // the guest reads host files by traversing above $rootfs. Result always starts with '/'.
@@ -20,11 +22,13 @@ static void confine(const char *p, char *out, size_t n) {
         while (*s && *s != '/')
             s++;
         int L = (int)(s - st);
-        if (L == 1 && st[0] == '.') continue; // "."  -> skip
+        // "."  -> skip
+        if (L == 1 && st[0] == '.') continue;
         if (L == 2 && st[0] == '.' && st[1] == '.') {
             if (nc > 0) nc--;
             continue;
-        } // ".." -> pop, never past root
+        // ".." -> pop, never past root
+        }
         if (nc < 512) {
             comp[nc] = st;
             clen[nc] = L;
@@ -37,17 +41,25 @@ static void confine(const char *p, char *out, size_t n) {
         for (int j = 0; j < clen[i] && o + 1 < n; j++)
             out[o++] = comp[i][j];
     }
-    if (o == 0 && n > 1) out[o++] = '/'; // empty -> "/"
+    // empty -> "/"
+    if (o == 0 && n > 1) out[o++] = '/';
     out[o < n ? o : n - 1] = 0;
 }
-static char g_rootfs_canon[4200]; // realpath(g_rootfs) -- the true rootfs boundary
+// realpath(g_rootfs) -- the true rootfs boundary
+static char g_rootfs_canon[4200];
 static size_t g_rootfs_canon_len;
-static char g_fdpath[1024][192]; // fd -> host path it was opened with (dir-fd confinement + cache)
-static char g_ovldir[1024][192]; // overlay: dir-fd -> its GUEST path (for merged getdents); "" = not an overlay dir
-static int g_eventfd_peer[1024]; // eventfd(read-end) -> pipe write-end + 1 (0 = not an eventfd)
-static uint8_t g_timerfd[1024];  // fd is a timerfd (a kqueue with an EVFILT_TIMER) -> read() drains it
-static uint8_t g_inotify[1024];  // fd is an inotify (a kqueue with EVFILT_VNODE watches) -> read() drains it
-static int g_root_fd = -1;       // pinned O_DIRECTORY fd to the rootfs (set at startup)
+// fd -> host path it was opened with (dir-fd confinement + cache)
+static char g_fdpath[1024][192];
+// overlay: dir-fd -> its GUEST path (for merged getdents); "" = not an overlay dir
+static char g_ovldir[1024][192];
+// eventfd(read-end) -> pipe write-end + 1 (0 = not an eventfd)
+static int g_eventfd_peer[1024];
+// fd is a timerfd (a kqueue with an EVFILT_TIMER) -> read() drains it
+static uint8_t g_timerfd[1024];
+// fd is an inotify (a kqueue with EVFILT_VNODE watches) -> read() drains it
+static uint8_t g_inotify[1024];
+// pinned O_DIRECTORY fd to the rootfs (set at startup)
+static int g_root_fd = -1;
 // Bind-mount volumes: a guest path prefix -> a host directory, each its own confined jail root.
 struct vol {
     char guest[256];
@@ -91,7 +103,8 @@ static int confine_in(const char *jcanon, size_t jclen, const char *rel, char *o
     char h[8400];
     snprintf(h, sizeof h, "%s%s", jcanon, norm);
     char rem[4400] = "";
-    if (nofollow) { // peel the final component, resolve its dir
+    // peel the final component, resolve its dir
+    if (nofollow) {
         char *sl = strrchr(h, '/');
         if (sl && (size_t)(sl - h) >= jclen) {
             snprintf(rem, sizeof rem, "/%s", sl + 1);
@@ -110,7 +123,8 @@ static int confine_in(const char *jcanon, size_t jclen, const char *rel, char *o
             snprintf(out, n, "%s%s", canon, rem);
             return 1;
         }
-        char *sl = strrchr(h, '/'); // final missing? climb to the deepest existing dir
+        // final missing? climb to the deepest existing dir
+        char *sl = strrchr(h, '/');
         if (!sl || strlen(h) <= jclen) {
             snprintf(out, n, "%s/.jail-escape-denied", jcanon);
             return 0;
@@ -125,21 +139,25 @@ static int secure_resolve(const char *guest, char *out, size_t n, int nofollow) 
     const char *jcanon;
     size_t jclen;
     const char *rel;
-    jail_pick(guest, &jcanon, &jclen, &rel); // rootfs or a volume root (jcanon is absolute)
+    // rootfs or a volume root (jcanon is absolute)
+    jail_pick(guest, &jcanon, &jclen, &rel);
     return confine_in(jcanon, jclen, rel, out, n, nofollow);
 }
 // ---- Overlay (OCI image layers): --rootfs is the writable UPPER; --lower dirs are read-only,
 // searched top->down when a path isn't in the upper. Whiteout (.wh.NAME) hides a lower entry;
 // copy-up brings a lower file into the upper on write. Off entirely when g_nlower==0.
 static const char *xresolve_exec(const char *p, char *buf,
-                                 size_t n); // fwd (defined below; overlay uses it for the upper)
+                                 // fwd (defined below; overlay uses it for the upper)
+                                 size_t n);
 struct olayer {
     char canon[1024];
     size_t clen;
 };
 static struct olayer g_lower[8];
-static int g_nlower = 0;                 // [0] = highest-priority lower (searched first)
-static void add_lower(const char *dir) { // register a read-only lower layer (image layer)
+// [0] = highest-priority lower (searched first)
+static int g_nlower = 0;
+// register a read-only lower layer (image layer)
+static void add_lower(const char *dir) {
     if (g_nlower >= 8 || !dir || !dir[0]) return;
     if (!realpath(dir, g_lower[g_nlower].canon))
         snprintf(g_lower[g_nlower].canon, sizeof g_lower[g_nlower].canon, "%s", dir);
@@ -147,7 +165,8 @@ static void add_lower(const char *dir) { // register a read-only lower layer (im
     g_nlower++;
 }
 static void wh_hostpath(const char *jcanon, size_t jclen, const char *guest, char *out,
-                        size_t n) { // host path of the .wh.NAME marker
+                        // host path of the .wh.NAME marker
+                        size_t n) {
     char par[4200];
     snprintf(par, sizeof par, "%s", guest);
     char *sl = strrchr(par, '/');
@@ -159,7 +178,8 @@ static void wh_hostpath(const char *jcanon, size_t jclen, const char *guest, cha
     confine_in(jcanon, jclen, gw, out, n, 1);
 }
 static int wh_exists(const char *jcanon, size_t jclen,
-                     const char *guest) { // is there a whiteout for `guest` in this layer?
+                     // is there a whiteout for `guest` in this layer?
+                     const char *guest) {
     char host[4300];
     wh_hostpath(jcanon, jclen, guest, host, sizeof host);
     struct stat st;
@@ -173,20 +193,24 @@ static void layer_follow(const char *jc, size_t jcl, const char *guest, char *ou
     snprintf(cur, sizeof cur, "%s", guest);
     for (int hop = 0; hop < 40; hop++) {
         char hb[4300];
-        confine_in(jc, jcl, cur, hb, sizeof hb, 1); // host path, final NOT followed
+        // host path, final NOT followed
+        confine_in(jc, jcl, cur, hb, sizeof hb, 1);
         struct stat st;
         if (lstat(hb, &st) != 0) {
             confine_in(jc, jcl, cur, out, n, nofollow);
             return;
-        } // missing -> report (confined)
+        // missing -> report (confined)
+        }
         if (!S_ISLNK(st.st_mode)) {
             snprintf(out, n, "%s", hb);
             return;
-        } // real file/dir -> done
+        // real file/dir -> done
+        }
         if (nofollow && !strcmp(cur, guest)) {
             snprintf(out, n, "%s", hb);
             return;
-        } // lstat/readlink: keep the final link
+        // lstat/readlink: keep the final link
+        }
         char tgt[4200];
         ssize_t k = readlink(hb, tgt, sizeof tgt - 1);
         if (k <= 0) {
@@ -195,7 +219,8 @@ static void layer_follow(const char *jc, size_t jcl, const char *guest, char *ou
         }
         tgt[k] = 0;
         if (tgt[0] == '/')
-            snprintf(cur, sizeof cur, "%s", tgt); // absolute -> layer-relative
+            // absolute -> layer-relative
+            snprintf(cur, sizeof cur, "%s", tgt);
         else {
             char d[4200];
             snprintf(d, sizeof d, "%s", cur);
@@ -220,12 +245,15 @@ static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollo
     if (lstat(up, &st) == 0) {
         snprintf(host, hn, "%s", up);
         return 1;
-    } // upper shadows lowers
+    // upper shadows lowers
+    }
     if (wh_exists(g_rootfs_canon, g_rootfs_canon_len, guest)) {
         snprintf(host, hn, "%s", up);
         return 0;
-    }                                    // deleted
-    for (int i = 0; i < g_nlower; i++) { // search lowers top->down
+    // deleted
+    }
+    // search lowers top->down
+    for (int i = 0; i < g_nlower; i++) {
         char lp[4300];
         layer_follow(g_lower[i].canon, g_lower[i].clen, guest, lp, sizeof lp, nofollow);
         if (lstat(lp, &st) == 0) {
@@ -238,7 +266,8 @@ static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollo
         }
     }
     snprintf(host, hn, "%s", up);
-    return 0; // absent -> upper path (for ENOENT/O_CREAT)
+    // absent -> upper path (for ENOENT/O_CREAT)
+    return 0;
 }
 // Copy-up: bring a lower file into the UPPER so it can be modified, then return the upper host path.
 // If the file is only in a lower, copy its bytes up; if absent everywhere, return the upper path (create).
@@ -247,8 +276,10 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
     xresolve_exec(guest, up, sizeof up);
     snprintf(host, hn, "%s", up);
     struct stat st;
-    if (lstat(up, &st) == 0) return;                            // already in the upper (writable)
-    if (wh_exists(g_rootfs_canon, g_rootfs_canon_len, guest)) { // was deleted -> drop the whiteout, create fresh
+    // already in the upper (writable)
+    if (lstat(up, &st) == 0) return;
+    // was deleted -> drop the whiteout, create fresh
+    if (wh_exists(g_rootfs_canon, g_rootfs_canon_len, guest)) {
         char wh[4300];
         wh_hostpath(g_rootfs_canon, g_rootfs_canon_len, guest, wh, sizeof wh);
         unlink(wh);
@@ -263,10 +294,12 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
         else if (wh_exists(g_lower[i].canon, g_lower[i].clen, guest))
             break;
     }
-    if (!have) return; // new file -> upper path as-is
+    // new file -> upper path as-is
+    if (!have) return;
     char dir[4300];
     snprintf(dir, sizeof dir, "%s", up);
-    char *sl = strrchr(dir, '/'); // mkdir -p the upper parent
+    // mkdir -p the upper parent
+    char *sl = strrchr(dir, '/');
     if (sl) {
         *sl = 0;
         for (char *q = dir + g_rootfs_canon_len + 1; *q; q++)
@@ -278,7 +311,8 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
         mkdir(dir, 0755);
     }
     int in = open(src, O_RDONLY),
-        out = open(up, O_CREAT | O_WRONLY | O_TRUNC, st.st_mode & 0777); // copy lower -> upper
+        // copy lower -> upper
+        out = open(up, O_CREAT | O_WRONLY | O_TRUNC, st.st_mode & 0777);
     if (in >= 0 && out >= 0) {
         char b[1 << 16];
         ssize_t r;
@@ -306,7 +340,8 @@ static void abs_guest(int dirfd, const char *raw, char *out, size_t n) {
                 }
         snprintf(out, n, "/%s/%s", gdir, raw ? raw : "");
     } else
-        snprintf(out, n, "%s/%s", g_cwd, raw ? raw : ""); // AT_FDCWD-relative -> guest cwd
+        // AT_FDCWD-relative -> guest cwd
+        snprintf(out, n, "%s/%s", g_cwd, raw ? raw : "");
 }
 // Overlay whiteout for a delete: remove the upper copy (if any) and drop a .wh.NAME marker in the upper.
 // Merged readdir across layers (upper first, then lowers). Higher layer wins; a .wh.NAME hides NAME
@@ -314,7 +349,8 @@ static void abs_guest(int dirfd, const char *raw, char *out, size_t n) {
 static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, int max) {
     char seen[1024][256];
     int ns = 0, nout = 0;
-    for (int L = -1; L < g_nlower && nout < max; L++) { // L=-1 is the upper (rootfs)
+    // L=-1 is the upper (rootfs)
+    for (int L = -1; L < g_nlower && nout < max; L++) {
         const char *jc = L < 0 ? g_rootfs_canon : g_lower[L].canon;
         size_t jcl = L < 0 ? g_rootfs_canon_len : g_lower[L].clen;
         char host[4300];
@@ -333,12 +369,14 @@ static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, 
                     break;
                 }
             if (dup) continue;
-            if (ns < 1024) snprintf(seen[ns++], 256, "%s", name); // higher layer already decided this name
+            // higher layer already decided this name
+            if (ns < 1024) snprintf(seen[ns++], 256, "%s", name);
             if (!wh) {
                 snprintf(names[nout], 256, "%s", name);
                 types[nout] = e->d_type;
                 nout++;
-            } // whiteout -> hide, don't emit
+            // whiteout -> hide, don't emit
+            }
         }
         closedir(d);
     }
@@ -347,12 +385,14 @@ static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, 
 static void overlay_whiteout(const char *guest) {
     char up[4300];
     xresolve_exec(guest, up, sizeof up);
-    remove(up); // drop any upper copy (file or empty dir)
+    // drop any upper copy (file or empty dir)
+    remove(up);
     char wh[4300];
     wh_hostpath(g_rootfs_canon, g_rootfs_canon_len, guest, wh, sizeof wh);
     char dir[4300];
     snprintf(dir, sizeof dir, "%s", wh);
-    char *s2 = strrchr(dir, '/'); // mkdir -p parent
+    // mkdir -p parent
+    char *s2 = strrchr(dir, '/');
     if (s2) {
         *s2 = 0;
         for (char *q = dir + g_rootfs_canon_len + 1; *q; q++)
@@ -366,14 +406,16 @@ static void overlay_whiteout(const char *guest) {
     int fd = open(wh, O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) close(fd);
 }
-static const char *xlate(const char *p, char *buf, size_t n) { // final NOT followed (readlink/lstat)
+// final NOT followed (readlink/lstat)
+static const char *xlate(const char *p, char *buf, size_t n) {
     if (g_rootfs && p && p[0] == '/') {
         secure_resolve(p, buf, n, 1);
         return buf;
     }
     return p;
 }
-static const char *xresolve(const char *p, char *buf, size_t n) { // follow symlinks (open/stat/exec)
+// follow symlinks (open/stat/exec)
+static const char *xresolve(const char *p, char *buf, size_t n) {
     if (g_rootfs && p && p[0] == '/') {
         secure_resolve(p, buf, n, 0);
         return buf;
@@ -388,21 +430,26 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
     if (!(g_rootfs && p && p[0] == '/')) return p;
     char cur[4200];
     snprintf(cur, sizeof cur, "%s", p);
-    for (int i = 0; i < 40; i++) { // bounded symlink chain
+    // bounded symlink chain
+    for (int i = 0; i < 40; i++) {
         char hb[4200];
-        secure_resolve(cur, hb, sizeof hb, 1); // host path, final component NOT followed
+        // host path, final component NOT followed
+        secure_resolve(cur, hb, sizeof hb, 1);
         struct stat st;
-        if (lstat(hb, &st) != 0) break; // missing -> let the loader report it
+        // missing -> let the loader report it
+        if (lstat(hb, &st) != 0) break;
         if (!S_ISLNK(st.st_mode)) {
             snprintf(buf, n, "%s", hb);
             return buf;
-        } // real file -> done
+        // real file -> done
+        }
         char tgt[4200];
         ssize_t k = readlink(hb, tgt, sizeof tgt - 1);
         if (k <= 0) break;
         tgt[k] = 0;
         if (tgt[0] == '/')
-            snprintf(cur, sizeof cur, "%s", tgt); // absolute target: rootfs-relative
+            // absolute target: rootfs-relative
+            snprintf(cur, sizeof cur, "%s", tgt);
         else {
             char d[4200];
             snprintf(d, sizeof d, "%s", cur);
@@ -411,10 +458,12 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
             char j[8400];
             snprintf(j, sizeof j, "%s/%s", d, tgt);
             snprintf(cur, sizeof cur, "%s", j);
-        } // relative to its dir
+        // relative to its dir
+        }
     }
     secure_resolve(cur, buf, n, 0);
-    return buf; // fallback: realpath-confine the last hop
+    // fallback: realpath-confine the last hop
+    return buf;
 }
 // TOCTOU-FREE confinement. Resolve `guest` (absolute) one component at a time on PINNED dir-fds,
 // never following a symlink out of the jail. Returns a fresh dir-fd to the confined parent (caller
@@ -425,7 +474,8 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
 static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
     if (g_root_fd < 0) return -1;
     const char *rel;
-    int root_fd = jail_pick(guest, NULL, NULL, &rel); // rootfs or a volume root
+    // rootfs or a volume root
+    int root_fd = jail_pick(guest, NULL, NULL, &rel);
     char rest[8192];
     snprintf(rest, sizeof rest, "%s", rel);
     int fds[260], nf = 0, budget = 40, ret = -EACCES;
@@ -458,7 +508,8 @@ static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
             if (nf > 1) close(fds[--nf]);
             snprintf(rest, sizeof rest, "%s", tail);
             continue;
-        } // clamp at root
+        // clamp at root
+        }
         if (last && nofollow) {
             snprintf(final, fn, "%s", comp);
             break;
@@ -480,9 +531,11 @@ static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
                 while (nf > 1)
                     close(fds[--nf]);
                 snprintf(rest, sizeof rest, "%s%s", lk, tail);
-            } // abs -> back to root
+            // abs -> back to root
+            }
             else
-                snprintf(rest, sizeof rest, "%s%s", lk, tail); // tail already carries its leading '/' (or is empty)
+                // tail already carries its leading '/' (or is empty)
+                snprintf(rest, sizeof rest, "%s%s", lk, tail);
             continue;
         }
         if (last) {
@@ -493,7 +546,8 @@ static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
         if (d < 0) {
             ret = -errno;
             goto out;
-        } // ENOENT/ENOTDIR/ELOOP -> natural
+        // ENOENT/ENOTDIR/ELOOP -> natural
+        }
         if (nf >= 260) {
             close(d);
             ret = -ELOOP;
@@ -516,16 +570,19 @@ static int jail_at(int dirfd, const char *raw, char *final, size_t fn, int nofol
     if (raw[0] == '/')
         snprintf(abs, sizeof abs, "%s", raw);
     else if (dirfd == -100)
-        snprintf(abs, sizeof abs, "%s/%s", g_cwd, raw); // AT_FDCWD -> guest cwd
+        // AT_FDCWD -> guest cwd
+        snprintf(abs, sizeof abs, "%s/%s", g_cwd, raw);
     else if (dirfd >= 0 && dirfd < 1024 && g_fdpath[dirfd][0]) {
         const char *gdir = g_fdpath[dirfd];
         if (strncmp(gdir, g_rootfs_canon, g_rootfs_canon_len) == 0) gdir += g_rootfs_canon_len;
         snprintf(abs, sizeof abs, "/%s/%s", gdir, raw);
     } else
-        return -EACCES; // untracked dir-fd: fail closed
+        // untracked dir-fd: fail closed
+        return -EACCES;
     size_t al = strlen(abs);
     while (al > 1 && abs[al - 1] == '/')
-        abs[--al] = 0; // strip trailing '/' (mkdir foo/, rmdir foo/)
+        // strip trailing '/' (mkdir foo/, rmdir foo/)
+        abs[--al] = 0;
     return resolve_at(abs, final, fn, nofollow);
 }
 // Real macOS stat -> Linux struct stat (the fake S_IFCHR version corrupted libc buffering).
@@ -537,16 +594,20 @@ static void fill_linux_stat(uint8_t *d, const struct stat *s) {
     *(uint32_t *)(d + 20) = s->st_nlink ? s->st_nlink : 1;
     *(uint32_t *)(d + 24) = s->st_uid;
     *(uint32_t *)(d + 28) = s->st_gid;
-    *(uint64_t *)(d + 32) = s->st_rdev; // st_rdev
+    // st_rdev
+    *(uint64_t *)(d + 32) = s->st_rdev;
     *(uint64_t *)(d + 48) = s->st_size;
     *(uint32_t *)(d + 56) = 4096;
     *(uint64_t *)(d + 64) = s->st_blocks;
     *(uint64_t *)(d + 72) = (uint64_t)s->st_atimespec.tv_sec;
-    *(uint64_t *)(d + 80) = (uint64_t)s->st_atimespec.tv_nsec; // st_atim
+    // st_atim
+    *(uint64_t *)(d + 80) = (uint64_t)s->st_atimespec.tv_nsec;
     *(uint64_t *)(d + 88) = (uint64_t)s->st_mtimespec.tv_sec;
-    *(uint64_t *)(d + 96) = (uint64_t)s->st_mtimespec.tv_nsec; // st_mtim
+    // st_mtim
+    *(uint64_t *)(d + 96) = (uint64_t)s->st_mtimespec.tv_nsec;
     *(uint64_t *)(d + 104) = (uint64_t)s->st_ctimespec.tv_sec;
-    *(uint64_t *)(d + 112) = (uint64_t)s->st_ctimespec.tv_nsec; // st_ctim
+    // st_ctim
+    *(uint64_t *)(d + 112) = (uint64_t)s->st_ctimespec.tv_nsec;
 }
 // Synthesize the common /proc files Linux programs read (macOS has no /proc). Returns an fd
 // holding the content, -1 on mkstemp error, or -2 if rp isn't a path we synthesize.
@@ -564,7 +625,8 @@ static int proc_open(const char *rp) {
                           "CPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n\n",
                           i);
     } else if (!strcmp(rp, "/proc/meminfo")) {
-        unsigned long long tot = g_mem_max ? g_mem_max / 1024 : 8388608; // reflect cgroup memory.max
+        // reflect cgroup memory.max
+        unsigned long long tot = g_mem_max ? g_mem_max / 1024 : 8388608;
         unsigned long long used = (unsigned long long)atomic_load(&g_mem_charged) / 1024;
         unsigned long long fre = tot > used ? tot - used : 0;
         n = snprintf(buf, sizeof buf,
@@ -583,12 +645,15 @@ static int proc_open(const char *rp) {
     } else if (!strcmp(rp, "/proc/sys/vm/overcommit_memory")) {
         n = snprintf(buf, sizeof buf, "0\n");
     } else if (!strcmp(rp, "/proc/sys/kernel/hostname")) {
-        n = snprintf(buf, sizeof buf, "%s\n", g_hostname[0] ? g_hostname : "jit"); // UTS ns (hostname cmd reads this)
+        // UTS ns (hostname cmd reads this)
+        n = snprintf(buf, sizeof buf, "%s\n", g_hostname[0] ? g_hostname : "jit");
     } else if (!strcmp(rp, "/proc/self/cgroup")) {
-        n = snprintf(buf, sizeof buf, "0::/\n"); // cgroup v2 unified
+        // cgroup v2 unified
+        n = snprintf(buf, sizeof buf, "0::/\n");
     } else if (!strcmp(rp, "/proc/version")) {
         n = snprintf(buf, sizeof buf, "Linux version 6.1.0 (ddockerd) aarch64\n");
-    } else if (!strcmp(rp, "/sys/fs/cgroup/memory.max")) { // cgroup v2: memory limit
+    // cgroup v2: memory limit
+    } else if (!strcmp(rp, "/sys/fs/cgroup/memory.max")) {
         if (g_mem_max)
             n = snprintf(buf, sizeof buf, "%llu\n", (unsigned long long)g_mem_max);
         else
@@ -603,12 +668,14 @@ static int proc_open(const char *rp) {
     } else if (!strcmp(rp, "/sys/fs/cgroup/pids.current")) {
         n = snprintf(buf, sizeof buf, "%d\n", atomic_load(&g_pids_cur));
     } else if (!strcmp(rp, "/proc/self/status") || !strcmp(rp, "/proc/self/stat")) {
-        if (rp[11] == 'a' && rp[12] == 't' && rp[13] == 'u') // status (key:value)
+        // status (key:value)
+        if (rp[11] == 'a' && rp[12] == 't' && rp[13] == 'u')
             n = snprintf(buf, sizeof buf,
                          "Name:\tinit\nState:\tR (running)\nTgid:\t1\nPid:\t1\nPPid:\t0\n"
                          "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n");
         else
-            n = snprintf(buf, sizeof buf, "1 (init) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0\n"); // stat
+            // stat
+            n = snprintf(buf, sizeof buf, "1 (init) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0\n");
     }
     if (n < 0) return -2;
     char tn[] = "/tmp/.ddprocXXXXXX";
@@ -623,20 +690,24 @@ static int proc_open(const char *rp) {
 // Linux-layout stat for a synthesized /proc or /sys file (so stat()/access() see it -- find, du,
 // container runtimes that stat /etc/mtab -> /proc/mounts, JVM that stats cgroup files, etc.).
 static void fill_linux_stat(uint8_t *d, const struct stat *s);
-static int synth_stat_raw(const char *gp, struct stat *s) { // -> macOS struct stat for a synth file
+// -> macOS struct stat for a synth file
+static int synth_stat_raw(const char *gp, struct stat *s) {
     if (!gp || (strncmp(gp, "/proc/", 6) && strncmp(gp, "/sys/fs/cgroup/", 15))) return 0;
     int fd = proc_open(gp);
-    if (fd < 0) return 0; // -2 (not synth) or mkstemp fail
+    // -2 (not synth) or mkstemp fail
+    if (fd < 0) return 0;
     if (fstat(fd, s) != 0) {
         close(fd);
         return 0;
     }
     close(fd);
     s->st_mode = S_IFREG | 0444;
-    s->st_nlink = 1; // present as a readable regular file
+    // present as a readable regular file
+    s->st_nlink = 1;
     return 1;
 }
-static int synth_stat(const char *gp, uint8_t *out) { // -> Linux struct stat buffer
+// -> Linux struct stat buffer
+static int synth_stat(const char *gp, uint8_t *out) {
     struct stat s;
     if (!synth_stat_raw(gp, &s)) return 0;
     fill_linux_stat(out, &s);

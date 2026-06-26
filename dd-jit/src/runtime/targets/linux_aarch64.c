@@ -35,18 +35,30 @@
 
 #include "../include/cpu_aarch64.h"
 
-#include "../os/linux/container/state.c"   // container/ns config state + parsers (early globals)
-#include "../jit/cache.c"                  // code cache + block map + chaining
-#include "../jit/emit_arm64.c"             // aarch64 host emitters + IBTC/IC
-#include "../frontend/aarch64/translate.c" // transliterate + mangle + §B + LSE + depth-gate
-#include "../os/linux/thread.c"            // clone/futex/threads (declares run_guest)
-#include "../os/linux/signal.c"            // signal delivery
-#include "../os/linux/container/vfs.c"     // path jail + overlay + /proc synth
-#include "../os/linux/container/netns.c"   // termios + NET-ns loopback
-#include "../os/linux/fscache.c"           // ELF fwd-decls + FS-metadata cache
-#include "../os/linux/service.c"           // the syscall layer (service())
-#include "../jit/dispatch.c"               // host trampoline + run_guest
-#include "../os/linux/elf.c"               // ELF loader + initial stack
+// container/ns config state + parsers (early globals)
+#include "../os/linux/container/state.c"
+// code cache + block map + chaining
+#include "../jit/cache.c"
+// aarch64 host emitters + IBTC/IC
+#include "../jit/emit_arm64.c"
+// transliterate + mangle + §B + LSE + depth-gate
+#include "../frontend/aarch64/translate.c"
+// clone/futex/threads (declares run_guest)
+#include "../os/linux/thread.c"
+// signal delivery
+#include "../os/linux/signal.c"
+// path jail + overlay + /proc synth
+#include "../os/linux/container/vfs.c"
+// termios + NET-ns loopback
+#include "../os/linux/container/netns.c"
+// ELF fwd-decls + FS-metadata cache
+#include "../os/linux/fscache.c"
+// the syscall layer (service())
+#include "../os/linux/service.c"
+// host trampoline + run_guest
+#include "../jit/dispatch.c"
+// ELF loader + initial stack
+#include "../os/linux/elf.c"
 
 // ---- library entry (Rust binding) + main() ----
 // ---------------- library entry (Rust bindings call this) ----------------
@@ -60,7 +72,8 @@ static void diag_hx(char *b, uint64_t v) {
         b[i] = d < 10 ? '0' + d : 'a' + d - 10;
     }
 }
-static void diag_crash(int s, siginfo_t *si, void *uc) { // async-signal-safe (write only)
+// async-signal-safe (write only)
+static void diag_crash(int s, siginfo_t *si, void *uc) {
     (void)uc;
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     char b[96];
@@ -94,7 +107,8 @@ typedef struct {
     int64_t code[2];
     char pad[64];
 } exc_msg_t;
-static void *exc_thread(void *arg) { // catches faults on ALL threads (incl MAP_JIT workers)
+// catches faults on ALL threads (incl MAP_JIT workers)
+static void *exc_thread(void *arg) {
     (void)arg;
     exc_msg_t msg;
     for (;;) {
@@ -148,10 +162,12 @@ static void install_mach_exc(void) {
 }
 int jit_run(const char *rootfs, int argc, char *const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return 2;
-    if (rootfs) g_init_hostpid = getpid(); // PID ns: only containers (rootfs) get PID 1
+    // PID ns: only containers (rootfs) get PID 1
+    if (rootfs) g_init_hostpid = getpid();
     {
         const char *h = getenv("DD_HOSTNAME");
-        if (h && !g_hostname[0]) { strncpy(g_hostname, h, 64); } // ddockerd -> jit config
+        // ddockerd -> jit config
+        if (h && !g_hostname[0]) { strncpy(g_hostname, h, 64); }
         const char *m = getenv("DD_MEM_MAX");
         if (m && !g_mem_max) g_mem_max = parse_size(m);
         const char *p = getenv("DD_PIDS_MAX");
@@ -161,7 +177,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         const char *low = getenv("DD_LOWER");
         if (low && !g_nlower) {
             char tb[8192];
-            snprintf(tb, sizeof tb, "%s", low); // ro lowers, colon-sep (highest first)
+            // ro lowers, colon-sep (highest first)
+            snprintf(tb, sizeof tb, "%s", low);
             char *sv = NULL;
             for (char *t = strtok_r(tb, ":", &sv); t; t = strtok_r(NULL, ":", &sv))
                 add_lower(t);
@@ -170,12 +187,14 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         if (nn && nn[0] && !g_netns[0]) {
             snprintf(g_netns, sizeof g_netns, "/tmp/.ddnet-%.40s", nn);
             mkdir(g_netns, 0700);
-        } // private loopback ns
+        // private loopback ns
+        }
         const char *eu = getenv("DD_UID");
         if (eu && g_uid < 0) g_uid = atoi(eu);
         const char *eg = getenv("DD_GID");
         if (eg && g_gid < 0) g_gid = atoi(eg);
-    } // USER ns (process.user)
+    // USER ns (process.user)
+    }
     if (getenv("CRASHDBG")) {
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
@@ -188,11 +207,15 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     if (rootfs && rootfs[0]) {
         g_rootfs = (char *)rootfs;
         if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
-        g_rootfs_canon_len = strlen(g_rootfs_canon);              // the immutable jail boundary for secure_resolve
-        g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY); // pinned root for the per-component resolver
+        // the immutable jail boundary for secure_resolve
+        g_rootfs_canon_len = strlen(g_rootfs_canon);
+        // pinned root for the per-component resolver
+        g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
         if (g_uid < 0) g_uid = 0;
-        if (g_gid < 0) g_gid = 0;            // container default: run as root (0); unless DD_UID/--uid set
-        const char *vspec = getenv("DDVOL"); // bind-mount volumes: "guestpath:hostdir,..."
+        // container default: run as root (0); unless DD_UID/--uid set
+        if (g_gid < 0) g_gid = 0;
+        // bind-mount volumes: "guestpath:hostdir,..."
+        const char *vspec = getenv("DDVOL");
         if (vspec) {
             char tmp[4096];
             snprintf(tmp, sizeof tmp, "%s", vspec);
@@ -215,25 +238,33 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     }
     const char *prog = argv[0];
 
-    if (getenv("TIER2_SELFTEST")) { // verify the purity gate, PoC-style: pure->1, impure->0
-        uint32_t pure[] = {0x8b010000u, 0x9b027c00u, 0xd65f03c0u};   // add x0,x0,x1; mul x0,x0,x2; ret
-        uint32_t impure[] = {0xf9400001u, 0x8b010000u, 0xd65f03c0u}; // ldr x1,[x0]; add; ret
-        uint32_t sidef[] = {0xf9000001u, 0xd65f03c0u};               // str x1,[x0]; ret
+    // verify the purity gate, PoC-style: pure->1, impure->0
+    if (getenv("TIER2_SELFTEST")) {
+        // add x0,x0,x1; mul x0,x0,x2; ret
+        uint32_t pure[] = {0x8b010000u, 0x9b027c00u, 0xd65f03c0u};
+        // ldr x1,[x0]; add; ret
+        uint32_t impure[] = {0xf9400001u, 0x8b010000u, 0xd65f03c0u};
+        // str x1,[x0]; ret
+        uint32_t sidef[] = {0xf9000001u, 0xd65f03c0u};
         fprintf(stderr, "[tier2] purity gate: pure=%d(want1) load=%d(want0) store=%d(want0)\n", region_pure(pure, 3),
                 region_pure(impure, 3), region_pure(sidef, 2));
         struct cpu sc;
         sc.ssp = 0;
-        int errs = 0, fast = 0; // §B shadow-stack mechanism
+        // §B shadow-stack mechanism
+        int errs = 0, fast = 0;
         for (int d = 0; d < 200; d++)
-            shadow_push(&sc, 0x1000 + d, 0); // 200 nested calls
+            // 200 nested calls
+            shadow_push(&sc, 0x1000 + d, 0);
         for (int d = 199; d >= 0; d--)
             (shadow_classify(&sc, 0x1000 + d) == SS_FAST) ? fast++ : errs++;
         sc.ssp = 0;
         shadow_push(&sc, 0xA, 0);
         shadow_push(&sc, 0xB, 0);
         shadow_push(&sc, 0xC, 0);
-        int unwind = (shadow_classify(&sc, 0xA) == SS_UNWIND);      // longjmp past B,C -> A
-        int foreign = (shadow_classify(&sc, 0xDEAD) == SS_FOREIGN); // computed return
+        // longjmp past B,C -> A
+        int unwind = (shadow_classify(&sc, 0xA) == SS_UNWIND);
+        // computed return
+        int foreign = (shadow_classify(&sc, 0xDEAD) == SS_FOREIGN);
         fprintf(stderr, "[tier2] shadow stack: fast=%d/200 errs=%d(want0) unwind=%d(want1) foreign=%d(want1)\n", fast,
                 errs, unwind, foreign);
     }
@@ -258,7 +289,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     g_exe_path = prog;
     char pb[4200];
     const char *prog_host =
-        xresolve_exec(prog, pb, sizeof pb); // follow entry symlink rootfs-relative (/bin/sh->busybox)
+        // follow entry symlink rootfs-relative (/bin/sh->busybox)
+        xresolve_exec(prog, pb, sizeof pb);
     struct loaded lm;
     load_elf(prog_host, &lm);
 
@@ -267,7 +299,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     char interp[256];
     if (elf_interp(prog_host, interp, sizeof interp) == 0) {
         char ib[4200];
-        const char *ihost = xresolve_exec(interp, ib, sizeof ib); // follow+confine ld.so symlink
+        // follow+confine ld.so symlink
+        const char *ihost = xresolve_exec(interp, ib, sizeof ib);
         struct loaded li;
         load_elf(ihost, &li);
         jump = li.entry;
@@ -280,7 +313,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
 
     struct cpu c;
     memset(&c, 0, sizeof c);
-    c.sp = build_stack(argc, (char **)argv, &lm, at_base); // guest argv = prog + its args
+    // guest argv = prog + its args
+    c.sp = build_stack(argc, (char **)argv, &lm, at_base);
     c.pc = jump;
 
     run_guest(&c);
@@ -291,7 +325,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
 int main(int argc, char **argv) {
     int ai = 1;
     const char *rootfs = NULL;
-    while (ai < argc && argv[ai][0] == '-' && argv[ai][1] == '-') { // container flags (SentryConfig)
+    // container flags (SentryConfig)
+    while (ai < argc && argv[ai][0] == '-' && argv[ai][1] == '-') {
         if (!strcmp(argv[ai], "--rootfs") && ai + 1 < argc) {
             rootfs = argv[ai + 1];
             ai += 2;
@@ -310,16 +345,19 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[ai], "--lower") && ai + 1 < argc) {
             add_lower(argv[ai + 1]);
             ai += 2;
-        } // ro overlay lower layer
+        // ro overlay lower layer
+        }
         else if (!strcmp(argv[ai], "--netns") && ai + 1 < argc) {
             snprintf(g_netns, sizeof g_netns, "/tmp/.ddnet-%.40s", argv[ai + 1]);
             mkdir(g_netns, 0700);
             ai += 2;
-        } // private loopback ns
+        // private loopback ns
+        }
         else if (!strcmp(argv[ai], "--uid") && ai + 1 < argc) {
             g_uid = atoi(argv[ai + 1]);
             ai += 2;
-        } // USER ns uid
+        // USER ns uid
+        }
         else if (!strcmp(argv[ai], "--gid") && ai + 1 < argc) {
             g_gid = atoi(argv[ai + 1]);
             ai += 2;

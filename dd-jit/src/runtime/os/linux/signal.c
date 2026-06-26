@@ -7,12 +7,15 @@
 static struct {
     uint64_t handler, flags, mask;
 } g_sigact[65];
-static volatile uint64_t g_pending;    // bitmask of pending signals (1<<signo)
-#define SIGRETURN_PC 0xFFFFFFFFFFF0ull // sentinel lr: handler return -> sigreturn
+// bitmask of pending signals (1<<signo)
+static volatile uint64_t g_pending;
+// sentinel lr: handler return -> sigreturn
+#define SIGRETURN_PC 0xFFFFFFFFFFF0ull
 
 static int sig_is_sync(int s) {
     return s == 4 || s == 5 || s == 7 || s == 8 || s == 11;
-} // ILL TRAP BUS FPE SEGV (Linux nums)
+// ILL TRAP BUS FPE SEGV (Linux nums)
+}
 // Signal numbers diverge: Linux SIGUSR1=10/CHLD=17/BUS=7/SYS=31/USR2=12/URG=23/IO=29/STOP=19/
 // CONT=18/TSTP=20 vs macOS 30/20/10/12/31/16/23/17/19/18. Translate at the host boundary.
 static int sig_l2m(int s) {
@@ -25,16 +28,21 @@ static int sig_m2l(int s) {
                                         23, 19, 20, 18, 17, 21, 22, 29, 24, 25, 26, 27, 28, 29, 10, 12};
     return (s >= 1 && s <= 31) ? T[s] : s;
 }
-static int g_sigfd_pipe[2] = {-1, -1}; // signalfd self-pipe (write end poked from host_sigh)
-static int g_sigfd_read = -1;          // its read end (the guest's signalfd)
-static volatile uint64_t g_sigfd_mask; // signals routed to the signalfd (1<<signo)
+// signalfd self-pipe (write end poked from host_sigh)
+static int g_sigfd_pipe[2] = {-1, -1};
+// its read end (the guest's signalfd)
+static int g_sigfd_read = -1;
+// signals routed to the signalfd (1<<signo)
+static volatile uint64_t g_sigfd_mask;
 static void host_sigh(int sig) {
-    int ls = sig_m2l(sig); // host(macOS) signo -> Linux
+    // host(macOS) signo -> Linux
+    int ls = sig_m2l(sig);
     __atomic_or_fetch(&g_pending, 1ull << ls, __ATOMIC_SEQ_CST);
     if ((g_sigfd_mask & (1ull << ls)) && g_sigfd_pipe[1] >= 0) {
         char b = (char)ls;
         if (write(g_sigfd_pipe[1], &b, 1) < 0) {}
-    } // wake signalfd/epoll
+    // wake signalfd/epoll
+    }
 }
 
 // Linux aarch64 rt_sigframe: siginfo(128) then ucontext{flags,link,stack(24),
@@ -47,23 +55,29 @@ static void build_signal_frame(struct cpu *c, int sig) {
     uint64_t frame = (c->sp - 4688) & ~15ull;
     uint8_t *f = (uint8_t *)frame;
     memset(f, 0, 4688);
-    *(int *)(f + 0) = sig; // siginfo.si_signo
+    // siginfo.si_signo
+    *(int *)(f + 0) = sig;
     uint64_t uc = frame + 128, mc = uc + 168;
-    *(uint64_t *)(uc + 40) = c->sigmask; // uc_sigmask (signal mask to restore)
+    // uc_sigmask (signal mask to restore)
+    *(uint64_t *)(uc + 40) = c->sigmask;
     for (int i = 0; i < 31; i++)
         *(uint64_t *)(mc + 8 + i * 8) = c->x[i];
     *(uint64_t *)(mc + 256) = c->sp;
     *(uint64_t *)(mc + 264) = c->pc;
     *(uint64_t *)(mc + 272) = c->nzcv;
-    memcpy((void *)(mc + 280), c->v, sizeof c->v); // preserve NEON across the handler
+    // preserve NEON across the handler
+    memcpy((void *)(mc + 280), c->v, sizeof c->v);
     c->x[0] = (uint64_t)sig;
     c->x[1] = frame;
-    c->x[2] = uc;            // handler(signo, siginfo*, ucontext*)
-    c->x[30] = SIGRETURN_PC; // return address -> sigreturn
+    // handler(signo, siginfo*, ucontext*)
+    c->x[2] = uc;
+    // return address -> sigreturn
+    c->x[30] = SIGRETURN_PC;
     c->sp = frame;
     c->pc = g_sigact[sig].handler;
     c->sigmask |= g_sigact[sig].mask;
-    if (!(g_sigact[sig].flags & 0x40000000)) c->sigmask |= (1ull << (sig - 1)); // SA_NODEFER (sigset_t bit N-1)
+    // SA_NODEFER (sigset_t bit N-1)
+    if (!(g_sigact[sig].flags & 0x40000000)) c->sigmask |= (1ull << (sig - 1));
 }
 static void do_sigreturn(struct cpu *c) {
     uint64_t frame = c->sp, uc = frame + 128, mc = uc + 168;
@@ -79,12 +93,14 @@ static void maybe_deliver_signal(struct cpu *c) {
     uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
     for (int sig = 1; sig <= 64; sig++) {
         uint64_t bit = 1ull << sig;
-        if (!(p & bit) || (c->sigmask & (1ull << (sig - 1)))) continue; // sigmask is sigset_t (bit N-1)
+        // sigmask is sigset_t (bit N-1)
+        if (!(p & bit) || (c->sigmask & (1ull << (sig - 1)))) continue;
         uint64_t h = g_sigact[sig].handler;
         if (h <= 1) {
             __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST);
             continue;
-        } // DFL/IGN: host did it
+        // DFL/IGN: host did it
+        }
         if (__atomic_fetch_and(&g_pending, ~bit, __ATOMIC_SEQ_CST) & bit) {
             build_signal_frame(c, sig);
             return;
@@ -100,9 +116,12 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     if (h > 1) {
         __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
         return;
-    }                                              // custom handler
-    if (h == 1) return;                            // SIG_IGN
-    if (c && (c->sigmask & (1ull << (sig - 1)))) { // blocked: make pending (signalfd / deliver on unblock)
+    // custom handler
+    }
+    // SIG_IGN
+    if (h == 1) return;
+    // blocked: make pending (signalfd / deliver on unblock)
+    if (c && (c->sigmask & (1ull << (sig - 1)))) {
         __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
         if ((g_sigfd_mask & (1ull << sig)) && g_sigfd_pipe[1] >= 0) {
             char b = (char)sig;
@@ -110,11 +129,14 @@ static void raise_guest_signal(struct cpu *c, int sig) {
         }
         return;
     }
-    if (sig == 17 || sig == 18 || sig == 23 || sig == 28) return; // SIGCHLD/CONT/URG/WINCH: ignore
+    // SIGCHLD/CONT/URG/WINCH: ignore
+    if (sig == 17 || sig == 18 || sig == 23 || sig == 28) return;
     signal(sig_l2m(sig), SIG_DFL);
-    raise(sig_l2m(sig)); // default: die BY the signal (host signo)
+    // default: die BY the signal (host signo)
+    raise(sig_l2m(sig));
     c->exited = 1;
-    c->exit_code = 128 + sig; // fallback if raise returns / signo invalid on host
+    // fallback if raise returns / signo invalid on host
+    c->exit_code = 128 + sig;
 }
 
 // Linux mmap flags -> macOS.

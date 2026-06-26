@@ -10,39 +10,48 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 // against the dir-fd by the *at syscall, e.g. ls stat-ing entries relative to a dir).
 static const char *atpath(int dirfd, const char *raw, char *buf, size_t n) {
     if (!raw) return raw;
-    if (raw[0] == '/') { // absolute -> follow symlinks rootfs-relative + confine
+    // absolute -> follow symlinks rootfs-relative + confine
+    if (raw[0] == '/') {
         if (g_nlower) {
             overlay_resolve(raw, buf, n, 0);
             return buf;
-        } // overlay: search upper+lowers
+        // overlay: search upper+lowers
+        }
         return xresolve_exec(raw, buf, n);
     }
     if (!g_rootfs) return raw;
-    if (dirfd >= 0) {                               // relative via a real dir-fd
-        if (dirfd >= 1024 || !g_fdpath[dirfd][0]) { // untracked dir-fd (dup/inherited/high): FAIL CLOSED
+    // relative via a real dir-fd
+    if (dirfd >= 0) {
+        // untracked dir-fd (dup/inherited/high): FAIL CLOSED
+        if (dirfd >= 1024 || !g_fdpath[dirfd][0]) {
             snprintf(buf, n, "%s/.jail-escape-denied", g_rootfs_canon);
             return buf;
         }
-        const char *gdir = g_fdpath[dirfd]; // turn it into a confined absolute path
+        // turn it into a confined absolute path
+        const char *gdir = g_fdpath[dirfd];
         if (strncmp(gdir, g_rootfs_canon, g_rootfs_canon_len) == 0)
-            gdir += g_rootfs_canon_len; // upper -> guest dir
+            // upper -> guest dir
+            gdir += g_rootfs_canon_len;
         else
             for (int i = 0; i < g_nlower; i++)
                 if (strncmp(gdir, g_lower[i].canon, g_lower[i].clen) == 0) {
                     gdir += g_lower[i].clen;
                     break;
-                } // a lower -> guest dir
+                // a lower -> guest dir
+                }
         char combined[8400];
         snprintf(combined, sizeof combined, "/%s/%s", gdir, raw);
         if (g_nlower) {
             overlay_resolve(combined, buf, n, 0);
             return buf;
         }
-        return xresolve(combined, buf, n); // openat then ignores dirfd (path absolute)
+        // openat then ignores dirfd (path absolute)
+        return xresolve(combined, buf, n);
     }
     {
         char j[8400];
-        snprintf(j, sizeof j, "%s/%s", g_cwd, raw); // AT_FDCWD-relative -> join the guest cwd, then confine
+        // AT_FDCWD-relative -> join the guest cwd, then confine
+        snprintf(j, sizeof j, "%s/%s", g_cwd, raw);
         if (g_nlower) {
             overlay_resolve(j, buf, n, 0);
             return buf;
@@ -63,7 +72,8 @@ static struct mcent {
     int rc;
     struct stat st;
 } g_mc[MCACHE_N];
-static uint64_t g_mc_hits, g_mc_miss; // PROF
+// PROF
+static uint64_t g_mc_hits, g_mc_miss;
 static uint64_t mc_hash(const char *s) {
     uint64_t h = 1469598103934665603ull;
     for (; *s; s++) {
@@ -88,7 +98,8 @@ static int mc_lookup(const char *p, int *rc, struct stat *out) {
 }
 static void mc_store(const char *p, int rc, const struct stat *s) {
     if (!p || strlen(p) >= 192) return;
-    if (g_nvols && strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) return; // don't cache mutable volume paths
+    // don't cache mutable volume paths
+    if (g_nvols && strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) return;
     CLK;
     struct mcent *e = &g_mc[mc_hash(p) & (MCACHE_N - 1)];
     e->hash = mc_hash(p);
