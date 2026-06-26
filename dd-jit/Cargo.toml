@@ -1,0 +1,15 @@
+[package]
+name = "ddjit"
+version = "0.1.0"
+edition = "2021"
+description = "The dd VM-less JIT container runtime (C, aarch64 + x86-64 guests) + its Rust bindings."
+license = "MIT"
+build = "build.rs"
+
+# The crate name is `ddjit`; `cargo build` triggers build.rs which compiles + codesigns both guest-arch
+# JIT binaries via the macOS toolchain. Library code exposes SpawnConfig + the built binary paths.
+[lib]
+name = "ddjit"
+path = "src/lib.rs"
+
+[dependencies]

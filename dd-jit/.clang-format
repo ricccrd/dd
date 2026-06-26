@@ -1,0 +1,14 @@
+# dd C style: 4-space indent, 120-col, attach braces. Matches the original jit.c layout.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortBlocksOnASingleLine: Always
+AllowShortCaseLabelsOnASingleLine: true
+SpaceBeforeParens: ControlStatements
+PointerAlignment: Right
+SortIncludes: false
