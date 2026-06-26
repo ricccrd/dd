@@ -63,20 +63,20 @@ The cpu-interface SEAM is built and verified:
 
 ## Finishing the dedup (the concrete remaining work)
 
-To make x86-64 *use* the shared `os/linux/` instead of its copy, the x86 frontend must supply:
+The seam is done (above). The remaining swap, to make x86-64 *use* shared `os/linux/` instead of its copy:
 
-1. **`frontend/x86_64/abi.h`** — `G_NR` mapping x86 `rax` → the canonical (aarch64) syscall number via a
-   number table; `G_A0..G_A5` = `rdi/rsi/rdx/r10/r8/r9`; `G_RET` = `rax`.
-2. **Per-arch struct fills** — `fill_stat`/`fill_statx`/sigaction in `frontend/x86_64/` (x86_64 layouts),
-   called by `os/linux/service.c` through a small hook (the aarch64 fills move behind the same hook).
-3. **A few per-arch hooks** — the §B shadow-stack reset is a no-op for x86 (no `ssp`); TLS reads
-   `fs_base`; sigaltstack uses common fields.
+1. **Legacy-syscall shim** — x86-64 has 58 legacy syscalls aarch64 lacks (`open`/`stat`/`pipe`/`access`/
+   `dup2`/`getdents`/`rename`/`mkdir`/…). A thin x86 entry translates each to its `*at` canonical form
+   (e.g. `open(p,fl,m)` → `openat(AT_FDCWD,p,fl,m)`) before delegating to the shared `service()`.
+2. **Per-arch struct fills** — move `fill_linux_stat` (+ statx/sigaction) out of the shared layer into
+   each frontend (both already define it with the same signature, just different layouts).
+3. **Wire** `targets/linux_x86_64.c` to shared `os/linux/` + `jit/` + only x86-specific
+   `frontend/x86_64/{cpu,decode,translate,emit,abi,sysmap,sigframe}`; delete the x86 service/container/
+   cache/elf copies.
 
-Then `targets/linux_x86_64.c` includes the shared `os/linux/` + `jit/` + only the x86-specific
-`frontend/x86_64/{cpu,decode,translate,emit,abi,sigframe}`, and the x86 copies of service/container/
-cache/elf are deleted. **Gate:** this swap needs broader x86 test coverage first (today: 5 bare
-fixtures, no container cases) so the change is verifiable rather than hopeful — jit86 is also under
-active bug-fixing upstream (the base32 NEON path), so the swap lands cleanly after it stabilizes.
+**The verification gate is now satisfied:** the dense matrix (x86 cross-compiler + qemu oracle) runs
+the same ~25 guest programs on x86, exercising the common syscall + struct-fill paths — so the swap is
+checked, not hopeful. (The 5 `xfail`'d jit86 codegen bugs are orthogonal and stay tracked.)
 
 The same pattern lifts **jitdarwin** onto the shared `jit/` engine — it already shares the entire
 aarch64 host codegen; only the Mach-O loader, the Darwin syscall map, and Mach traps are darwin-specific.
