@@ -36,6 +36,8 @@ binaries) and `dd-daemon` (Docker Engine API). This file is the **work list only
   symlink-follow (`layer_follow`). (Found by dd-tests sandbox/jail group.)
 
 ## Remaining JIT gaps
+- **`--network none` egress isolation** — dd-daemon can pass `DD_NET_ISOLATE=1` (poc ddockerd sets it),
+  but the JIT doesn't yet enforce it (Seatbelt egress block). Stub only today.
 - **ET_EXEC loader** (non-PIE static) — platform-blocked by macOS `__PAGEZERO`; needs a fixed-vaddr map.
 - **IPC namespace** — SysV/POSIX shm/sem/msg per IPC-ns.
 - **cpu/io cgroup** — only mem+pids enforced (cpu/io best-effort on macOS).
