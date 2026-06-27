@@ -31,7 +31,9 @@ static struct {
     void *body;
 } g_map[MAP_N];
 static int map_idx(uint64_t gpc) {
-    uint32_t h = (uint32_t)((gpc >> 2) * 2654435761u) & (MAP_N - 1);
+    // hash shift is per-arch (frontend/<arch>/abi.h G_GPC_HASH_SHIFT): aarch64 PCs are 4-byte aligned
+    // (>>2 spreads), x86 PCs are byte-granular (>>0). Pure tuning constant; aarch64 value is 2 (unchanged).
+    uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (MAP_N - 1);
     for (int i = 0; i < MAP_N; i++) {
         uint32_t j = (h + i) & (MAP_N - 1);
         if (g_map[j].host && g_map[j].gpc == gpc) return j;
@@ -48,7 +50,7 @@ static void *map_body(uint64_t gpc) {
     return i < 0 ? NULL : g_map[i].body;
 }
 static void map_put(uint64_t gpc, void *host, void *body) {
-    uint32_t h = (uint32_t)((gpc >> 2) * 2654435761u) & (MAP_N - 1);
+    uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (MAP_N - 1);
     for (int i = 0; i < MAP_N; i++) {
         uint32_t j = (h + i) & (MAP_N - 1);
         if (!g_map[j].host) {

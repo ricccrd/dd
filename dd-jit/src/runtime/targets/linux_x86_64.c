@@ -61,7 +61,8 @@
 #include "../frontend/x86_64/fill_stat.c"    // per-arch struct-stat layout os/linux fills
 
 #include "../os/linux/container/state.c"     // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
-#include "../frontend/x86_64/cache.c"        // x86 engine: code cache + block map
+#include "../frontend/x86_64/engine_glue.c"  // x86-only engine globals (trace/diag) the shared cache.c omits
+#include "../jit/cache.c"                     // SHARED engine: code cache + block map (hash via G_GPC_HASH_SHIFT)
 #include "../frontend/x86_64/emit.c"         // x86 engine: arm64 emitters + SSE + x87
 #include "../frontend/x86_64/decode.c"       // x86-64 decoder
 #include "../frontend/x86_64/translate.c"    // x86-64 translate_block + trampolines

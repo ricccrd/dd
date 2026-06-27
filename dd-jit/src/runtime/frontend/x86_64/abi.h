@@ -15,6 +15,10 @@
 #define G_A5(c) ((c)->r[9])                // r9
 #define G_RET(c) ((c)->r[0])               // rax
 
+// Engine seam: the shared jit/cache.c hashes the guest PC as (gpc >> G_GPC_HASH_SHIFT). x86 PCs are
+// byte-granular, so do not shift (>>0) -- matches the original frontend/x86_64/cache.c hash.
+#define G_GPC_HASH_SHIFT 0
+
 #define G_PC(c) ((c)->rip)
 #define G_SP(c) ((c)->r[4])                // rsp
 #define G_TLS(c) ((c)->fs_base)            // x86 TLS base (arch_prctl SET_FS)

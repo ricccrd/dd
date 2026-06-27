@@ -22,6 +22,11 @@
 #define G_A5(c) ((c)->x[5])
 #define G_RET(c) ((c)->x[0])
 
+// Engine seam: the shared jit/cache.c hashes the guest PC as (gpc >> G_GPC_HASH_SHIFT). aarch64 PCs are
+// 4-byte aligned, so shifting out the low 2 bits spreads the map. (Pure tuning constant; value 2 is the
+// historical aarch64 hash, so this keeps the aarch64 engine bit-identical.)
+#define G_GPC_HASH_SHIFT 2
+
 // PC / SP / TLS / §B shadow-stack reset — the remaining per-arch cpu state os/linux touches.
 #define G_PC(c) ((c)->pc)
 #define G_SP(c) ((c)->sp)
