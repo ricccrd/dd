@@ -2712,6 +2712,65 @@ static void service(struct cpu *c) {
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
+    // waitid(idtype, id, infop, options): host waitid into a macOS siginfo, then hand-build the guest's
+    // Linux siginfo (layout + signal/status numbers differ). idtype P_ALL/P_PID/P_PGID (0/1/2) match.
+    case 95: {
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        int lopt = (int)a3, mopt = 0;
+        // Linux wait-option bits -> macOS bits (only WNOHANG/WEXITED share a value)
+        if (lopt & 0x00000001) mopt |= WNOHANG;    // WNOHANG
+        if (lopt & 0x00000002) mopt |= WSTOPPED;   // Linux WSTOPPED(2) -> macOS WSTOPPED
+        if (lopt & 0x00000004) mopt |= WEXITED;    // WEXITED
+        if (lopt & 0x00000008) mopt |= WCONTINUED; // Linux WCONTINUED(8) -> macOS WCONTINUED
+        if (lopt & 0x01000000) mopt |= WNOWAIT;    // Linux WNOWAIT -> macOS WNOWAIT
+        int r = waitid((idtype_t)(int)a0, (id_t)a1, &si, mopt);
+        if (r < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        uint8_t *gi = (uint8_t *)a2;
+        if (gi) {
+            // Linux siginfo_t is 128 bytes; zero it (also the WNOHANG "no child" case -> si_pid stays 0)
+            memset(gi, 0, 128);
+            if (si.si_pid != 0) {
+                int code = si.si_code, status = si.si_status;
+                // si_status carries a signal number for kill/dump/stop/cont -> translate macOS->Linux
+                if (code == CLD_KILLED || code == CLD_DUMPED || code == CLD_STOPPED || code == CLD_CONTINUED)
+                    status = sig_m2l(status);
+                *(int *)(gi + 0) = 17;            // si_signo = Linux SIGCHLD
+                *(int *)(gi + 4) = 0;             // si_errno
+                *(int *)(gi + 8) = code;          // si_code (CLD_* values match Linux<->macOS)
+                *(int *)(gi + 16) = (int)si.si_pid;
+                *(int *)(gi + 20) = (int)si.si_uid;
+                *(int *)(gi + 24) = status;       // si_status
+            }
+        }
+        G_RET(c) = 0;
+        break;
+    }
+    // truncate(path, length): resolve the guest path through the overlay (same helper execve uses), then
+    // truncate by host path. Evict the stat cache so the new size is observed.
+    case 45: {
+        char pb[4200];
+        const char *p = xresolve_overlay((const char *)a0, pb, sizeof pb);
+        int r = truncate(p, (off_t)a1);
+        if (r >= 0) mc_evict(p);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        break;
+    }
+    // getrlimit(resource, rlim) / setrlimit(resource, rlim): alias prlimit64 (case 261). RLIMIT_STACK(3)
+    // reports 8MB, everything else unlimited; setrlimit is accepted (no-op).
+    case 163: {
+        if (a1) {
+            uint64_t *o = (uint64_t *)a1;
+            o[0] = ((int)a0 == 3) ? (8ull << 20) : ~0ull; // rlim_cur
+            o[1] = ~0ull;                                 // rlim_max
+        }
+        G_RET(c) = 0;
+        break;
+    }
+    case 164: G_RET(c) = 0; break; // setrlimit -> accepted
 
     // ===================== unhandled =====================
     default:
