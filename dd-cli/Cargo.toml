@@ -6,7 +6,7 @@ description = "The `ddcli` command — run dd containers with easy-access defaul
 license = "MIT"
 
 [[bin]]
-name = "dd"
+name = "ddcli"
 path = "src/main.rs"
 
 [dependencies]
