@@ -360,7 +360,7 @@ fn pull_progress(name: &str, tag: &str, result: Result<bool, String>) -> Respons
     let body = match result {
         Ok(true) => format!("{}\r\n", json!({ "status": format!("Status: Image is up to date for {name}:{tag}") })),
         Ok(false) => [
-            json!({ "status": format!("Pulling from library/{name}") }).to_string(),
+            json!({ "status": format!("Pulling from {}", image_ref(name, tag).repository) }).to_string(),
             json!({ "status": "Verifying Checksum" }).to_string(),
             json!({ "status": "Download complete" }).to_string(),
             json!({ "status": "Pull complete" }).to_string(),
