@@ -82,14 +82,15 @@ groups + the dynamic corpus.
   `getcpu`(168)
 - **File I/O:** ~~`flock`(32)~~ **done**, ~~`preadv/pwritev`(69/70)~~ **done**; still: `truncate`(45, by-path),
   `preadv2/pwritev2`(286/287), `sync_file_range`(84→fsync), `readahead`(213→noop/fadvise)
-- **Memory:** ~~`memfd_create`(279)~~ **done** (unlinked tmpfile), `mlockall/munlockall`(230/231→noop),
-  `mlock2`(284)
-- **Timers/clocks:** `getitimer/setitimer`(102/103), `clock_settime`(112), `clock_adjtime`(266)
+- **Memory:** ~~`memfd_create`(279)~~ **done**, ~~`mlockall/munlockall`(230/231)~~ **done** (no-op), `mlock2`(284)
+- **Timers/clocks:** ~~`getitimer/setitimer`(102/103)~~ **done** (host wrap); still `clock_settime`(112),
+  `clock_adjtime`(266)
+- **Scheduling:** ~~`sched_get/setscheduler`(119/120), `sched_get/setparam`(118/121),
+  `sched_get_priority_max/min`(125/126), `sched_rr_get_interval`(127)~~ **done** (SCHED_OTHER stubs)
 - **Resource:** `getrlimit/setrlimit`(163/164) *(prlimit64=261 already handled — alias these to it)*
 - **Signals:** `rt_sigtimedwait`(137), `rt_sigsuspend`(133), `rt_tgsigqueuei`(240); the **`sigqueue`
   si_value payload path** is **done** (`rt_sigqueueinfo`→sigframe `si_code`/`si_value`)
-- **Scheduling (stub sane values):** `sched_get/setscheduler`(119/120), `sched_get/setparam`(118/121),
-  `sched_get_priority_max/min`(125/126), `sched_rr_get_interval`(127), `sched_get/setattr`(274/275)
+- **Scheduling (still):** `sched_get/setattr`(274/275)
 - **Misc (all done):** ~~`prctl PR_GET_NAME`~~ (stores the set name), ~~POSIX `shm_open`~~ (`/dev/shm`→
   host-file backing), ~~`glob("*")`~~ (it was a stale getdents `DIR*` cache, not `d_type` — invalidated
   on `close`, dropped in fork children)
