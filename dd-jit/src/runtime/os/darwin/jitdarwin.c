@@ -109,6 +109,7 @@ static void translate_block(uint64_t gpc){                     // gpc is a LOADE
             uint32_t *p=CP; emit(0); exit_const(gpc+4,R_NEXT);
             *p=(in&0xFFF8001Fu)|(((uint32_t)(CP-p)&0x3FFF)<<5); exit_const(gpc+(o<<2),R_NEXT); return; }
         if((in&0x9F000000u)==0x10000000u){ int rd=in&0x1F; int64_t imm=(((in>>5)&0x7FFFF)<<2)|((in>>29)&3); if(imm&(1LL<<20))imm|=~((1LL<<21)-1); e_movc(rd,gpc+imm); gpc+=4; continue; } // adr -> loaded target
+        if((in&0x9F000000u)==0x90000000u){ int rd=in&0x1F; int64_t imm=(((in>>5)&0x7FFFF)<<2)|((in>>29)&3); if(imm&(1LL<<20))imm|=~((1LL<<21)-1); e_movc(rd,(int64_t)(gpc&~0xFFFLL)+(imm<<12)); gpc+=4; continue; } // adrp -> loaded PAGE (slide-relocated; copying it verbatim would page off the host cache PC)
         emit(in); gpc+=4;                                                                            // same-ISA copy
     }
 }

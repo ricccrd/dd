@@ -43,12 +43,6 @@ plain `localhost:5000` (`dd-daemon/src/registry.rs`; 41/41 docker-CLI scenarios 
 - **`docker cp` into bind-volume paths** — the `/archive` endpoints work against the rootfs (upper); a
   path that falls inside a bind volume isn't redirected to the host volume dir yet.
 
-## Bugs found by the test harness
-- **jitdarwin: adrp/`__cstring` literal not relocated under the segment slide** — a guest that reads a
-  string literal (via adrp) gets zeros; stack/SP-relative data works. (Found by dd-tests darwin group;
-  the test deliberately builds its string on the stack to dodge this.) Low priority: jitdarwin is the
-  research DBT — native macOS containers use `darwinjail` (real binaries jailed), not the DBT.
-
 ## Remaining JIT gaps
 - **ET_EXEC loader** (non-PIE static) — platform-blocked by macOS `__PAGEZERO`; needs a fixed-vaddr map.
 - **IPC namespace** — SysV/POSIX shm/sem/msg per IPC-ns.

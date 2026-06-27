@@ -144,6 +144,7 @@ fn sandbox() -> Group {
 fn darwin() -> Group {
     group("darwin", vec![
         darwin_src("hello", "hello.c").exit(42).out("hi\n"),   // write(1,"hi\n") + exit(42) via BSD svc
+        darwin_src("adrp", "adrp.c").exit(42).out("ADRP-OK\n"), // __cstring literal via adrp (segment slide)
     ])
 }
 
