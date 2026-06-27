@@ -23,6 +23,7 @@ jobs:
   dmg:
     # macos-14 = Apple Silicon (arm64). dd only targets arm64 macOS.
     runs-on: macos-14
+    timeout-minutes: 60   # never let a wedged step hang the runner for hours
     steps:
       - uses: actions/checkout@v4
 
@@ -41,18 +42,27 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      # Stable key (NOT per-version) so compiled dependencies are reused across releases.
+      # rust-cache already keys on Cargo.lock + rustc, so a real dep change still busts it.
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: dmg-${{ steps.ver.outputs.version }}
+          shared-key: dmg-release
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Cache the Nix store (GTK4 dev shell)
-        uses: DeterminateSystems/magic-nix-cache-action@main
+      # Persist the GTK4 dev-shell closure in the GitHub Actions cache so later releases
+      # restore /nix instead of re-downloading it from cache.nixos.org every time.
+      # (Replaces magic-nix-cache, which is sunset and crashes on Apple-Silicon runners.)
+      # Key is the flake lock+def: it only busts when the pinned nixpkgs / inputs change.
+      - name: Cache the Nix store (GTK4 dev shell closure)
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('nix/flake.lock', 'nix/flake.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
 
-      - name: Warm the dev shell (fetch GTK4 + tools)
+      - name: Warm the dev shell (fetch GTK4 + tools on a cache miss)
         run: nix develop "path:$PWD/nix" --command true
 
       - name: Build the DMG
