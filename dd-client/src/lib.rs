@@ -104,6 +104,11 @@ impl Client {
         self.get_json("/images/json").await
     }
 
+    /// `DELETE /images/{name}`.
+    pub async fn remove_image(&self, name: &str) -> Result<()> {
+        self.raw(hyper::Method::DELETE, &format!("/images/{name}"), None).await.map(|_| ())
+    }
+
     /// `GET /containers/json?all=1` (we always include stopped containers).
     pub async fn list_containers(&self) -> Result<Vec<Container>> {
         self.get_json("/containers/json?all=1").await

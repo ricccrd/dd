@@ -13,9 +13,13 @@ use std::ffi::OsStr;
 /// the detail pane (info on top, a fixed logs area pinned at the bottom).
 pub struct Widgets {
     stack: gtk::Stack,
+    update_btn: gtk::Button,
     onboard_status: gtk::Label,
-    cli_label: gtk::Label,
     nav: gtk::ListBox,
+    nav_bottom: gtk::ListBox,
+    content_stack: gtk::Stack,
+    home: gtk::Box,
+    settings: gtk::Box,
     list: gtk::ListBox,
     detail_info: gtk::Box,
     logs_area: gtk::Box,
@@ -78,20 +82,41 @@ pub fn build(root: &gtk::ApplicationWindow, sender: &ComponentSender<AppModel>) 
     group.append(&daemon_toggle);
     group.append(&context_seg);
 
-    // --- pane 1: category nav (Containers / Images) ------------------------
+    // --- pane 1: category nav (Home / Containers / Images; Settings pinned bottom) ---
     let nav = nav_list();
-    nav.append(&nav_item("Containers", "", false));
-    nav.append(&nav_item("Images", "", false));
+    nav.append(&cat_row("go-home-symbolic", "Home"));
+    nav.append(&cat_row("package-x-generic-symbolic", "Containers"));
+    nav.append(&cat_row("image-x-generic-symbolic", "Images"));
+    let nav_bottom = nav_list();
+    nav_bottom.append(&cat_row("emblem-system-symbolic", "Settings"));
     {
         let s = sender.clone();
+        let other = nav_bottom.clone();
         nav.connect_row_activated(move |_, row| {
-            let cat = if row.index() == 0 { Category::Containers } else { Category::Images };
+            other.unselect_all();
+            let cat = match row.index() {
+                1 => Category::Containers,
+                2 => Category::Images,
+                _ => Category::Home,
+            };
             s.input(Msg::SetCategory(cat));
         });
     }
+    {
+        let s = sender.clone();
+        let other = nav.clone();
+        nav_bottom.connect_row_activated(move |_, _| {
+            other.unselect_all();
+            s.input(Msg::SetCategory(Category::Settings));
+        });
+    }
     let nav_card = sidebar_card();
-    nav_card.set_size_request(148, -1);
+    nav_card.set_size_request(150, -1);
     nav_card.append(&nav);
+    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    spacer.set_vexpand(true);
+    nav_card.append(&spacer);
+    nav_card.append(&nav_bottom);
 
     // --- pane 2: the items in the selected category ------------------------
     let list = nav_list();
@@ -134,8 +159,13 @@ pub fn build(root: &gtk::ApplicationWindow, sender: &ComponentSender<AppModel>) 
     logs_scroll.set_size_request(-1, 220); // fixed-height log pane at the bottom
     let logs_area = gtk::Box::new(gtk::Orientation::Vertical, 0);
     logs_area.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let logs_cap = section_caption("Logs");
-    logs_cap.set_margin_bottom(0);
+    let logs_cap = gtk::Label::new(Some("LOGS"));
+    logs_cap.set_xalign(0.0);
+    logs_cap.set_halign(gtk::Align::Start);
+    logs_cap.add_css_class("dd-section-title");
+    logs_cap.set_margin_start(14);
+    logs_cap.set_margin_top(8);
+    logs_cap.set_margin_bottom(4);
     logs_area.append(&logs_cap);
     logs_area.append(&logs_scroll);
 
@@ -157,16 +187,51 @@ pub fn build(root: &gtk::ApplicationWindow, sender: &ComponentSender<AppModel>) 
     paned.set_wide_handle(false); // a thin handle, so the list↔detail gap matches the nav↔list gap
     paned.set_hexpand(true);
 
+    // Home dashboard (filled by render()).
+    let home = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    home.set_margin_top(20);
+    home.set_margin_bottom(20);
+    home.set_margin_start(22);
+    home.set_margin_end(22);
+    let home_scroll = gtk::ScrolledWindow::builder()
+        .child(&home)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    home_scroll.add_css_class("dd-home");
+
+    // Settings page (filled by render()).
+    let settings = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    settings.set_margin_top(20);
+    settings.set_margin_bottom(20);
+    settings.set_margin_start(22);
+    settings.set_margin_end(22);
+    let settings_scroll = gtk::ScrolledWindow::builder()
+        .child(&settings)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    settings_scroll.add_css_class("dd-home");
+
+    // Content area: dashboard ("home") / settings / browse (list | detail).
+    let content_stack = gtk::Stack::new();
+    content_stack.set_hexpand(true);
+    content_stack.add_named(&home_scroll, Some("home"));
+    content_stack.add_named(&settings_scroll, Some("settings"));
+    content_stack.add_named(&paned, Some("browse"));
+
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 7);
     body.set_margin_top(0);
     body.set_margin_bottom(7);
     body.set_margin_start(7);
     body.set_margin_end(7);
     body.append(&nav_card);
-    body.append(&paned);
+    body.append(&content_stack);
 
     // Onboarding / splash screen, shown when the daemon is off.
-    let (onboarding, onboard_status, cli_label) = build_onboarding(sender);
+    let (onboarding, onboard_status) = build_onboarding(sender);
 
     // Two views: compact onboarding vs. the full app.
     let stack = gtk::Stack::new();
@@ -174,12 +239,23 @@ pub fn build(root: &gtk::ApplicationWindow, sender: &ComponentSender<AppModel>) 
     stack.add_named(&onboarding, Some("onboarding"));
     stack.add_named(&body, Some("main"));
 
+    // "Update available" button (hidden unless a newer release is found).
+    let update_btn = gtk::Button::new();
+    update_btn.add_css_class("dd-update");
+    update_btn.set_valign(gtk::Align::Center);
+    update_btn.set_visible(false);
+    {
+        let s = sender.clone();
+        update_btn.connect_clicked(move |_| s.input(Msg::ApplyUpdate));
+    }
+
     // Slim status strip (under the native title bar) above the body.
     let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     strip.add_css_class("dd-topstrip");
     strip.set_size_request(-1, 38); // title-bar height; traffic lights float over the (empty) left
     strip.set_margin_start(12);
     strip.set_margin_end(7);
+    strip.append(&update_btn);
     strip.append(&group);
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -192,15 +268,15 @@ pub fn build(root: &gtk::ApplicationWindow, sender: &ComponentSender<AppModel>) 
     root.connect_realize(|_| crate::mac::unify_titlebar());
 
     Widgets {
-        stack, onboard_status, cli_label,
-        nav, list, detail_info, logs_area, logs_view,
+        stack, update_btn, onboard_status,
+        nav, nav_bottom, content_stack, home, settings, list, detail_info, logs_area, logs_view,
         daemon_dot, daemon_label, daemon_toggle, context_menu, context_pop_box, context_seg,
     }
 }
 
 /// The onboarding/splash view: a 2-column layout — branding + enable on the left, CLI install on
 /// the right.
-fn build_onboarding(sender: &ComponentSender<AppModel>) -> (gtk::Widget, gtk::Label, gtk::Label) {
+fn build_onboarding(sender: &ComponentSender<AppModel>) -> (gtk::Widget, gtk::Label) {
     // Left column: status + enable the daemon.
     let head = gtk::Label::new(Some("Daemon"));
     head.set_xalign(0.0);
@@ -245,18 +321,12 @@ fn build_onboarding(sender: &ComponentSender<AppModel>) -> (gtk::Widget, gtk::La
         let s = sender.clone();
         install.connect_clicked(move |_| s.input(Msg::InstallCli));
     }
-    let cli_label = gtk::Label::new(None);
-    cli_label.set_wrap(true);
-    cli_label.set_xalign(0.0);
-    cli_label.set_visible(false);
-    cli_label.add_css_class("dd-cli-msg");
     let right = gtk::Box::new(gtk::Orientation::Vertical, 7);
     right.set_valign(gtk::Align::Center);
     right.set_size_request(250, -1);
     right.append(&cli_head);
     right.append(&cli_desc);
     right.append(&install);
-    right.append(&cli_label);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 28);
     row.set_halign(gtk::Align::Center);
@@ -285,7 +355,7 @@ fn build_onboarding(sender: &ComponentSender<AppModel>) -> (gtk::Widget, gtk::La
     outer.set_margin_bottom(8);
     outer.append(&top);
     outer.append(&row);
-    (outer.upcast(), onboard_status, cli_label)
+    (outer.upcast(), onboard_status)
 }
 
 /// Locate the dd logo: the app bundle's `Contents/Resources/logo.png`, or `assets/logo.png` in dev.
@@ -314,6 +384,16 @@ fn sidebar_card() -> gtk::Box {
 pub fn render(w: &Widgets, m: &AppModel, sender: &ComponentSender<AppModel>) {
     let snap = &m.snap;
 
+    // Update affordance.
+    match &m.update {
+        Some(rel) => {
+            w.update_btn.set_visible(true);
+            w.update_btn.set_label(&format!("Update v{}", rel.version));
+            w.update_btn.set_tooltip_text(Some("Download and install the new version"));
+        }
+        None => w.update_btn.set_visible(false),
+    }
+
     // Onboarding (compact) vs. the full app.
     w.stack.set_visible_child_name(if snap.connected { "main" } else { "onboarding" });
     w.onboard_status.set_label(if snap.connected {
@@ -321,80 +401,93 @@ pub fn render(w: &Widgets, m: &AppModel, sender: &ComponentSender<AppModel>) {
     } else {
         "The dd daemon is not running."
     });
-    match &m.cli_msg {
-        Some(msg) => {
-            w.cli_label.set_visible(true);
-            w.cli_label.set_label(msg);
-        }
-        None => w.cli_label.set_visible(false),
-    }
 
-    // Pane 1: reflect the active category.
-    let cat_idx = if m.category == Category::Images { 1 } else { 0 };
-    w.nav.select_row(w.nav.row_at_index(cat_idx).as_ref());
-
-    // Pane 2: the items in the active category.
-    clear(&w.list);
-    match m.category {
-        Category::Containers => {
-            if snap.containers.is_empty() {
-                w.list.append(&dim_row(if snap.connected { "No containers" } else { "—" }));
-            }
-            for c in &snap.containers {
-                let sub = if c.running() { "running".to_string() } else { c.display_status() };
-                let row = nav_item(&c.name(), &sub, c.running());
-                row.set_widget_name(&format!("c:{}", c.id));
-                w.list.append(&row);
-            }
-        }
-        Category::Images => {
-            if snap.images.is_empty() {
-                w.list.append(&dim_row("No images"));
-            }
-            for img in &snap.images {
-                let row = nav_item(&img.name(), &img.architecture, false);
-                row.set_widget_name(&format!("i:{}", img.name()));
-                w.list.append(&row);
-            }
-        }
-    }
-    w.list.unselect_all();
-    match &m.selection {
-        Selection::Container(id) => select_named(&w.list, &format!("c:{id}")),
-        Selection::Image(name) => select_named(&w.list, &format!("i:{name}")),
-        Selection::None => {}
-    }
-
-    // Pane 3: detail info.
-    clear_box(&w.detail_info);
-    let info = match &m.selection {
-        Selection::Container(id) => match snap.containers.iter().find(|c| &c.id == id) {
-            Some(c) => container_info(c, &snap.networks, sender),
-            None => placeholder("This container no longer exists."),
-        },
-        Selection::Image(name) => match snap.images.iter().find(|i| &i.name() == name) {
-            Some(img) => image_detail(img, sender),
-            None => placeholder("This image no longer exists."),
-        },
-        Selection::None => placeholder(if snap.connected { "Select an item." } else { "Daemon not running." }),
-    };
-    w.detail_info.append(&info);
-
-    // Logs pane (only for containers; auto-rendered, scrolled to the end).
-    if let Selection::Container(id) = &m.selection {
-        w.logs_area.set_visible(true);
-        let text = match &m.current_logs {
-            Some((lid, t)) if lid == id => {
-                if t.is_empty() { "(no output)".to_string() } else { t.clone() }
-            }
-            _ => "loading…".to_string(),
-        };
-        let buf = w.logs_view.buffer();
-        buf.set_text(&text);
-        let mut end = buf.end_iter();
-        w.logs_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+    // Pane 1: reflect the active category across the top + bottom (Settings) nav lists.
+    if m.category == Category::Settings {
+        w.nav.unselect_all();
+        w.nav_bottom.select_row(w.nav_bottom.row_at_index(0).as_ref());
     } else {
-        w.logs_area.set_visible(false);
+        w.nav_bottom.unselect_all();
+        let idx = match m.category {
+            Category::Containers => 1,
+            Category::Images => 2,
+            _ => 0,
+        };
+        w.nav.select_row(w.nav.row_at_index(idx).as_ref());
+    }
+
+    if m.category == Category::Home {
+        w.content_stack.set_visible_child_name("home");
+        render_home(&w.home, m, sender);
+    } else if m.category == Category::Settings {
+        w.content_stack.set_visible_child_name("settings");
+        render_settings(&w.settings, m, sender);
+    } else {
+        w.content_stack.set_visible_child_name("browse");
+
+        // Pane 2: the items in the active category.
+        clear(&w.list);
+        match m.category {
+            Category::Containers => {
+                if snap.containers.is_empty() {
+                    w.list.append(&dim_row(if snap.connected { "No containers" } else { "—" }));
+                }
+                for c in &snap.containers {
+                    let row = container_list_row(c);
+                    row.set_widget_name(&format!("c:{}", c.id));
+                    w.list.append(&row);
+                }
+            }
+            Category::Images => {
+                if snap.images.is_empty() {
+                    w.list.append(&dim_row("No images"));
+                }
+                for img in &snap.images {
+                    let row = nav_item(&img.name(), &img.architecture, false);
+                    row.set_widget_name(&format!("i:{}", img.name()));
+                    w.list.append(&row);
+                }
+            }
+            Category::Home | Category::Settings => {}
+        }
+        w.list.unselect_all();
+        match &m.selection {
+            Selection::Container(id) => select_named(&w.list, &format!("c:{id}")),
+            Selection::Image(name) => select_named(&w.list, &format!("i:{name}")),
+            Selection::None => {}
+        }
+
+        // Pane 3: detail info.
+        clear_box(&w.detail_info);
+        let info = match &m.selection {
+            Selection::Container(id) => match snap.containers.iter().find(|c| &c.id == id) {
+                Some(c) => container_info(c, &snap.networks, sender),
+                None => placeholder("This container no longer exists."),
+            },
+            Selection::Image(name) => match snap.images.iter().find(|i| &i.name() == name) {
+                Some(img) => image_detail(img, sender),
+                None => placeholder("This image no longer exists."),
+            },
+            Selection::None => placeholder(if snap.connected { "Select an item." } else { "Daemon not running." }),
+        };
+        w.detail_info.append(&info);
+
+        // Logs pane (only for containers; auto-rendered, scrolled to the end).
+        if let Selection::Container(id) = &m.selection {
+            w.logs_area.set_visible(true);
+            let text = match &m.current_logs {
+                Some((lid, t)) if lid == id => {
+                    if t.is_empty() { "(no output)".to_string() } else { t.clone() }
+                }
+                _ => "loading…".to_string(),
+            };
+            let buf = w.logs_view.buffer();
+            buf.set_text(&text);
+            let mut end = buf.end_iter();
+            w.logs_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+        } else {
+            w.logs_area.set_visible(false);
+        }
     }
 
     // Header status pill: daemon dot + Running/Stopped (click toggles enable/disable).
@@ -445,6 +538,435 @@ pub fn render(w: &Widgets, m: &AppModel, sender: &ComponentSender<AppModel>) {
         }
         None => w.context_seg.set_visible(false),
     }
+}
+
+// ---- home dashboard --------------------------------------------------------
+
+fn render_home(home: &gtk::Box, m: &AppModel, sender: &ComponentSender<AppModel>) {
+    clear_box(home);
+    let snap = &m.snap;
+
+    let title = gtk::Label::new(Some("Overview"));
+    title.set_xalign(0.0);
+    title.add_css_class("dd-h1");
+    home.append(&title);
+
+    let running = snap.containers.iter().filter(|c| c.running()).count();
+    let stats = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    stats.append(&stat_card(&running.to_string(), "Running", true));
+    stats.append(&stat_card(&snap.containers.len().to_string(), "Containers", false));
+    stats.append(&stat_card(&snap.images.len().to_string(), "Images", false));
+    home.append(&stats);
+
+    if let Some(rel) = &m.update {
+        home.append(&update_card(&rel.version, sender));
+    }
+
+    // ---- Get started -------------------------------------------------------
+    let gs = gtk::Label::new(Some("Get started"));
+    gs.set_xalign(0.0);
+    gs.add_css_class("dd-h2");
+    home.append(&gs);
+
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    card.add_css_class("dd-step-card");
+
+    // 1. Run hello-world — works immediately (the image is bundled + seeded into ~/.dd/images).
+    card.append(&action_row(
+        "Run your first container",
+        "A hello-world image is bundled — give it a try.",
+        "Run hello-world",
+        true,
+        sender,
+        || Msg::RunImage("hello-dd".to_string()),
+    ));
+
+    card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    // 2. Terminal path: install the CLI, point Docker at dd, then the (working) command.
+    card.append(&action_row(
+        "Use the terminal",
+        "Install the dd CLI, point Docker at dd (selector, top-right), then:",
+        "Install CLI",
+        false,
+        sender,
+        || Msg::InstallCli,
+    ));
+    let code = gtk::Label::new(Some("docker run --rm hello-dd"));
+    code.set_xalign(0.0);
+    code.set_hexpand(true); // full-width code box (not shrink-wrapped to the text)
+    code.set_selectable(true);
+    code.add_css_class("dd-code");
+    card.append(&code);
+
+    home.append(&card);
+}
+
+/// The Settings page: version, locations, CLI install, and the reset (danger) action.
+fn render_settings(s: &gtk::Box, m: &AppModel, sender: &ComponentSender<AppModel>) {
+    clear_box(s);
+
+    let title = gtk::Label::new(Some("Settings"));
+    title.set_xalign(0.0);
+    title.add_css_class("dd-h1");
+    s.append(&title);
+
+    // About + locations.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let about = setting_card(&[
+        ("Version", env!("DD_VERSION")),
+        ("Socket", &m.socket.to_string_lossy()),
+        ("Images", &format!("{home}/.dd/images")),
+        ("State", &format!("{home}/.dd/state.json")),
+    ]);
+    s.append(&about);
+
+    // Command-line tool.
+    let cli = gtk::Label::new(Some("Command-line tool"));
+    cli.set_xalign(0.0);
+    cli.add_css_class("dd-h2");
+    s.append(&cli);
+    let cli_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    cli_card.add_css_class("dd-step-card");
+    cli_card.append(&action_row(
+        "Install the dd CLI",
+        "Adds dd to your terminal (~/.local/bin).",
+        "Install",
+        false,
+        sender,
+        || Msg::InstallCli,
+    ));
+    s.append(&cli_card);
+
+    // Reset (danger).
+    let rz = gtk::Label::new(Some("Reset"));
+    rz.set_xalign(0.0);
+    rz.add_css_class("dd-h2");
+    s.append(&rz);
+    let rt = gtk::Label::new(Some("Reset dd"));
+    rt.set_xalign(0.0);
+    rt.add_css_class("heading");
+    let rd = gtk::Label::new(Some("Remove all containers, volumes and networks (images are kept)."));
+    rd.set_xalign(0.0);
+    rd.set_wrap(true);
+    rd.add_css_class("dim-label");
+    rd.add_css_class("caption");
+    let rtexts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    rtexts.set_hexpand(true);
+    rtexts.set_valign(gtk::Align::Center);
+    rtexts.append(&rt);
+    rtexts.append(&rd);
+    let rbtn = gtk::Button::with_label("Reset…");
+    rbtn.add_css_class("dd-btn");
+    rbtn.add_css_class("destructive-action");
+    rbtn.set_valign(gtk::Align::Center);
+    {
+        let s2 = sender.clone();
+        rbtn.connect_clicked(move |_| s2.input(Msg::ConfirmReset));
+    }
+    let rcard = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    rcard.add_css_class("dd-step-card");
+    rcard.append(&rtexts);
+    rcard.append(&rbtn);
+    s.append(&rcard);
+}
+
+/// A card of key/value rows (selectable monospace values) for the Settings page.
+fn setting_card(rows: &[(&str, &str)]) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    card.add_css_class("dd-step-card");
+    for (k, v) in rows {
+        let key = gtk::Label::new(Some(k));
+        key.set_xalign(0.0);
+        key.set_width_request(72);
+        key.add_css_class("dim-label");
+        key.add_css_class("caption");
+        let val = gtk::Label::new(Some(v));
+        val.set_xalign(0.0);
+        val.set_hexpand(true);
+        val.set_selectable(true);
+        val.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        val.add_css_class("dd-mono");
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.append(&key);
+        row.append(&val);
+        card.append(&row);
+    }
+    card
+}
+
+fn stat_card(value: &str, name: &str, accent: bool) -> gtk::Widget {
+    let v = gtk::Label::new(Some(value));
+    v.set_xalign(0.0);
+    v.add_css_class("dd-stat-value");
+    if accent {
+        v.add_css_class("accent");
+    }
+    let n = gtk::Label::new(Some(name));
+    n.set_xalign(0.0);
+    n.add_css_class("dd-stat-name");
+    let c = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    c.add_css_class("dd-stat-card");
+    c.set_size_request(132, -1);
+    c.append(&v);
+    c.append(&n);
+    c.upcast()
+}
+
+fn update_card(version: &str, sender: &ComponentSender<AppModel>) -> gtk::Widget {
+    let t = gtk::Label::new(Some(&format!("Update available — v{version}")));
+    t.set_xalign(0.0);
+    t.add_css_class("heading");
+    let d = gtk::Label::new(Some("A newer version of dd is ready to install."));
+    d.set_xalign(0.0);
+    d.add_css_class("dim-label");
+    let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    texts.set_hexpand(true);
+    texts.set_valign(gtk::Align::Center);
+    texts.append(&t);
+    texts.append(&d);
+    let btn = gtk::Button::with_label("Install update");
+    btn.add_css_class("dd-btn");
+    btn.add_css_class("suggested-action");
+    btn.set_valign(gtk::Align::Center);
+    {
+        let s = sender.clone();
+        btn.connect_clicked(move |_| s.input(Msg::ApplyUpdate));
+    }
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("dd-update-card");
+    row.append(&texts);
+    row.append(&btn);
+    row.upcast()
+}
+
+/// A "title + description on the left, action button on the right" row for the Get Started card.
+fn action_row(
+    title: &str,
+    desc: &str,
+    btn_label: &str,
+    primary: bool,
+    sender: &ComponentSender<AppModel>,
+    msg: impl Fn() -> Msg + 'static,
+) -> gtk::Box {
+    let t = gtk::Label::new(Some(title));
+    t.set_xalign(0.0);
+    t.add_css_class("heading");
+    let d = gtk::Label::new(Some(desc));
+    d.set_xalign(0.0);
+    d.set_wrap(true);
+    d.add_css_class("dim-label");
+    d.add_css_class("caption");
+    let texts = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    texts.set_hexpand(true);
+    texts.set_valign(gtk::Align::Center);
+    texts.append(&t);
+    texts.append(&d);
+    let btn = gtk::Button::with_label(btn_label);
+    btn.add_css_class("dd-btn");
+    if primary {
+        btn.add_css_class("suggested-action");
+    }
+    btn.set_valign(gtk::Align::Center);
+    {
+        let s = sender.clone();
+        btn.connect_clicked(move |_| s.input(msg()));
+    }
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.append(&texts);
+    row.append(&btn);
+    row
+}
+
+/// A category nav row: symbolic icon + label.
+fn cat_row(icon: &str, label: &str) -> gtk::ListBoxRow {
+    let img = gtk::Image::from_icon_name(icon);
+    img.set_pixel_size(16);
+    let lbl = gtk::Label::new(Some(label));
+    lbl.set_xalign(0.0);
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    b.set_margin_top(7);
+    b.set_margin_bottom(7);
+    b.set_margin_start(4);
+    b.append(&img);
+    b.append(&lbl);
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&b));
+    row
+}
+
+/// A container list row: short id on top, "image · state" below, with a running/stopped dot.
+fn container_list_row(c: &Container) -> gtk::ListBoxRow {
+    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    dot.add_css_class("dd-dot");
+    dot.add_css_class(if c.running() { "success" } else { "error" });
+    dot.set_valign(gtk::Align::Center);
+
+    let id = gtk::Label::new(Some(&c.short_id()));
+    id.set_xalign(0.0);
+    id.add_css_class("heading");
+    let state = if c.running() { "running".to_string() } else { c.display_status() };
+    let sub = gtk::Label::new(Some(&format!("{} · {}", c.image, state)));
+    sub.set_xalign(0.0);
+    sub.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    sub.add_css_class("caption");
+    sub.add_css_class("dim-label");
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    v.set_hexpand(true);
+    v.append(&id);
+    v.append(&sub);
+
+    let h = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    h.set_margin_top(5);
+    h.set_margin_bottom(5);
+    h.set_margin_start(8);
+    h.set_margin_end(8);
+    h.append(&dot);
+    h.append(&v);
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&h));
+    row
+}
+
+/// Install the `dd` CLI and show a small window with a shell picker + matching PATH instructions.
+pub fn show_cli_install(parent: &gtk::ApplicationWindow) {
+    let result = crate::install_cli();
+    let ok = result.is_ok();
+    let on_path = result.as_ref().map(|(_, p)| *p).unwrap_or(false);
+    let cmd = result
+        .as_ref()
+        .ok()
+        .and_then(|(link, _)| link.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "dd".to_string());
+    let status_text = match &result {
+        Ok((link, _)) => format!("Installed to {}", link.display()),
+        Err(e) => format!("Couldn't install: {e}"),
+    };
+
+    let heading = gtk::Label::new(Some("dd command-line tool"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("dd-onboard-head");
+    let status = gtk::Label::new(Some(&status_text));
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("dd-sub");
+
+    // Shell picker.
+    let dropdown = gtk::DropDown::from_strings(&["zsh", "bash", "fish"]);
+    dropdown.set_selected(detect_shell_index());
+    let shell_lbl = gtk::Label::new(Some("Shell"));
+    shell_lbl.add_css_class("dim-label");
+    let shell_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    shell_row.append(&shell_lbl);
+    shell_row.append(&dropdown);
+    shell_row.set_visible(ok && !on_path);
+
+    // Per-shell instructions.
+    let instr = gtk::Label::new(None);
+    instr.set_xalign(0.0);
+    instr.set_wrap(true);
+    instr.set_selectable(true);
+    instr.add_css_class("dd-cli-msg");
+    instr.set_visible(ok);
+    if ok {
+        instr.set_label(&shell_instr(dropdown.selected(), on_path, &cmd));
+        let instr2 = instr.clone();
+        let cmd2 = cmd.clone();
+        dropdown.connect_selected_notify(move |d| instr2.set_label(&shell_instr(d.selected(), on_path, &cmd2)));
+    }
+
+    let done = gtk::Button::with_label("Done");
+    done.add_css_class("dd-btn");
+    done.add_css_class("suggested-action");
+    let btnrow = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    btnrow.set_halign(gtk::Align::End);
+    btnrow.set_margin_top(8);
+    btnrow.append(&done);
+
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    v.set_margin_top(20);
+    v.set_margin_bottom(18);
+    v.set_margin_start(22);
+    v.set_margin_end(22);
+    v.append(&heading);
+    v.append(&status);
+    v.append(&shell_row);
+    v.append(&instr);
+    v.append(&btnrow);
+
+    let win = gtk::Window::builder().title("Install dd CLI").modal(true).resizable(false).default_width(460).child(&v).build();
+    win.set_transient_for(Some(parent));
+    let w = win.clone();
+    done.connect_clicked(move |_| w.close());
+    win.present();
+}
+
+fn detect_shell_index() -> u32 {
+    let sh = std::env::var("SHELL").unwrap_or_default();
+    if sh.contains("fish") {
+        2
+    } else if sh.contains("bash") {
+        1
+    } else {
+        0 // zsh (macOS default) or unknown
+    }
+}
+
+fn shell_instr(idx: u32, on_path: bool, cmd: &str) -> String {
+    if on_path {
+        return format!("~/.local/bin is already on your PATH.\nJust run:  {cmd}");
+    }
+    match idx {
+        1 => "Add to ~/.bashrc, then restart your terminal:\n\nexport PATH=\"$HOME/.local/bin:$PATH\"",
+        2 => "Run once (fish):\n\nfish_add_path ~/.local/bin",
+        _ => "Add to ~/.zshrc, then restart your terminal:\n\nexport PATH=\"$HOME/.local/bin:$PATH\"",
+    }
+    .to_string()
+}
+
+/// Confirm a full reset (remove all containers/volumes/networks). Frameless dialog, pill buttons.
+pub fn confirm_reset(parent: &gtk::ApplicationWindow, sender: &ComponentSender<AppModel>) {
+    let title = gtk::Label::new(Some("Reset dd?"));
+    title.set_xalign(0.0);
+    title.add_css_class("dd-onboard-head");
+    let detail = gtk::Label::new(Some("This removes all containers, volumes and networks. Your images are kept."));
+    detail.set_xalign(0.0);
+    detail.set_wrap(true);
+    detail.set_max_width_chars(36);
+    detail.add_css_class("dim-label");
+
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.add_css_class("dd-btn");
+    let ok = gtk::Button::with_label("Reset");
+    ok.add_css_class("dd-btn");
+    ok.add_css_class("destructive-action");
+    let btns = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    btns.set_halign(gtk::Align::End);
+    btns.set_margin_top(8);
+    btns.append(&cancel);
+    btns.append(&ok);
+
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    v.add_css_class("dd-dialog");
+    v.set_margin_top(20);
+    v.set_margin_bottom(18);
+    v.set_margin_start(22);
+    v.set_margin_end(22);
+    v.append(&title);
+    v.append(&detail);
+    v.append(&btns);
+
+    let win = gtk::Window::builder().modal(true).resizable(false).decorated(false).child(&v).build();
+    win.set_transient_for(Some(parent));
+    let w1 = win.clone();
+    cancel.connect_clicked(move |_| w1.close());
+    let s = sender.clone();
+    let w2 = win.clone();
+    ok.connect_clicked(move |_| {
+        s.input(Msg::Reset);
+        w2.close();
+    });
+    win.present();
 }
 
 /// On first launch, offer to point the `docker` CLI at our daemon (the `dd` context). A small,
@@ -539,10 +1061,28 @@ fn image_detail(img: &Image, sender: &ComponentSender<AppModel>) -> gtk::Widget 
         let name = img.name();
         move || Msg::RunImage(name.clone())
     });
+    let del = text_btn("Delete", "destructive-action", sender, {
+        let name = img.name();
+        move || Msg::RemoveImage(name.clone())
+    });
     let arch = if img.architecture.is_empty() { "unknown".into() } else { img.architecture.clone() };
-    root.append(&detail_header(&img.name(), &arch, vec![run]));
-    root.append(&section("Size", &if img.size > 0 { vec![format!("{} bytes", img.size)] } else { vec![] }));
+    root.append(&detail_header(&img.name(), &arch, vec![run, del]));
+    root.append(&section("Size", &[human_size(img.size)]));
     root.upcast()
+}
+
+/// Format a byte count compactly (B / KB / MB / GB).
+fn human_size(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    if b < 1024.0 {
+        format!("{} B", bytes.max(0))
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 fn detail_root() -> gtk::Box {
@@ -814,6 +1354,49 @@ popover.dd-pop > contents {
 .dd-popitem.dd-active { color: #0a84ff; font-weight: 600; }
 
 .dd-dialog { background-color: @theme_base_color; border-radius: 14px; }
+
+/* 'Update available' pill in the top strip. */
+.dd-update { background-color: #0a84ff; color: #ffffff; border: none; box-shadow: none; border-radius: 7px; padding: 3px 11px; font-weight: 600; min-height: 0; }
+.dd-update:hover { background-color: #2b95ff; }
+
+/* Nav icons. */
+list.navigation-sidebar image { opacity: 0.7; }
+
+/* Home dashboard. */
+.dd-home { background: transparent; }
+.dd-h1 { font-size: 22px; font-weight: 800; margin-bottom: 2px; }
+.dd-stat-card {
+  background-color: @theme_base_color;
+  border: 1px solid alpha(@borders, 0.7);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.dd-stat-value { font-size: 28px; font-weight: 800; }
+.dd-stat-value.accent { color: #30a14e; }
+.dd-stat-name { font-size: 12px; opacity: 0.55; }
+.dd-update-card {
+  background-color: alpha(#0a84ff, 0.10);
+  border: 1px solid alpha(#0a84ff, 0.30);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.dd-h2 { font-size: 15px; font-weight: 700; margin-top: 6px; }
+.dd-mono { font-family: 'SF Mono', 'Menlo', monospace; font-size: 12px; }
+.dd-step-card {
+  background-color: @theme_base_color;
+  border: 1px solid alpha(@borders, 0.7);
+  border-radius: 12px;
+  padding: 11px 16px;
+}
+.dd-code {
+  font-family: 'SF Mono', 'Menlo', monospace;
+  font-size: 12px;
+  color: alpha(@theme_fg_color, 0.85);
+  background-color: alpha(@theme_fg_color, 0.06);
+  border: 1px solid alpha(@borders, 0.6);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
 
 /* Onboarding / splash screen — slightly larger, clearer text (not overdone). */
 .dd-bigtitle { font-size: 34px; font-weight: 800; }

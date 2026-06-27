@@ -21,6 +21,8 @@ dd-client = { path = "../dd-client" }
 relm4 = "0.9"
 gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 tokio = { version = "1", features = ["time", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Native AppKit shim to give the window a unified macOS title bar (full-size content view +
 # transparent titlebar) so the traffic lights float over our content — no separate title bar.

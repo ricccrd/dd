@@ -302,6 +302,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
@@ -318,6 +319,8 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "relm4",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

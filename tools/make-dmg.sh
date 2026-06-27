@@ -40,4 +40,6 @@ fi
 
 # create-dmg can leave a read-write scratch image behind; tidy it up.
 rm -f "$DIST"/rw.*.dmg
+# Publish a checksum alongside the dmg (handy for release notes).
+( cd "$DIST" && shasum -a 256 "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
 echo "[make-dmg] done -> $OUT ($(du -sh "$OUT" | cut -f1))"

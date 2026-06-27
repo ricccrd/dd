@@ -8,6 +8,7 @@
 //! Built only on macOS where the GTK stack is available (see the workspace `default-members` note).
 
 mod ui;
+mod update;
 #[cfg(target_os = "macos")]
 mod mac;
 
@@ -21,8 +22,10 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Category {
     #[default]
+    Home,
     Containers,
     Images,
+    Settings,
 }
 
 /// What the detail pane is currently showing.
@@ -52,12 +55,17 @@ struct Snapshot {
 enum Msg {
     ToggleDaemon,
     InstallCli,
+    ConfirmReset,
+    Reset,
+    UpdateFound(update::Release),
+    ApplyUpdate,
     SetContext(String),
     SetCategory(Category),
     Select(Selection),
     RunImage(String),
     StartContainer(String),
     RemoveContainer(String),
+    RemoveImage(String),
 }
 
 /// Results delivered back to the UI thread from async work.
@@ -77,8 +85,8 @@ struct AppModel {
     current_logs: Option<(String, String)>,
     /// Tracks connection transitions so we resize the window only when it flips.
     was_connected: bool,
-    /// Result/instructions from the last "Install CLI" action, shown on the onboarding screen.
-    cli_msg: Option<String>,
+    /// A newer release found on GitHub, if any (drives the "Update" button).
+    update: Option<update::Release>,
     /// The daemon process we started (so we can stop it), if any.
     daemon_child: Option<std::process::Child>,
     /// Whether we've already offered to switch the docker context this session.
@@ -101,15 +109,28 @@ impl Component for AppModel {
         let model = AppModel {
             socket: socket.clone(),
             snap: Snapshot::default(),
-            category: Category::Containers,
+            category: Category::Home,
             selection: Selection::None,
             current_logs: None,
             was_connected: false,
-            cli_msg: None,
+            update: None,
             daemon_child: None,
             context_prompted: false,
         };
         let widgets = ui::build(&root, &sender);
+
+        // Seed ~/.dd/images with the bundled starter image(s) so a novice has something to run.
+        seed_images();
+
+        // One-shot update check on startup (off the UI thread).
+        {
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                if let Some(rel) = update::check(env!("DD_VERSION")) {
+                    sender.input(Msg::UpdateFound(rel));
+                }
+            });
+        }
 
         // Background poll loop: fetch a snapshot every 2s until the component shuts down.
         sender.command(move |out, shutdown| {
@@ -131,7 +152,7 @@ impl Component for AppModel {
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Msg, sender: ComponentSender<Self>, _root: &Self::Root) {
+    fn update(&mut self, msg: Msg, sender: ComponentSender<Self>, root: &Self::Root) {
         let socket = self.socket.clone();
         match msg {
             Msg::ToggleDaemon => {
@@ -153,11 +174,41 @@ impl Component for AppModel {
                     Cmd::Snapshot(Box::new(fetch(&Client::new(&socket)).await))
                 });
             }
-            Msg::InstallCli => {
-                self.cli_msg = Some(match install_cli() {
-                    Ok(m) => m,
-                    Err(e) => format!("Couldn't install: {e}"),
+            Msg::InstallCli => ui::show_cli_install(root),
+            Msg::ConfirmReset => ui::confirm_reset(root, &sender),
+            Msg::Reset => {
+                self.selection = Selection::None;
+                self.current_logs = None;
+                sender.oneshot_command(async move {
+                    let c = Client::new(&socket);
+                    if let Ok(cs) = c.list_containers().await {
+                        for ct in cs {
+                            let _ = c.remove_container(&ct.id).await;
+                        }
+                    }
+                    if let Ok(vs) = c.list_volumes().await {
+                        for v in vs {
+                            let _ = c.remove_volume(&v.name).await;
+                        }
+                    }
+                    if let Ok(ns) = c.list_networks().await {
+                        for n in ns {
+                            if !matches!(n.name.as_str(), "bridge" | "host" | "none") {
+                                let _ = c.remove_network(&n.id).await;
+                            }
+                        }
+                    }
+                    Cmd::Snapshot(Box::new(fetch(&c).await))
                 });
+            }
+            Msg::UpdateFound(rel) => self.update = Some(rel),
+            Msg::ApplyUpdate => {
+                if let Some(rel) = self.update.clone() {
+                    std::thread::spawn(move || match update::install(&rel) {
+                        Ok(()) => std::process::exit(0), // the freshly-installed copy is launching
+                        Err(e) => eprintln!("update failed: {e}"),
+                    });
+                }
             }
             Msg::SetContext(name) => {
                 sender.oneshot_command(async move {
@@ -180,12 +231,17 @@ impl Component for AppModel {
                     fetch_logs(&sender, self.socket.clone(), id);
                 }
             }
-            Msg::RunImage(image) => self.act(sender, socket, move |c| async move {
-                let spec = ddclient::CreateContainer { image, ..Default::default() };
-                if let Ok(id) = c.create_container(&spec).await {
-                    let _ = c.start_container(&id).await;
-                }
-            }),
+            Msg::RunImage(image) => {
+                // Jump to Containers so the user sees the new one appear.
+                self.category = Category::Containers;
+                self.selection = Selection::None;
+                self.act(sender, socket, move |c| async move {
+                    let spec = ddclient::CreateContainer { image, ..Default::default() };
+                    if let Ok(id) = c.create_container(&spec).await {
+                        let _ = c.start_container(&id).await;
+                    }
+                });
+            }
             Msg::StartContainer(id) => self.act(sender, socket, move |c| async move {
                 let _ = c.start_container(&id).await;
             }),
@@ -196,6 +252,14 @@ impl Component for AppModel {
                 self.current_logs = None;
                 self.act(sender, socket, move |c| async move {
                     let _ = c.remove_container(&id).await;
+                });
+            }
+            Msg::RemoveImage(name) => {
+                if self.selection == Selection::Image(name.clone()) {
+                    self.selection = Selection::None;
+                }
+                self.act(sender, socket, move |c| async move {
+                    let _ = c.remove_image(&name).await;
                 });
             }
         }
@@ -226,6 +290,7 @@ impl Component for AppModel {
                 // Auto-select the first item of the current category if nothing is selected.
                 if self.selection == Selection::None {
                     match self.category {
+                        Category::Home | Category::Settings => {}
                         Category::Containers => {
                             if let Some(c) = self.snap.containers.first() {
                                 self.selection = Selection::Container(c.id.clone());
@@ -273,14 +338,15 @@ impl AppModel {
     }
 }
 
-/// Symlink the bundled `dd` CLI into `~/.local/bin` (no root). Returns a success message, plus
-/// per-shell PATH instructions when `~/.local/bin` isn't already on `PATH`.
-fn install_cli() -> Result<String, String> {
+/// Symlink the bundled `dd` CLI into `~/.local/bin` (no root). Returns `(link path, already on
+/// PATH)`. The onboarding window turns this into per-shell instructions.
+pub(crate) fn install_cli() -> Result<(PathBuf, bool), String> {
     let cli = resolve_cli().ok_or("dd CLI binary not found in the app bundle")?;
+    let name = cli.file_name().ok_or("bad CLI path")?;
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     let bindir = PathBuf::from(&home).join(".local/bin");
     std::fs::create_dir_all(&bindir).map_err(|e| e.to_string())?;
-    let link = bindir.join("dd");
+    let link = bindir.join(name);
     let _ = std::fs::remove_file(&link);
     std::os::unix::fs::symlink(&cli, &link).map_err(|e| e.to_string())?;
 
@@ -288,17 +354,7 @@ fn install_cli() -> Result<String, String> {
         .unwrap_or_default()
         .split(':')
         .any(|p| p == bindir.to_string_lossy());
-    if on_path {
-        return Ok(format!("Installed — run `dd` in your terminal.\n({})", link.display()));
-    }
-    Ok(format!(
-        "Installed to {}.\nAdd it to your PATH:\n\n\
-         • zsh   → echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc\n\
-         • bash  → echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc\n\
-         • fish  → fish_add_path ~/.local/bin\n\n\
-         Then restart your terminal.",
-        link.display()
-    ))
+    Ok((link, on_path))
 }
 
 /// Locate the bundled `dd` CLI: `$DD_CLI_BIN`, the app bundle, or a sibling of this binary (dev).
@@ -306,15 +362,54 @@ fn resolve_cli() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("DD_CLI_BIN") {
         return Some(PathBuf::from(p));
     }
-    let exe = std::env::current_exe().ok()?;
-    if let Some(contents) = exe.parent().and_then(|p| p.parent()) {
-        let c = contents.join("Resources/dd");
-        if c.exists() {
-            return Some(c);
+    let names = ["ddcli", "dd"]; // whichever the CLI is built as
+    // Prefer the *installed* bundle so the symlink stays valid across relaunches and updates
+    // (which replace /Applications/dd-app.app in place), not the dev copy we run from.
+    for n in names {
+        let p = PathBuf::from("/Applications/dd-app.app/Contents/Resources").join(n);
+        if p.exists() {
+            return Some(p);
         }
     }
-    let sib = exe.parent()?.join("dd");
-    sib.exists().then_some(sib)
+    let exe = std::env::current_exe().ok()?;
+    if let Some(contents) = exe.parent().and_then(|p| p.parent()) {
+        for n in names {
+            let c = contents.join("Resources").join(n);
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+    let dir = exe.parent()?;
+    names.iter().map(|n| dir.join(n)).find(|p| p.exists())
+}
+
+/// Copy any bundled starter images into `~/.dd/images` (skipping ones already there).
+fn seed_images() {
+    let Some(src) = bundled_images_dir() else { return };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dest = PathBuf::from(home).join(".dd/images");
+    let _ = std::fs::create_dir_all(&dest);
+    let Ok(rd) = std::fs::read_dir(&src) else { return };
+    for e in rd.flatten() {
+        if e.path().is_dir() && !dest.join(e.file_name()).exists() {
+            let _ = std::process::Command::new("cp").arg("-R").arg(e.path()).arg(&dest).output();
+        }
+    }
+}
+
+/// The bundled images dir: `Contents/Resources/images`, or `assets/images` in dev.
+fn bundled_images_dir() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(contents) = exe.parent().and_then(|p| p.parent()) {
+            let p = contents.join("Resources/images");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    let dev = PathBuf::from("assets/images");
+    dev.exists().then_some(dev)
 }
 
 /// Fetch a container's logs off-thread and deliver them as `Cmd::Logs`.
