@@ -78,19 +78,19 @@ Static: **178/323 canonical syscalls handled, 145 missing.** Surfaced by the dd-
 groups + the dynamic corpus.
 
 **Syscalls worth implementing (macOS has the primitive — mostly a wire-up):**
-- **Process/session:** ~~`setsid`(157)~~ **done**, `waitid`(95), `setregid`(143), `setfsuid/gid`(151/152),
-  `getcpu`(168)
-- **File I/O:** ~~`flock`(32)~~ **done**, ~~`preadv/pwritev`(69/70)~~ **done**; still: `truncate`(45, by-path),
-  `preadv2/pwritev2`(286/287), `sync_file_range`(84→fsync), `readahead`(213→noop/fadvise)
+- **Process/session:** ~~`setsid`(157), `setregid`(143), `setfsuid/gid`(151/152), `getcpu`(168)~~ **done**;
+  still `waitid`(95) (siginfo layout differs — needs translation)
+- **File I/O:** ~~`flock`(32), `preadv/pwritev`(69/70), `preadv2/pwritev2`(286/287),
+  `sync_file_range`(84→fsync), `readahead`(213→noop)~~ **done**; still `truncate`(45, by-path)
 - **Memory:** ~~`memfd_create`(279)~~ **done**, ~~`mlockall/munlockall`(230/231)~~ **done** (no-op), `mlock2`(284)
-- **Timers/clocks:** ~~`getitimer/setitimer`(102/103)~~ **done** (host wrap); still `clock_settime`(112),
-  `clock_adjtime`(266)
+- **Timers/clocks:** ~~`getitimer/setitimer`(102/103)~~ **done** (host wrap), ~~`clock_settime`(112)~~ **done**
+  (EPERM, no CAP_SYS_TIME); still `clock_adjtime`(266)
 - **Scheduling:** ~~`sched_get/setscheduler`(119/120), `sched_get/setparam`(118/121),
   `sched_get_priority_max/min`(125/126), `sched_rr_get_interval`(127)~~ **done** (SCHED_OTHER stubs)
 - **Resource:** `getrlimit/setrlimit`(163/164) *(prlimit64=261 already handled — alias these to it)*
 - **Signals:** `rt_sigtimedwait`(137), `rt_sigsuspend`(133), `rt_tgsigqueuei`(240); the **`sigqueue`
   si_value payload path** is **done** (`rt_sigqueueinfo`→sigframe `si_code`/`si_value`)
-- **Scheduling (still):** `sched_get/setattr`(274/275)
+- **Scheduling:** ~~`sched_setattr`(274)~~ **done** (no-op); still `sched_getattr`(275) (attr fill)
 - **Misc (all done):** ~~`prctl PR_GET_NAME`~~ (stores the set name), ~~POSIX `shm_open`~~ (`/dev/shm`→
   host-file backing), ~~`glob("*")`~~ (it was a stale getdents `DIR*` cache, not `d_type` — invalidated
   on `close`, dropped in fork children)
@@ -103,6 +103,28 @@ NUMA/keyring/module/`ptrace` are out of scope. (`eventfd` **EFD_SEMAPHORE** and 
 
 **Opcodes:** the dynamic corpus currently hits **0 `UNIMPL`** (the SSE `packuswb` `66 0F 67` gap that
 `heavy/bigmem` + `posix/mmapshared` exposed is fixed). `make coverage dynamic` is the way to catch new ones.
+
+**Edge cases — obscure syscall corners (the `edge` group; 13/14 diverge from real Linux, all
+xfail-tracked, found by reading `os/linux/service.c` + frontends).** Each is a differential (oracle) or
+verdict test; fix → XPASS:
+- `madvise(MADV_DONTNEED)` is a **no-op** — anon pages aren't dropped, a reread returns stale data
+  instead of zeros (this is why **redis/jemalloc** misbehave). Implement DONTNEED (re-`mmap` the range
+  `MAP_FIXED|ANON`, or `madvise` the host mapping).
+- `renameat2` **flags dropped** — `RENAME_NOREPLACE` overwrites, `RENAME_EXCHANGE` doesn't swap.
+- **`SCM_RIGHTS` fd-passing over AF_UNIX broken** — `recvmsg` yields no fd (the cmsg control block
+  isn't translated). Breaks systemd socket-activation / Docker / D-Bus patterns.
+- `fallocate(FALLOC_FL_PUNCH_HOLE)` ignored — region keeps old data (only ftruncate-extend handled).
+- `lseek(SEEK_HOLE/SEEK_DATA)` unsupported — no hole/data offsets on a sparse file.
+- `open(O_TMPFILE)` **fails** — no unnamed-temp-file support.
+- `pipe2(O_DIRECT)` packet mode ignored — writes coalesce instead of preserving message boundaries.
+- abstract-namespace AF_UNIX (`sun_path[0]==0`) **bind fails** — Linux-only; X11/D-Bus/systemd use it.
+- `F_SETPIPE_SZ`/`F_GETPIPE_SZ` no-op and `dup3(fd,fd,0)` doesn't return EINVAL.
+- **`mprotect` is a no-op** — `PROT_NONE` doesn't fault (darwin native DOES — `edge/mprotect` passes on
+  darwin, fails on the Linux JIT). RELRO/guard pages and GC write-barriers are unenforced.
+- `clock_nanosleep(TIMER_ABSTIME)` treated as **relative** → sleeps for the absolute value (**hangs**).
+- `MSG_NOSIGNAL` ignored — a write to a closed socket delivers a fatal **SIGPIPE** instead of EPIPE.
+- `/proc/self/fd` not synthesized — readlink/enumerate of the live fd table fails.
+- (Works: `recv` `MSG_PEEK` + `MSG_DONTWAIT`/EAGAIN — `edge/msgflags` passes.)
 
 **RWX / guest-JIT pages (`soak/smc`):** `mmap(PROT_READ|WRITE|EXEC)` returns **EPERM** under the JIT
 (macOS W^X blocks RWX without `MAP_JIT`). Any guest that JITs its own code — JVM, V8/Node, LuaJIT,
