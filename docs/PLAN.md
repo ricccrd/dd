@@ -78,8 +78,9 @@ Static: **178/323 canonical syscalls handled, 145 missing.** Surfaced by the dd-
 groups + the dynamic corpus.
 
 **Syscalls worth implementing (macOS has the primitive — mostly a wire-up):**
-- **Process/session:** `setsid`(157), `waitid`(95), `setregid`(143), `setfsuid/gid`(151/152), `getcpu`(168)
-- **File I/O:** `flock`(32) *(macOS has flock(2))*, `truncate`(45, by-path), `preadv/pwritev`(69/70) +
+- **Process/session:** ~~`setsid`(157)~~ **done**, `waitid`(95), `setregid`(143), `setfsuid/gid`(151/152),
+  `getcpu`(168)
+- **File I/O:** ~~`flock`(32)~~ **done**, ~~`preadv/pwritev`(69/70)~~ **done**; still: `truncate`(45, by-path),
   `preadv2/pwritev2`(286/287), `sync_file_range`(84→fsync), `readahead`(213→noop/fadvise)
 - **Memory:** ~~`memfd_create`(279)~~ **done** (unlinked tmpfile), `mlockall/munlockall`(230/231→noop),
   `mlock2`(284)
