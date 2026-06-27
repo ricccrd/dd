@@ -1656,8 +1656,11 @@ static void service(struct cpu *c) {
         }
         // fork/vfork: COW copy; child continues
         pid_t pid = fork();
-        // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
-        if (pid == 0) G_SHADOW_RESET(c);
+        if (pid == 0) {
+            G_SHADOW_RESET(c); // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
+            g_ndirs = 0;       // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
+                               // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
+        }
         // parent: pid, child: 0
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
