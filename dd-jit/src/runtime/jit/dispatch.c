@@ -46,6 +46,9 @@ static void run_guest(struct cpu *c) {
             continue;
         // handler returned -> restore context
         }
+        // A non-PIE image's un-relocated absolute jump lands on its (unmapped) low link vaddr; redirect it
+        // into the biased image so we translate real code instead of faulting on the unmapped low address.
+        if (g_nonpie_lo && c->pc >= g_nonpie_lo && c->pc < g_nonpie_hi) c->pc += g_nonpie_bias;
         // With threads, the WHOLE cache lookup is under the lock: an unlocked
         // map_host() races map_put() (torn entry) and lacks the acquire barrier
         // that makes a peer thread's freshly-emitted+icache-flushed code visible.

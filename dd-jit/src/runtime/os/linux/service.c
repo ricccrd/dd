@@ -1754,6 +1754,7 @@ static void service(struct cpu *c) {
         for (int i = 0; i < ac && i < 255; i++) xargv[i] = strdup(argv[i]);
         xargv[ac < 255 ? ac : 255] = NULL;
         gmap_reset_all();
+        g_nonpie_lo = g_nonpie_hi = 0; // reset; load_elf re-sets it iff the new main image is non-PIE
         p = xpath;
         for (int i = 0; i < ac && i < 255; i++) argv[i] = xargv[i];
         argv[ac < 255 ? ac : 255] = NULL;

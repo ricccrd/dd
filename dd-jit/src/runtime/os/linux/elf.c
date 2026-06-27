@@ -76,6 +76,9 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     gmap_add((uint64_t)base, span); // track so execve() can reclaim the inherited image
     uint64_t bias = (uint64_t)base - basepage;
+    // ET_EXEC (non-PIE): record the un-biased link span so the dispatcher can redirect absolute jumps that
+    // land on the (unmapped) low link vaddr into the biased image. ET_DYN/PIE leaves it (the interp is PIE).
+    if (rd16(f + 16) == 2) { g_nonpie_lo = basepage; g_nonpie_hi = basepage + span; g_nonpie_bias = bias; }
     for (int i = 0; i < phnum; i++) {
         uint8_t *ph = f + phoff + (uint64_t)i * phentsize;
         if (rd32(ph) != 1) continue;

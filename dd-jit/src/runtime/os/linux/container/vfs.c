@@ -79,6 +79,11 @@ static void gmap_reset_all(void) { // munmap every tracked guest mapping; the ca
     for (int i = 0; i < g_ngmap; i++) munmap((void *)g_gmap[i].addr, (size_t)g_gmap[i].len);
     g_ngmap = 0;
 }
+// A non-PIE ET_EXEC is linked at a fixed low vaddr but __PAGEZERO forbids mapping there, so load_elf biases
+// it high. Its un-relocated absolute refs still point at the low link range; when the guest takes an
+// absolute jump there, the dispatcher redirects pc into the biased image (pc += bias) instead of faulting
+// on the unmapped low address. [lo,hi) is the un-biased link span of the current main image (0 if PIE).
+static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 // fd is a timerfd (a kqueue with an EVFILT_TIMER) -> read() drains it
 static uint8_t g_timerfd[1024];
 // fd is an inotify (a kqueue with EVFILT_VNODE watches) -> read() drains it
