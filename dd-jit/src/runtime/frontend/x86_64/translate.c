@@ -1394,6 +1394,18 @@ static void *translate_block(uint64_t gpc) {
                                                           : 3;
                     uint32_t b = (hi ? 0x4E007800u : 0x4E003800u) | ((uint32_t)sz << 22);
                     e_v3(b, vd, vd, s);
+                } else if (op == 0x67 || op == 0x63 || op == 0x6B) {
+                    // pack with saturation: 0x67 PACKUSWB (16->u8), 0x63 PACKSSWB (16->s8),
+                    // 0x6B PACKSSDW (32->s16). dst.low half from dst's lanes, dst.high half from src's.
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) { emit_ea(&I, next); e_ldr_q(16, 17, 0); }
+                    uint32_t sz = (op == 0x6B) ? 1u : 0u;                  // source element: 0x6B = 16-bit, else 8-bit dest
+                    uint32_t lo = (op == 0x67) ? 0x2E212800u               // SQXTUN  (signed->unsigned narrow)
+                                              : 0x0E214800u;               // SQXTN   (signed->signed narrow)
+                    uint32_t hi = (op == 0x67) ? 0x6E212800u : 0x4E214800u; // ...2 (Q=1, high half)
+                    emit32(lo | (sz << 22) | (vd << 5) | 17);             // narrow dst's lanes -> v17 low
+                    emit32(hi | (sz << 22) | (s << 5) | 17);              // narrow src's lanes -> v17 high
+                    e_vmov(vd, 17);
                 } else if (op == 0xD7) {       // pmovmskb: byte MSBs -> GPR (reg)
                     e_str_q(vm, 28, OFF_MM);   // spill the 16 bytes to scratch
                     e_addi(17, 28, OFF_MM, 1); // x17 = &scratch
