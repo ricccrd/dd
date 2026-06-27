@@ -23,8 +23,8 @@
       <a href="#features" class="hide-sm">Features</a>
       <a href="#why" class="hide-sm">Why no VM</a>
       <a href="#how" class="hide-sm">How it works</a>
-      <a href="#examples" class="hide-sm">Examples</a>
-      <a href="#install">Install</a>
+      <a href="#get-started" class="hide-sm">Get started</a>
+      <a href="#install">Download</a>
       <a href="./docs.html">Docs</a>
       <a class="btn btn-ghost" href="https://github.com/ricccrd/dd">GitHub</a>
     </nav>
@@ -35,8 +35,7 @@
 <div class="hero">
   <div class="wrap hero-inner">
     <img class="logo" src="./assets/logo@2x.png" alt="dd" />
-    <h1>dd</h1>
-    <p class="tagline">Run Linux containers on macOS — with <em>no</em> VM.</p>
+    <h1 class="tagline">Run Linux containers on macOS — with <em>no</em> VM.</h1>
     <p class="sub">There is no Linux kernel and no hypervisor underneath. A JIT translates the
       container's code and services its Linux syscalls in userspace — it <em>is</em> the guest's
       kernel. And it speaks the Docker Engine API, so the ordinary <code>docker</code> CLI just works.</p>
@@ -64,40 +63,40 @@
       instructions, and only its syscalls are interpreted — by code that <em>is</em> the kernel.</p>
     <div class="grid">
       <div class="card">
-        <div class="ico">⚡</div>
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg></div>
         <h3>No virtual machine</h3>
         <p>No hypervisor, no Linux kernel, no VM to boot and keep resident. The guest's instructions run
           natively; only the syscall boundary is trapped and serviced in userspace.</p>
       </div>
       <div class="card">
-        <div class="ico">🐳</div>
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5z"/><path d="M3 7l9 5 9-5"/><path d="M12 12v10"/></svg></div>
         <h3>Drop-in Docker</h3>
-        <p>dd implements the Docker Engine API. Point <code>DOCKER_HOST</code> at its socket and your
-          existing <code>docker run / ps / build</code> muscle memory works unchanged.</p>
+        <p>dd implements the Docker Engine API, so the ordinary <code>docker</code> CLI drives it. Your
+          existing <code>docker run / ps / images / build</code> muscle memory works unchanged.</p>
       </div>
       <div class="card">
-        <div class="ico">🧠</div>
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1.5"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg></div>
         <h3>The JIT is the kernel</h3>
         <p>Namespaces, cgroups, overlay image layers and networking are ordinary userspace state — the
           gVisor / PRoot lineage, with none of a VM's virtualization cost.</p>
       </div>
       <div class="card">
-        <div class="ico">🏗️</div>
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 12l10 5 10-5"/><path d="M2 17l10 5 10-5"/></svg></div>
         <h3>aarch64 and x86-64 guests</h3>
         <p>Run native arm64 Linux images, or x86-64 images via a JIT that decodes x86, synthesizes its
           flags, and lowers SSE/x87 onto NEON. glibc-class binaries run.</p>
       </div>
       <div class="card">
-        <div class="ico">📦</div>
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.4 8.6-8 11-4.6-2.4-8-6-8-11V5l8-3z"/><path d="M8.5 12l2.3 2.3 4.7-4.6"/></svg></div>
         <h3>Real container isolation</h3>
         <p>Overlay layers (copy-up / whiteout), a TOCTOU-free path-jail VFS, PID/UTS/USER namespaces,
           a private loopback netns, port publishing, and cgroup memory + pids limits.</p>
       </div>
       <div class="card">
-        <div class="ico">🖥️</div>
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/><circle cx="6.5" cy="6.6" r=".7" fill="currentColor" stroke="none"/><circle cx="9" cy="6.6" r=".7" fill="currentColor" stroke="none"/></svg></div>
         <h3>Desktop app, no root</h3>
-        <p>A native GTK4 "dd-app" plus a <code>dd</code> CLI install a per-user background daemon and a
-          <code>docker context</code> — everything under <code>$HOME</code>, never <code>sudo</code>.</p>
+        <p>A native macOS app plus a <code>dd</code> command-line tool install a per-user background daemon
+          and a <code>docker context</code> — everything under your home folder, never <code>sudo</code>.</p>
       </div>
     </div>
   </div>
@@ -230,113 +229,82 @@
   </div>
 </section>
 
-<!-- examples -->
-<section id="examples">
+<!-- get started -->
+<section id="get-started">
   <div class="wrap">
-    <p class="eyebrow">Examples</p>
-    <h2 class="section-title">Drive it with the tools you already use</h2>
-    <p class="section-lead">Once the daemon is running and <code>DOCKER_HOST</code> points at its
-      socket, it is just Docker.</p>
+    <p class="eyebrow">Get started</p>
+    <h2 class="section-title">Install once, then it's just Docker</h2>
+    <p class="section-lead">Download the app, drop it in Applications, and run a single setup command.
+      dd registers a background daemon and a <code>docker</code> context for you — no VM, no
+      <code>sudo</code>. The <code>dd</code> command-line tool ships inside the app.</p>
 
-    <div class="two-col">
-      <div>
-        <h3>Start the daemon</h3>
-        <p>Build the JITs, launch the daemon, and tell <code>docker</code> where to find it.</p>
-        <div class="code">
-          <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="label">bash</span></div>
-<pre><span class="c"># build.rs compiles + codesigns the JITs</span>
-<span class="p">$</span> make jit
-
-<span class="c"># start the userspace-kernel daemon</span>
-<span class="p">$</span> DD_IMAGES=/path/to/images cargo run -p dd-daemon
-
-<span class="c"># point docker at dd's socket</span>
-<span class="p">$</span> <span class="k">export</span> DOCKER_HOST=unix://$PWD/dd.sock</pre>
-        </div>
+    <div class="steps">
+      <div class="step">
+        <div class="num">1</div>
+        <div><h4>Download &amp; install</h4><p>Open the <code>.dmg</code> and drag <strong>dd</strong>
+          into Applications. Everything it needs is bundled — no extra tools to install.</p></div>
       </div>
-      <div>
-        <h3>Run a container</h3>
-        <p>Publish a port, cap memory, exec a shell — the ordinary flags all flow through.</p>
-        <div class="code">
-          <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="label">bash</span></div>
-<pre><span class="c"># a normal docker run, serviced by dd</span>
-<span class="p">$</span> docker run -p 8080:80 -m 256m alpine \
-      sh -c <span class="s">'echo hi from $(hostname)'</span>
-
-<span class="p">$</span> docker ps
-<span class="p">$</span> docker images
-<span class="p">$</span> docker run --rm -it ubuntu bash</pre>
-        </div>
+      <div class="step">
+        <div class="num">2</div>
+        <div><h4>Set it up</h4><p>Launch <strong>dd</strong> once (or run <code>dd install</code>). It
+          starts a per-user background daemon and adds a <code>docker</code> context — all under your
+          home folder, never <code>sudo</code>.</p></div>
+      </div>
+      <div class="step">
+        <div class="num">3</div>
+        <div><h4>Run containers</h4><p>Point <code>docker</code> at the <code>dd</code> context, or use
+          the app's UI. Your existing images and commands just work.</p></div>
+      </div>
+      <div class="step">
+        <div class="num">4</div>
+        <div><h4>Check it's healthy</h4><p><code>dd doctor</code> verifies the socket, daemon and
+          context and prints a fix for anything that needs attention.</p></div>
       </div>
     </div>
 
     <div class="two-col" style="margin-top:34px;">
       <div>
-        <h3>Use the desktop app</h3>
-        <p>The DMG installs the GTK4 app, a per-user background daemon, and a <code>docker context</code>
-          — all without <code>sudo</code>.</p>
+        <h3>Run containers — just Docker</h3>
+        <p>dd registers a <code>dd</code> context, so every ordinary flag flows straight through.</p>
         <div class="code">
           <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="label">bash</span></div>
-<pre><span class="c"># after installing the .dmg</span>
-<span class="p">$</span> dd install      <span class="c"># LaunchAgent + docker context</span>
-<span class="p">$</span> dd app          <span class="c"># open the GUI</span>
-<span class="p">$</span> dd doctor       <span class="c"># socket / agent / context check</span>
+<pre><span class="c"># publish a port, cap memory, run a shell</span>
+<span class="p">$</span> docker --context dd run -p 8080:80 -m 256m alpine \
+      sh -c <span class="s">'echo hi from $(hostname)'</span>
 
-<span class="p">$</span> docker --context dd run alpine echo hi</pre>
+<span class="p">$</span> docker --context dd ps
+<span class="p">$</span> docker --context dd images
+<span class="p">$</span> docker --context dd run --rm -it ubuntu bash</pre>
         </div>
       </div>
       <div>
-        <h3>Run the test matrix</h3>
-        <p>A declarative harness runs each case across every engine and prints a grouped report.</p>
+        <h3>Manage dd</h3>
+        <p>The <code>dd</code> tool is the control surface for the app and its background daemon.</p>
         <div class="code">
           <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="label">bash</span></div>
-<pre><span class="p">$</span> make test                 <span class="c"># engine × case matrix</span>
-<span class="p">$</span> make test ENGINE=x86_64   <span class="c"># one engine</span>
-<span class="p">$</span> make test FILTER=container
-
-<span class="p">$</span> cargo run -p dd-tests -- --list</pre>
+<pre><span class="p">$</span> dd install        <span class="c"># daemon + docker context (no sudo)</span>
+<span class="p">$</span> dd app            <span class="c"># open the desktop app</span>
+<span class="p">$</span> dd doctor         <span class="c"># health check + fixes</span>
+<span class="p">$</span> dd daemon status  <span class="c"># start | stop | restart | logs</span></pre>
         </div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- install -->
+<!-- download -->
 <section id="install" class="alt">
-  <div class="wrap">
-    <p class="eyebrow">Install</p>
-    <h2 class="section-title">Get dd</h2>
-    <p class="section-lead">dd targets <strong>Apple-Silicon macOS</strong> (arm64, macOS 12+). The JIT
-      needs the Xcode Command Line Tools (<code>clang</code> + <code>codesign</code>).</p>
-
-    <div class="two-col">
-      <div class="install-card">
-        <h3>Download the app (recommended)</h3>
-        <p>Grab the latest <code>.dmg</code> from the releases page, open it, and drag <strong>dd</strong>
-          to Applications.</p>
-        <p style="margin-top:18px"><a class="btn btn-primary" href="https://github.com/ricccrd/dd/releases/latest">Download latest .dmg</a></p>
-        <p class="note"><strong>Gatekeeper:</strong> the DMG is unsigned (ad-hoc). On first launch,
-          right-click the app → <strong>Open</strong>, or run
-          <code>xattr -dr com.apple.quarantine /Applications/dd-app.app</code>.
-          <code>dd doctor</code> detects this and prints the fix.</p>
-      </div>
-      <div class="install-card">
-        <h3>Build from source</h3>
-        <ol class="steps-list">
-          <li>Install the Xcode CLT: <code>xcode-select --install</code></li>
-          <li>Install Rust (stable) and <a href="https://nixos.org/download">Nix</a> (for the GTK4 dev shell).</li>
-          <li>Clone and build the app + DMG:</li>
-        </ol>
-        <div class="code" style="margin-top:8px">
-          <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="label">bash</span></div>
-<pre><span class="p">$</span> git clone https://github.com/ricccrd/dd
-<span class="p">$</span> <span class="k">cd</span> dd
-<span class="p">$</span> make app    <span class="c"># target/dd-app.app</span>
-<span class="p">$</span> make dmg    <span class="c"># target/dist/dd-*.dmg</span>
-<span class="p">$</span> make install <span class="c"># /Applications + `dd install`</span></pre>
-        </div>
-      </div>
-    </div>
+  <div class="wrap center">
+    <p class="eyebrow">Download</p>
+    <h2 class="section-title">Get dd for macOS</h2>
+    <p class="section-lead">Apple-Silicon Macs (arm64), macOS 12 or later. The download is a single
+      self-contained app — the desktop UI, the <code>dd</code> tool and the runtime, all in one.
+      Free and open source under the MIT license.</p>
+    <p><a class="btn btn-primary" href="https://github.com/ricccrd/dd/releases/latest">Download the latest&nbsp;.dmg</a></p>
+    <p class="note" style="max-width:640px;margin:18px auto 0;">The download isn't notarized yet, so on
+      first launch macOS Gatekeeper asks before opening it: right-click <strong>dd</strong> →
+      <strong>Open</strong> once, and it runs normally thereafter. <code>dd doctor</code> can clear this
+      for you too.</p>
   </div>
 </section>
 
