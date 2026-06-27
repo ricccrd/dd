@@ -985,11 +985,25 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
         log.push(json!({"stream": format!("Step {}/{} : {} {}\n", i + 1, total, inst, args)}).to_string());
         match inst.as_str() {
             "FROM" => {
-                let base = args.split_whitespace().next().unwrap_or("");
-                let found = { let g = a.inner.lock().await;
-                    g.images.iter().find(|im| ref_name(&im.name) == ref_name(base)).map(|im| (im.rootfs.clone(), im.arch)) };
+                let base = args.split_whitespace().next().unwrap_or("").to_string();
+                let mut found = { let g = a.inner.lock().await;
+                    g.images.iter().find(|im| ref_name(&im.name) == ref_name(&base)).map(|im| (im.rootfs.clone(), im.arch)) };
+                if found.is_none() {
+                    // not local -> auto-pull the base like real docker build (reuses the registry pull)
+                    log.push(json!({"stream": format!("Unable to find image '{base}' locally; pulling\n")}).to_string());
+                    let (n, t) = match base.rsplit_once(':') {
+                        Some((n, t)) if !t.contains('/') => (n.to_string(), t.to_string()),
+                        _ => (base.clone(), "latest".to_string()),
+                    };
+                    let (dir, archs) = (a.images_dir.clone(), platform_archs(None));
+                    match tokio::task::spawn_blocking(move || pull_image(&dir, &n, &t, Credentials::default(), &archs)).await
+                        .unwrap_or_else(|e| Err(format!("pull task crashed: {e}"))) {
+                        Ok(img) => { found = Some((img.rootfs.clone(), img.arch)); a.inner.lock().await.images.push(img); }
+                        Err(e) => { cleanup(&ctx); return build_err(log, format!("pull of base image '{base}' failed: {e}")); }
+                    }
+                }
                 let Some((base_rootfs, base_arch)) = found else {
-                    cleanup(&ctx); return build_err(log, format!("base image '{base}' not found locally — pull it first")); };
+                    cleanup(&ctx); return build_err(log, format!("base image '{base}' unavailable")); };
                 arch = base_arch;
                 std::fs::create_dir_all(&img_dir).ok();
                 if !matches!(std::process::Command::new("cp").arg("-a").arg(&base_rootfs).arg(&rootfs).status(), Ok(s) if s.success()) {

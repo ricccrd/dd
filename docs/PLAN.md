@@ -35,9 +35,8 @@ binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-cli
 OCI registry **pull/push now works against any registry** — Docker Hub, `ghcr.io`, `quay.io`, ECR, a
 plain `localhost:5000` (`dd-daemon/src/registry.rs`; 44/44 docker-CLI scenarios pass). `docker build`
 works for the common path (FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/ENTRYPOINT — RUN executes in the JIT, writes
-persist). What is still missing on `docker build`:
-- **auto-pull of a non-local base** (today `FROM <image>` requires the base already pulled),
-  **multi-stage builds**, the **BuildKit cache**, and **persisting ENV/WORKDIR/ENTRYPOINT into the image
+persist; a non-local `FROM` is auto-pulled). What is still missing on `docker build`:
+- **multi-stage builds**, the **BuildKit cache**, and **persisting ENV/WORKDIR/ENTRYPOINT into the image
   metadata** (they currently affect RUN steps but the Image model only stores name/rootfs/arch/cmd).
 
 ## Remaining JIT gaps
