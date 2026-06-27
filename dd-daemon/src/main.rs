@@ -288,7 +288,7 @@ async fn info(State(a): State<App>) -> Json<Value> {
 }
 async fn images_json(State(a): State<App>) -> Json<Value> {
     let imgs: Vec<Value> = a.inner.lock().await.images.iter().map(|i| json!({
-        "Id": format!("sha256:{}", fake_id(&i.name)), "RepoTags": [format!("{}:latest", i.name)],
+        "Id": format!("sha256:{}", fake_id(&i.name)), "RepoTags": [repo_tag(&i.name)],
         "Architecture": i.arch.target(), "Created": 0, "Size": 0})).collect();
     Json(json!(imgs))
 }
@@ -299,7 +299,7 @@ async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Respon
     match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
         Some(i) => Json(json!({
             "Id": format!("sha256:{}", fake_id(&i.name)),
-            "RepoTags": [format!("{}:latest", i.name)], "RepoDigests": [],
+            "RepoTags": [repo_tag(&i.name)], "RepoDigests": [],
             "Architecture": if i.arch.arch() == "x86_64" { "amd64" } else { "arm64" },
             "Os": "linux", "Size": 0, "Created": "1970-01-01T00:00:00Z",
             "Config": {"Cmd": i.cmd, "Entrypoint": Value::Null, "Env": [
@@ -316,7 +316,10 @@ async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>, head
     let name = q.from_image.unwrap_or_default();
     let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
     if name.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"}))).into_response(); }
-    if a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name)) {
+    // "already local" must compare the FULL reference (registry/repo:tag) -- two images can share a short
+    // name across registries (docker.io/busybox vs quay.io/quay/busybox), and those are distinct images.
+    let want = image_ref(&name, &tag).short();
+    if a.inner.lock().await.images.iter().any(|i| repo_tag(&i.name) == want) {
         return pull_progress(&name, &tag, Ok(true));
     }
     let creds = registry_auth(&headers);
@@ -366,7 +369,14 @@ fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials)
     let pulled = Client::new(iref.clone(), creds).pull(&rootfs, &["arm64", "amd64"])?;
     let arch = detect_arch(&rootfs).ok_or("could not detect the image architecture")?;
     let cmd = config_cmd(&pulled.config).unwrap_or_else(|| default_shell(&rootfs));
-    Ok(Image { name: iref.canonical(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd })
+    Ok(Image { name: iref.short(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd })
+}
+
+/// A `repository:tag` string with exactly one tag — discovered images carry a bare name (`busybox`),
+/// pulled ones already include the tag (`busybox:latest`); append `:latest` only when absent.
+fn repo_tag(name: &str) -> String {
+    let last = name.rsplit('/').next().unwrap_or(name);
+    if last.contains(':') { name.to_string() } else { format!("{name}:latest") }
 }
 
 /// A filesystem-safe directory name for an image reference.

@@ -67,6 +67,16 @@ impl ImageRef {
         let host = if self.registry == DOCKER_HUB { "docker.io" } else { &self.registry };
         format!("{host}/{}:{}", self.repository, self.tag)
     }
+    /// The short, docker-style display name (`busybox:latest`, `user/app:1`, `ghcr.io/o/a:v2`): Hub's
+    /// implicit `docker.io/library/` is elided, other registries are shown.
+    pub fn short(&self) -> String {
+        let repo = if self.registry == DOCKER_HUB {
+            self.repository.strip_prefix("library/").unwrap_or(&self.repository).to_string()
+        } else {
+            format!("{}/{}", self.registry, self.repository)
+        };
+        format!("{repo}:{}", self.tag)
+    }
     fn base_url(&self) -> String {
         // local dev registries are plain HTTP; everything else is HTTPS
         let scheme = if is_local_registry(&self.registry) { "http" } else { "https" };
@@ -173,6 +183,9 @@ impl Client {
         if http::head(&format!("{base}/blobs/{digest}"), self.token.as_deref())? == 200 { return Ok(()); }
         // start an upload session -> Location, then monolithic PUT with ?digest=
         let start = http::post(&format!("{base}/blobs/uploads/"), self.token.as_deref())?;
+        if start.status == 401 || start.status == 403 {
+            return Err("denied: requested access to the resource is denied (run `docker login`)".into());
+        }
         if start.status != 202 { return Err(format!("blob upload not accepted ({})", start.status)); }
         let location = header(&start.headers, "location").ok_or("upload returned no Location")?;
         let sep = if location.contains('?') { '&' } else { '?' };

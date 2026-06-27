@@ -111,7 +111,9 @@ d rm -f myapp2 >/dev/null
 echo "== image tag / push / rmi =="
 d tag alpine myalp:v1 >/dev/null
 has "tag"  "$(d images --format '{{.Repository}}')" "myalp"
-has "push" "$(d push myalp:v1 2>&1)" "push refers"
+# Real push pipeline: tar the rootfs -> blob upload -> manifest. Without `docker login`, Docker Hub
+# denies it (exactly like real docker) -- the point is the daemon contacts the registry, not a no-op.
+has "push-reaches-registry" "$(d push myalp:v1 2>&1)" "denied"
 d rmi myalp:v1 >/dev/null 2>&1
 ok "rmi"   "$(d images --format '{{.Repository}}' | grep -c '^myalp$')" "0"
 
