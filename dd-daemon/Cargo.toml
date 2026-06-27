@@ -18,6 +18,4 @@ axum = "0.7"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 tower = { version = "0.5", features = ["util"] }
-
-[profile.release]
-opt-level = 2
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

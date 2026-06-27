@@ -15,7 +15,8 @@
 //!      DD_STATE (state file), DD_VOLUMES (named-volume root).
 
 use axum::{
-    extract::{Path, Query, State},
+    body::Body,
+    extract::{Path, Query, Request, State},
     http::{StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -28,7 +29,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use std::process::Stdio;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use hyper_util::rt::TokioIo;
 
 const API_VERSION: &str = "1.43";
 
@@ -54,6 +58,8 @@ struct Container {
     created: i64,
     status: String,
     exit_code: i64,
+    #[serde(default)]
+    tty: bool,
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]
     arch: Option<Guest>,
@@ -62,6 +68,31 @@ struct Container {
     stdout: Vec<u8>,
     #[serde(skip)]
     stderr: Vec<u8>,
+}
+
+/// A running container's live IO plumbing. Created on first attach-or-start, dropped when the guest
+/// process exits. The process stdout/stderr fan out to (a) any attached clients via `out`, (b) the log
+/// buffers for `docker logs`. `stdin` feeds the guest for `-i`/attach.
+struct Live {
+    out: broadcast::Sender<(u8, Vec<u8>)>, // (1=stdout, 2=stderr, chunk)
+    stdin_tx: mpsc::Sender<Vec<u8>>,        // attach writes here; an empty Vec = stdin EOF
+    stdin_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>, // start() takes it and feeds the guest
+    stdout_buf: Mutex<Vec<u8>>,
+    stderr_buf: Mutex<Vec<u8>>,
+    exit: watch::Sender<Option<i64>>, // Some(code) once exited
+    exit_rx: watch::Receiver<Option<i64>>,
+    started: std::sync::atomic::AtomicBool, // start() spawns the process exactly once
+    tty: bool,
+}
+impl Live {
+    fn new(tty: bool) -> Arc<Self> {
+        let (out, _) = broadcast::channel(1024);
+        let (exit, exit_rx) = watch::channel(None);
+        let (stdin_tx, stdin_rx) = mpsc::channel(256);
+        Arc::new(Live { out, stdin_tx, stdin_rx: Mutex::new(Some(stdin_rx)), stdout_buf: Mutex::new(Vec::new()),
+            stderr_buf: Mutex::new(Vec::new()), exit, exit_rx,
+            started: std::sync::atomic::AtomicBool::new(false), tty })
+    }
 }
 
 /// A named volume — a directory under the volumes root that containers can bind by name.
@@ -92,6 +123,7 @@ struct Inner {
     images: Vec<Image>,
     volumes: Vec<Vol>,
     networks: Vec<Net>,
+    live: HashMap<String, Arc<Live>>, // running containers' IO plumbing (not persisted)
 }
 
 /// The serializable slice of [`Inner`] written to `DD_STATE`.
@@ -147,6 +179,7 @@ async fn main() {
         .route("/containers/json", get(containers_json))
         .route("/containers/create", post(containers_create))
         .route("/containers/:id/start", post(containers_start))
+        .route("/containers/:id/attach", post(containers_attach))
         .route("/containers/:id/stop", post(containers_stop))
         .route("/containers/:id/kill", post(containers_stop))
         .route("/containers/:id/restart", post(containers_restart))
@@ -174,10 +207,12 @@ async fn main() {
             let io = hyper_util::rt::TokioIo::new(socket);
             let hsvc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                 strip_api_version(&mut req);
+                if std::env::var("DD_DEBUG").is_ok() { eprintln!("[req] {} {}", req.method(), req.uri().path()); }
                 tower::ServiceExt::oneshot(svc.clone(), req)
             });
+            // serve_connection_with_upgrades: required for the attach/exec hijack (HTTP Upgrade: tcp).
             let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(io, hsvc).await;
+                .serve_connection_with_upgrades(io, hsvc).await;
         });
     }
 }
@@ -247,7 +282,9 @@ async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>) -> R
 struct CreateBody {
     #[serde(rename = "Image")] image: Option<String>,
     #[serde(rename = "Cmd")] cmd: Option<Vec<String>>,
+    #[serde(rename = "Entrypoint")] entrypoint: Option<Vec<String>>,
     #[serde(rename = "Hostname")] hostname: Option<String>,
+    #[serde(rename = "Tty")] tty: Option<bool>,
     #[serde(rename = "HostConfig")] host_config: Option<HostConfig>,
 }
 #[derive(Deserialize)]
@@ -275,7 +312,15 @@ async fn containers_create(State(a): State<App>, Json(body): Json<CreateBody>) -
         Some(i) => i,
         None => return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {image}")}))).into_response(),
     };
-    let cmd = body.cmd.filter(|c| !c.is_empty()).unwrap_or_else(|| img.cmd.clone());
+    // Final argv = entrypoint ++ cmd (docker semantics): --entrypoint resets the command to its own args;
+    // with no entrypoint, an empty Cmd falls back to the image's default command.
+    let mut argv = body.entrypoint.unwrap_or_default();
+    let had_ep = !argv.is_empty();
+    let cmd = body.cmd.filter(|c| !c.is_empty()).unwrap_or_else(|| if had_ep { vec![] } else { img.cmd.clone() });
+    argv.extend(cmd);
+    if argv.is_empty() { argv = img.cmd.clone(); }
+    let cmd = argv;
+    let tty = body.tty.unwrap_or(false);
     let id = new_id(&image);
     let hc = body.host_config;
     let c = Container {
@@ -285,7 +330,7 @@ async fn containers_create(State(a): State<App>, Json(body): Json<CreateBody>) -
         memory: hc.as_ref().and_then(|h| h.memory).unwrap_or(0),
         pids_limit: hc.as_ref().and_then(|h| h.pids_limit).unwrap_or(0),
         publish: hc.as_ref().and_then(|h| h.port_bindings.as_ref()).map(publish_str).unwrap_or_default(),
-        created: now_secs(),
+        created: now_secs(), tty,
         status: "created".into(), ..Default::default()
     };
     g.containers.insert(id.clone(), c);
@@ -309,17 +354,16 @@ fn resolve_cid(g: &Inner, id: &str) -> Option<String> {
 }
 
 async fn containers_start(State(a): State<App>, Path(id): Path<String>) -> Response {
-    let (c, vols) = {
-        let g = a.inner.lock().await;
+    let (c, vols, live) = {
+        let mut g = a.inner.lock().await;
         let full = match resolve_cid(&g, &id) { Some(f) => f, None => return no_such(&id) };
-        match g.containers.get(&full).cloned() { Some(c) => (c, g.volumes.clone()), None => return no_such(&id) }
+        let c = match g.containers.get(&full).cloned() { Some(c) => c, None => return no_such(&id) };
+        let live = g.live.entry(full.clone()).or_insert_with(|| Live::new(c.tty)).clone();
+        if let Some(cc) = g.containers.get_mut(&full) { cc.status = "running".into(); }
+        (c, g.volumes.clone(), live)
     };
-    let (out, err, code) = run_in_jit(&c, &a.volumes_dir, &vols).await;
-    let mut g = a.inner.lock().await;
-    if let Some(c) = g.containers.get_mut(&c.id) {
-        c.stdout = out; c.stderr = err; c.exit_code = code; c.status = "exited".into();
-    }
-    save_state(&g, &a.state_path);
+    if std::env::var("DD_DEBUG").is_ok() { eprintln!("[start] {} cmd={:?}", &c.id[..12], c.cmd); }
+    spawn_live(&a, &c, &vols, live).await;
     StatusCode::NO_CONTENT.into_response()
 }
 /// stop / kill: containers run to completion synchronously, so there is no live process left to signal --
@@ -339,10 +383,106 @@ async fn containers_stop(State(a): State<App>, Path(id): Path<String>) -> Respon
 /// restart: just re-run the container in place.
 async fn containers_restart(a: State<App>, id: Path<String>) -> Response { containers_start(a, id).await }
 
+/// POST /containers/:id/attach -- hijack the connection and stream the guest's IO. `docker run` (no -d)
+/// and `docker run -it` use this: stdout/stderr come back framed (raw in TTY mode), and the client's
+/// stdin (for -i) is fed to the guest. The hijacked stream closes when the guest exits.
+async fn containers_attach(State(a): State<App>, Path(id): Path<String>, req: Request) -> Response {
+    let (full, tty) = {
+        let g = a.inner.lock().await;
+        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+        let tty = g.containers.get(&full).map(|c| c.tty).unwrap_or(false);
+        (full, tty)
+    };
+    let live = { let mut g = a.inner.lock().await; g.live.entry(full).or_insert_with(|| Live::new(tty)).clone() };
+    let mut rx = live.out.subscribe();
+    let mut exit_rx = live.exit_rx.clone();
+    let live_in = live.clone();
+    let dbg = std::env::var("DD_DEBUG").is_ok();
+    if dbg { eprintln!("[attach] entered, awaiting upgrade"); }
+    let on_upgrade = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await { Ok(u) => u, Err(e) => { if dbg { eprintln!("[attach] upgrade err: {e}"); } return; } };
+        if dbg { eprintln!("[attach] upgraded"); }
+        let (mut rd, mut wr) = tokio::io::split(TokioIo::new(upgraded));
+        // guest stdout/stderr -> client (framed unless TTY)
+        let writer = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    m = rx.recv() => match m {
+                        Ok((kind, chunk)) => {
+                            if dbg { eprintln!("[attach] chunk kind={kind} len={}", chunk.len()); }
+                            let f = if tty { chunk } else { log_frame(kind, &chunk) };
+                            if wr.write_all(&f).await.is_err() { return; }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = exit_rx.changed() => {
+                        if dbg { eprintln!("[attach] exit signalled, draining+closing"); }
+                        while let Ok((kind, chunk)) = rx.try_recv() {
+                            let f = if tty { chunk } else { log_frame(kind, &chunk) };
+                            let _ = wr.write_all(&f).await;
+                        }
+                        break;
+                    }
+                }
+            }
+            let _ = wr.flush().await;
+            let _ = wr.shutdown().await;
+            if dbg { eprintln!("[attach] writer closed"); }
+        });
+        // client stdin -> guest stdin (via the channel, which buffers until start connects it)
+        let mut buf = [0u8; 8192];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if live_in.stdin_tx.send(buf[..n].to_vec()).await.is_err() { break; }
+                }
+            }
+        }
+        let _ = live_in.stdin_tx.send(Vec::new()).await; // EOF sentinel -> close the guest's stdin
+        let _ = writer.await;
+    });
+    Response::builder().status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("Content-Type", "application/vnd.docker.raw-stream")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "tcp")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// POST /containers/:id/wait -- block until the container exits, then return {"StatusCode": n}. CRITICAL:
+/// the docker `run` CLI sends this BEFORE /start and reads it concurrently, so we must flush the response
+/// HEADERS immediately (200) and stream the JSON body only once the guest exits -- otherwise the CLI
+/// blocks waiting for the response and never sends /start (a deadlock).
 async fn containers_wait(State(a): State<App>, Path(id): Path<String>) -> Response {
-    let g = a.inner.lock().await;
-    match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {
-        Some(c) => Json(json!({"StatusCode": c.exit_code})).into_response(), None => no_such(&id) }
+    let (full, live, done_code) = {
+        let g = a.inner.lock().await;
+        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+        let live = g.live.get(&full).cloned();
+        let done = g.containers.get(&full).filter(|c| c.status == "exited").map(|c| c.exit_code);
+        (full.clone(), live, done)
+    };
+    let stream = futures_util::stream::once(async move {
+        let code = if let Some(c) = done_code {
+            c
+        } else if let Some(live) = live {
+            let mut rx = live.exit_rx.clone();
+            loop {
+                let cur = *rx.borrow();
+                if let Some(c) = cur { break c; }
+                if rx.changed().await.is_err() { break 0; }
+            }
+        } else {
+            0
+        };
+        let _ = full;
+        Ok::<_, std::io::Error>(format!("{{\"StatusCode\":{code}}}\n").into_bytes())
+    });
+    Response::builder().status(StatusCode::OK).header("Content-Type", "application/json")
+        .body(Body::from_stream(stream)).unwrap()
 }
 async fn containers_logs(State(a): State<App>, Path(id): Path<String>) -> Response {
     let g = a.inner.lock().await;
@@ -542,7 +682,9 @@ fn default_networks() -> Vec<Net> {
 
 /// Translate the container into a typed [`SpawnConfig`] and run it in the matching guest's JIT.
 /// Named-volume binds (`name:/path`, no leading `/`) are resolved against `volumes_dir`.
-async fn run_in_jit(c: &Container, volumes_dir: &str, vols: &[Vol]) -> (Vec<u8>, Vec<u8>, i64) {
+/// Build the (program, args) that launches this container in the matching guest's JIT. `None` if no JIT
+/// was built for the image's arch.
+fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol]) -> Option<(String, Vec<String>)> {
     let guest = c.arch.unwrap_or(Guest::LinuxAarch64);
     let mut cfg = SpawnConfig::new(String::new(), c.rootfs.clone()); // absolute paths -> no work_dir cd
     cfg.argv = c.cmd.clone();
@@ -563,15 +705,87 @@ async fn run_in_jit(c: &Container, volumes_dir: &str, vols: &[Vol]) -> (Vec<u8>,
     })).collect();
     cfg.publish = c.publish.split(',').filter(|s| !s.is_empty()).filter_map(|p| p.split_once(':'))
         .filter_map(|(h, cc)| Some(PortMap { host: h.parse().ok()?, container: cc.parse().ok()? })).collect();
+    cfg.command(guest)
+}
 
-    let (prog, args) = match cfg.command(guest) {
-        Some(x) => x,
-        None => return (vec![], format!("no JIT built for guest arch {}\n", guest.target()).into_bytes(), 127),
-    };
-    match tokio::process::Command::new(prog).args(args).output().await {
-        Ok(o) => (o.stdout, o.stderr, o.status.code().unwrap_or(-1) as i64),
-        Err(e) => (vec![], format!("jit exec failed: {e}\n").into_bytes(), 127),
+/// Spawn the container's guest process live (piped stdio) and wire its IO into `live`: stdout/stderr fan
+/// out to attached clients + the log buffers; on exit, the container's status/exit-code are finalized.
+/// Idempotent per container (start is a no-op if already running). Returns false if no JIT for the arch.
+async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc<Live>) -> bool {
+    use std::sync::atomic::Ordering;
+    if live.started.swap(true, Ordering::SeqCst) {
+        return true; // already started
     }
+    let Some((prog, args)) = spawn_cfg(c, &app.volumes_dir, vols) else { return false };
+    let mut child = match tokio::process::Command::new(prog).args(args)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(ch) => ch,
+        Err(e) => {
+            let _ = live.out.send((2, format!("jit exec failed: {e}\n").into_bytes()));
+            *live.stderr_buf.lock().await = format!("jit exec failed: {e}\n").into_bytes();
+            let _ = live.exit.send(Some(127));
+            if let Some(cc) = app.inner.lock().await.containers.get_mut(&c.id) { cc.status = "exited".into(); cc.exit_code = 127; }
+            return false;
+        }
+    };
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    // Feed the guest's stdin from the channel attach writes to (buffered until now). An empty Vec is the
+    // stdin-EOF sentinel: close the guest's stdin so a shell reading to EOF can finish.
+    if let Some(mut child_in) = child.stdin.take() {
+        if let Some(mut rx) = live.stdin_rx.lock().await.take() {
+            tokio::spawn(async move {
+                while let Some(chunk) = rx.recv().await {
+                    if chunk.is_empty() { break; }
+                    if child_in.write_all(&chunk).await.is_err() { break; }
+                    let _ = child_in.flush().await;
+                }
+                drop(child_in); // EOF to the guest
+            });
+        }
+    }
+
+    // pump one stream: broadcast each chunk to attached clients + accumulate for `docker logs`.
+    async fn pump(mut r: impl AsyncReadExt + Unpin, kind: u8, live: Arc<Live>) {
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = buf[..n].to_vec();
+                    let _ = live.out.send((kind, chunk.clone()));
+                    let b = if kind == 1 { &live.stdout_buf } else { &live.stderr_buf };
+                    b.lock().await.extend_from_slice(&chunk);
+                }
+            }
+        }
+    }
+    let lo = live.clone();
+    let h_out = tokio::spawn(async move { pump(stdout, 1, lo).await; });
+    let le = live.clone();
+    let h_err = tokio::spawn(async move { pump(stderr, 2, le).await; });
+
+    let app = app.clone();
+    let cid = c.id.clone();
+    let dbg = std::env::var("DD_DEBUG").is_ok();
+    tokio::spawn(async move {
+        let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1) as i64;
+        if dbg { eprintln!("[live] {} exited code={code}", &cid[..12]); }
+        let _ = h_out.await;
+        let _ = h_err.await;
+        {
+            let mut g = app.inner.lock().await;
+            if let Some(cc) = g.containers.get_mut(&cid) {
+                cc.status = "exited".into();
+                cc.exit_code = code;
+                cc.stdout = std::mem::take(&mut *live.stdout_buf.lock().await);
+                cc.stderr = std::mem::take(&mut *live.stderr_buf.lock().await);
+            }
+            save_state(&g, &app.state_path);
+        }
+        let _ = live.exit.send(Some(code));
+    });
+    true
 }
 
 // ---- persistence -----------------------------------------------------------
