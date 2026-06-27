@@ -51,6 +51,16 @@ static int x86_normalize(struct cpu *c) {
         r[10] = r[6]; r[2] = ATFD; r[6] = r[7]; r[7] = ATFD; r[0] = 264; return 0;
     case 86: // link(old,new) -> linkat(AT_FDCWD,old,AT_FDCWD,new,0)
         r[8] = 0; r[10] = r[6]; r[2] = ATFD; r[6] = r[7]; r[7] = ATFD; r[0] = 265; return 0;
+    // poll(fds, nfds, timeout_ms) -> ppoll(fds, nfds, &timespec | NULL, NULL): the canonical handler reads
+    // arg2 as a timespec*, but x86 poll's arg2 is an int ms, so synthesize the timespec here.
+    case 7: {
+        static __thread struct timespec pts;
+        long ms = (long)r[2];
+        if (ms < 0) r[2] = 0; // infinite -> NULL timespec
+        else { pts.tv_sec = ms / 1000; pts.tv_nsec = (ms % 1000) * 1000000L; r[2] = (uint64_t)&pts; }
+        r[10] = 0; r[0] = 271; return 0; // -> x86 ppoll (271), which canon_x86 maps to canonical 73
+    }
+    case 232: r[8] = 0; r[0] = 281; return 0; // epoll_wait(epfd,ev,max,timeout) -> epoll_pwait(...,NULL sigmask)
     // --- flag-arg variants (append a 0 flags) ---
     case 22: r[6] = 0; r[0] = 293; return 0;  // pipe(fds) -> pipe2(fds,0)
     case 33: r[2] = 0; r[0] = 292; return 0;  // dup2(old,new) -> dup3(old,new,0)
