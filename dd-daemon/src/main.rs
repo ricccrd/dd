@@ -1331,14 +1331,9 @@ fn discover_images(images_dir: &str) -> Vec<Image> {
         };
         out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd });
     }
-    // A built-in `macos` image for `ddcli mac`: the host macOS filesystem in a darwin jail, run by the
-    // darwin JIT. Offered only when that engine is built; the jail root is DD_MAC_ROOTFS (default "/").
-    if ddjit::available(Guest::DarwinAarch64) {
-        let rootfs = std::env::var("DD_MAC_ROOTFS").unwrap_or_else(|_| "/".into());
-        if std::path::Path::new(&rootfs).is_dir() {
-            out.push(Image { name: "macos".into(), rootfs, arch: Guest::DarwinAarch64, cmd: vec!["/bin/zsh".into()] });
-        }
-    }
+    // NOTE: no synthesized `macos` image yet -- the darwin engine runs only static, thin, arm64 Mach-O
+    // binaries; macOS system tools (/bin/zsh, ...) are universal + arm64e + dynamically linked, which
+    // needs a Mach-O dynamic loader (dyld/dylibs) the engine doesn't have. `ddcli mac` says so.
     out
 }
 

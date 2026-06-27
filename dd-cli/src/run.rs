@@ -43,9 +43,16 @@ pub fn parse(raw: Vec<String>) -> Result<RunArgs, String> {
     Ok(RunArgs { platform, isolated, keep, image, command: rest.collect() })
 }
 
-/// `ddcli mac [command…]` — run a macOS container (the `macos` darwin image the daemon synthesizes).
-pub fn mac(raw: Vec<String>) -> i32 {
-    run(RunArgs { platform: None, isolated: false, keep: false, image: "macos".into(), command: raw })
+/// `ddcli mac` — macOS containers aren't supported yet; explain why rather than failing cryptically.
+pub fn mac(_raw: Vec<String>) -> i32 {
+    eprintln!("ddcli mac: macOS containers aren't supported yet.");
+    eprintln!();
+    eprintln!("dd's darwin engine runs only *static, thin, arm64* Mach-O binaries. macOS system tools");
+    eprintln!("like /bin/zsh are universal (fat) + arm64e + dynamically linked (they need dyld + libSystem),");
+    eprintln!("which the engine doesn't load yet — that needs a full Mach-O dynamic linker.");
+    eprintln!();
+    eprintln!("Linux containers are the supported path:  ddcli ubuntu   ·   ddcli run <image> …");
+    1
 }
 
 /// Run a container with the easy-access defaults, by invoking `docker` against dd's socket.
