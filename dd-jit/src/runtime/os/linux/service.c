@@ -2647,6 +2647,21 @@ static void service(struct cpu *c) {
         G_RET(c) = fd < 0 ? (uint64_t)(-errno) : (uint64_t)fd;
         break;
     }
+    // flock(fd, op): macOS flock(2); Linux LOCK_SH/EX/UN/NB op values match the host
+    case 32: G_RET(c) = flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    // preadv/pwritev: struct iovec layout is identical Linux<->macOS
+    case 69: {
+        ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+    case 70: {
+        ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+    // setsid(): new session / process-group leader
+    case 157: { pid_t s = setsid(); G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s; break; }
 
     // ===================== unhandled =====================
     default:
