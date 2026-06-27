@@ -298,8 +298,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     g_exe_path = prog;
     char pb[4200];
     const char *prog_host =
-        // follow entry symlink rootfs-relative (/bin/sh->busybox)
-        xresolve_exec(prog, pb, sizeof pb);
+        // resolve through the overlay (upper, then lowers) + follow the entry symlink (/bin/sh->busybox)
+        xresolve_overlay(prog, pb, sizeof pb);
     struct loaded lm;
     load_elf(prog_host, &lm);
 
@@ -308,8 +308,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     char interp[256];
     if (elf_interp(prog_host, interp, sizeof interp) == 0) {
         char ib[4200];
-        // follow+confine ld.so symlink
-        const char *ihost = xresolve_exec(interp, ib, sizeof ib);
+        // follow+confine ld.so symlink (through the overlay)
+        const char *ihost = xresolve_overlay(interp, ib, sizeof ib);
         struct loaded li;
         load_elf(ihost, &li);
         jump = li.entry;

@@ -196,7 +196,7 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     g_exe_path = prog;
 
     char pb[4200];
-    const char *prog_host = xresolve_exec(prog, pb, sizeof pb);
+    const char *prog_host = xresolve_overlay(prog, pb, sizeof pb); // upper, then lowers (pure --lower image)
     struct loaded lm;
     load_elf(prog_host, &lm);
     g_loadbase = lm.base;
@@ -205,7 +205,7 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     char interp[256];
     if (elf_interp(prog_host, interp, sizeof interp) == 0) {
         char ib[4200];
-        const char *ihost = xresolve_exec(interp, ib, sizeof ib);
+        const char *ihost = xresolve_overlay(interp, ib, sizeof ib);
         struct loaded li;
         load_elf(ihost, &li);
         jump = li.entry;

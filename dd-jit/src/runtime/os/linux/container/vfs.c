@@ -285,6 +285,15 @@ static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollo
     // absent -> upper path (for ENOENT/O_CREAT)
     return 0;
 }
+// Resolve an executable/interpreter path through the FULL overlay (upper THEN lowers), returning the host
+// path in `buf`. Drop-in for xresolve_exec at the ELF-loader sites so a program that lives only in a
+// read-only --lower (empty upper) is found -- a bare xresolve_exec checks the upper alone and ENOENTs.
+// With no lowers (the flat-rootfs pull case) this is identical to xresolve_exec.
+static const char *xresolve_overlay(const char *p, char *buf, size_t n) {
+    if (!(g_rootfs && p && p[0] == '/')) return p;
+    overlay_resolve(p, buf, n, 0);
+    return buf;
+}
 // Copy-up: bring a lower file into the UPPER so it can be modified, then return the upper host path.
 // If the file is only in a lower, copy its bytes up; if absent everywhere, return the upper path (create).
 static void overlay_copyup(const char *guest, char *host, size_t hn) {

@@ -49,10 +49,6 @@ plain `localhost:5000` (`dd-daemon/src/registry.rs`; 38/38 docker-CLI scenarios 
   `sha256sum`. The aarch64 engine passes all; these are jit86-specific.
 - **jitdarwin: adrp/`__cstring` literal not relocated under the segment slide** — a guest that reads a
   string literal (via adrp) gets zeros; stack/SP-relative data works. (Found by dd-tests darwin group.)
-- **ELF loader resolves the executable in the overlay UPPER only, not through lowers** — running a
-  program from an image given purely as `--lower` (empty upper) fails with "open: No such file". The
-  program loader needs to go through `overlay_resolve` like the syscall paths do. (A registry `pull`
-  unpacks into a flat rootfs, so this isn't hit there — only on a pure read-only-lower mount.)
 
 ## Remaining JIT gaps
 - **`--network none` egress isolation** — dd-daemon can pass `DD_NET_ISOLATE=1`, but the JIT doesn't yet

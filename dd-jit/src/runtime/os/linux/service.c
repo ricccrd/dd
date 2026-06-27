@@ -1532,8 +1532,8 @@ static void service(struct cpu *c) {
     case 221: {
         char pb[4200];
         const char *p =
-            // follow symlink rootfs-relative (busybox applets)
-            xresolve_exec((const char *)a0, pb, sizeof pb);
+            // follow symlink rootfs-relative (busybox applets), through the overlay (upper then lowers)
+            xresolve_overlay((const char *)a0, pb, sizeof pb);
         if (access(p, F_OK) != 0) {
             G_RET(c) = (uint64_t)(-2);
             break;
@@ -1604,8 +1604,8 @@ static void service(struct cpu *c) {
         char interp[256];
         if (elf_interp(p, interp, sizeof interp) == 0) {
             char ib[4200];
-            // follow+confine ld.so symlink
-            const char *ih = xresolve_exec(interp, ib, sizeof ib);
+            // follow+confine ld.so symlink (through the overlay)
+            const char *ih = xresolve_overlay(interp, ib, sizeof ib);
             struct loaded li;
             load_elf(ih, &li);
             jump = li.entry;
