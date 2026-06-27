@@ -143,6 +143,7 @@ async fn main() {
         .route("/_ping", get(|| async { "OK" }))
         .route("/version", get(version)).route("/info", get(info))
         .route("/images/json", get(images_json)).route("/images/create", post(images_create))
+        .route("/images/:name/json", get(image_inspect))
         .route("/containers/json", get(containers_json))
         .route("/containers/create", post(containers_create))
         .route("/containers/:id/start", post(containers_start))
@@ -211,12 +212,35 @@ async fn images_json(State(a): State<App>) -> Json<Value> {
         "Architecture": i.arch.target(), "Created": 0, "Size": 0})).collect();
     Json(json!(imgs))
 }
+/// GET /images/:name/json — `docker image inspect` / `docker run`'s local-image probe. Returns the
+/// image config (Cmd/Entrypoint/Env) so the CLI doesn't treat the image as missing and re-pull.
+async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Response {
+    let g = a.inner.lock().await;
+    match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
+        Some(i) => Json(json!({
+            "Id": format!("sha256:{}", fake_id(&i.name)),
+            "RepoTags": [format!("{}:latest", i.name)], "RepoDigests": [],
+            "Architecture": if i.arch.arch() == "x86_64" { "amd64" } else { "arm64" },
+            "Os": "linux", "Size": 0, "Created": "1970-01-01T00:00:00Z",
+            "Config": {"Cmd": i.cmd, "Entrypoint": Value::Null, "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"], "WorkingDir": ""},
+            "RootFS": {"Type": "layers", "Layers": []}})).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response(),
+    }
+}
 #[derive(Deserialize)]
-struct ImageCreateQ { #[serde(rename = "fromImage")] from_image: Option<String> }
-async fn images_create(Query(q): Query<ImageCreateQ>) -> Response {
-    // TODO(OCI pull): registry pull + unpack -> overlay lower dirs. Today: local rootfs only.
+struct ImageCreateQ { #[serde(rename = "fromImage")] from_image: Option<String>, #[serde(rename = "tag")] tag: Option<String> }
+async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>) -> Response {
+    // No registry pull yet: succeed iff the image is already local, else report it's missing (so the CLI
+    // surfaces a real "not found" instead of a confusing downstream error). TODO(OCI): real registry pull.
     let name = q.from_image.unwrap_or_default();
-    (StatusCode::OK, Json(json!({"status": format!("Using local image {name}")}))).into_response()
+    let tag = q.tag.unwrap_or_else(|| "latest".into());
+    let found = a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name));
+    if found {
+        (StatusCode::OK, Json(json!({"status": format!("Status: Image is up to date for {name}:{tag}")}))).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({"message": format!("pull access denied for {name}, repository does not exist or no local image (dd has no registry yet)")}))).into_response()
+    }
 }
 
 #[derive(Deserialize)]
@@ -247,7 +271,7 @@ fn publish_str(pb: &HashMap<String, Vec<PortBinding>>) -> String {
 async fn containers_create(State(a): State<App>, Json(body): Json<CreateBody>) -> Response {
     let image = body.image.unwrap_or_default();
     let mut g = a.inner.lock().await;
-    let img = match g.images.iter().find(|i| i.name == image || format!("{}:latest", i.name) == image).cloned() {
+    let img = match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&image)).cloned() {
         Some(i) => i,
         None => return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {image}")}))).into_response(),
     };
@@ -664,6 +688,15 @@ fn fake_id(seed: &str) -> String {
     let mut h: u64 = 1469598103934665603;
     for b in seed.bytes() { h ^= b as u64; h = h.wrapping_mul(1099511628211); }
     format!("{h:016x}{h:016x}{h:016x}{h:08x}")
+}
+
+/// The bare repository name of a docker image reference, ignoring registry, namespace and tag/digest:
+/// `docker.io/library/ubuntu:latest` -> `ubuntu`, `library/ubuntu` -> `ubuntu`, `ubuntu:22.04` -> `ubuntu`.
+/// Lets `docker run ubuntu` match an image discovered/tagged as `ubuntu` regardless of how docker
+/// canonicalizes the reference.
+fn ref_name(s: &str) -> &str {
+    let last = s.rsplit('/').next().unwrap_or(s);
+    last.split('@').next().unwrap_or(last).split(':').next().unwrap_or(last)
 }
 
 /// A unique container id. Seeded from a never-reset process counter + nanosecond clock, so it stays

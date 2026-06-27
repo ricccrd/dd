@@ -77,6 +77,26 @@ ok "kill"    "$(d kill "$cidk"    | head -c 12)" "$(echo "$cidk" | head -c 12)"
 ok "restart" "$(d restart "$cidk" | head -c 12)" "$(echo "$cidk" | head -c 12)"
 d rm -f "$cidk" >/dev/null
 
+echo "== non-default image (ubuntu) + image inspect =="
+ucid="$(d run -d ubuntu /bin/bash -c 'echo ubuntu-bash; head -1 /etc/os-release')"
+has "run-ubuntu"    "$(d logs "$ucid")" "ubuntu-bash"
+d rm -f "$ucid" >/dev/null
+has "image-inspect" "$(d image inspect ubuntu --format '{{.Os}}' 2>&1)" "linux"
+
+echo "== foreground run (attach, streams stdout) =="
+has "run-fg"        "$(d run --rm alpine echo fg-streamed)" "fg-streamed"
+
+echo "== entrypoint override =="
+has "entrypoint"    "$(d run --rm --entrypoint /bin/echo alpine via-ep)" "via-ep"
+
+echo "== run -i interactive (stdin) =="
+has "run-it"        "$(printf 'echo it-line\nexit\n' | d run -i --rm alpine sh)" "it-line"
+
+echo "== exec in a running container =="
+xcid="$(d run -d alpine sh -c 'sleep 20')"
+has "exec"          "$(d exec "$xcid" echo exec-out)" "exec-out"
+d rm -f "$xcid" >/dev/null
+
 echo "== volumes =="
 d volume create scen-vol >/dev/null
 has "volume-listed" "$(d volume ls --format '{{.Name}}')" "scen-vol"
