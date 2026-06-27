@@ -68,6 +68,10 @@ pub(crate) struct Container {
     pub(crate) labels: std::collections::HashMap<String, String>, // `docker run --label`
     #[serde(default)]
     pub(crate) network_mode: String,
+    #[serde(default)]
+    pub(crate) started_at: i64, // unix secs, set on start (inspect State.StartedAt)
+    #[serde(default)]
+    pub(crate) finished_at: i64, // unix secs, set on stop/natural exit (inspect State.FinishedAt)
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]
     pub(crate) arch: Option<Guest>,
@@ -190,4 +194,5 @@ pub(crate) struct App {
     pub(crate) state_path: String,
     pub(crate) volumes_dir: String,
     pub(crate) images_dir: String,
+    pub(crate) events: crate::events::EventBus, // docker events lifecycle bus
 }

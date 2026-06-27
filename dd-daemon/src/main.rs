@@ -37,6 +37,7 @@ mod archive;
 mod volumes;
 mod networks;
 mod runtime;
+mod events;
 
 use crate::model::*;
 use crate::util::*;
@@ -77,12 +78,12 @@ async fn main() {
     for g in Guest::ALL {
         eprintln!("[dd-daemon] JIT {}: {}", g.target(), if ddjit::available(g) { "ready" } else { "NOT BUILT" });
     }
-    let app = App { inner: Arc::new(Mutex::new(inner)), state_path, volumes_dir, images_dir };
+    let app = App { inner: Arc::new(Mutex::new(inner)), state_path, volumes_dir, images_dir, events: events::new_bus() };
 
     let router = Router::new()
         .route("/_ping", get(|| async { "OK" }))
         .route("/version", get(version)).route("/info", get(info))
-        .route("/events", get(events))
+        .route("/events", get(events::events))
         .route("/system/df", get(system_df))
         .route("/auth", post(auth))
         .route("/distribution/:name/json", get(distribution_inspect))

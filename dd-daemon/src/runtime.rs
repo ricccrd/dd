@@ -227,9 +227,11 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
             if let Some(cc) = g.containers.get_mut(&cid) {
                 cc.status = "exited".into();
                 cc.exit_code = code;
+                cc.finished_at = now_secs();
                 cc.stdout = std::mem::take(&mut *live.stdout_buf.lock().await);
                 cc.stderr = std::mem::take(&mut *live.stderr_buf.lock().await);
             }
+            crate::events::emit_event(&app.events, "container", "die", &cid, serde_json::json!({"exitCode": code.to_string()}));
             save_state(&g, &app.state_path);
         }
         let _ = live.exit.send(Some(code));

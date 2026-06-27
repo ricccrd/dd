@@ -86,10 +86,5 @@ pub(crate) async fn system_df(State(a): State<App>) -> Json<Value> {
         "Volumes": volumes, "BuildCache": [], "BuilderSize": 0}))
 }
 
-/// `GET /events` — `docker events`. dd has no event bus yet; keep the connection open and emit a
-/// JSON-stream content type so the CLI/GUI wait quietly instead of erroring on a 404.
-pub(crate) async fn events() -> Response {
-    let stream = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
-    Response::builder().status(StatusCode::OK).header("Content-Type", "application/json")
-        .body(Body::from_stream(stream)).unwrap()
-}
+// `GET /events` — `docker events`. The handler now lives in `crate::events` (the lifecycle bus):
+// see `events.rs` for the broadcast-backed, newline-delimited JSON stream and `emit_event`.

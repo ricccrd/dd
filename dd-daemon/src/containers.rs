@@ -120,6 +120,7 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         other => other,                 // a user-defined network by name
     };
     if !net_name.is_empty() { join_network(&mut g.networks, net_name, &id, &cname); }
+    crate::events::emit_event(&a.events, "container", "create", &id, json!({"name": c.name, "image": c.image}));
     g.containers.insert(id.clone(), c);
     save_state(&g, &a.state_path);
     (StatusCode::CREATED, Json(json!({"Id": id, "Warnings": []}))).into_response()
@@ -132,11 +133,12 @@ pub(crate) async fn containers_start(State(a): State<App>, Path(id): Path<String
         let full = match resolve_cid(&g, &id) { Some(f) => f, None => return no_such(&id) };
         let c = match g.containers.get(&full).cloned() { Some(c) => c, None => return no_such(&id) };
         let live = g.live.entry(full.clone()).or_insert_with(|| Live::new(c.tty)).clone();
-        if let Some(cc) = g.containers.get_mut(&full) { cc.status = "running".into(); }
+        if let Some(cc) = g.containers.get_mut(&full) { cc.status = "running".into(); cc.started_at = now_secs(); }
         (c, g.volumes.clone(), live)
     };
     if std::env::var("DD_DEBUG").is_ok() { eprintln!("[start] {} cmd={:?}", &c.id[..12], c.cmd); }
     spawn_live(&a, &c, &vols, live).await;
+    crate::events::emit_event(&a.events, "container", "start", &c.id, json!({"name": c.name, "image": c.image}));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -147,7 +149,8 @@ pub(crate) async fn containers_stop(State(a): State<App>, Path(id): Path<String>
     let mut g = a.inner.lock().await;
     match resolve_cid(&g, &id) {
         Some(full) => {
-            if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); }
+            if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
+            crate::events::emit_event(&a.events, "container", "stop", &full, json!({}));
             save_state(&g, &a.state_path);
             StatusCode::NO_CONTENT.into_response()
         }
@@ -257,9 +260,24 @@ pub(crate) async fn exec_create(State(a): State<App>, Path(id): Path<String>, Js
     (StatusCode::CREATED, Json(json!({"Id": exec_id}))).into_response()
 }
 
-/// POST /exec/:id/start -- run the exec command as a fresh JIT in the container's rootfs and stream its
-/// IO over the hijacked connection (same path as attach).
+/// POST /exec/:id/start body: `{"Detach": bool, "Tty": bool}`. Detach => run the exec in the
+/// background and return 200 (no connection hijack).
+#[derive(Deserialize, Default)]
+pub(crate) struct ExecStartBody {
+    #[serde(rename = "Detach", default)] detach: bool,
+    #[serde(rename = "Tty", default)] tty: bool,
+}
+
+/// POST /exec/:id/start -- run the exec command as a fresh JIT in the container's rootfs. With
+/// `Detach=false` (the default) stream its IO over the hijacked connection (same path as attach);
+/// with `Detach=true` spawn it in the background and return 200 immediately (no upgrade, no wait).
 pub(crate) async fn exec_start(State(a): State<App>, Path(id): Path<String>, req: Request) -> Response {
+    // Read the (small) JSON start body for Detach, keeping the request parts so the OnUpgrade
+    // extension survives for the hijack path. `to_bytes` consumes the body; we rebuild an empty one.
+    let (parts, body) = req.into_parts();
+    let detach = axum::body::to_bytes(body, 64 * 1024).await.ok()
+        .and_then(|b| serde_json::from_slice::<ExecStartBody>(&b).ok())
+        .map(|b| b.detach).unwrap_or(false);
     let (temp, vols, live, tty) = {
         let mut g = a.inner.lock().await;
         let Some(exec) = g.execs.get(&id).cloned() else {
@@ -280,6 +298,13 @@ pub(crate) async fn exec_start(State(a): State<App>, Path(id): Path<String>, req
         if let Some(e) = g.execs.get_mut(&id) { e.started = true; }
         (temp, g.volumes.clone(), live, exec.tty)
     };
+    if detach {
+        // Detached exec: spawn the process in the background (spawn_live already runs+reaps it in a
+        // task) and return 200 immediately. No hijack, so the client doesn't block.
+        spawn_live(&a, &temp, &vols, live).await;
+        return StatusCode::OK.into_response();
+    }
+    let req = Request::from_parts(parts, Body::empty()); // carries OnUpgrade in extensions
     spawn_hijack_io(hyper::upgrade::on(req), live.clone(), tty); // subscribe before spawning
     spawn_live(&a, &temp, &vols, live).await;
     hijack_response()
@@ -477,8 +502,15 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
 
 pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<String>) -> Response {
     let g = a.inner.lock().await;
-    match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {
+    let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+    match g.containers.get(&full) {
         Some(c) => {
+            let running = c.status == "running" || c.status == "paused";
+            // Pid = the live JIT process pid while running, else 0 (docker reports 0 for stopped).
+            let pid = if running { g.live.get(&full).and_then(|l| *l.pid.lock().unwrap()).unwrap_or(0) } else { 0 };
+            // StartedAt/FinishedAt as RFC3339; docker's zero value is "0001-01-01T00:00:00Z".
+            let started_at = if c.started_at == 0 { "0001-01-01T00:00:00Z".to_string() } else { fmt_rfc3339(c.started_at) };
+            let finished_at = if c.finished_at == 0 { "0001-01-01T00:00:00Z".to_string() } else { fmt_rfc3339(c.finished_at) };
             // Networks the container has joined -> NetworkSettings.Networks, with the IPAM-assigned
             // identity (IP/gateway/mac) per network.
             let networks: serde_json::Map<String, Value> = g.networks.iter()
@@ -491,7 +523,8 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
             let primary = g.networks.iter().find_map(|n| n.endpoints.get(&c.id).map(|e| (e.ip.clone(), n.gateway.clone()))).unwrap_or_default();
             Json(json!({"Id": c.id, "Image": c.image, "Created": fmt_rfc3339(c.created),
             "Name": format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() }),
-            "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": c.status == "running" || c.status == "paused", "Paused": c.status == "paused"},
+            "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": running, "Paused": c.status == "paused",
+                "Pid": pid, "StartedAt": started_at, "FinishedAt": finished_at},
             "Config": {"Cmd": c.cmd, "Hostname": c.hostname, "Image": c.image, "Env": c.env, "Labels": c.labels},
             "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
             "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit},
@@ -503,7 +536,25 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
 }
 
 #[derive(Deserialize)]
-pub(crate) struct PsQ { all: Option<String> }
+pub(crate) struct PsQ { all: Option<String>, filters: Option<String> }
+
+/// Apply `docker ps --filter`. `f` is the decoded `filters` map (`{"status":[..],"name":[..],"label":[..]}`).
+/// Within a filter type the values are OR'd; `label` entries are AND'd (each must match). `name` is a
+/// substring match against the container's effective name; `label` matches `key` or `key=value`.
+fn ps_match(c: &Container, name: &str, f: &HashMap<String, Vec<String>>) -> bool {
+    if let Some(vals) = f.get("status") { if !vals.iter().any(|v| v == &c.status) { return false; } }
+    if let Some(vals) = f.get("name") { if !vals.iter().any(|v| name.contains(v.as_str())) { return false; } }
+    if let Some(vals) = f.get("label") {
+        for v in vals {
+            let ok = match v.split_once('=') {
+                Some((k, val)) => c.labels.get(k).map(|cv| cv == val).unwrap_or(false),
+                None => c.labels.contains_key(v),
+            };
+            if !ok { return false; }
+        }
+    }
+    true
+}
 
 /// Render a container's `docker ps` Status column the way docker does: "Up 3 minutes" while
 /// running/paused, "Exited (0) 5 minutes ago" otherwise. The elapsed time is measured from the
@@ -523,8 +574,28 @@ fn human_status(c: &Container) -> String {
 
 pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) -> Json<Value> {
     let all = matches!(q.all.as_deref(), Some("1") | Some("true") | Some("True"));
+    // `filters` arrives URL-encoded JSON; axum has already percent-decoded it. Bad JSON => no filters.
+    // Docker encodes it as map[key]->{value:true} (e.g. {"name":{"web":true}}), older clients as
+    // map[key]->[value]. Accept BOTH: decode to a generic Value, normalize to key -> [values].
+    let filters: HashMap<String, Vec<String>> = q.filters.as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.as_object().map(|m| m.iter().map(|(k, val)| {
+            let vals = match val {
+                Value::Object(set) => set.keys().cloned().collect(),                 // {"web":true}
+                Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(), // ["web"]
+                _ => vec![],
+            };
+            (k.clone(), vals)
+        }).collect()))
+        .unwrap_or_default();
+    // A `status` filter implies "show all matching" (like `docker ps --filter status=exited`).
+    let status_filter = filters.contains_key("status");
     let v: Vec<Value> = a.inner.lock().await.containers.values()
-        .filter(|c| all || c.status == "running")
+        .filter(|c| all || status_filter || c.status == "running")
+        .filter(|c| {
+            let name = if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() };
+            ps_match(c, &name, &filters)
+        })
         .map(|c| json!({
         "Id": c.id, "Image": c.image, "Command": c.cmd.join(" "), "Created": c.created,
         "State": c.status, "Status": human_status(c), "ExitCode": c.exit_code, "Ports": ports_json(&c.publish),
@@ -537,7 +608,8 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
 pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<String>) -> Response {
     let mut g = a.inner.lock().await;
     let full = match resolve_cid(&g, &id) { Some(f) => f, None => return no_such(&id) };
-    if g.containers.remove(&full).is_some() {
+    if let Some(dc) = g.containers.remove(&full) {
+        crate::events::emit_event(&a.events, "container", "destroy", &full, json!({"name": dc.name, "image": dc.image}));
         // Drop the container from any network membership too.
         for n in g.networks.iter_mut() { leave_network(n, &full); }
         save_state(&g, &a.state_path);
