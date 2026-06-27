@@ -58,7 +58,9 @@ at a time with the cross-engine matrix as the regression gate.**
    `os/linux/`; what's left is the host `jit/` engine). Design: `cache.c` is the clean first merge
    (`G_GPC_HASH_SHIFT` + lock-aliasing + the dormant `is_bl` path), `dispatch.c` needs 4 frontend hooks
    (IBTC `ic_site` vs `ic_miss`, post-`run_block` reason switch, the two trampolines, x86 debug), `emit`
-   stays per-arch. **First PR:** lift `cache.c`, aarch64 binary bit-identical.
+   stays per-arch. ✅ **PR1 DONE** (x86 lifted onto shared `jit/cache.c` via `G_GPC_HASH_SHIFT` + a new
+   `engine_glue.c`; aarch64 bit-identical; **matrix 240 green both engines**). **Next PR:** the 4 dispatch
+   hooks → lift `dispatch.c` (PRs 2-4 in the design).
 2. **Networking Phase-2b — userspace netstack.** → **`docs/design/netstack.md`**. Reframing: external
    egress already works root-free (a guest socket *is* a host socket); the real gap is L3 **identity**
    (per-container IP) — what breaks `docker-net.sh` (3/7). ✅ **PR1 DONE** (daemon IPAM `172.18/12` +
