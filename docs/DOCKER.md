@@ -9,7 +9,7 @@ drives the *real* `docker` binary against the daemon and asserts every step — 
 
 | area | commands |
 |---|---|
-| **images** | `images`, `image inspect`, `pull` (local), `tag`, `rmi`, `push` (local no-op) |
+| **images** | `images`, `image inspect`, `pull` (real, any registry), `tag`, `rmi`, `push` (real upload) |
 | **run** | `run` (foreground, streams stdout/stderr), `run -d`, `run -i`, `run -it`, `run --name`, `--entrypoint` |
 | **exec** | `exec`, `exec -i`, `exec -it` (runs in the container's rootfs) |
 | **inspect/logs** | `inspect` (container + image), `logs`, `wait`, `ps`, `ps -a`, `top`, `stats` |
@@ -21,13 +21,25 @@ How: containers run as **live background JIT processes** the daemon tracks; fore
 stream over a hijacked connection (the docker multiplexed-frame protocol, raw in TTY mode); `wait`
 streams its response so the CLI's create→attach→wait→start sequence doesn't deadlock.
 
+### Registries (`dd-daemon/src/registry.rs`)
+
+`pull`/`push` work against **any** OCI registry, not just Docker Hub — `ghcr.io`, `quay.io`, ECR, a
+plain `localhost:5000`. The registry is parsed from the reference the way docker does it (a leading
+segment is a host iff it has a `.`/`:` or is `localhost`); auth is the standard `WWW-Authenticate:
+Bearer` challenge flow, with credentials taken from the CLI's `X-Registry-Auth` (i.e. `docker login`).
+
+- **pull** — token → manifest (picks `linux/arm64`, falls back to `amd64`) → layer blobs streamed into a
+  fresh rootfs (whiteouts applied). Verified end-to-end against Docker Hub *and* quay.io.
+- **push** — tar the rootfs into one layer → blob uploads → manifest `PUT`. A successful push needs
+  `docker login` + a writable repo, exactly like real docker.
+
+The HTTP/tar/sha256 work is shelled to `curl`/`tar`/`gzip`/`sha256sum` (the offline build can't pull in
+an async-HTTP+TLS+tar crate stack); it's confined to a small `http` submodule, typed code above it.
+
 ## Not yet (the honest gaps)
 
-- **registry** — `pull`/`push` are local-only (images come from `DD_IMAGES`); no registry transfer yet.
-  This is the next big piece: OCI registry pull/unpack in `images_create`, then `push`.
 - **`docker build`** — needs a BuildKit-compatible builder.
 - **`docker cp`** — the `/archive` tar endpoints aren't implemented.
 - **freezer pause** — `pause`/`unpause` are accepted but no-ops (dd has no freezer cgroup).
 
-The core interactive workflow — pull an image, `run -it` a shell, `exec` into it, check `logs`, `stop`/
-`rm` — is fully working.
+The core workflow — `pull` from any registry, `run -it` a shell, `exec` into it, `logs`, `push` — works.
