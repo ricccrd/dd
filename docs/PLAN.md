@@ -5,9 +5,17 @@ binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-cli
 `dd-cli`). This file is the **work list only** — what is missing or not yet implemented.
 
 ## ✅ Completed — to validate
-Run `bash dd-tests/scenarios/docker.sh` (the docker-CLI battery, **50/50**) and
-`cargo run -p dd-tests` (the cross-engine matrix, **~236 green**; the only non-pass is `soak/smc`
-(RWX limitation) plus the intermittent fork+exec crash — both documented below) to validate all of the below.
+Validation entry points (all via the Makefile):
+- `make test` — cross-engine matrix (`dd-tests`, **~236 green** over 21 groups × 3 engines: Linux
+  aarch64 + x86_64 + **darwin**; portable `port()` guests prove identical behaviour on Linux and macOS).
+  Only non-pass: `soak/smc` (RWX, below) + the fork+exec crash (below), both xfail-tracked.
+- `make test-docker` — docker-CLI battery (**50/50**); `make test-docker-full` — full per-command
+  compliance matrix; `make test-compose` — Docker Compose (skips if compose absent).
+- `make test-macos` — **macOS-container parity (23/23)**: the *same* `docker` lifecycle (run/logs/exec/
+  inspect/ps/stop/rm) runs a Linux container AND a native-macOS container (the `macos` darwinjail image)
+  identically — dd's signature capability, validated.
+- `make test-realsw` — real pulled software (python ✅; redis/postgres/nats gaps below).
+- `make coverage` — syscall/opcode gap report (static switch-diff + dynamic corpus). Source of truth below.
 
 Harness bugs (all fixed; matrix/battery green):
 - [x] aarch64 open-flag bits were x86 values → every symlink open ELOOPd (`cat /etc/os-release` on alpine).
@@ -102,22 +110,94 @@ pages (the `__builtin___clear_cache` / coherency path the soak test patches 200k
 holds: `soak/{codecache,indirect,threadchurn,forkchurn,allocchurn}` pass on all three engines
 (sustained block-chaining/IBTC churn + thread/fork/heap churn over thousands of cycles).
 
-**Intermittent fork+exec Bus error (the flaky matrix tail) — main reliability gap.** A shell running
-several commands (`sh -c 'a; b | c'`) flake-crashes: ~1–2 of the fork+exec-heavy tests per *full* matrix
-run produce empty output (`busybox/{find,seq}`, `containersw/nc-loopback`, `container/symlink`). It is
-**fork+exec-specific** (`soak/forkchurn` — fork *without* exec — is rock-solid over thousands of cycles;
-`container/symlink` uses no pipe and no getdents, just three forked commands, and still flakes),
-**load-dependent** (reproduces only under the concurrent full-matrix run, not a standalone daemon loop),
-and **pre-existing** (not introduced by the syscall fixes above). Suspects: host `fork()` interacting with
-the MAP_JIT/W^X state + the per-block cache-flush-on-`execve`. Next step is a crash capture under matrix
-load (the macOS DiagnosticReports backtrace + faulting address) — the JIT installs its own SIGSEGV/SIGBUS
-handler, so it likely needs disarming for the child to drop a core.
+**fork()+execve() crash — DIAGNOSED, main reliability gap.** Root cause: **`execve` (service.c case 221)
+never `munmap`s the inherited address space, and `load_elf` (os/linux/elf.c) relocates even a non-PIE
+`ET_EXEC` off its fixed link-time vaddr (forced — macOS `__PAGEZERO` reserves the low 4 GB; see Platform
+limitations). The bias is survivable in a fresh exec's sparse layout but not in the dense post-`fork()`
+layout, where the non-PIE image's baked absolute (un-relocated) references land on live memory → SIGSEGV.**
+The marquee victim is the **GCC toolchain** (`compile` group): `gcc-14`/`cc1` are `ET_EXEC` non-PIE
+(entry `0x433880`). Evidence (deterministic, gcc-bundle image):
+- `sh -c 'gcc-14 --version'` (fork → execve) → **SIGSEGV (rc 139), 6/6**; `env gcc-14 --version` and
+  `sh -c 'exec gcc-14 --version'` (execve, **no fork**) and gcc as the initial image → **rc 0**. ⇒ the
+  trigger is *fork-then-execve*, not gcc codegen. **`perl` (PIE) fork+exec works** — PIE is fully
+  relocatable, so only non-PIE images crash.
+- `JT=1` `[LOADED]` traces: the no-fork run spreads gcc to an isolated high base (`0x11ec98000`); the
+  crashing fork run packs dash+ld.so+gcc+ld.so into a dense `0x100da0000–0x10124f000` window.
+- The **intermittent** tail (`busybox/{find,seq}`, `containersw/nc-loopback`) flakes under full-matrix
+  load; `soak/forkchurn` (fork *without* exec) is rock-solid. **But `busybox` is `ET_DYN`/PIE** (verified:
+  `e_type == 3`), so the flaky tail is a **DISTINCT bug from the non-PIE gcc crash** — PIE is fully
+  relocatable and immune to the bias issue. The tail is some *other* fork+exec race (SIGSEGV, code 139, in
+  the exec'd child; `diag_crash` never fires even with `SA_ONSTACK`, so the fault bypasses the POSIX signal
+  handler — suspect the Mach exception path). (`container/symlink`'s "failure" is unrelated: leftover `/l`
+  in the overlay UPPER from a prior run, an overlay-cleanup issue.)
 
-**Docker API compliance** (from `scenarios/docker-full.sh`, 33/49): missing endpoints/behaviour —
-`/system/df`, `/containers/{id}/changes` (`docker diff`), `/commit`, `/images/get`+`/images/load` (405:
-`save`/`load`), `/images/{name}/history`, `/containers/prune` (405), `docker export` tar incomplete,
-`docker import` doesn't register the image; inspect omits `.NetworkSettings` (breaks `docker port` → CLI
-panic, and network-membership reporting); `--user`, `--label`, and `exec -e/-w` not honoured.
+**Fix — IN PROGRESS, address-space reset alone is NOT sufficient.** `execve` now tears down the previous
+guest address space (`munmap` the old image/interp/heap/stack + tracked guest mmaps via a registry) before
+`load_elf` — this fixes a real **per-exec leak** (each execve used to mmap a fresh 256MB heap + image +
+stack and never free the old ones) and is the kernel-like reset. **But it does NOT fix the gcc non-PIE
+crash** (verified: `gcc-14 --version` via `sh -c` still SIGSEGVs 6/6), and neither does forcing a high
+monotonic load base (tried + reverted). So the layout hypothesis is incomplete — the biased non-PIE's
+absolute refs fault regardless of whether the freed low region is sparse or dense, because `__PAGEZERO`
+makes the link vaddr (`0x4xxxxx`) permanently unmappable. The real fix likely needs to **relocate the
+non-PIE's absolute references to the bias** (apply the bias to GOT/abs relocs in `load_elf`, or trap+fix
+faults at the link-vaddr range), not just reshape the layout. Next: dump the faulting PC + the offending
+ref under `CRASHDBG` (needs the Mach-exception handler to log, since `diag_crash` is bypassed).
+
+**Docker API compliance** — goal is a faithful Engine API **v1.43** for the **everyday developer
+workflow** so the stock `docker` CLI + bollard work unmodified. **Swarm / services / nodes / tasks /
+secrets / configs / managed plugins are out of scope** (single-node, local dev — `/info` reports
+`Swarm: inactive`).
+
+_Done 2026-06-27:_ `dd-daemon` decomposed (1805-line `main.rs` → `model`/`util`/`system`/`images`/
+`containers`/`build`/`archive`/`volumes`/`networks`/`runtime` modules); `dd-client` rewrapped on
+**bollard** (GUI + CLI share it). Added routes/behaviour: global Docker headers (`Api-Version`… → CLI
+handshake + `GET`/`HEAD /_ping`), `POST /auth`, `GET /system/df`, `GET /events` (open stream), prune
+(containers/volumes/networks/images/build), `/containers/{id}/{changes,export,update}`, image
+`history`/`search`/`distribution`, `VirtualSize` on `images/json` (bollard strict-deserialize fix),
+`tag`-query honoring, `version`/`info` fills. _(every everyday route now returns a Docker-shaped
+response — no 404s; what's left is field/behaviour fidelity.)_
+
+Remaining — what still needs to be figured out / built (priority):
+
+| Area | What needs work | Pri |
+|------|-----------------|:---:|
+| `docker inspect` (container) | the big one: fill `Name`, `Mounts`, `NetworkSettings` (IP/ports → fixes `docker port`), `State.{Pid,StartedAt,FinishedAt}`, full `Config` — **`docker compose` depends on it** | P1 |
+| `docker logs` | `-f`/follow, `--tail`/`--since`/`--timestamps`; emit a **raw** stream for `-t` (today always framed → garbled TTY logs) | P1 |
+| `docker ps` | `--filter`/`--size`; human `Status` (`Up 3 minutes`); `Labels`/`ImageID`/network info | P1 |
+| `docker exec` | apply `-e`/`-u`/`-w`/`--privileged`; `exec -d` must return 200 (today 101-hijacks → hangs) | P1 |
+| `docker events` | wire a real lifecycle event bus into the open stream (compose + GUI watch it) | P1 |
+| `docker stats` | real CPU/mem accounting from the JIT runtime + streaming *(design: runtime has no cgroup metrics)* | P1 |
+| networks | model `IPAM` (subnet/gateway), labels/options, per-endpoint IP/MAC in inspect *(design: dd uses a per-container loopback netns, no bridge)* | P2 |
+| `docker build` | honor `buildargs`/`labels`/`target`/`nocache`; real content-digest image IDs; (BuildKit cache, above) | P2 |
+| `docker run` opts | `--user` (uid not applied — `id -u`=0) + `--label` (not stored → empty `Config.Labels`, breaks `ps --filter label`); wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` | P2 |
+| volumes | persist `--driver`/`--opt`/`--label`; `409` when in use; RFC3339 `CreatedAt` | P2 |
+| `docker pull`/`push` | per-layer progress bars; push returns final `aux{Digest}` | P2 |
+| image inspect/history | real `Created`/`Size`/`Entrypoint`/`Env`/`Labels` (today hard-coded) | P2 |
+| `docker cp` | redirect a `cp` into a bind-mount path to the host volume dir (today rootfs only) | P2 |
+| `save`/`load`/`import` | `images/get` + `images/load` + `fromSrc` import have no route yet | P3 |
+| stop/kill/restart | honor `signal`/`t` + real signal delivery (containers run synchronously today) | P3 |
+
+Hard problems (not plumbing): **live resource metrics** for `stats`, an **event bus**, and a real
+**network/IPAM model** over the loopback-netns isolation.
+
+## Real software — `make test-realsw` (pulled from Docker Hub) + the `compile` group
+Real, syscall/fork/thread/mmap-heavy production binaries run with deterministic workloads. Snapshot:
+- **python:alpine** ✅ — a mixed workload (lru_cache fib(35), dict aggregation, sort) runs correctly; a
+  large C runtime (bytecode VM, import machinery) is solid.
+- **GCC-14 toolchain** (`compile` group, gcc-bundle image) ❌ — `gcc`/`g++`/`cc1` **segfault**: this IS
+  the fork()+execve()/non-PIE crash diagnosed above (driver is always fork+exec'd by the shell).
+  xfail-tracked (`compile/{hello,c-primes,cpp-stl}`); XPASS fires when the execve address-space-reset lands.
+- **redis:alpine** ❌ — DISTINCT bug (redis-server is **PIE**, so *not* the non-PIE crash): the server
+  **crashes during startup** — prints its config banner (+ jemalloc `MADV_DONTNEED` unsupported / overcommit
+  warnings) then exits *before* binding (nothing on the port; `redis-cli` → refused). Dies in bootstrap
+  (post-config, pre-listener) — suspect the `madvise`/jemalloc or an eventloop/thread-init path; needs a
+  faulting-address capture.
+- **postgres:alpine** ❌ — DISTINCT bug (postgres is **PIE**): never reaches "ready to accept connections".
+  Its `setuid`/`setgid` drop *works* (146/144/145/147 are handled) — the gap is the daemonize, i.e. the
+  still-missing **`setsid`(157)**, plus possibly the fork+exec path during initdb.
+- **nats:latest** ❌ — won't even **pull**: `dd-daemon` reports "could not detect the image architecture"
+  on a distroless/scratch image (the arch sniffer in `containers_create`/`detect_arch` scans for an ELF
+  where there is none — needs a manifest-`platform` fallback). A `dd-daemon` image-arch-detection gap.
 
 ### Platform limitations (macOS host — need Linux primitives the host can't provide; off the work-list)
 Non-PIE **ET_EXEC** (macOS `__PAGEZERO` reserves the low 4 GB the fixed vaddr needs), **cpu/io throttling**
