@@ -2671,6 +2671,25 @@ static void service(struct cpu *c) {
     }
     // setsid(): new session / process-group leader
     case 157: { pid_t s = setsid(); G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s; break; }
+    // scheduling: stub with sane SCHED_OTHER values (real-time priorities aren't offered)
+    case 118: // sched_setparam
+    case 119: G_RET(c) = 0; break;                            // sched_setscheduler -> ok (ignored)
+    case 120: G_RET(c) = 0; break;                            // sched_getscheduler -> SCHED_OTHER(0)
+    case 121: if (a1) *(int *)a1 = 0; G_RET(c) = 0; break;    // sched_getparam -> priority 0
+    case 125: G_RET(c) = (a0 == 1 || a0 == 2) ? 99 : 0; break; // sched_get_priority_max: FIFO/RR=99 else 0
+    case 126: G_RET(c) = 0; break;                            // sched_get_priority_min -> 0
+    case 127: // sched_rr_get_interval -> a nominal 100ms slice
+        if (a1) { ((struct timespec *)a1)->tv_sec = 0; ((struct timespec *)a1)->tv_nsec = 100000000L; }
+        G_RET(c) = 0; break;
+    // mlockall/munlockall: no macOS equivalent; the guest's "don't swap" intent is a safe no-op
+    case 230:
+    case 231: G_RET(c) = 0; break;
+    // getitimer/setitimer: wrap the host (ITIMER_* + struct itimerval layouts match Linux<->macOS)
+    case 102: G_RET(c) = getitimer((int)a0, (struct itimerval *)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 103:
+        G_RET(c) = setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0
+                       ? (uint64_t)(-errno) : 0;
+        break;
 
     // ===================== unhandled =====================
     default:
