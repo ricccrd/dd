@@ -775,7 +775,7 @@ static void service(struct cpu *c) {
         if (lf & 0x200) mf |= O_TRUNC;
         if (lf & 0x400) mf |= O_APPEND;
         if (lf & 0x800) mf |= O_NONBLOCK;
-        if (lf & 0x10000) mf |= O_DIRECTORY;
+        if (lf & G_O_DIRECTORY) mf |= O_DIRECTORY;
         if (lf & 0x80000) mf |= O_CLOEXEC;
         {
             // pty: /dev/ptmx -> posix_openpt; /dev/pts/N -> slave
@@ -812,8 +812,8 @@ static void service(struct cpu *c) {
                 // copy-up the lower file (or upper path to create)
                 overlay_copyup(gp, host, sizeof host);
             else
-                overlay_resolve(gp, host, sizeof host, (lf & 0x20000) != 0);
-            int r = open(host, mf | ((lf & 0x20000) ? O_NOFOLLOW : 0), (mode_t)a3);
+                overlay_resolve(gp, host, sizeof host, (lf & G_O_NOFOLLOW) != 0);
+            int r = open(host, mf | ((lf & G_O_NOFOLLOW) ? O_NOFOLLOW : 0), (mode_t)a3);
             if (r >= 0) {
                 char gpa[4200];
                 if (fcntl(r, F_GETPATH, gpa) == 0) {
@@ -833,8 +833,8 @@ static void service(struct cpu *c) {
         // TOCTOU-free per-component resolve in the jail
         if (g_rootfs) {
             char fin[512];
-            // O_NOFOLLOW
-            int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (lf & 0x20000) != 0);
+            // resolve following the final symlink unless the guest asked O_NOFOLLOW (per-arch bit)
+            int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (lf & G_O_NOFOLLOW) != 0);
             if (pfd < 0) {
                 G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;

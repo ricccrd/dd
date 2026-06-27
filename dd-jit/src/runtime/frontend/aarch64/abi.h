@@ -40,3 +40,10 @@
 
 // brk policy: aarch64 grows a real brk heap (works on macOS).
 #define G_BRK_GROWABLE 1
+
+// Open-flag bits that DIFFER by guest arch (the high O_* group). aarch64 uses the asm-generic values; the
+// service must test the GUEST's bit, not a hardcoded one -- e.g. aarch64 O_LARGEFILE (0x20000, which musl
+// ORs into every open) is the SAME bit as x86's O_NOFOLLOW, so a hardcoded 0x20000 check turned every
+// symlink open into ELOOP. (Low flags O_CREAT/EXCL/TRUNC/APPEND/NONBLOCK + O_CLOEXEC match across arches.)
+#define G_O_DIRECTORY 0x4000 // asm-generic O_DIRECTORY = 0040000
+#define G_O_NOFOLLOW  0x8000 // asm-generic O_NOFOLLOW  = 0100000

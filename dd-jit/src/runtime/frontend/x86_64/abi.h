@@ -33,3 +33,8 @@
 // brk policy: x86 reports a fixed break so glibc uses its mmap allocator -- a brk heap the guest then
 // mmap/mprotects cannot be split on the macOS VM. (jit86 learned this the hard way.)
 #define G_BRK_GROWABLE 0
+
+// Open-flag bits that DIFFER by guest arch (the high O_* group): x86-64 has its own values for the
+// O_DIRECTORY/O_NOFOLLOW group, distinct from aarch64's asm-generic ones (see frontend/aarch64/abi.h).
+#define G_O_DIRECTORY 0x10000 // x86-64 O_DIRECTORY = 0200000
+#define G_O_NOFOLLOW  0x20000 // x86-64 O_NOFOLLOW  = 0400000

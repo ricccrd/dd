@@ -53,10 +53,6 @@ plain `localhost:5000` (`dd-daemon/src/registry.rs`; 38/38 docker-CLI scenarios 
   program from an image given purely as `--lower` (empty upper) fails with "open: No such file". The
   program loader needs to go through `overlay_resolve` like the syscall paths do. (A registry `pull`
   unpacks into a flat rootfs, so this isn't hit there — only on a pure read-only-lower mount.)
-- **Relative symlink in the jail mis-resolves as "Symbolic link loop"** — alpine's
-  `/etc/os-release -> ../usr/lib/os-release` fails to read through the JIT (`cat /etc/os-release` →
-  symlink loop), though the target exists. Breaks tools that read os-release. In the overlay/jail
-  symlink-follow (`layer_follow`). (Found by dd-tests sandbox/jail group.)
 
 ## Remaining JIT gaps
 - **`--network none` egress isolation** — dd-daemon can pass `DD_NET_ISOLATE=1`, but the JIT doesn't yet
