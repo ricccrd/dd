@@ -137,6 +137,9 @@ async fn main() {
         // Every response carries Docker's negotiation/identity headers so the CLI's version
         // handshake and `docker version`/`info` work without falling back to defaults.
         .layer(axum::middleware::map_response(docker_headers))
+        // A Docker daemon ingests large tarball bodies (build contexts, `docker load`, `docker cp`),
+        // which exceed axum's 2MB default Bytes-extractor limit -> disable it.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(app);
 
     let listener = tokio::net::UnixListener::bind(&sock).expect("bind unix socket");
