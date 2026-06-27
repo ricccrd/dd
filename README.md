@@ -28,7 +28,7 @@ the **Docker Engine API**, so the ordinary `docker` CLI drives it.
 The container's *compute* runs as native Apple-Silicon instructions; only its *syscalls* are
 interpreted. No VM to boot, no daemon-in-a-VM, no virtualization cost.
 
-> 🌐 **Website & docs:** https://ricccrd.github.io/dd/
+> **Website & docs:** https://ricccrd.github.io/dd/
 
 ```sh
 make jit                                          # build.rs compiles + codesigns the JITs
@@ -39,18 +39,18 @@ docker run -p 8080:80 -m 256m alpine sh -c 'echo hi from $(hostname)'
 
 ## Features
 
-- **🚫 No virtual machine.** No hypervisor, no Linux kernel, no VM to keep resident. The guest's
+- **No virtual machine.** No hypervisor, no Linux kernel, no VM to keep resident. The guest's
   instructions run natively on arm64; only the syscall boundary is trapped and serviced in userspace.
-- **🐳 Drop-in Docker.** dd implements the Docker Engine API. Point `DOCKER_HOST` at its socket and your
+- **Drop-in Docker.** dd implements the Docker Engine API. Point `DOCKER_HOST` at its socket and your
   existing `docker run / ps / images / build` commands work unchanged.
-- **🧠 The JIT is the kernel.** Namespaces, cgroups, overlay image layers and networking are ordinary
+- **The JIT is the kernel.** Namespaces, cgroups, overlay image layers and networking are ordinary
   userspace state — a userspace kernel in the gVisor / PRoot lineage, with none of a VM's cost.
-- **🏗️ aarch64 *and* x86-64 guests.** Run native arm64 Linux images, or x86-64 images via a JIT
+- **aarch64 *and* x86-64 guests.** Run native arm64 Linux images, or x86-64 images via a JIT
   (`jit86`) that decodes x86, synthesizes its flags, and lowers SSE/x87 onto NEON. glibc binaries run.
-- **📦 Real container isolation.** Overlay image layers (copy-up / `.wh.` whiteout, merged `getdents`),
+- **Real container isolation.** Overlay image layers (copy-up / `.wh.` whiteout, merged `getdents`),
   a TOCTOU-free path-jail VFS, PID / UTS / USER namespaces, a private loopback netns with `-p` port
   publishing, and cgroup memory + pids limits (OOM at the limit).
-- **🖥️ Desktop app, no root.** A native GTK4 app (**dd-app**) plus a `dd` CLI install a per-user
+- **Desktop app, no root.** A native GTK4 app (**dd-app**) plus a `dd` CLI install a per-user
   background daemon and a `docker context` — everything under `$HOME`, never `sudo`.
 
 ## Why a JIT, not a VM?
