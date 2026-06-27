@@ -56,6 +56,7 @@ static char g_ovldir[1024][192];
 static int g_eventfd_peer[1024];
 // eventfd accumulating counter: write() adds, read() returns + resets (the pipe is only readiness)
 static uint64_t g_eventfd_count[1024];
+static uint8_t g_eventfd_sema[1024]; // EFD_SEMAPHORE: read() returns 1 and decrements by 1, not the whole counter
 // fd is a timerfd (a kqueue with an EVFILT_TIMER) -> read() drains it
 static uint8_t g_timerfd[1024];
 // fd is an inotify (a kqueue with EVFILT_VNODE watches) -> read() drains it

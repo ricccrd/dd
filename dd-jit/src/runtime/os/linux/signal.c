@@ -9,6 +9,9 @@ static struct {
 } g_sigact[65];
 // bitmask of pending signals (1<<signo)
 static volatile uint64_t g_pending;
+// rt_sigqueueinfo extras carried to the handler's siginfo: si_code + si_value (consumed on delivery)
+static int g_sigcode[65];
+static uint64_t g_sigval[65];
 // sentinel lr: handler return -> sigreturn
 #define SIGRETURN_PC 0xFFFFFFFFFFF0ull
 

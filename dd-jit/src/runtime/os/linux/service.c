@@ -60,6 +60,7 @@ static int snap_has(const char *snap, const char *name, size_t nl) {
     }
     return 0;
 }
+static char g_procname[16]; // prctl PR_SET_NAME / PR_GET_NAME (the 15-char process/thread name)
 static void service(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
@@ -181,12 +182,15 @@ static void service(struct cpu *c) {
                 if (fcntl(rfd, F_GETFL) & O_NONBLOCK) { G_RET(c) = (uint64_t)(-EAGAIN); break; }
                 char b; if (read(rfd, &b, 1) < 0) {} // block until a writer signals 0->positive
             }
-            uint64_t v = g_eventfd_count[rfd];
-            g_eventfd_count[rfd] = 0;
-            int fl = fcntl(rfd, F_GETFL); // drain any readiness bytes so poll() clears
+            uint64_t v;
+            if (g_eventfd_sema[rfd]) { v = 1; g_eventfd_count[rfd] -= 1; } // EFD_SEMAPHORE: one at a time
+            else { v = g_eventfd_count[rfd]; g_eventfd_count[rfd] = 0; }
+            // re-sync the pipe to "counter > 0": drain it, then re-signal one byte if still positive
+            int fl = fcntl(rfd, F_GETFL);
             fcntl(rfd, F_SETFL, fl | O_NONBLOCK);
             char buf[64]; while (read(rfd, buf, sizeof buf) > 0) {}
             fcntl(rfd, F_SETFL, fl);
+            if (g_eventfd_count[rfd] > 0) { char b = 1; if (write(g_eventfd_peer[rfd] - 1, &b, 1) < 0) {} }
             if (a1) *(uint64_t *)a1 = v;
             G_RET(c) = 8;
             break;
@@ -1589,6 +1593,8 @@ static void service(struct cpu *c) {
     }
     // prctl(option,...)
     case 167: {
+        if ((int)a0 == 15) { snprintf(g_procname, sizeof g_procname, "%.15s", (const char *)a1); G_RET(c) = 0; break; } // PR_SET_NAME
+        if ((int)a0 == 16) { snprintf((char *)a1, 16, "%s", g_procname); G_RET(c) = 0; break; }                          // PR_GET_NAME
         // 0 for known no-ops; EINVAL for unknown (kernel does)
         switch ((int)a0) {
         case 1:
@@ -1806,6 +1812,16 @@ static void service(struct cpu *c) {
         G_RET(c) = 0;
         // tgkill(tgid,tid,sig)
         break;
+    case 138: { // rt_sigqueueinfo(tgid, sig, siginfo): carry si_code + si_value to the handler's siginfo
+        int sig = (int)a1;
+        if (sig >= 1 && sig <= 64 && a2) {
+            g_sigcode[sig] = *(int *)(a2 + 8);     // siginfo.si_code
+            g_sigval[sig] = *(uint64_t *)(a2 + 24); // siginfo.si_value (sival_int/ptr)
+        }
+        raise_guest_signal(c, sig);
+        G_RET(c) = 0;
+        break;
+    }
     // sigaltstack(new, old)
     case 132: {
         if (a1) {
@@ -2246,12 +2262,12 @@ static void service(struct cpu *c) {
             fcntl(fds[1], F_SETFL, O_NONBLOCK);
         // EFD_NONBLOCK
         }
-        // writes to the eventfd go to fds[1]
-        if (fds[0] < 1024 && fds[1] < 1024) g_eventfd_peer[fds[0]] = fds[1] + 1;
-        if (a0 > 0) {
-            uint64_t v = a0;
-            if (write(fds[1], &v, 8) < 0) {}
-        // initval: read() returns it (else blocks)
+        // writes to the eventfd go to fds[1]; the counter + sema-flag live alongside.
+        if (fds[0] < 1024 && fds[1] < 1024) {
+            g_eventfd_peer[fds[0]] = fds[1] + 1;
+            g_eventfd_sema[fds[0]] = (a1 & 1) != 0;   // EFD_SEMAPHORE
+            g_eventfd_count[fds[0]] = a0;             // initval
+            if (a0 > 0) { char b = 1; if (write(fds[1], &b, 1) < 0) {} } // make it readable
         }
         G_RET(c) = (uint64_t)fds[0];
         break;

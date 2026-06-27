@@ -13,6 +13,9 @@ static void build_signal_frame(struct cpu *c, int sig) {
     memset(f, 0, 4688);
     // siginfo.si_signo
     *(int *)(f + 0) = sig;
+    *(int *)(f + 8) = g_sigcode[sig];       // si_code (SI_QUEUE for sigqueue, else 0)
+    *(uint64_t *)(f + 24) = g_sigval[sig];  // si_value (sigqueue's sival_int/ptr)
+    g_sigcode[sig] = 0; g_sigval[sig] = 0;  // consumed
     uint64_t uc = frame + 128, mc = uc + 168;
     // uc_sigmask (signal mask to restore)
     *(uint64_t *)(uc + 40) = c->sigmask;

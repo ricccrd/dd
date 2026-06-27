@@ -30,6 +30,9 @@ static void build_signal_frame(struct cpu *c, int sig) {
     *(uint64_t *)(uc + 296) = c->sigmask;                 // uc_sigmask (restored on sigreturn)
     memcpy((void *)xs, c->v, sizeof c->v);                // preserve guest xmm across the handler
     *(int *)(info + 0) = sig;                             // siginfo.si_signo
+    *(int *)(info + 8) = g_sigcode[sig];                  // si_code (SI_QUEUE for sigqueue, else 0)
+    *(uint64_t *)(info + 24) = g_sigval[sig];             // si_value
+    g_sigcode[sig] = 0; g_sigval[sig] = 0;                // consumed
     uint64_t rsp = sp - 8;
     *(uint64_t *)rsp = SIGRETURN_PC; // pushed return address
     c->r[7] = (uint64_t)sig;
