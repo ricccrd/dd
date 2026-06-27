@@ -76,6 +76,15 @@ static void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already
             e_bfi(I->rm_reg, val, 0, 8 * w, 1);
     }
 }
+// Lazy flags (x86-perf PR1): pending PF_SUB record. Translate-time only -- no guest state,
+// never exists at runtime. Set true by a width-4/8 sub/cmp producer that *deferred* its
+// e_nzcv_save (§3.1/§7 Phase 1); means the LIVE ARM NZCV currently holds that op's flags in
+// the canonical borrow convention (== exactly what e_nzcv_save would have spilled to cpu->nzcv,
+// and what x86cc_to_arm() already assumes). Consumed live only by an *immediately following*
+// Jcc; any other instruction or block boundary materializes it to membank (identical bytes to
+// today) and clears it -- so the cross-block nzcv ABI is byte-identical. Reset per block.
+static int g_pf_sub_live;
+
 // Width-correct ALU: dst = a <kind> b, set cpu->nzcv.  dst<0 => cmp/test (no write).
 // 4/8-byte: direct ARM op. 1/2-byte: operate in the HIGH bits (<<sh) so ARM NZCV matches
 // x86 byte/word flags exactly, then merge the low w bytes back (preserving upper bits).
@@ -103,7 +112,10 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
         else if (logical)
             e_nzcv_save_c1(); // x86 CF=0 -> stored C=1
         else
-            e_nzcv_save();
+            // PF_SUB (sub/cmp, width 4/8): defer e_nzcv_save. ARM SUBS already left the live
+            // NZCV in borrow convention; an immediately-following Jcc reads it directly, and
+            // any other consumer/boundary materializes it via e_nzcv_save (same bytes as here).
+            g_pf_sub_live = 1;
         return;
     }
     int sh = 8 * (4 - w);                       // 24 for byte, 16 for word
@@ -158,8 +170,10 @@ static void *translate_block(uint64_t gpc) {
     void *host = g_cp;
     emit_prologue();
     void *body = g_cp;
+    g_pf_sub_live = 0; // lazy flags: no pending sub/cmp at block entry
     for (;;) {
         if (g_itrace && gpc != start) {
+            if (g_pf_sub_live) { e_nzcv_save(); g_pf_sub_live = 0; } // materialize before boundary
             emit_chain_exit(gpc);
             break;
         } // 1 insn/block: per-instruction register dump
@@ -172,6 +186,18 @@ static void *translate_block(uint64_t gpc) {
             fprintf(stderr, "[dec] %llx %s%02x len=%d mod%d rm%d reg%d mem%d base%d idx%d disp=%lld imm=%lld\n",
                     (unsigned long long)gpc, I.two ? "0F " : "", op, I.len, I.mod, I.rm_reg, I.reg, I.is_mem,
                     I.m_hasbase ? I.m_base : -1, I.m_hasindex ? I.m_index : -1, (long long)I.disp, (long long)I.imm);
+
+        // Lazy flags: a pending width-4/8 sub/cmp left its flags live in NZCV instead of spilling
+        // to cpu->nzcv. The ONLY consumer allowed to read them live is an immediately-following Jcc
+        // (rel8 70-7F / rel32 0F 80-8F). For every other instruction -- another flag op, a non-Jcc
+        // consumer (setcc/cmovcc/adc/...), or a block-ender -- materialize to membank NOW, before it
+        // emits anything, with the exact e_nzcv_save the producer would have emitted. This keeps the
+        // cross-block nzcv ABI byte-identical and makes the fast path strictly producer-then-Jcc.
+        int is_jcc = (!I.two && op >= 0x70 && op <= 0x7F) || (I.two && (op & 0xF0) == 0x80);
+        if (g_pf_sub_live && !is_jcc) {
+            e_nzcv_save();
+            g_pf_sub_live = 0;
+        }
 
         if (!I.two) {
             // ---- mov r8, imm8 (B0+r) ----
@@ -674,11 +700,22 @@ static void *translate_block(uint64_t gpc) {
             if (op >= 0x70 && op <= 0x7F) {
                 int cc = x86cc_to_arm(op & 0xF);
                 if (cc < 0) {
+                    if (g_pf_sub_live) { e_nzcv_save(); g_pf_sub_live = 0; } // materialize before boundary
                     report_unimpl(gpc, &I);
                     break;
                 }
                 uint64_t taken = next + (uint64_t)I.imm;
-                e_nzcv_load();
+                if (g_pf_sub_live) {
+                    // Fast path: live NZCV still holds the immediately-preceding width-4/8 sub/cmp
+                    // flags (borrow-convention C, exactly what x86cc_to_arm assumes). Spill them to
+                    // membank for the successor blocks (boundary materialize -- mrs;str, identical
+                    // bytes to today's producer save, and preserves NZCV), then branch straight off
+                    // the live flags -- dropping the redundant e_nzcv_load (ldr;msr) round-trip.
+                    e_nzcv_save();
+                    g_pf_sub_live = 0;
+                } else {
+                    e_nzcv_load();
+                }
                 uint32_t *patch = (uint32_t *)g_cp;
                 emit32(0); // b.cond -> taken
                 emit_chain_exit(next);
@@ -1787,11 +1824,19 @@ static void *translate_block(uint64_t gpc) {
             if ((op & 0xF0) == 0x80) {
                 int cc = x86cc_to_arm(op & 0xF);
                 if (cc < 0) {
+                    if (g_pf_sub_live) { e_nzcv_save(); g_pf_sub_live = 0; } // materialize before boundary
                     report_unimpl(gpc, &I);
                     break;
                 }
                 uint64_t taken = next + (uint64_t)I.imm;
-                e_nzcv_load();
+                if (g_pf_sub_live) {
+                    // Fast path (see jcc rel8): membank-spill the live sub/cmp flags for successors,
+                    // then branch off live NZCV; drop the redundant e_nzcv_load.
+                    e_nzcv_save();
+                    g_pf_sub_live = 0;
+                } else {
+                    e_nzcv_load();
+                }
                 uint32_t *patch = (uint32_t *)g_cp;
                 emit32(0);
                 emit_chain_exit(next);
