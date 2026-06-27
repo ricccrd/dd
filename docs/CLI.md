@@ -66,4 +66,5 @@ docker --context dd pull ubuntu        # real registry pull (any registry)
 docker --context dd ps
 ```
 
-See [Docker compatibility](DOCKER.md) for the full matrix of supported commands.
+`ddcli` wraps the Docker Engine API the daemon implements, so the ordinary `docker` CLI works too
+(`docker --context dd …`).
