@@ -65,6 +65,19 @@ impl Guest {
         };
         if p.is_empty() { None } else { Some(p.to_string()) }
     }
+
+    /// Path to the darwinjail interposing dylib (DYLD_INSERT) that runs native macOS arm64 binaries in a
+    /// container. `DDJIT_DIR/darwinjail.dylib` (bundle) wins, else the build-time path. `None` if absent.
+    pub fn jail_dylib(&self) -> Option<String> {
+        if let Ok(dir) = std::env::var("DDJIT_DIR") {
+            let cand = format!("{dir}/darwinjail.dylib");
+            if Path::new(&cand).exists() {
+                return Some(cand);
+            }
+        }
+        let p = env!("DDJAIL_DARWIN_AARCH64");
+        if p.is_empty() { None } else { Some(p.to_string()) }
+    }
 }
 
 /// A published port: the host port forwards to the container port (`docker -p HOST:CONTAINER`).
@@ -123,15 +136,32 @@ impl SpawnConfig {
     /// differs per guest OS — linux (jit/jit86) takes the full container flag set + `DDVOL`/`DD_NETNS`
     /// env; darwin (jitdarwin) takes `--rootfs` + `--volume HOST:CONT`. Returns `None` if not built.
     pub fn script(&self, guest: Guest) -> Option<String> {
-        let jit = guest.jit_path()?;
         let cd = if self.work_dir.is_empty() { String::new() } else { format!("cd {} && ", shq(&self.work_dir)) };
         let argv = self.argv.iter().map(|a| shq(a)).collect::<Vec<_>>().join(" ");
         let body = if guest.os() == "darwin" {
-            let mut f = String::from("-q ");
-            if !self.rootfs.is_empty() { f += &format!("--rootfs {} ", shq(&self.rootfs)); }
-            for v in &self.volumes { f += &format!("--volume {}:{} ", shq(&v.host), shq(&v.container)); } // docker order: HOST:CONT
-            format!("{jit} {f}{argv}")
+            // darwinjail: run the native arm64 binary jailed via an interposing dylib (DYLD_INSERT) -- no
+            // DBT. The container model (rootfs/lowers/volumes/hostname/limits/publish) is passed as env.
+            let jail = guest.jail_dylib()?;
+            let mut env = format!("DYLD_INSERT_LIBRARIES={} DD_SANDBOX=1 ", shq(&jail));
+            if !self.rootfs.is_empty() { env += &format!("DD_ROOTFS={} ", shq(&self.rootfs)); }
+            if !self.lowers.is_empty() { env += &format!("DD_LOWERS={} ", shq(&self.lowers.join(","))); }
+            if !self.volumes.is_empty() {
+                let v = self.volumes.iter().map(|v| format!("{}:{}", v.host, v.container)).collect::<Vec<_>>().join(",");
+                env += &format!("DD_VOLUMES={} ", shq(&v));
+            }
+            if let Some(h) = &self.hostname { if !h.is_empty() { env += &format!("DD_HOSTNAME={} ", shq(h)); } }
+            if self.mem_max > 0 { env += &format!("DD_MEM_MAX={} ", self.mem_max); }
+            if self.pids_max > 0 { env += &format!("DD_PIDS_MAX={} ", self.pids_max); }
+            if !self.publish.is_empty() {
+                let p = self.publish.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>().join(",");
+                env += &format!("DD_PUBLISH={} ", shq(&p));
+            }
+            for (k, val) in &self.env { env += &format!("{}={} ", k, shq(val)); }
+            // `exec env …` so the container process REPLACES this shell -- it becomes the session leader /
+            // foreground of the PTY, so an interactive shell can read the terminal (no job-control stall).
+            format!("exec env {env}{argv}")
         } else {
+            let jit = guest.jit_path()?;
             let mut env = String::new();
             if !self.volumes.is_empty() {
                 let v = self.volumes.iter().map(|v| format!("{}:{}", v.container, v.host)).collect::<Vec<_>>().join(",");

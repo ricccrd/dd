@@ -1056,6 +1056,21 @@ fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol]) -> Option<(String, 
     })).collect();
     cfg.publish = c.publish.split(',').filter(|s| !s.is_empty()).filter_map(|p| p.split_once(':'))
         .filter_map(|(h, cc)| Some(PortMap { host: h.parse().ok()?, container: cc.parse().ok()? })).collect();
+    // macOS containers (darwinjail): the userland (nix arm64 tools) is on PATH at /profile/bin, and the
+    // host filesystem is the read-only lower so native binaries find their /nix deps; writes land in the
+    // rootfs + volumes. The entry argv[0] is run by the mac shell, so it must be a real host path -- we
+    // exec it through the profile's bash, which resolves the command via the in-jail PATH (so a bare
+    // `bash`/`uname`/… is found at /profile/bin and execve()'d into the jail).
+    if guest.os() == "darwin" {
+        cfg.lowers = vec!["/".into()];
+        cfg.env.push(("PATH".into(), "/profile/bin".into()));
+        // `-c` (not `-lc`): a login shell would source the host's /etc/profile via the lower and exec
+        // arm64e system tools (which the arm64 jail can't inject into); the container has its own env.
+        let wrapper = format!("{}/profile/bin/bash", c.rootfs);
+        let mut wrapped = vec![wrapper, "-c".into(), "exec \"$@\"".into(), "dd-mac".into()];
+        wrapped.extend(std::mem::take(&mut cfg.argv));
+        cfg.argv = wrapped;
+    }
     cfg.command(guest)
 }
 
@@ -1313,27 +1328,27 @@ fn discover_images(images_dir: &str) -> Vec<Image> {
     for e in rd.flatten() {
         let rootfs = e.path().join("rootfs");
         if !rootfs.is_dir() { continue; }
-        let arch = detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64);
-        // Prefer dd-image.json (written by a pull) so name + cmd round-trip exactly; else parse the dir.
-        let (name, cmd) = match std::fs::read_to_string(e.path().join("dd-image.json")).ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        {
+        // Prefer dd-image.json so name/cmd/os round-trip exactly (macOS images have no probe-able ELF);
+        // else parse the dir name + detect the arch from a probe binary.
+        let meta = std::fs::read_to_string(e.path().join("dd-image.json")).ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let (name, cmd, arch) = match &meta {
             Some(m) => {
                 let name = m["name"].as_str().unwrap_or("img").to_string();
                 let cmd: Vec<String> = m["cmd"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-                (name, if cmd.is_empty() { vec!["/bin/sh".into()] } else { cmd })
+                // os:darwin marks a native-macOS (darwinjail) image; otherwise detect from the rootfs.
+                let arch = if m["os"].as_str() == Some("darwin") { Guest::DarwinAarch64 }
+                           else { detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64) };
+                (name, if cmd.is_empty() { vec!["/bin/sh".into()] } else { cmd }, arch)
             }
             None => {
                 let raw = e.path().file_name().and_then(|s| s.to_str()).unwrap_or("img").to_string();
                 let name = raw.trim_end_matches("-bundle").split("__").next().unwrap_or("img").rsplit('_').next().unwrap_or("img").to_string();
-                (name, vec!["/bin/sh".into()])
+                (name, vec!["/bin/sh".into()], detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64))
             }
         };
         out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd });
     }
-    // NOTE: no synthesized `macos` image yet -- the darwin engine runs only static, thin, arm64 Mach-O
-    // binaries; macOS system tools (/bin/zsh, ...) are universal + arm64e + dynamically linked, which
-    // needs a Mach-O dynamic loader (dyld/dylibs) the engine doesn't have. `ddcli mac` says so.
     out
 }
 
