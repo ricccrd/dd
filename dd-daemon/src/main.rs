@@ -152,6 +152,7 @@ struct App {
     inner: Arc<Mutex<Inner>>,
     state_path: String,
     volumes_dir: String,
+    images_dir: String,
 }
 
 #[tokio::main]
@@ -182,7 +183,7 @@ async fn main() {
     for g in Guest::ALL {
         eprintln!("[dd-daemon] JIT {}: {}", g.target(), if ddjit::available(g) { "ready" } else { "NOT BUILT" });
     }
-    let app = App { inner: Arc::new(Mutex::new(inner)), state_path, volumes_dir };
+    let app = App { inner: Arc::new(Mutex::new(inner)), state_path, volumes_dir, images_dir };
 
     let router = Router::new()
         .route("/_ping", get(|| async { "OK" }))
@@ -306,17 +307,112 @@ async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Respon
 }
 #[derive(Deserialize)]
 struct ImageCreateQ { #[serde(rename = "fromImage")] from_image: Option<String>, #[serde(rename = "tag")] tag: Option<String> }
+/// POST /images/create -- `docker pull`. If the image isn't local, pull it from Docker Hub (real OCI
+/// registry: token -> manifest -> layers) and unpack it into a rootfs, then register it.
 async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>) -> Response {
-    // No registry pull yet: succeed iff the image is already local, else report it's missing (so the CLI
-    // surfaces a real "not found" instead of a confusing downstream error). TODO(OCI): real registry pull.
     let name = q.from_image.unwrap_or_default();
-    let tag = q.tag.unwrap_or_else(|| "latest".into());
-    let found = a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name));
-    if found {
-        (StatusCode::OK, Json(json!({"status": format!("Status: Image is up to date for {name}:{tag}")}))).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(json!({"message": format!("pull access denied for {name}, repository does not exist or no local image (dd has no registry yet)")}))).into_response()
+    let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
+    if name.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"}))).into_response(); }
+    if a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name)) {
+        return pull_progress(&name, &tag, Ok(true));
     }
+    let (dir, nm, tg) = (a.images_dir.clone(), name.clone(), tag.clone());
+    let res = tokio::task::spawn_blocking(move || pull_image(&dir, &nm, &tg)).await
+        .unwrap_or_else(|e| Err(format!("pull task crashed: {e}")));
+    match res {
+        Ok(img) => { a.inner.lock().await.images.push(img); pull_progress(&name, &tag, Ok(false)) }
+        Err(e) => pull_progress(&name, &tag, Err(e)),
+    }
+}
+
+/// docker-style pull progress: a stream of JSON status lines the CLI renders.
+fn pull_progress(name: &str, tag: &str, result: Result<bool, String>) -> Response {
+    let body = match result {
+        Ok(true) => format!("{}\r\n", json!({ "status": format!("Status: Image is up to date for {name}:{tag}") })),
+        Ok(false) => [
+            json!({ "status": format!("Pulling from library/{name}") }).to_string(),
+            json!({ "status": "Verifying Checksum" }).to_string(),
+            json!({ "status": "Download complete" }).to_string(),
+            json!({ "status": "Pull complete" }).to_string(),
+            json!({ "status": format!("Status: Downloaded newer image for {name}:{tag}") }).to_string(),
+        ].join("\r\n") + "\r\n",
+        Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
+    };
+    (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
+}
+
+/// Normalize a docker reference to (Hub repo path, tag): `ubuntu` -> (`library/ubuntu`, `latest`);
+/// `user/app:1` -> (`user/app`, `1`); strips a `docker.io/` prefix.
+fn normalize_repo(name: &str, default_tag: &str) -> (String, String) {
+    let s = name.strip_prefix("docker.io/").unwrap_or(name);
+    let (path, tag) = match s.rsplit_once(':') {
+        Some((p, t)) if !t.contains('/') => (p.to_string(), t.to_string()),
+        _ => (s.to_string(), default_tag.to_string()),
+    };
+    let repo = if path.contains('/') { path } else { format!("library/{path}") };
+    (repo, tag)
+}
+
+/// GET a registry URL with curl and parse the JSON body.
+fn curl_json(url: &str, headers: &[&str]) -> Result<Value, String> {
+    let mut c = std::process::Command::new("curl");
+    c.arg("-sSL").arg("--max-time").arg("120");
+    for h in headers { c.arg("-H").arg(h); }
+    c.arg(url);
+    let out = c.output().map_err(|e| format!("curl: {e}"))?;
+    if !out.status.success() { return Err(format!("curl {url}: {}", String::from_utf8_lossy(&out.stderr))); }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("bad JSON from {url}: {e}"))
+}
+
+/// Pull `name:tag` from Docker Hub and unpack it into `<images_dir>/<safe>/rootfs`. Picks the
+/// linux/arm64 variant of a multi-arch image (the native arch; falls back to amd64). curl + tar, so no
+/// extra crates. Whiteouts (`.wh.*`) are applied per layer.
+fn pull_image(images_dir: &str, name: &str, tag: &str) -> Result<Image, String> {
+    let (repo, tag) = normalize_repo(name, tag);
+    let tok = curl_json(
+        &format!("https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"), &[])?;
+    let token = tok["token"].as_str().ok_or("registry returned no token")?;
+    let auth = format!("Authorization: Bearer {token}");
+    let accept = "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json";
+    let mut man = curl_json(&format!("https://registry-1.docker.io/v2/{repo}/manifests/{tag}"), &[&auth, accept])?;
+    if let Some(list) = man["manifests"].as_array().cloned() {
+        let pick = |arch: &str| list.iter().find(|m| m["platform"]["architecture"] == arch && m["platform"]["os"] == "linux")
+            .and_then(|m| m["digest"].as_str().map(str::to_string));
+        let digest = pick("arm64").or_else(|| pick("amd64"))
+            .ok_or("no linux/arm64 or linux/amd64 in the manifest list")?;
+        man = curl_json(&format!("https://registry-1.docker.io/v2/{repo}/manifests/{digest}"), &[&auth, accept])?;
+    }
+    let layers = man["layers"].as_array().ok_or("manifest has no layers")?.clone();
+    if layers.is_empty() { return Err("manifest has no layers".into()); }
+    let safe = name.replace(['/', ':'], "_");
+    let imgdir = format!("{images_dir}/{safe}");
+    let rootfs = format!("{imgdir}/rootfs");
+    let _ = std::fs::remove_dir_all(&imgdir);
+    std::fs::create_dir_all(&rootfs).map_err(|e| format!("mkdir {rootfs}: {e}"))?;
+    for layer in &layers {
+        let digest = layer["digest"].as_str().ok_or("layer missing digest")?;
+        let url = format!("https://registry-1.docker.io/v2/{repo}/blobs/{digest}");
+        // stream the gzipped-tar layer straight into the rootfs, then apply this layer's whiteouts
+        let script = format!(
+            "set -o pipefail; curl -sSL --max-time 600 -H '{auth}' '{url}' | tar xz -C '{rootfs}' 2>/dev/null; \
+             find '{rootfs}' -name '.wh.*' 2>/dev/null | while IFS= read -r w; do \
+               d=$(dirname \"$w\"); b=$(basename \"$w\"); \
+               if [ \"$b\" = .wh..wh..opq ]; then rm -f \"$w\"; else rm -rf \"$d/${{b#.wh.}}\"; rm -f \"$w\"; fi; done");
+        let st = std::process::Command::new("sh").arg("-c").arg(&script).status().map_err(|e| format!("extract: {e}"))?;
+        if !st.success() { return Err(format!("failed to unpack layer {digest}")); }
+    }
+    let arch = detect_arch(std::path::Path::new(&rootfs)).ok_or("could not detect the image architecture")?;
+    let cmd = image_default_cmd(std::path::Path::new(&rootfs));
+    Ok(Image { name: name.to_string(), rootfs, arch, cmd })
+}
+
+/// Best-effort default command for a freshly pulled image (the registry config blob isn't fetched yet):
+/// prefer /bin/sh, else /bin/bash.
+fn image_default_cmd(rootfs: &std::path::Path) -> Vec<String> {
+    for sh in ["/bin/sh", "/bin/bash"] {
+        if rootfs.join(sh.trim_start_matches('/')).exists() { return vec![sh.to_string()]; }
+    }
+    vec!["/bin/sh".to_string()]
 }
 
 #[derive(Deserialize)]
