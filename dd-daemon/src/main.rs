@@ -220,6 +220,7 @@ async fn main() {
         .route("/containers/:id/resize", post(resize))
         .route("/containers/:id/logs", get(containers_logs))
         .route("/containers/:id/json", get(containers_inspect))
+        .route("/containers/:id/archive", get(archive_get).put(archive_put).head(archive_head))
         .route("/containers/:id/exec", post(exec_create))
         .route("/exec/:id/start", post(exec_start))
         .route("/exec/:id/resize", post(resize))
@@ -891,6 +892,109 @@ async fn containers_delete(State(a): State<App>, Path(id): Path<String>) -> Resp
 }
 fn no_such(id: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such container: {id}")}))).into_response()
+}
+
+// ===================== docker cp — the /archive tar endpoints =====================
+// `docker cp` tars a path out of (GET) / into (PUT) the container filesystem; HEAD returns a path-stat the
+// CLI uses to pick file-vs-dir semantics. We operate on the container's rootfs (the overlay upper) -- the
+// common case; bind-volume paths aren't redirected yet.
+#[derive(serde::Deserialize)]
+struct ArchiveQ { path: String }
+
+/// Map a container path to its host path inside `rootfs`, lexically clamping `..` so it can't escape.
+fn archive_host_path(rootfs: &str, path: &str) -> std::path::PathBuf {
+    let root = std::path::Path::new(rootfs).to_path_buf();
+    let mut out = root.clone();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => { if out != root { out.pop(); } }
+            p => out.push(p),
+        }
+    }
+    out
+}
+
+/// Go `os.FileMode` bits for docker's path-stat (the CLI keys off the dir/symlink flags).
+fn go_filemode(md: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    let mut m = md.permissions().mode() & 0o7777;
+    let ft = md.file_type();
+    if ft.is_dir() { m |= 1 << 31; }
+    if ft.is_symlink() { m |= 1 << 27; }
+    m
+}
+
+/// The `X-Docker-Container-Path-Stat` header value: base64(JSON{name,size,mode,mtime,linkTarget}).
+fn path_stat_b64(host: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(host).ok()?;
+    let name = host.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let link = if md.file_type().is_symlink() {
+        std::fs::read_link(host).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+    } else { String::new() };
+    let stat = json!({"name": name, "size": md.len(), "mode": go_filemode(&md),
+        "mtime": fmt_rfc3339(md.mtime()), "linkTarget": link});
+    Some(base64_std(stat.to_string().as_bytes()))
+}
+
+/// Standard base64 (no line breaks).
+fn base64_std(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(A[(n >> 18 & 63) as usize] as char);
+        out.push(A[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+async fn archive_head(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
+    let g = a.inner.lock().await;
+    let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
+    match path_stat_b64(&archive_host_path(&c.rootfs, &q.path)) {
+        Some(stat) => (StatusCode::OK, [("X-Docker-Container-Path-Stat", stat)]).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(),
+    }
+}
+
+async fn archive_get(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
+    let rootfs = { let g = a.inner.lock().await;
+        let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
+        c.rootfs.clone() };
+    let host = archive_host_path(&rootfs, &q.path);
+    let Some(stat) = path_stat_b64(&host) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(); };
+    let parent = host.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+    let base = host.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ".".into());
+    match std::process::Command::new("tar").arg("cf").arg("-").arg("-C").arg(&parent).arg(&base).output() {
+        Ok(o) if o.status.success() => (StatusCode::OK,
+            [("Content-Type", "application/x-tar".to_string()), ("X-Docker-Container-Path-Stat", stat)], o.stdout).into_response(),
+        Ok(o) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": String::from_utf8_lossy(&o.stderr)}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))).into_response(),
+    }
+}
+
+async fn archive_put(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>, body: axum::body::Bytes) -> Response {
+    let rootfs = { let g = a.inner.lock().await;
+        let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
+        c.rootfs.clone() };
+    let host = archive_host_path(&rootfs, &q.path);
+    if !host.is_dir() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"message": format!("extraction point {} is not a directory", q.path)}))).into_response(); }
+    let tmp = std::env::temp_dir().join(format!("dd-cp-{}.tar", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))).into_response(); }
+    let out = std::process::Command::new("tar").arg("xf").arg(&tmp).arg("-C").arg(&host).output();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) if o.status.success() => (StatusCode::OK, Json(json!({}))).into_response(),
+        Ok(o) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": String::from_utf8_lossy(&o.stderr)}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))).into_response(),
+    }
 }
 
 /// Build the `Ports` array Docker clients expect from our "host:container,..." publish string.

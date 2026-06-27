@@ -36,11 +36,12 @@ binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-cli
 
 ## Docker CLI gaps (`dd-daemon`)
 OCI registry **pull/push now works against any registry** — Docker Hub, `ghcr.io`, `quay.io`, ECR, a
-plain `localhost:5000` (`dd-daemon/src/registry.rs`; 38/38 docker-CLI scenarios pass). So
+plain `localhost:5000` (`dd-daemon/src/registry.rs`; 41/41 docker-CLI scenarios pass). So
 `DD_IMAGES` no longer has to point at a pre-extracted rootfs. What is still missing:
 - **`docker build`** — needs a BuildKit-compatible builder.
-- **`docker cp`** — the `/archive` tar endpoints aren't implemented.
 - **freezer `pause`/`unpause`** — accepted but no-ops (dd has no freezer cgroup on macOS).
+- **`docker cp` into bind-volume paths** — the `/archive` endpoints work against the rootfs (upper); a
+  path that falls inside a bind volume isn't redirected to the host volume dir yet.
 
 ## Bugs found by the test harness
 - **jit86 (x86-64) translator/service bugs (xfail in dd-tests)** — surfaced by running the aarch64 test

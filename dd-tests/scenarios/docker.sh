@@ -137,6 +137,19 @@ has "network-listed" "$(d network ls --format '{{.Name}}')" "scen-net"
 has "network-default-bridge" "$(d network ls --format '{{.Name}}')" "bridge"
 d network rm scen-net >/dev/null
 
+echo "== docker cp — the /archive tar endpoints (file roundtrip + directory) =="
+cpc="$(d create alpine sleep 60)"
+printf 'CP-ROUNDTRIP-OK\n' > "$ROOT/cp-in.txt"
+d cp "$ROOT/cp-in.txt" "$cpc":/tmp/ >/dev/null
+d cp "$cpc":/tmp/cp-in.txt "$ROOT/cp-back.txt" >/dev/null
+has "cp-file-roundtrip" "$(cat "$ROOT/cp-back.txt" 2>/dev/null)" "CP-ROUNDTRIP-OK"
+d cp "$cpc":/etc/alpine-release "$ROOT/cp-rel.txt" >/dev/null
+has "cp-file-out" "$(cat "$ROOT/cp-rel.txt" 2>/dev/null)" "3."
+d cp "$cpc":/etc "$ROOT/cp-etc" >/dev/null
+has "cp-dir-out" "$(ls "$ROOT/cp-etc" 2>/dev/null)" "alpine-release"
+d rm "$cpc" >/dev/null
+rm -rf "$ROOT/cp-in.txt" "$ROOT/cp-back.txt" "$ROOT/cp-rel.txt" "$ROOT/cp-etc"
+
 echo ""
 echo "scenarios: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
