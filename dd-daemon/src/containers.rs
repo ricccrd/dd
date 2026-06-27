@@ -38,6 +38,7 @@ pub(crate) struct CreateBody {
     #[serde(rename = "Hostname")] hostname: Option<String>,
     #[serde(rename = "Tty")] tty: Option<bool>,
     #[serde(rename = "WorkingDir")] working_dir: Option<String>,
+    #[serde(rename = "Labels")] labels: Option<HashMap<String, String>>,
     #[serde(rename = "HostConfig")] host_config: Option<HostConfig>,
 }
 
@@ -106,6 +107,7 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         created: now_secs(), tty,
         name: cq.name.unwrap_or_default().trim_start_matches('/').to_string(),
         working_dir, env,
+        labels: body.labels.unwrap_or_default(),
         network_mode: hc.as_ref().and_then(|h| h.network_mode.clone()).unwrap_or_default(),
         status: "created".into(), ..Default::default()
     };
@@ -395,19 +397,73 @@ pub(crate) async fn containers_wait(State(a): State<App>, Path(id): Path<String>
         .body(Body::from_stream(stream)).unwrap()
 }
 
-pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>) -> Response {
-    let g = a.inner.lock().await;
-    match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {
-        // Docker's non-TTY log stream is multiplexed: 8-byte frame header per chunk. The docker
-        // CLI demuxes it (and so does our dd-client).
-        Some(c) => {
-            let mut b = Vec::new();
-            if !c.stdout.is_empty() { b.extend(log_frame(1, &c.stdout)); }
-            if !c.stderr.is_empty() { b.extend(log_frame(2, &c.stderr)); }
-            b.into_response()
-        }
-        None => no_such(&id),
+#[derive(Deserialize)]
+pub(crate) struct LogsQ {
+    /// `--tail`: "all" (or absent) for everything, otherwise the number of trailing lines.
+    tail: Option<String>,
+    /// `--timestamps`: prefix each line with an RFC3339 timestamp.
+    timestamps: Option<String>,
+    /// `--follow`: best-effort no-op here (dd containers run to completion; we return the buffer).
+    follow: Option<String>,
+    /// Stream selection. Docker requests at least one; default to both when neither is given.
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+fn q_truthy(s: &Option<String>) -> bool {
+    matches!(s.as_deref(), Some("1") | Some("true") | Some("True"))
+}
+
+/// Split a log buffer into newline-terminated lines, keeping the trailing `\n` on each line and any
+/// final unterminated fragment as its own line. Used to apply `--tail` and `--timestamps` per line.
+fn split_log_lines(buf: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, b) in buf.iter().enumerate() {
+        if *b == b'\n' { lines.push(buf[start..=i].to_vec()); start = i + 1; }
     }
+    if start < buf.len() { lines.push(buf[start..].to_vec()); }
+    lines
+}
+
+pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>, Query(q): Query<LogsQ>) -> Response {
+    let g = a.inner.lock().await;
+    let c = match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {
+        Some(c) => c,
+        None => return no_such(&id),
+    };
+    let _follow = q_truthy(&q.follow); // accepted; dd containers run to completion, so we serve the buffer
+    let timestamps = q_truthy(&q.timestamps);
+    // Stream selection: honor explicit stdout/stderr flags, defaulting to both when neither is given.
+    let (mut want_out, mut want_err) = (q_truthy(&q.stdout), q_truthy(&q.stderr));
+    if !want_out && !want_err { want_out = true; want_err = true; }
+    // `--tail`: "all"/absent/unparsable -> everything; a number -> that many trailing lines.
+    let tail = match q.tail.as_deref() {
+        None | Some("") | Some("all") => None,
+        Some(s) => s.parse::<usize>().ok(),
+    };
+    // Collect lines as (stream_id, bytes); stdout first then stderr, mirroring the previous ordering.
+    let mut entries: Vec<(u8, Vec<u8>)> = Vec::new();
+    if want_out { for line in split_log_lines(&c.stdout) { entries.push((1, line)); } }
+    if want_err { for line in split_log_lines(&c.stderr) { entries.push((2, line)); } }
+    if let Some(n) = tail { if entries.len() > n { entries.drain(0..entries.len() - n); } }
+    // dd doesn't record per-line emit times; use the current time as a best-effort timestamp.
+    let ts = fmt_rfc3339(now_secs());
+    // TTY containers stream raw bytes (no demux header); non-TTY uses Docker's multiplexed framing
+    // (8-byte header per chunk, stream id 1=stdout / 2=stderr). The timestamp, when requested, is part
+    // of the stream payload so it survives demuxing -- exactly how dockerd writes it.
+    let mut b = Vec::new();
+    for (stream, line) in entries {
+        let payload = if timestamps {
+            let mut p = Vec::with_capacity(ts.len() + 1 + line.len());
+            p.extend_from_slice(ts.as_bytes());
+            p.push(b' ');
+            p.extend_from_slice(&line);
+            p
+        } else { line };
+        if c.tty { b.extend_from_slice(&payload); } else { b.extend(log_frame(stream, &payload)); }
+    }
+    b.into_response()
 }
 
 pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<String>) -> Response {
@@ -422,7 +478,7 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
             Json(json!({"Id": c.id, "Image": c.image, "Created": fmt_rfc3339(c.created),
             "Name": format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() }),
             "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": c.status == "running" || c.status == "paused", "Paused": c.status == "paused"},
-            "Config": {"Cmd": c.cmd, "Hostname": c.hostname, "Image": c.image, "Env": c.env},
+            "Config": {"Cmd": c.cmd, "Hostname": c.hostname, "Image": c.image, "Env": c.env, "Labels": c.labels},
             "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
             "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit},
             // NetworkSettings present so `docker port` (reads .NetworkSettings.Ports) doesn't panic.
@@ -458,6 +514,7 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
         .map(|c| json!({
         "Id": c.id, "Image": c.image, "Command": c.cmd.join(" "), "Created": c.created,
         "State": c.status, "Status": human_status(c), "ExitCode": c.exit_code, "Ports": ports_json(&c.publish),
+        "Labels": c.labels,
         "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
         "Names": [format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() })]})).collect();
     Json(json!(v))

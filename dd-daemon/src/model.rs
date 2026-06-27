@@ -65,6 +65,8 @@ pub(crate) struct Container {
     #[serde(default)]
     pub(crate) env: Vec<String>, // "K=V" entries from the image ENV + `docker run -e`
     #[serde(default)]
+    pub(crate) labels: std::collections::HashMap<String, String>, // `docker run --label`
+    #[serde(default)]
     pub(crate) network_mode: String,
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]

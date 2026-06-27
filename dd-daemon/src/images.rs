@@ -117,13 +117,22 @@ pub(crate) async fn image_inspect(State(a): State<App>, Path(name): Path<String>
 #[derive(Deserialize)]
 pub(crate) struct ImageCreateQ {
     #[serde(rename = "fromImage")] from_image: Option<String>,
+    #[serde(rename = "fromSrc")] from_src: Option<String>,
+    repo: Option<String>,
     #[serde(rename = "tag")] tag: Option<String>,
     platform: Option<String>,
 }
 
-/// POST /images/create -- `docker pull`. If the image isn't local (for the requested platform), pull it
-/// from its registry (any registry) and unpack it into a rootfs, then register it.
-pub(crate) async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>, headers: axum::http::HeaderMap) -> Response {
+/// POST /images/create -- `docker pull` (when `fromImage` is set) or `docker import` (when `fromSrc`
+/// is set). For a pull: if the image isn't local (for the requested platform), pull it from its
+/// registry (any registry) and unpack it into a rootfs, then register it. For an import: extract the
+/// rootfs tar from the request body into a new image named by `repo`.
+pub(crate) async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>, headers: axum::http::HeaderMap, body: axum::body::Bytes) -> Response {
+    // `docker import` routes through this same endpoint but carries `fromSrc` (the rootfs source)
+    // instead of `fromImage`; dispatch it to the import path before the pull logic.
+    if let Some(src) = q.from_src.clone().filter(|s| !s.is_empty()) {
+        return image_import(a, q.repo.clone().unwrap_or_default(), q.tag.clone().unwrap_or_default(), &src, body).await;
+    }
     let name = q.from_image.unwrap_or_default();
     let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
     if name.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"}))).into_response(); }
@@ -339,4 +348,162 @@ pub(crate) fn push_progress(name: &str, result: Result<String, String>) -> Respo
         Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
     };
     (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
+}
+
+
+// ---- image save / load / import --------------------------------------------
+//
+// dd's archive format is intentionally simple (not full OCI): a tar whose top level is the image's
+// `rootfs/` directory plus a `dd-manifest.json` sidecar recording the image identity (name + run
+// config). `docker save` produces it, `docker load` consumes it; `docker import` instead takes a
+// bare rootfs tar (no manifest) whose files land directly in a new image's rootfs.
+
+#[derive(Deserialize)]
+pub(crate) struct SaveQ { names: Option<String> }
+
+/// GET /images/get?names=<name> -- `docker save`. Streams a tar of the image's `rootfs/` directory
+/// plus a `dd-manifest.json` naming the image, as `application/x-tar`.
+pub(crate) async fn image_save(State(a): State<App>, Query(q): Query<SaveQ>) -> Response {
+    let names = q.names.unwrap_or_default();
+    if names.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"message": "names is required"}))).into_response();
+    }
+    let img = {
+        let g = a.inner.lock().await;
+        g.images.iter().find(|i| repo_tag(&i.name) == names || ref_name(&i.name) == ref_name(&names)).cloned()
+    };
+    let Some(img) = img else {
+        return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {names}")}))).into_response();
+    };
+    // The `macos` image is the live host filesystem (rootfs ~ `/`); taring it would be catastrophic.
+    if img.name == "macos" {
+        return (StatusCode::BAD_REQUEST, Json(json!({"message": "cannot save the host `macos` image"}))).into_response();
+    }
+    let rootfs = std::path::PathBuf::from(&img.rootfs);
+    let Some(parent) = rootfs.parent() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": "image has no rootfs directory"}))).into_response();
+    };
+    // Stage the manifest in a temp dir and tar it via a second `-C` so the on-disk image directory is
+    // left untouched (and a later `docker load` can restore name/cmd/env exactly).
+    let staging = std::env::temp_dir().join(format!("dd-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))).into_response();
+    }
+    let mut meta = json!({ "name": img.name, "cmd": img.cmd, "env": img.env, "entrypoint": img.entrypoint, "workdir": img.workdir });
+    if img.arch.os() == "darwin" { meta["os"] = json!("darwin"); }
+    let _ = std::fs::write(staging.join("dd-manifest.json"), meta.to_string());
+    let out = std::process::Command::new("tar").arg("cf").arg("-")
+        .arg("-C").arg(parent).arg("rootfs")
+        .arg("-C").arg(&staging).arg("dd-manifest.json").output();
+    let _ = std::fs::remove_dir_all(&staging);
+    match out {
+        Ok(o) if o.status.success() =>
+            Response::builder().status(StatusCode::OK).header("Content-Type", "application/x-tar")
+                .body(Body::from(o.stdout)).unwrap(),
+        Ok(o) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": String::from_utf8_lossy(&o.stderr).into_owned()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))).into_response(),
+    }
+}
+
+/// POST /images/load -- `docker load`. Extracts a dd save archive (rootfs/ + dd-manifest.json) from
+/// the request body into a new image directory and registers the image.
+pub(crate) async fn image_load(State(a): State<App>, body: axum::body::Bytes) -> Response {
+    let tmp = std::env::temp_dir().join(format!("dd-load-{}.tar", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &body) { return load_err(e.to_string()); }
+    // Extract into a staging dir under DD_IMAGES (same filesystem) so we can rename it into place once
+    // we've read the image name out of the manifest.
+    let staging = std::path::PathBuf::from(format!("{}/.load-{}", a.images_dir, std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(e) = std::fs::create_dir_all(&staging) { let _ = std::fs::remove_file(&tmp); return load_err(e.to_string()); }
+    let out = std::process::Command::new("tar").arg("xf").arg(&tmp).arg("-C").arg(&staging).output();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => { let _ = std::fs::remove_dir_all(&staging); return load_err(String::from_utf8_lossy(&o.stderr).into_owned()); }
+        Err(e) => { let _ = std::fs::remove_dir_all(&staging); return load_err(e.to_string()); }
+    }
+    if !staging.join("rootfs").is_dir() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return load_err("archive is not a dd image (no rootfs/ at top level)".into());
+    }
+    // dd-manifest.json (written by `docker save`) carries the image identity; tolerate a rootfs-only
+    // archive by falling back to a generic name.
+    let meta = std::fs::read_to_string(staging.join("dd-manifest.json")).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let strs = |k: &str| meta.as_ref().and_then(|m| m[k].as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+    let name = meta.as_ref().and_then(|m| m["name"].as_str()).filter(|s| !s.is_empty()).unwrap_or("loaded").to_string();
+    let darwin = meta.as_ref().and_then(|m| m["os"].as_str()) == Some("darwin");
+    let target = std::path::PathBuf::from(format!("{}/{}", a.images_dir, name.replace(['/', ':'], "_")));
+    let _ = std::fs::remove_dir_all(&target);
+    if let Err(e) = std::fs::rename(&staging, &target) { let _ = std::fs::remove_dir_all(&staging); return load_err(e.to_string()); }
+    let rootfs = target.join("rootfs");
+    let arch = if darwin { Guest::DarwinAarch64 } else { detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64) };
+    let mut cmd = strs("cmd");
+    if cmd.is_empty() { cmd = if darwin { vec!["bash".into()] } else { default_shell(&rootfs) }; }
+    let (env, entrypoint) = (strs("env"), strs("entrypoint"));
+    let workdir = meta.as_ref().and_then(|m| m["workdir"].as_str()).unwrap_or("").to_string();
+    let img = Image {
+        name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch,
+        cmd: cmd.clone(), env: env.clone(), entrypoint: entrypoint.clone(), workdir: workdir.clone(),
+    };
+    // Persist a dd-image.json so the image round-trips through `discover_images` after a daemon restart.
+    let mut dd = json!({ "name": name, "cmd": cmd, "env": env, "entrypoint": entrypoint, "workdir": workdir });
+    if darwin { dd["os"] = json!("darwin"); }
+    let _ = std::fs::write(target.join("dd-image.json"), dd.to_string());
+    register_image(&a, img).await;
+    Json(json!({ "stream": format!("Loaded image: {}", repo_tag(&name)) })).into_response()
+}
+
+/// `docker import` -- extract a bare rootfs tar (request body) into a new image named by `repo`
+/// (optionally `repo:tag`) and register it. Routed from `images_create` on `fromSrc`.
+pub(crate) async fn image_import(a: App, repo: String, tag: String, src: &str, body: axum::body::Bytes) -> Response {
+    if repo.is_empty() { return import_progress(Err("repo is required".into())); }
+    // dd imports a rootfs tar streamed in the body (`docker import - <name>`); importing from a remote
+    // URL is not supported (dd has no HTTP fetcher).
+    if src != "-" { return import_progress(Err(format!("unsupported import source {src:?}; pipe the rootfs to `-`"))); }
+    let name = if tag.is_empty() { repo } else { format!("{repo}:{tag}") };
+    let target = std::path::PathBuf::from(format!("{}/{}", a.images_dir, name.replace(['/', ':'], "_")));
+    let rootfs = target.join("rootfs");
+    let _ = std::fs::remove_dir_all(&target);
+    if let Err(e) = std::fs::create_dir_all(&rootfs) { return import_progress(Err(e.to_string())); }
+    let tmp = std::env::temp_dir().join(format!("dd-import-{}.tar", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &body) { return import_progress(Err(e.to_string())); }
+    let out = std::process::Command::new("tar").arg("xf").arg(&tmp).arg("-C").arg(&rootfs).output();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => return import_progress(Err(String::from_utf8_lossy(&o.stderr).into_owned())),
+        Err(e) => return import_progress(Err(e.to_string())),
+    }
+    let arch = detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64);
+    let cmd = default_shell(&rootfs);
+    let img = Image { name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd: cmd.clone(), ..Default::default() };
+    let _ = std::fs::write(target.join("dd-image.json"), json!({ "name": name, "cmd": cmd }).to_string());
+    register_image(&a, img).await;
+    import_progress(Ok(format!("sha256:{}", fake_id(&name))))
+}
+
+/// Register a freshly load/import-ed image in the daemon's in-memory state, replacing any existing
+/// image sharing the same `repository:tag` (mirrors the re-pull dedupe in `images_create`).
+async fn register_image(a: &App, img: Image) {
+    let mut g = a.inner.lock().await;
+    let tag = repo_tag(&img.name);
+    g.images.retain(|i| repo_tag(&i.name) != tag);
+    g.images.push(img);
+}
+
+/// `docker import` progress: a single JSON status line carrying the new image id, or an error line.
+fn import_progress(result: Result<String, String>) -> Response {
+    let body = match result {
+        Ok(id) => json!({ "status": id }).to_string() + "\r\n",
+        Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
+    };
+    (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
+}
+
+/// `docker load` failure -> 500 + a Docker-shaped `{"message": …}` error body.
+fn load_err(msg: String) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": msg}))).into_response()
 }

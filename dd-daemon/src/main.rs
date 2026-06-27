@@ -87,6 +87,7 @@ async fn main() {
         .route("/auth", post(auth))
         .route("/distribution/:name/json", get(distribution_inspect))
         .route("/images/json", get(images_json)).route("/images/create", post(images_create))
+        .route("/images/get", get(image_save)).route("/images/load", post(image_load))
         .route("/images/search", get(image_search))
         .route("/images/prune", post(images_prune))
         .route("/images/:name/json", get(image_inspect))

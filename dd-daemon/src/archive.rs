@@ -32,7 +32,7 @@ use ddjit::{Guest, PortMap, SpawnConfig, Volume};
 // ===================== docker cp — the /archive tar endpoints =====================
 // `docker cp` tars a path out of (GET) / into (PUT) the container filesystem; HEAD returns a path-stat the
 // CLI uses to pick file-vs-dir semantics. We operate on the container's rootfs (the overlay upper) -- the
-// common case; bind-volume paths aren't redirected yet.
+// common case -- except paths under a bind, which `archive_host_path` redirects to the host bind source.
 #[derive(serde::Deserialize)]
 pub(crate) struct ArchiveQ { path: String }
 
@@ -41,13 +41,22 @@ pub(crate) struct ArchiveQ { path: String }
 /// `docker cp` to e.g. ddcli's mounted cwd hits the real files); otherwise it lands in the container
 /// rootfs (the overlay upper). `..` is lexically clamped inside whichever base so it can't escape.
 pub(crate) fn archive_host_path(rootfs: &str, binds: &[String], path: &str) -> std::path::PathBuf {
-    // bind volumes first (host:container with an absolute host source), same precedence as the JIT jail
+    // bind volumes first (host:container with an absolute host source), same precedence as the JIT jail.
+    // The most specific (longest container-dest) bind wins so nested binds resolve to the right source;
+    // a requested path under a bind hits the HOST source, and only otherwise do we fall back to the rootfs.
+    let mut best: Option<(&str, &str)> = None; // (host source, container dest)
     for b in binds {
-        if let Some((host, cont)) = b.split_once(':') {
-            if host.starts_with('/') && (path == cont || path.strip_prefix(cont).is_some_and(|r| r.starts_with('/'))) {
-                return clamp_join(host, &path[cont.len()..]);
+        let Some((host, cont)) = b.split_once(':') else { continue };
+        if !host.starts_with('/') { continue; } // named volumes carry no absolute host source here
+        let cont = cont.trim_end_matches('/');
+        if path == cont || path.strip_prefix(cont).is_some_and(|r| r.starts_with('/')) {
+            if best.map_or(true, |(_, bc)| cont.len() > bc.len()) {
+                best = Some((host, cont));
             }
         }
+    }
+    if let Some((host, cont)) = best {
+        return clamp_join(host, &path[cont.len()..]);
     }
     clamp_join(rootfs, path)
 }
