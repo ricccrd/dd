@@ -213,10 +213,12 @@ async fn main() {
         .route("/containers/:id/top", get(containers_top))
         .route("/containers/:id/stats", get(containers_stats))
         .route("/containers/:id/wait", post(containers_wait))
+        .route("/containers/:id/resize", post(resize))
         .route("/containers/:id/logs", get(containers_logs))
         .route("/containers/:id/json", get(containers_inspect))
         .route("/containers/:id/exec", post(exec_create))
         .route("/exec/:id/start", post(exec_start))
+        .route("/exec/:id/resize", post(resize))
         .route("/exec/:id/json", get(exec_inspect))
         .route("/containers/:id", delete(containers_delete))
         .route("/volumes", get(volumes_list))
@@ -293,7 +295,7 @@ async fn info(State(a): State<App>) -> Json<Value> {
 async fn images_json(State(a): State<App>) -> Json<Value> {
     let imgs: Vec<Value> = a.inner.lock().await.images.iter().map(|i| json!({
         "Id": format!("sha256:{}", fake_id(&i.name)), "RepoTags": [repo_tag(&i.name)],
-        "Architecture": i.arch.target(), "Created": 0, "Size": 0})).collect();
+        "Architecture": i.arch.target(), "Created": 0, "Size": image_size(&i.rootfs, &i.name)})).collect();
     Json(json!(imgs))
 }
 /// GET /images/:name/json — `docker image inspect` / `docker run`'s local-image probe. Returns the
@@ -386,7 +388,12 @@ fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials,
     let pulled = Client::new(iref.clone(), creds).pull(&rootfs, archs)?;
     let arch = detect_arch(&rootfs).ok_or("could not detect the image architecture")?;
     let cmd = config_cmd(&pulled.config).unwrap_or_else(|| default_shell(&rootfs));
-    Ok(Image { name: iref.short(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd })
+    let name = iref.short();
+    // Record name + cmd so the image keeps its real identity across a daemon restart (the dir name
+    // alone doesn't round-trip -- e.g. "docker.io_library_alpine_latest").
+    let _ = std::fs::write(format!("{images_dir}/{}/dd-image.json", safe_name(&iref)),
+        json!({ "name": name.clone(), "cmd": cmd.clone() }).to_string());
+    Ok(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd })
 }
 
 /// A `repository:tag` string with exactly one tag — discovered images carry a bare name (`busybox`),
@@ -773,6 +780,11 @@ async fn containers_stats(State(a): State<App>, Path(id): Path<String>) -> Respo
         "memory_stats": { "usage": 0, "limit": 0 }, "pids_stats": { "current": 1 },
         "networks": {}, "blkio_stats": {} })).into_response()
 }
+
+/// POST /containers/:id/resize and /exec/:id/resize -- TTY window size. dd pipes the guest's stdio rather
+/// than allocating a real PTY, so there's no kernel winsize to set; accept it (200) so `docker run -t`
+/// doesn't print "failed to resize tty".
+async fn resize() -> Response { StatusCode::OK.into_response() }
 
 /// POST /containers/:id/wait -- block until the container exits, then return {"StatusCode": n}. CRITICAL:
 /// the docker `run` CLI sends this BEFORE /start and reads it concurrently, so we must flush the response
@@ -1190,10 +1202,23 @@ fn discover_images(images_dir: &str) -> Vec<Image> {
     for e in rd.flatten() {
         let rootfs = e.path().join("rootfs");
         if !rootfs.is_dir() { continue; }
-        let raw = e.path().file_name().and_then(|s| s.to_str()).unwrap_or("img").to_string();
-        let name = raw.trim_end_matches("-bundle").split("__").next().unwrap_or("img").rsplit('_').next().unwrap_or("img").to_string();
         let arch = detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64);
-        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd: vec!["/bin/sh".into()] });
+        // Prefer dd-image.json (written by a pull) so name + cmd round-trip exactly; else parse the dir.
+        let (name, cmd) = match std::fs::read_to_string(e.path().join("dd-image.json")).ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        {
+            Some(m) => {
+                let name = m["name"].as_str().unwrap_or("img").to_string();
+                let cmd: Vec<String> = m["cmd"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+                (name, if cmd.is_empty() { vec!["/bin/sh".into()] } else { cmd })
+            }
+            None => {
+                let raw = e.path().file_name().and_then(|s| s.to_str()).unwrap_or("img").to_string();
+                let name = raw.trim_end_matches("-bundle").split("__").next().unwrap_or("img").rsplit('_').next().unwrap_or("img").to_string();
+                (name, vec!["/bin/sh".into()])
+            }
+        };
+        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd });
     }
     // A built-in `macos` image for `ddcli mac`: the host macOS filesystem in a darwin jail, run by the
     // darwin JIT. Offered only when that engine is built; the jail root is DD_MAC_ROOTFS (default "/").
@@ -1234,6 +1259,41 @@ fn fake_id(seed: &str) -> String {
     let mut h: u64 = 1469598103934665603;
     for b in seed.bytes() { h ^= b as u64; h = h.wrapping_mul(1099511628211); }
     format!("{h:016x}{h:016x}{h:016x}{h:08x}")
+}
+
+/// On-disk size of an image's rootfs, cached per rootfs path (computed once; rootfs rarely changes).
+/// The host-fs `macos` image is skipped (walking `/` would be catastrophic).
+fn image_size(rootfs: &str, name: &str) -> i64 {
+    if name == "macos" {
+        return 0;
+    }
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(s) = cache.lock().unwrap().get(rootfs) {
+        return *s;
+    }
+    let s = dir_size(std::path::Path::new(rootfs));
+    cache.lock().unwrap().insert(rootfs.to_string(), s);
+    s
+}
+
+/// Recursively sum the size of regular files under `p` (symlinks are not followed).
+fn dir_size(p: &std::path::Path) -> i64 {
+    let mut total = 0i64;
+    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+    for e in rd.flatten() {
+        let Ok(md) = e.path().symlink_metadata() else { continue };
+        let ft = md.file_type();
+        if ft.is_symlink() {
+            continue;
+        } else if ft.is_dir() {
+            total += dir_size(&e.path());
+        } else {
+            total += md.len() as i64;
+        }
+    }
+    total
 }
 
 /// The bare repository name of a docker image reference, ignoring registry, namespace and tag/digest:
