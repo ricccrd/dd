@@ -34,10 +34,11 @@ binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-cli
 ## Docker CLI gaps (`dd-daemon`)
 OCI registry **pull/push now works against any registry** — Docker Hub, `ghcr.io`, `quay.io`, ECR, a
 plain `localhost:5000` (`dd-daemon/src/registry.rs`; 44/44 docker-CLI scenarios pass). `docker build`
-works for the common path (FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/ENTRYPOINT — RUN executes in the JIT, writes
-persist; a non-local `FROM` is auto-pulled; ENV/WORKDIR/ENTRYPOINT are persisted into the image and
-inherited at `docker run`, which also honors `-e`). What is still missing on `docker build`:
-- **multi-stage builds** and the **BuildKit cache**.
+works for the common path (FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/ENTRYPOINT, **multi-stage** with
+`COPY --from=<stage>` — RUN executes in the JIT, writes persist; a non-local `FROM` is auto-pulled;
+ENV/WORKDIR/ENTRYPOINT are persisted into the image and inherited at `docker run`, which also honors `-e`).
+What is still missing on `docker build`:
+- the **BuildKit cache** (layer/step caching — today every build re-runs from the base).
 
 ## Remaining JIT gaps
 - **IPC namespace** — SysV/POSIX shm/sem/msg per IPC-ns. (The JIT doesn't implement SysV IPC at all yet,

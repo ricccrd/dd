@@ -171,6 +171,14 @@ has "build-env-persist"     "$eout" "bVAL"
 has "build-workdir-persist" "$eout" "/wd"
 d rmi scen-envimg >/dev/null 2>&1; rm -rf "$edir" "$IMAGES/scen-envimg"
 
+echo "== docker build multi-stage (COPY --from=<stage>) =="
+mdir="$ROOT/scen-multi"; rm -rf "$mdir"; mkdir -p "$mdir"
+printf 'FROM alpine AS builder\nRUN echo STAGE0-ART > /a.txt\nFROM alpine\nCOPY --from=builder /a.txt /b.txt\nCMD ["cat","/b.txt"]\n' > "$mdir/Dockerfile"
+d build -t scen-multi "$mdir" >/dev/null 2>&1
+has "build-multistage-copy-from" "$(d run --rm scen-multi 2>&1)" "STAGE0-ART"
+has "build-multistage-isolated"  "$(d run --rm scen-multi sh -c 'ls /a.txt 2>&1 || echo NONE')" "NONE"
+d rmi scen-multi >/dev/null 2>&1; rm -rf "$mdir" "$IMAGES/scen-multi"
+
 echo "== --network none blocks external egress (loopback still allowed) =="
 # deterministic: with no network, a non-loopback connect always fails with ENETUNREACH
 has "egress-none-blocked" "$(d run --rm --network none alpine sh -c 'nc -w3 1.1.1.1 80 </dev/null >/dev/null 2>&1; echo rc=$?')" "rc=1"

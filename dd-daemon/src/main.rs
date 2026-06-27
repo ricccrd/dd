@@ -988,7 +988,9 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
     let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
     let img_dir = std::path::PathBuf::from(format!("{}/{}", a.images_dir, safe));
     let _ = std::fs::remove_dir_all(&img_dir);
-    let rootfs = img_dir.join("rootfs");
+    let mut rootfs = img_dir.join("rootfs"); // the CURRENT stage's rootfs (reassigned at each FROM)
+    let mut stages: Vec<std::path::PathBuf> = Vec::new();      // stage index -> its rootfs (multi-stage)
+    let mut stage_names: HashMap<String, usize> = HashMap::new(); // name/index -> stage index
 
     // image config built up across the instructions (inherited from the base at FROM, then mutated)
     let (mut arch, mut cmd, mut entrypoint, mut workdir, mut env, mut from_done) =
@@ -1019,7 +1021,16 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
                 let Some((base_rootfs, base_arch, base_cmd, base_ep, base_env, base_wd)) = found else {
                     cleanup(&ctx); return build_err(log, format!("base image '{base}' unavailable")); };
                 arch = base_arch; cmd = base_cmd; entrypoint = base_ep; env = base_env; workdir = base_wd; // inherit base config
-                std::fs::create_dir_all(&img_dir).ok();
+                // start a new build stage (its own rootfs); `FROM <base> AS <name>` names it.
+                let sidx = stages.len();
+                rootfs = img_dir.join(format!("_s{sidx}")).join("rootfs");
+                stages.push(rootfs.clone());
+                stage_names.insert(sidx.to_string(), sidx);
+                let words: Vec<&str> = args.split_whitespace().collect();
+                if let Some(nm) = words.iter().position(|w| w.eq_ignore_ascii_case("AS")).and_then(|i| words.get(i + 1)) {
+                    stage_names.insert(nm.to_string(), sidx);
+                }
+                std::fs::create_dir_all(rootfs.parent().unwrap_or(&img_dir)).ok();
                 if !matches!(std::process::Command::new("cp").arg("-a").arg(&base_rootfs).arg(&rootfs).status(), Ok(s) if s.success()) {
                     cleanup(&ctx); return build_err(log, "failed to copy base image rootfs".into()); }
                 from_done = true;
@@ -1041,6 +1052,7 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
                 }
             }
             "COPY" | "ADD" => {
+                let from_stage = args.split_whitespace().find_map(|p| p.strip_prefix("--from="));
                 let parts: Vec<&str> = args.split_whitespace().filter(|p| !p.starts_with("--")).collect();
                 if parts.len() < 2 { cleanup(&ctx); return build_err(log, format!("{inst} needs a source and destination")); }
                 let dst = parts[parts.len() - 1];
@@ -1048,10 +1060,16 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
                 let dst_host = archive_host_path(&rootfs.to_string_lossy(), &[], &dst_guest);
                 let into_dir = dst.ends_with('/') || parts.len() > 2;
                 if into_dir { std::fs::create_dir_all(&dst_host).ok(); } else if let Some(p) = dst_host.parent() { std::fs::create_dir_all(p).ok(); }
+                // COPY --from=<stage>: source is a path inside that stage's rootfs; else the build context.
+                let src_root = match from_stage {
+                    Some(s) => match stage_names.get(s) { Some(&idx) => stages[idx].clone(),
+                        None => { cleanup(&ctx); return build_err(log, format!("COPY --from: unknown stage '{s}'")); } },
+                    None => ctx.clone(),
+                };
                 for src in &parts[..parts.len() - 1] {
-                    let src_host = ctx.join(src);
+                    let src_host = if from_stage.is_some() { archive_host_path(&src_root.to_string_lossy(), &[], src) } else { src_root.join(src) };
                     if !matches!(std::process::Command::new("cp").arg("-a").arg(&src_host).arg(&dst_host).status(), Ok(s) if s.success()) {
-                        cleanup(&ctx); return build_err(log, format!("{inst} {src}: no such file in the build context")); }
+                        cleanup(&ctx); return build_err(log, format!("{inst} {src}: not found")); }
                 }
             }
             "ENV" => {
@@ -1075,6 +1093,18 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
     }
     if !from_done { cleanup(&ctx); return build_err(log, "Dockerfile had no FROM".into()); }
     cleanup(&ctx);
+
+    // the LAST stage is the final image: move its rootfs to <img>/rootfs, drop the intermediate stages.
+    let final_rootfs = stages.last().cloned().unwrap_or_else(|| rootfs.clone());
+    let image_rootfs = img_dir.join("rootfs");
+    if final_rootfs != image_rootfs {
+        let _ = std::fs::remove_dir_all(&image_rootfs);
+        if std::fs::rename(&final_rootfs, &image_rootfs).is_err() {
+            let _ = std::process::Command::new("cp").arg("-a").arg(&final_rootfs).arg(&image_rootfs).status();
+        }
+    }
+    for s in &stages { if let Some(p) = s.parent() { if p != img_dir { let _ = std::fs::remove_dir_all(p); } } }
+    let rootfs = image_rootfs; // the registered image's rootfs
 
     // register the built image (persist the full config so it survives a daemon restart)
     if cmd.is_empty() && entrypoint.is_empty() { cmd = default_shell(&rootfs); }
