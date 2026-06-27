@@ -38,10 +38,13 @@ plain `localhost:5000` (`dd-daemon/src/registry.rs`; 42/42 docker-CLI scenarios 
 - **`docker build`** — needs a BuildKit-compatible builder.
 
 ## Remaining JIT gaps
-- **ET_EXEC loader** (non-PIE static) — platform-blocked by macOS `__PAGEZERO`; needs a fixed-vaddr map.
-- **IPC namespace** — SysV/POSIX shm/sem/msg per IPC-ns.
-- **cpu/io cgroup** — only mem+pids enforced (cpu/io best-effort on macOS).
-- **`pidfd`, `io_uring`** — no macOS primitive; defer.
+- **IPC namespace** — SysV/POSIX shm/sem/msg per IPC-ns. (The JIT doesn't implement SysV IPC at all yet,
+  so this is *implement it + namespace the keys*, not just isolation.)
+
+### Platform limitations (macOS host — need Linux primitives the host can't provide; off the work-list)
+Non-PIE **ET_EXEC** (macOS `__PAGEZERO` reserves the low 4 GB the fixed vaddr needs), **cpu/io throttling**
+(no cpu/io cgroup — mem+pids ARE enforced via rlimit), **`pidfd`** and **`io_uring`** (no macOS primitive).
+These can't be implemented on a macOS host; they'd come for free on a linux→linux build.
 
 ## Portability matrix (seams exist; only darwin-host / both-guests built)
 Host OS × host ISA × guest ISA × guest OS. The decomposition isolates each:
