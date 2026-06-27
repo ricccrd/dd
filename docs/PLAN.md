@@ -10,7 +10,10 @@ Validation entry points (all via the Makefile):
   aarch64 + x86_64 + **darwin**; portable `port()` guests prove identical behaviour on Linux and macOS).
   Only non-pass: `soak/smc` (RWX, below) + the fork+exec crash (below), both xfail-tracked.
 - `make test-docker` — docker-CLI battery (**50/50**); `make test-docker-full` — full per-command
-  compliance matrix; `make test-compose` — Docker Compose (skips if compose absent).
+  compliance matrix; `make test-compose` — Docker Compose (skips if compose absent);
+  `make test-docker-net` — container-to-container networking (by-name/by-IP/isolation; gaps below).
+- The `edge` group in `make test` probes obscure syscall corners (madvise/renameat2/SCM_RIGHTS/
+  fallocate-punch/SEEK_HOLE/O_TMPFILE/mprotect/abstract-sockets/…) — 13/14 are xfail-tracked gaps (below).
 - `make test-macos` — **macOS-container parity (23/23)**: the *same* `docker` lifecycle (run/logs/exec/
   inspect/ps/stop/rm) runs a Linux container AND a native-macOS container (the `macos` darwinjail image)
   identically — dd's signature capability, validated.
@@ -78,19 +81,18 @@ Static: **178/323 canonical syscalls handled, 145 missing.** Surfaced by the dd-
 groups + the dynamic corpus.
 
 **Syscalls worth implementing (macOS has the primitive — mostly a wire-up):**
-- **Process/session:** ~~`setsid`(157), `setregid`(143), `setfsuid/gid`(151/152), `getcpu`(168)~~ **done**;
-  still `waitid`(95) (siginfo layout differs — needs translation)
+- **Process/session:** ~~`setsid`(157), `setregid`(143), `setfsuid/gid`(151/152), `getcpu`(168),
+  `waitid`(95)~~ **done** (waitid translates the macOS→Linux siginfo)
 - **File I/O:** ~~`flock`(32), `preadv/pwritev`(69/70), `preadv2/pwritev2`(286/287),
-  `sync_file_range`(84→fsync), `readahead`(213→noop)~~ **done**; still `truncate`(45, by-path)
-- **Memory:** ~~`memfd_create`(279)~~ **done**, ~~`mlockall/munlockall`(230/231)~~ **done** (no-op), `mlock2`(284)
+  `sync_file_range`(84→fsync), `readahead`(213→noop), `truncate`(45, by-path)~~ **done**
+- **Memory:** ~~`memfd_create`(279), `mlockall/munlockall`(230/231), `mlock2`(284)~~ **done** (no-op locks)
 - **Timers/clocks:** ~~`getitimer/setitimer`(102/103)~~ **done** (host wrap), ~~`clock_settime`(112)~~ **done**
-  (EPERM, no CAP_SYS_TIME); still `clock_adjtime`(266)
+  (EPERM, no CAP_SYS_TIME), ~~`clock_adjtime`(266)~~ **done** (EPERM)
 - **Scheduling:** ~~`sched_get/setscheduler`(119/120), `sched_get/setparam`(118/121),
-  `sched_get_priority_max/min`(125/126), `sched_rr_get_interval`(127)~~ **done** (SCHED_OTHER stubs)
-- **Resource:** `getrlimit/setrlimit`(163/164) *(prlimit64=261 already handled — alias these to it)*
-- **Signals:** `rt_sigtimedwait`(137), `rt_sigsuspend`(133), `rt_tgsigqueuei`(240); the **`sigqueue`
-  si_value payload path** is **done** (`rt_sigqueueinfo`→sigframe `si_code`/`si_value`)
-- **Scheduling:** ~~`sched_setattr`(274)~~ **done** (no-op); still `sched_getattr`(275) (attr fill)
+  `sched_get_priority_max/min`(125/126), `sched_rr_get_interval`(127), `sched_get/setattr`(274/275)~~ **done**
+- **Resource:** ~~`getrlimit/setrlimit`(163/164)~~ **done** (aliased to prlimit64)
+- **Signals:** ~~`rt_tgsigqueuei`(240)~~ **done** (mirrors rt_sigqueueinfo), ~~`sigqueue` si_value path~~ **done**;
+  still `rt_sigtimedwait`(137), `rt_sigsuspend`(133) (need guest-mask aware signal waiting)
 - **Misc (all done):** ~~`prctl PR_GET_NAME`~~ (stores the set name), ~~POSIX `shm_open`~~ (`/dev/shm`→
   host-file backing), ~~`glob("*")`~~ (it was a stale getdents `DIR*` cache, not `d_type` — invalidated
   on `close`, dropped in fork children)
@@ -202,19 +204,19 @@ Remaining — what still needs to be figured out / built (priority):
 | Area | What needs work | Pri |
 |------|-----------------|:---:|
 | `docker inspect` (container) | ~~`NetworkSettings` (ports → fixes `docker port`, + membership), `Name`, `Mounts`, `Config.Image/Env`~~ **done**; still: `State.{Pid,StartedAt,FinishedAt}` (not tracked yet) | P1 |
-| `docker logs` | `-f`/follow, `--tail`/`--since`/`--timestamps`; emit a **raw** stream for `-t` (today always framed → garbled TTY logs) | P1 |
-| `docker ps` | `--filter`/`--size`; human `Status` (`Up 3 minutes`); `Labels`/`ImageID`/network info | P1 |
-| `docker exec` | apply `-e`/`-u`/`-w`/`--privileged`; `exec -d` must return 200 (today 101-hijacks → hangs) | P1 |
+| `docker logs` | ~~`--tail`/`--timestamps`, **raw** stream for `-t`~~ **done**; still `-f`/follow, `--since` | P1 |
+| `docker ps` | ~~human `Status` (`Up 3 minutes`)~~ **done**; still `--filter`/`--size`, `Labels`/`ImageID`/network info | P1 |
+| `docker exec` | ~~`-e`/`-w`~~ **done**; still `-u` (needs a `SpawnConfig` uid field), `--privileged`, `exec -d` → 200 | P1 |
 | `docker events` | wire a real lifecycle event bus into the open stream (compose + GUI watch it) | P1 |
 | `docker stats` | real CPU/mem accounting from the JIT runtime + streaming *(design: runtime has no cgroup metrics)* | P1 |
-| networks | model `IPAM` (subnet/gateway), labels/options, per-endpoint IP/MAC in inspect *(design: dd uses a per-container loopback netns, no bridge)* | P2 |
-| `docker build` | honor `buildargs`/`labels`/`target`/`nocache`; real content-digest image IDs; (BuildKit cache, above) | P2 |
-| `docker run` opts | `--user` (uid not applied — `id -u`=0) + `--label` (not stored → empty `Config.Labels`, breaks `ps --filter label`); wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` | P2 |
-| volumes | persist `--driver`/`--opt`/`--label`; `409` when in use; RFC3339 `CreatedAt` | P2 |
+| networks | **container-to-container connectivity** (`scenarios/docker-net.sh`, 3/7): two containers on a user network can't reach each other — no per-container IP is assigned (inspect/`network inspect` show no member IP, `"Containers": {}`), and there's no embedded DNS (`nc <name>` → "bad address"). Needs a real bridge + IPAM (subnet/gateway, per-endpoint IP/MAC) + name→IP resolution *(design: dd uses a per-container loopback netns, no bridge — see Networking Phase-2b #2)*. Cross-network isolation trivially holds today (nothing reaches anything). | P2 |
+| `docker build` | ~~`buildargs`/`target`/`nocache`~~ **done**; still `labels`, real content-digest image IDs; (BuildKit cache, above) | P2 |
+| `docker run` opts | ~~`--label` (stored → `Config.Labels`)~~ **done**; still `--user` (uid not applied — needs a `SpawnConfig` uid field), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` | P2 |
+| volumes | ~~`409` when in use, RFC3339 `CreatedAt`~~ **done**; still persist `--driver`/`--opt`/`--label` | P2 |
 | `docker pull`/`push` | per-layer progress bars; push returns final `aux{Digest}` | P2 |
-| image inspect/history | real `Created`/`Size`/`Entrypoint`/`Env`/`Labels` (today hard-coded) | P2 |
-| `docker cp` | redirect a `cp` into a bind-mount path to the host volume dir (today rootfs only) | P2 |
-| `save`/`load`/`import` | `images/get` + `images/load` + `fromSrc` import have no route yet | P3 |
+| image inspect/history | ~~real `Size`/`Entrypoint`/`Env`/`Cmd`/`WorkingDir`~~ **done** (from the Image struct); still real `Created` (needs an `Image.created` field) + `Labels` | P2 |
+| `docker cp` | ~~redirect a `cp` into a bind-mount path~~ **done** (longest-prefix bind match); still named-volume paths (handlers lack the volume list) | P2 |
+| `save`/`load`/`import` | ~~`images/get` + `images/load` + `fromSrc`~~ **done** (dd-native rootfs tar + manifest) | P3 |
 | stop/kill/restart | honor `signal`/`t` + real signal delivery (containers run synchronously today) | P3 |
 
 Hard problems (not plumbing): **live resource metrics** for `stats`, an **event bus**, and a real
