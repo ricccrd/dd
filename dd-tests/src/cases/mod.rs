@@ -19,6 +19,18 @@ fn realsw() -> Group {
     group("realsw", vec![
         // SQLite 3: WAL, a 5000-row transaction, then an aggregate query. Diffed against a native run.
         src("sqlite", "sqlite.c").arg("/tmp/dd_sqlite_test.db").only(&[Engine::LinuxAarch64]).oracle(),
+        // Perl 5 (the real Ubuntu interpreter): a prime sieve up to 10k -- heavy interpreter loop +
+        // dynamic dispatch. 1229 primes, last is 9973.
+        in_rootfs("perl-sieve", "ubuntu", &["/usr/bin/perl", "-e",
+            "my @p; for my $n (2..10000){ my $pr=1; for my $d (2..int(sqrt($n))){ $pr=0,last if $n%$d==0 } \
+             push @p,$n if $pr } print \"primes=\".scalar(@p).\" last=$p[-1]\\n\""])
+            .has("primes=1229 last=9973"),
+        // Intensive container-fs IO: create/write/read 200 files in a tight shell loop (open/write/close/
+        // readdir/unlink churn through the rootfs jail).
+        in_rootfs("io-churn", "ubuntu", &["/bin/sh", "-c",
+            "cd /tmp && rm -rf io && mkdir io && cd io && i=0; while [ $i -lt 200 ]; do echo data-$i payload > f$i; \
+             i=$((i+1)); done; cat f* | wc -l; cd /; rm -rf /tmp/io"])
+            .has("200"),
     ])
 }
 

@@ -146,6 +146,9 @@ async fn main() {
         .route("/containers/json", get(containers_json))
         .route("/containers/create", post(containers_create))
         .route("/containers/:id/start", post(containers_start))
+        .route("/containers/:id/stop", post(containers_stop))
+        .route("/containers/:id/kill", post(containers_stop))
+        .route("/containers/:id/restart", post(containers_restart))
         .route("/containers/:id/wait", post(containers_wait))
         .route("/containers/:id/logs", get(containers_logs))
         .route("/containers/:id/json", get(containers_inspect))
@@ -295,6 +298,23 @@ async fn containers_start(State(a): State<App>, Path(id): Path<String>) -> Respo
     save_state(&g, &a.state_path);
     StatusCode::NO_CONTENT.into_response()
 }
+/// stop / kill: containers run to completion synchronously, so there is no live process left to signal --
+/// mark the container exited and return success (docker treats 204 as "stopped"). A long-running model
+/// (background process + real signal delivery) is future work; the CLI verbs work today either way.
+async fn containers_stop(State(a): State<App>, Path(id): Path<String>) -> Response {
+    let mut g = a.inner.lock().await;
+    match resolve_cid(&g, &id) {
+        Some(full) => {
+            if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); }
+            save_state(&g, &a.state_path);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => no_such(&id),
+    }
+}
+/// restart: just re-run the container in place.
+async fn containers_restart(a: State<App>, id: Path<String>) -> Response { containers_start(a, id).await }
+
 async fn containers_wait(State(a): State<App>, Path(id): Path<String>) -> Response {
     let g = a.inner.lock().await;
     match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {

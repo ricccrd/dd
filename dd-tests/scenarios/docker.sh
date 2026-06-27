@@ -67,6 +67,16 @@ cid3="$(d run -d alpine sh -c 'exit 7')"
 ok "exit-code-propagates" "$(d inspect --format '{{.State.ExitCode}}' "$cid3")" "7"
 d rm "$cid3" >/dev/null
 
+echo "== pull (download / ensure the image) =="
+has "pull-alpine" "$(d pull alpine 2>&1 | tail -1)" "alpine"
+
+echo "== stop / kill / restart (lifecycle control verbs) =="
+cidk="$(d run -d alpine sh -c 'echo app-running')"
+ok "stop"    "$(d stop "$cidk"    | head -c 12)" "$(echo "$cidk" | head -c 12)"
+ok "kill"    "$(d kill "$cidk"    | head -c 12)" "$(echo "$cidk" | head -c 12)"
+ok "restart" "$(d restart "$cidk" | head -c 12)" "$(echo "$cidk" | head -c 12)"
+d rm -f "$cidk" >/dev/null
+
 echo "== volumes =="
 d volume create scen-vol >/dev/null
 has "volume-listed" "$(d volume ls --format '{{.Name}}')" "scen-vol"
