@@ -122,14 +122,25 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         memcpy(top, argv[i], l);
         argp[i] = (uint64_t)top;
     }
-    while (g_guest_env[envc])
-        envc++;
-    if (envc > 255) envc = 255;
-    for (int i = 0; i < envc; i++) {
+    // the container's env arrives as DD_GUEST_ENV="K=V\nK=V\n…" (set by the daemon) -- forward EXACTLY
+    // these to the guest FIRST so they override the defaults, NOT the daemon/host environment. Then the
+    // built-in defaults fill whatever the container didn't set (getenv returns the first match).
+    char *ge = getenv("DD_GUEST_ENV");
+    if (ge) {
+        char *copy = strdup(ge), *save = NULL;
+        for (char *ln = strtok_r(copy, "\n", &save); ln && envc < 250; ln = strtok_r(NULL, "\n", &save)) {
+            size_t l = strlen(ln) + 1;
+            top -= l;
+            memcpy(top, ln, l);
+            envp_[envc++] = (uint64_t)top;
+        }
+        free(copy);
+    }
+    for (int i = 0; g_guest_env[i] && envc < 255; i++) {
         size_t l = strlen(g_guest_env[i]) + 1;
         top -= l;
         memcpy(top, g_guest_env[i], l);
-        envp_[i] = (uint64_t)top;
+        envp_[envc++] = (uint64_t)top;
     }
     top -= 8;
     memcpy(top, "aarch64", 8);

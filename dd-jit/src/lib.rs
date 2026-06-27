@@ -21,8 +21,8 @@ use std::path::Path;
 /// A guest target = (OS personality, ISA) the JIT can run. Each maps to one binary built by `build.rs`
 /// from `targets/<target>.c`. The OS axis is `linux` (jit / jit86) or `darwin` (jitdarwin — native
 /// macOS Mach-O containers); the ISA axis is `aarch64` or `x86_64`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Guest { LinuxAarch64, LinuxX86_64, DarwinAarch64 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Guest { #[default] LinuxAarch64, LinuxX86_64, DarwinAarch64 }
 
 impl Guest {
     pub const ALL: [Guest; 3] = [Guest::LinuxAarch64, Guest::LinuxX86_64, Guest::DarwinAarch64];

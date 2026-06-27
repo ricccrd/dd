@@ -41,12 +41,16 @@ use registry::{Client, Credentials, ImageRef};
 
 const API_VERSION: &str = "1.43";
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Image {
     name: String,
     rootfs: String,
     arch: Guest,
     cmd: Vec<String>,
+    // the rest of the OCI/Dockerfile config metadata a container inherits at run
+    env: Vec<String>,        // "K=V" entries (ENV)
+    entrypoint: Vec<String>, // ENTRYPOINT (prepended to the command)
+    workdir: String,         // WORKDIR / Config.WorkingDir
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -69,6 +73,8 @@ struct Container {
     name: String,
     #[serde(default)]
     working_dir: String,
+    #[serde(default)]
+    env: Vec<String>, // "K=V" entries from the image ENV + `docker run -e`
     #[serde(default)]
     network_mode: String,
     // Re-derived from the image at load; never serialized.
@@ -400,7 +406,7 @@ fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials,
     // alone doesn't round-trip -- e.g. "docker.io_library_alpine_latest").
     let _ = std::fs::write(format!("{images_dir}/{}/dd-image.json", safe_name(&iref)),
         json!({ "name": name.clone(), "cmd": cmd.clone() }).to_string());
-    Ok(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd })
+    Ok(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, ..Default::default() })
 }
 
 /// A `repository:tag` string with exactly one tag — discovered images carry a bare name (`busybox`),
@@ -433,6 +439,7 @@ fn default_shell(rootfs: &std::path::Path) -> Vec<String> {
 struct CreateBody {
     #[serde(rename = "Image")] image: Option<String>,
     #[serde(rename = "Cmd")] cmd: Option<Vec<String>>,
+    #[serde(rename = "Env")] env: Option<Vec<String>>,
     #[serde(rename = "Entrypoint")] entrypoint: Option<Vec<String>>,
     #[serde(rename = "Hostname")] hostname: Option<String>,
     #[serde(rename = "Tty")] tty: Option<bool>,
@@ -474,14 +481,19 @@ async fn containers_create(State(a): State<App>, Query(cq): Query<CreateQ>, Json
         Some(i) => i,
         None => return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {image}")}))).into_response(),
     };
-    // Final argv = entrypoint ++ cmd (docker semantics): --entrypoint resets the command to its own args;
-    // with no entrypoint, an empty Cmd falls back to the image's default command.
-    let mut argv = body.entrypoint.unwrap_or_default();
-    let had_ep = !argv.is_empty();
-    let cmd = body.cmd.filter(|c| !c.is_empty()).unwrap_or_else(|| if had_ep { vec![] } else { img.cmd.clone() });
+    // Final argv = entrypoint ++ cmd (docker semantics). The entrypoint is the user's --entrypoint or the
+    // IMAGE's ENTRYPOINT; a user --entrypoint resets CMD, but the image's own ENTRYPOINT still keeps the
+    // image CMD. An empty Cmd falls back to the image default.
+    let user_ep = body.entrypoint.is_some();
+    let mut argv = body.entrypoint.unwrap_or_else(|| img.entrypoint.clone());
+    let cmd = body.cmd.filter(|c| !c.is_empty()).unwrap_or_else(|| if user_ep { vec![] } else { img.cmd.clone() });
     argv.extend(cmd);
     if argv.is_empty() { argv = img.cmd.clone(); }
     let cmd = argv;
+    // env = image ENV then `docker run -e` (later wins); working dir = -w or the image WORKDIR.
+    let mut env = img.env.clone();
+    env.extend(body.env.unwrap_or_default());
+    let working_dir = body.working_dir.filter(|w| !w.is_empty()).unwrap_or_else(|| img.workdir.clone());
     let tty = body.tty.unwrap_or(false);
     let id = new_id(&image);
     let hc = body.host_config;
@@ -494,7 +506,7 @@ async fn containers_create(State(a): State<App>, Query(cq): Query<CreateQ>, Json
         publish: hc.as_ref().and_then(|h| h.port_bindings.as_ref()).map(publish_str).unwrap_or_default(),
         created: now_secs(), tty,
         name: cq.name.unwrap_or_default().trim_start_matches('/').to_string(),
-        working_dir: body.working_dir.unwrap_or_default(),
+        working_dir, env,
         network_mode: hc.as_ref().and_then(|h| h.network_mode.clone()).unwrap_or_default(),
         status: "created".into(), ..Default::default()
     };
@@ -686,7 +698,7 @@ async fn image_tag(State(a): State<App>, Path(name): Path<String>, Query(q): Que
     let bare = ref_name(&q.repo.unwrap_or_default()).to_string();
     if bare.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "repo required"}))).into_response(); }
     if !g.images.iter().any(|i| i.name == bare) {
-        g.images.push(Image { name: bare, rootfs: src.rootfs, arch: src.arch, cmd: src.cmd });
+        g.images.push(Image { name: bare, ..src });
     }
     StatusCode::CREATED.into_response()
 }
@@ -978,16 +990,18 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
     let _ = std::fs::remove_dir_all(&img_dir);
     let rootfs = img_dir.join("rootfs");
 
-    let (mut arch, mut cmd, mut workdir, mut env, mut from_done) =
-        (Guest::LinuxAarch64, Vec::<String>::new(), String::new(), Vec::<(String, String)>::new(), false);
+    // image config built up across the instructions (inherited from the base at FROM, then mutated)
+    let (mut arch, mut cmd, mut entrypoint, mut workdir, mut env, mut from_done) =
+        (Guest::LinuxAarch64, Vec::<String>::new(), Vec::<String>::new(), String::new(), Vec::<String>::new(), false);
 
     for (i, (inst, args)) in steps.iter().enumerate() {
         log.push(json!({"stream": format!("Step {}/{} : {} {}\n", i + 1, total, inst, args)}).to_string());
         match inst.as_str() {
             "FROM" => {
                 let base = args.split_whitespace().next().unwrap_or("").to_string();
+                let pick = |im: &Image| (im.rootfs.clone(), im.arch, im.cmd.clone(), im.entrypoint.clone(), im.env.clone(), im.workdir.clone());
                 let mut found = { let g = a.inner.lock().await;
-                    g.images.iter().find(|im| ref_name(&im.name) == ref_name(&base)).map(|im| (im.rootfs.clone(), im.arch)) };
+                    g.images.iter().find(|im| ref_name(&im.name) == ref_name(&base)).map(&pick) };
                 if found.is_none() {
                     // not local -> auto-pull the base like real docker build (reuses the registry pull)
                     log.push(json!({"stream": format!("Unable to find image '{base}' locally; pulling\n")}).to_string());
@@ -998,13 +1012,13 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
                     let (dir, archs) = (a.images_dir.clone(), platform_archs(None));
                     match tokio::task::spawn_blocking(move || pull_image(&dir, &n, &t, Credentials::default(), &archs)).await
                         .unwrap_or_else(|e| Err(format!("pull task crashed: {e}"))) {
-                        Ok(img) => { found = Some((img.rootfs.clone(), img.arch)); a.inner.lock().await.images.push(img); }
+                        Ok(img) => { found = Some(pick(&img)); a.inner.lock().await.images.push(img); }
                         Err(e) => { cleanup(&ctx); return build_err(log, format!("pull of base image '{base}' failed: {e}")); }
                     }
                 }
-                let Some((base_rootfs, base_arch)) = found else {
+                let Some((base_rootfs, base_arch, base_cmd, base_ep, base_env, base_wd)) = found else {
                     cleanup(&ctx); return build_err(log, format!("base image '{base}' unavailable")); };
-                arch = base_arch;
+                arch = base_arch; cmd = base_cmd; entrypoint = base_ep; env = base_env; workdir = base_wd; // inherit base config
                 std::fs::create_dir_all(&img_dir).ok();
                 if !matches!(std::process::Command::new("cp").arg("-a").arg(&base_rootfs).arg(&rootfs).status(), Ok(s) if s.success()) {
                     cleanup(&ctx); return build_err(log, "failed to copy base image rootfs".into()); }
@@ -1013,7 +1027,7 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
             _ if !from_done => { cleanup(&ctx); return build_err(log, "no FROM before the first instruction".into()); }
             "RUN" => {
                 let mut cfg = SpawnConfig::new(workdir.clone(), rootfs.to_string_lossy().into_owned());
-                cfg.env = env.clone();
+                cfg.env = env.iter().filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
                 cfg.argv = vec!["/bin/sh".into(), "-c".into(), args.clone()];
                 let Some((prog, cargs)) = cfg.command(arch) else { cleanup(&ctx); return build_err(log, "JIT not available for this arch".into()); };
                 match tokio::process::Command::new(prog).args(cargs).output().await {
@@ -1041,12 +1055,13 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
                 }
             }
             "ENV" => {
-                // `ENV K V` or `ENV K=V [K2=V2 …]`
-                if let Some((k, v)) = args.split_once('=') {
-                    env.push((k.trim().to_string(), v.split_whitespace().next().unwrap_or("").trim_matches('"').to_string()));
+                // `ENV K V` or `ENV K=V`; stored as "K=V"
+                let kv = if let Some((k, v)) = args.split_once('=') {
+                    format!("{}={}", k.trim(), v.split_whitespace().next().unwrap_or("").trim_matches('"'))
                 } else if let Some((k, v)) = args.split_once(char::is_whitespace) {
-                    env.push((k.trim().to_string(), v.trim().trim_matches('"').to_string()));
-                }
+                    format!("{}={}", k.trim(), v.trim().trim_matches('"'))
+                } else { String::new() };
+                if !kv.is_empty() { env.retain(|e| e.split_once('=').map(|(k, _)| k) != kv.split_once('=').map(|(k, _)| k)); env.push(kv); }
             }
             "WORKDIR" => {
                 workdir = if args.starts_with('/') { args.clone() } else { format!("{}/{}", workdir.trim_end_matches('/'), args) };
@@ -1054,22 +1069,22 @@ async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum:
                 std::fs::create_dir_all(&wh).ok();
             }
             "CMD" => cmd = parse_exec_form(args),
-            "ENTRYPOINT" => cmd = parse_exec_form(args),
+            "ENTRYPOINT" => entrypoint = parse_exec_form(args),
             _ => {} // EXPOSE/LABEL/ARG/MAINTAINER/USER/VOLUME/HEALTHCHECK — no rootfs effect in this builder
         }
     }
     if !from_done { cleanup(&ctx); return build_err(log, "Dockerfile had no FROM".into()); }
     cleanup(&ctx);
 
-    // register the built image
-    if cmd.is_empty() { cmd = default_shell(&rootfs); }
+    // register the built image (persist the full config so it survives a daemon restart)
+    if cmd.is_empty() && entrypoint.is_empty() { cmd = default_shell(&rootfs); }
     std::fs::write(img_dir.join("dd-image.json"),
-        format!("{{\"name\":{:?},\"cmd\":{}}}", name, serde_json::to_string(&cmd).unwrap_or_else(|_| "[]".into()))).ok();
+        json!({"name": name, "cmd": cmd, "entrypoint": entrypoint, "env": env, "workdir": workdir}).to_string()).ok();
     let id = format!("{:x}", md5_like(&safe));
     {
         let mut g = a.inner.lock().await;
         g.images.retain(|im| ref_name(&im.name) != name);
-        g.images.push(Image { name: name.to_string(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd });
+        g.images.push(Image { name: name.to_string(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, entrypoint, env, workdir });
     }
     log.push(json!({"stream": format!("Successfully built {}\n", &id[..12.min(id.len())])}).to_string());
     log.push(json!({"stream": format!("Successfully tagged {raw_tag}\n")}).to_string());
@@ -1348,6 +1363,9 @@ fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol]) -> Option<(String, 
     cfg.argv = c.cmd.clone();
     // `-w DIR` (WorkingDir): the guest's initial cwd, read as DD_CWD by the runtime at startup.
     if !c.working_dir.is_empty() { cfg.env.push(("DD_CWD".into(), c.working_dir.clone())); }
+    // container env (image ENV + `docker run -e`) -> one DD_GUEST_ENV var so the JIT forwards EXACTLY
+    // these to the guest, never the daemon/host environment.
+    if !c.env.is_empty() { cfg.env.push(("DD_GUEST_ENV".into(), c.env.join("\n"))); }
     cfg.hostname = (!c.hostname.is_empty()).then(|| c.hostname.clone());
     cfg.mem_max = c.memory.max(0) as u64;
     cfg.pids_max = c.pids_limit.max(0) as u32;
@@ -1660,7 +1678,10 @@ fn discover_images(images_dir: &str) -> Vec<Image> {
                 (name, vec!["/bin/sh".into()], detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64))
             }
         };
-        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd });
+        let arr = |k: &str| meta.as_ref().and_then(|m| m[k].as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+        let workdir = meta.as_ref().and_then(|m| m["workdir"].as_str()).unwrap_or("").to_string();
+        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env: arr("env"), entrypoint: arr("entrypoint"), workdir });
     }
     out
 }

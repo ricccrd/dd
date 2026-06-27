@@ -160,6 +160,17 @@ has "build-run-modified-rootfs" "$bout" "BUILT-OK"
 has "build-copy-from-context"   "$bout" "CTX-OK"
 d rmi scen-built >/dev/null 2>&1; rm -rf "$bdir" "$IMAGES/scen-built"
 
+echo "== env: docker run -e + built-image ENV/WORKDIR persist (no host-env leak) =="
+has "run-env-flag"     "$(d run --rm -e SCEN_E=eVAL alpine sh -c 'echo $SCEN_E')" "eVAL"
+has "env-home-default" "$(d run --rm alpine sh -c 'echo HOME=$HOME')" "HOME=/root"
+edir="$ROOT/scen-env"; rm -rf "$edir"; mkdir -p "$edir"
+printf 'FROM alpine\nENV SCEN_BUILT=bVAL\nWORKDIR /wd\nCMD ["sh","-c","echo $SCEN_BUILT $(pwd)"]\n' > "$edir/Dockerfile"
+d build -t scen-envimg "$edir" >/dev/null 2>&1
+eout="$(d run --rm scen-envimg 2>&1)"
+has "build-env-persist"     "$eout" "bVAL"
+has "build-workdir-persist" "$eout" "/wd"
+d rmi scen-envimg >/dev/null 2>&1; rm -rf "$edir" "$IMAGES/scen-envimg"
+
 echo "== --network none blocks external egress (loopback still allowed) =="
 # deterministic: with no network, a non-loopback connect always fails with ENETUNREACH
 has "egress-none-blocked" "$(d run --rm --network none alpine sh -c 'nc -w3 1.1.1.1 80 </dev/null >/dev/null 2>&1; echo rc=$?')" "rc=1"
