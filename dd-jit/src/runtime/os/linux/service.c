@@ -61,6 +61,14 @@ static int snap_has(const char *snap, const char *name, size_t nl) {
     return 0;
 }
 static char g_procname[16]; // prctl PR_SET_NAME / PR_GET_NAME (the 15-char process/thread name)
+// getdents directory-stream cache (guest fd -> host DIR*). MUST be invalidated on close(), else a reused
+// fd gets a stale DIR* already at EOF (a second opendir of the same path then reads nothing -- broke glob).
+static struct { int fd; DIR *d; } g_dirs[64];
+static int g_ndirs;
+static void dirs_drop(int fd) {
+    for (int i = 0; i < g_ndirs; i++)
+        if (g_dirs[i].fd == fd) { closedir(g_dirs[i].d); g_dirs[i] = g_dirs[--g_ndirs]; return; }
+}
 static void service(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
@@ -993,8 +1001,11 @@ static void service(struct cpu *c) {
             g_ovldir[cf][0] = 0;
             g_lo_port[cf] = 0;
             g_sock_stream[cf] = 0;
+            g_eventfd_count[cf] = 0;
+            g_eventfd_sema[cf] = 0;
         // reap eventfd peer / timerfd / overlay dir / loopback
         }
+        dirs_drop(cf); // invalidate the getdents DIR* cache so a reused fd re-opendir's
         int r = close(cf);
         fd_clear(cf);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -1071,15 +1082,10 @@ static void service(struct cpu *c) {
             G_RET(c) = (uint64_t)o;
             break;
         }
-        static struct {
-            int fd;
-            DIR *d;
-        } dirs[64];
-        static int ndirs;
         DIR *dir = NULL;
-        for (int i = 0; i < ndirs; i++)
-            if (dirs[i].fd == fd) {
-                dir = dirs[i].d;
+        for (int i = 0; i < g_ndirs; i++)
+            if (g_dirs[i].fd == fd) {
+                dir = g_dirs[i].d;
                 break;
             }
         if (!dir) {
@@ -1088,10 +1094,10 @@ static void service(struct cpu *c) {
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            if (ndirs < 64) {
-                dirs[ndirs].fd = fd;
-                dirs[ndirs].d = dir;
-                ndirs++;
+            if (g_ndirs < 64) {
+                g_dirs[g_ndirs].fd = fd;
+                g_dirs[g_ndirs].d = dir;
+                g_ndirs++;
             }
         }
         uint8_t *out = (uint8_t *)a1;
