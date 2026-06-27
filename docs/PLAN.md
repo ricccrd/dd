@@ -132,17 +132,33 @@ The marquee victim is the **GCC toolchain** (`compile` group): `gcc-14`/`cc1` ar
   handler — suspect the Mach exception path). (`container/symlink`'s "failure" is unrelated: leftover `/l`
   in the overlay UPPER from a prior run, an overlay-cleanup issue.)
 
-**Fix — IN PROGRESS, address-space reset alone is NOT sufficient.** `execve` now tears down the previous
-guest address space (`munmap` the old image/interp/heap/stack + tracked guest mmaps via a registry) before
-`load_elf` — this fixes a real **per-exec leak** (each execve used to mmap a fresh 256MB heap + image +
-stack and never free the old ones) and is the kernel-like reset. **But it does NOT fix the gcc non-PIE
-crash** (verified: `gcc-14 --version` via `sh -c` still SIGSEGVs 6/6), and neither does forcing a high
-monotonic load base (tried + reverted). So the layout hypothesis is incomplete — the biased non-PIE's
-absolute refs fault regardless of whether the freed low region is sparse or dense, because `__PAGEZERO`
-makes the link vaddr (`0x4xxxxx`) permanently unmappable. The real fix likely needs to **relocate the
-non-PIE's absolute references to the bias** (apply the bias to GOT/abs relocs in `load_elf`, or trap+fix
-faults at the link-vaddr range), not just reshape the layout. Next: dump the faulting PC + the offending
-ref under `CRASHDBG` (needs the Mach-exception handler to log, since `diag_crash` is bypassed).
+**Fix — MECHANISM CONFIRMED, partial fix landed, full fix has a tradeoff.** Captured the exact fault (the
+`mac` bridge drops the ambient env, so `CRASHDBG` never reached the jit — `SpawnConfig` now forwards it +
+the fork child clears its inherited Mach exception port so the POSIX `diag_crash` fires):
+
+    [CRASH] sig=11 fault=0x42b440 pc=0x42b440      (then, after the redirect: pc=biased, fault=0x4c90d9)
+
+So `pc == fault == a low non-PIE link vaddr`: the guest takes an **absolute jump to a link vaddr** (the
+un-relocated ref), the JIT reads guest code there 1:1, but the image is biased high → unmapped → SIGSEGV.
+Landed so far:
+- **execve address-space teardown** — kernel-like reset, fixes a real per-exec leak (256MB heap + image +
+  stack leaked every exec). Necessary but not sufficient.
+- **dispatcher PC-redirect** (`g_nonpie_*` set by `load_elf` for `ET_EXEC`) — redirects absolute *code*
+  jumps from the link vaddr into the biased image. This advances the crash from a code-jump fault to a
+  **data-ref fault** (pc now real biased code; fault still a low link vaddr = an un-relocated data pointer).
+- **`-pagezero_size 0x1000` + pinning the non-PIE at its link vaddr (MAP_FIXED, bias 0)** — **fully fixes
+  the non-PIE crash** (`gcc-14 --version`: SIGSEGV 6/6 → **rc 0**; code+data refs resolve natively). **But
+  it broke the PIE common case hard** (43/195 — basic PIE guests exit 255), so it was **reverted**. Too
+  global: shrinking __PAGEZERO perturbs every PIE load + the heap/stack placement.
+
+**The achievable full fix** is the shrunk-__PAGEZERO approach made safe: keep __PAGEZERO small so the
+non-PIE can pin low, but force **every other** guest mapping (PIE image+interp, heap, stack, anon mmaps)
+to a **high hint** so the PIE world is unchanged and only the non-PIE uses the low region. (Alternative:
+an arm64 load/store fault-fixup handler that re-does a link-range data access at `+bias` — heavier.) Either
+way the diagnostic plumbing (`CRASHDBG` forwarding + `[CRASH]`) is now in place to iterate.
+
+**Separately, the flaky busybox tail is a DISTINCT, still-open bug** (busybox is PIE, immune to all the
+above) — a different fork+exec SIGSEGV under load, not yet root-caused.
 
 **Docker API compliance** — goal is a faithful Engine API **v1.43** for the **everyday developer
 workflow** so the stock `docker` CLI + bollard work unmodified. **Swarm / services / nodes / tasks /
