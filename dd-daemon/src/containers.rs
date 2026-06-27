@@ -410,8 +410,10 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
                 .map(|n| (n.name.clone(), json!({"NetworkID": n.id, "IPAddress": "", "Gateway": ""})))
                 .collect();
             Json(json!({"Id": c.id, "Image": c.image, "Created": fmt_rfc3339(c.created),
+            "Name": format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() }),
             "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": c.status == "running" || c.status == "paused", "Paused": c.status == "paused"},
-            "Config": {"Cmd": c.cmd, "Hostname": c.hostname},
+            "Config": {"Cmd": c.cmd, "Hostname": c.hostname, "Image": c.image, "Env": c.env},
+            "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
             "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit},
             // NetworkSettings present so `docker port` (reads .NetworkSettings.Ports) doesn't panic.
             "NetworkSettings": {"Ports": ports_map_json(&c.publish), "IPAddress": "", "Gateway": "",
