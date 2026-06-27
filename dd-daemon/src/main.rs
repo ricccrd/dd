@@ -60,6 +60,8 @@ struct Container {
     exit_code: i64,
     #[serde(default)]
     tty: bool,
+    #[serde(default)]
+    name: String,
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]
     arch: Option<Guest>,
@@ -187,6 +189,9 @@ async fn main() {
         .route("/version", get(version)).route("/info", get(info))
         .route("/images/json", get(images_json)).route("/images/create", post(images_create))
         .route("/images/:name/json", get(image_inspect))
+        .route("/images/:name/push", post(image_push))
+        .route("/images/:name/tag", post(image_tag))
+        .route("/images/:name", delete(image_delete))
         .route("/containers/json", get(containers_json))
         .route("/containers/create", post(containers_create))
         .route("/containers/:id/start", post(containers_start))
@@ -194,6 +199,11 @@ async fn main() {
         .route("/containers/:id/stop", post(containers_stop))
         .route("/containers/:id/kill", post(containers_stop))
         .route("/containers/:id/restart", post(containers_restart))
+        .route("/containers/:id/pause", post(containers_pause))
+        .route("/containers/:id/unpause", post(containers_pause))
+        .route("/containers/:id/rename", post(containers_rename))
+        .route("/containers/:id/top", get(containers_top))
+        .route("/containers/:id/stats", get(containers_stats))
         .route("/containers/:id/wait", post(containers_wait))
         .route("/containers/:id/logs", get(containers_logs))
         .route("/containers/:id/json", get(containers_inspect))
@@ -232,12 +242,29 @@ async fn main() {
 }
 
 fn strip_api_version<B>(req: &mut hyper::Request<B>) {
-    let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
+    let mut pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
+    // strip the /v1.NN API-version prefix
     if let Some(rest) = pq.strip_prefix("/v1.") {
-        if let Some(slash) = rest.find('/') {
-            if let Ok(uri) = rest[slash..].parse::<Uri>() { *req.uri_mut() = uri; }
-        }
+        if let Some(slash) = rest.find('/') { pq = rest[slash..].to_string(); }
     }
+    // collapse a multi-segment image reference to its bare name so the :name routes match. docker sends
+    // the canonical path, e.g. POST /images/docker.io/library/ubuntu/push -> /images/ubuntu/push.
+    pq = normalize_image_path(&pq);
+    if let Ok(uri) = pq.parse::<Uri>() { *req.uri_mut() = uri; }
+}
+/// `/images/<registry>/<ns>/<name>/<verb>` -> `/images/<name>/<verb>` (verb = push|tag|json); other
+/// paths pass through unchanged. The handlers further ref_name() the captured segment.
+fn normalize_image_path(pq: &str) -> String {
+    let (path, query) = pq.split_once('?').map(|(p, q)| (p, Some(q))).unwrap_or((pq, None));
+    let rebuild = |p: String| match query { Some(q) => format!("{p}?{q}"), None => p };
+    let Some(rest) = path.strip_prefix("/images/") else { return pq.to_string() };
+    let segs: Vec<&str> = rest.split('/').collect();
+    if segs.len() <= 2 { return pq.to_string(); } // already /images/<name>[/<verb>]
+    if let Some(verb @ ("push" | "tag" | "json")) = segs.last().copied() {
+        let name = segs[segs.len() - 2]; // bare image name sits right before the verb
+        return rebuild(format!("/images/{name}/{verb}"));
+    }
+    pq.to_string()
 }
 
 async fn not_found(uri: Uri) -> Response {
@@ -319,7 +346,9 @@ fn publish_str(pb: &HashMap<String, Vec<PortBinding>>) -> String {
     v.join(",")
 }
 
-async fn containers_create(State(a): State<App>, Json(body): Json<CreateBody>) -> Response {
+#[derive(Deserialize)]
+struct CreateQ { name: Option<String> }
+async fn containers_create(State(a): State<App>, Query(cq): Query<CreateQ>, Json(body): Json<CreateBody>) -> Response {
     let image = body.image.unwrap_or_default();
     let mut g = a.inner.lock().await;
     let img = match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&image)).cloned() {
@@ -345,6 +374,7 @@ async fn containers_create(State(a): State<App>, Json(body): Json<CreateBody>) -
         pids_limit: hc.as_ref().and_then(|h| h.pids_limit).unwrap_or(0),
         publish: hc.as_ref().and_then(|h| h.port_bindings.as_ref()).map(publish_str).unwrap_or_default(),
         created: now_secs(), tty,
+        name: cq.name.unwrap_or_default().trim_start_matches('/').to_string(),
         status: "created".into(), ..Default::default()
     };
     g.containers.insert(id.clone(), c);
@@ -363,8 +393,10 @@ fn resolve_cid(g: &Inner, id: &str) -> Option<String> {
     if hits.len() == 1 {
         return hits.into_iter().next();
     }
-    // Fall back to the short-id "name" we expose in containers_json.
-    g.containers.keys().find(|k| k.get(..12).map(|p| p == id).unwrap_or(false)).cloned()
+    // Fall back to the short-id "name" we expose in containers_json, then the user-assigned --name.
+    let want = id.trim_start_matches('/');
+    g.containers.keys().find(|k| k.get(..12).map(|p| p == want).unwrap_or(false)).cloned()
+        .or_else(|| g.containers.iter().find(|(_, c)| c.name == want).map(|(k, _)| k.clone()))
 }
 
 async fn containers_start(State(a): State<App>, Path(id): Path<String>) -> Response {
@@ -521,6 +553,81 @@ async fn exec_inspect(State(a): State<App>, Path(id): Path<String>) -> Response 
             "arguments": exec.cmd.get(1..).map(|s| s.to_vec()).unwrap_or_default()}})).into_response()
 }
 
+// ---- image management: tag / rmi / push -------------------------------------
+#[derive(Deserialize)]
+struct TagQ { repo: Option<String> }
+/// POST /images/:name/tag -- alias an image under a new repo name (same rootfs).
+async fn image_tag(State(a): State<App>, Path(name): Path<String>, Query(q): Query<TagQ>) -> Response {
+    let mut g = a.inner.lock().await;
+    let Some(src) = g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
+    };
+    let bare = ref_name(&q.repo.unwrap_or_default()).to_string();
+    if bare.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "repo required"}))).into_response(); }
+    if !g.images.iter().any(|i| i.name == bare) {
+        g.images.push(Image { name: bare, rootfs: src.rootfs, arch: src.arch, cmd: src.cmd });
+    }
+    StatusCode::CREATED.into_response()
+}
+/// DELETE /images/:name -- `docker rmi`.
+async fn image_delete(State(a): State<App>, Path(name): Path<String>) -> Response {
+    let mut g = a.inner.lock().await;
+    let bare = ref_name(&name).to_string();
+    let before = g.images.len();
+    g.images.retain(|i| ref_name(&i.name) != bare);
+    if g.images.len() == before {
+        return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
+    }
+    Json(json!([{ "Untagged": format!("{bare}:latest") }, { "Deleted": format!("sha256:{}", fake_id(&bare)) }])).into_response()
+}
+/// POST /images/:name/push -- dd has no registry yet (images are local), so this is a clean no-op that
+/// reports success rather than erroring. TODO(OCI): real registry push.
+async fn image_push(State(a): State<App>, Path(name): Path<String>) -> Response {
+    let found = a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name));
+    if !found { return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response(); }
+    let body = format!("{}\r\n{}\r\n",
+        json!({ "status": format!("The push refers to repository [{name}]") }),
+        json!({ "status": "dd: local-only image (no registry configured); nothing to push" }));
+    (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
+}
+
+// ---- container control: pause / rename / top / stats ------------------------
+/// POST /containers/:id/(un)pause -- dd runs a container as one process group with no freezer cgroup;
+/// accept and no-op so the CLI verbs succeed.
+async fn containers_pause(State(a): State<App>, Path(id): Path<String>) -> Response {
+    let g = a.inner.lock().await;
+    match resolve_cid(&g, &id) { Some(_) => StatusCode::NO_CONTENT.into_response(), None => no_such(&id) }
+}
+#[derive(Deserialize)]
+struct RenameQ { name: Option<String> }
+async fn containers_rename(State(a): State<App>, Path(id): Path<String>, Query(q): Query<RenameQ>) -> Response {
+    let mut g = a.inner.lock().await;
+    let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+    if let Some(name) = q.name {
+        if let Some(c) = g.containers.get_mut(&full) { c.name = name.trim_start_matches('/').to_string(); }
+    }
+    save_state(&g, &a.state_path);
+    StatusCode::NO_CONTENT.into_response()
+}
+/// GET /containers/:id/top -- `docker top` (one synthetic process; dd doesn't expose a guest process tree).
+async fn containers_top(State(a): State<App>, Path(id): Path<String>) -> Response {
+    let g = a.inner.lock().await;
+    let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+    let cmd = g.containers.get(&full).map(|c| c.cmd.join(" ")).unwrap_or_default();
+    Json(json!({ "Titles": ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"],
+        "Processes": [["root", "1", "0", "0", "00:00", "?", "00:00:00", cmd]] })).into_response()
+}
+/// GET /containers/:id/stats -- one stats sample (dd has no cgroup accounting yet; zeros, valid shape).
+async fn containers_stats(State(a): State<App>, Path(id): Path<String>) -> Response {
+    let g = a.inner.lock().await;
+    if resolve_cid(&g, &id).is_none() { return no_such(&id) }
+    Json(json!({ "read": "1970-01-01T00:00:00Z", "name": format!("/{}", &id[..12.min(id.len())]),
+        "cpu_stats": { "cpu_usage": { "total_usage": 0 }, "system_cpu_usage": 0, "online_cpus": 1 },
+        "precpu_stats": { "cpu_usage": { "total_usage": 0 }, "system_cpu_usage": 0 },
+        "memory_stats": { "usage": 0, "limit": 0 }, "pids_stats": { "current": 1 },
+        "networks": {}, "blkio_stats": {} })).into_response()
+}
+
 /// POST /containers/:id/wait -- block until the container exits, then return {"StatusCode": n}. CRITICAL:
 /// the docker `run` CLI sends this BEFORE /start and reads it concurrently, so we must flush the response
 /// HEADERS immediately (200) and stream the JSON body only once the guest exits -- otherwise the CLI
@@ -595,7 +702,7 @@ async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) -> Json<Val
         "Id": c.id, "Image": c.image, "Command": c.cmd.join(" "), "Created": c.created,
         "State": c.status, "Status": c.status, "ExitCode": c.exit_code, "Ports": ports_json(&c.publish),
         "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
-        "Names": [format!("/{}", &c.id[..12.min(c.id.len())])]})).collect();
+        "Names": [format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() })]})).collect();
     Json(json!(v))
 }
 async fn containers_delete(State(a): State<App>, Path(id): Path<String>) -> Response {

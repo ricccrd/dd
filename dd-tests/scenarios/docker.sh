@@ -99,6 +99,30 @@ xcid="$(d run -d alpine sh -c 'sleep 8')"
 has "exec"          "$(d exec "$xcid" echo exec-out)" "exec-out"
 d rm -f "$xcid" >/dev/null
 
+echo "== --name + rename + lookup-by-name =="
+ncid="$(d run -d --name myapp alpine sh -c 'echo named-ran')"
+d wait "$ncid" >/dev/null
+has "run-name"     "$(d ps -a --format '{{.Names}}')" "myapp"
+has "logs-by-name" "$(d logs myapp)" "named-ran"
+d rename myapp myapp2 >/dev/null
+has "rename"       "$(d ps -a --format '{{.Names}}')" "myapp2"
+d rm -f myapp2 >/dev/null
+
+echo "== image tag / push / rmi =="
+d tag alpine myalp:v1 >/dev/null
+has "tag"  "$(d images --format '{{.Repository}}')" "myalp"
+has "push" "$(d push myalp:v1 2>&1)" "push refers"
+d rmi myalp:v1 >/dev/null 2>&1
+ok "rmi"   "$(d images --format '{{.Repository}}' | grep -c '^myalp$')" "0"
+
+echo "== pause / unpause / top / stats =="
+pcid="$(d run -d alpine sh -c 'sleep 6')"
+ok  "pause"   "$(d pause "$pcid"   | head -c 12)" "$(echo "$pcid" | head -c 12)"
+ok  "unpause" "$(d unpause "$pcid" | head -c 12)" "$(echo "$pcid" | head -c 12)"
+has "top"     "$(d top "$pcid" 2>&1)" "PID"
+has "stats"   "$(d stats --no-stream --format '{{.Name}}' "$pcid" 2>&1)" "$(echo "$pcid" | head -c 6)"
+d rm -f "$pcid" >/dev/null
+
 echo "== volumes =="
 d volume create scen-vol >/dev/null
 has "volume-listed" "$(d volume ls --format '{{.Name}}')" "scen-vol"
