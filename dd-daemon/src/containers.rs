@@ -226,6 +226,9 @@ pub(crate) async fn containers_attach(State(a): State<App>, Path(id): Path<Strin
 pub(crate) struct ExecCreateBody {
     #[serde(rename = "Cmd")] cmd: Option<Vec<String>>,
     #[serde(rename = "Tty")] tty: Option<bool>,
+    #[serde(rename = "Env")] env: Option<Vec<String>>,
+    #[serde(rename = "WorkingDir")] working_dir: Option<String>,
+    #[serde(rename = "User")] user: Option<String>,
 }
 
 /// POST /containers/:id/exec -- create an exec (record the command). Run it with /exec/:id/start.
@@ -237,7 +240,9 @@ pub(crate) async fn exec_create(State(a): State<App>, Path(id): Path<String>, Js
         return (StatusCode::BAD_REQUEST, Json(json!({"message": "No exec command specified"}))).into_response();
     }
     let exec_id = new_id(&format!("exec-{full}"));
-    g.execs.insert(exec_id.clone(), Exec { container_id: full, cmd, tty: body.tty.unwrap_or(false), started: false });
+    g.execs.insert(exec_id.clone(), Exec { container_id: full, cmd, tty: body.tty.unwrap_or(false), started: false,
+        env: body.env.unwrap_or_default(), working_dir: body.working_dir.unwrap_or_default(),
+        user: body.user.unwrap_or_default() });
     (StatusCode::CREATED, Json(json!({"Id": exec_id}))).into_response()
 }
 
@@ -254,6 +259,11 @@ pub(crate) async fn exec_start(State(a): State<App>, Path(id): Path<String>, req
         temp.id = id.clone();
         temp.cmd = exec.cmd.clone();
         temp.tty = exec.tty;
+        // `docker exec -e/-w`: the exec inherits the container's env and adds `-e` overrides (later wins),
+        // and `-w` overrides the working dir. spawn_cfg reads temp.env / temp.working_dir, so set them here.
+        // (`-u`/User is captured on the Exec but not applied: SpawnConfig has no user/uid field yet.)
+        temp.env.extend(exec.env.iter().cloned());
+        if !exec.working_dir.is_empty() { temp.working_dir = exec.working_dir.clone(); }
         let live = Live::new(exec.tty);
         g.live.insert(id.clone(), live.clone());
         if let Some(e) = g.execs.get_mut(&id) { e.started = true; }
@@ -425,13 +435,29 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
 #[derive(Deserialize)]
 pub(crate) struct PsQ { all: Option<String> }
 
+/// Render a container's `docker ps` Status column the way docker does: "Up 3 minutes" while
+/// running/paused, "Exited (0) 5 minutes ago" otherwise. The elapsed time is measured from the
+/// container's `created` unix timestamp and humanized coarsely (seconds/minutes/hours/days).
+fn human_status(c: &Container) -> String {
+    let secs = (now_secs() - c.created).max(0);
+    let dur = if secs < 60 { format!("{secs} seconds") }
+        else if secs < 3600 { format!("{} minutes", secs / 60) }
+        else if secs < 86400 { format!("{} hours", secs / 3600) }
+        else { format!("{} days", secs / 86400) };
+    if c.status == "running" || c.status == "paused" {
+        format!("Up {dur}")
+    } else {
+        format!("Exited ({}) {dur} ago", c.exit_code)
+    }
+}
+
 pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) -> Json<Value> {
     let all = matches!(q.all.as_deref(), Some("1") | Some("true") | Some("True"));
     let v: Vec<Value> = a.inner.lock().await.containers.values()
         .filter(|c| all || c.status == "running")
         .map(|c| json!({
         "Id": c.id, "Image": c.image, "Command": c.cmd.join(" "), "Created": c.created,
-        "State": c.status, "Status": c.status, "ExitCode": c.exit_code, "Ports": ports_json(&c.publish),
+        "State": c.status, "Status": human_status(c), "ExitCode": c.exit_code, "Ports": ports_json(&c.publish),
         "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
         "Names": [format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() })]})).collect();
     Json(json!(v))

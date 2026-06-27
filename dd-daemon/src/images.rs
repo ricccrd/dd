@@ -1,0 +1,342 @@
+#![allow(unused_imports, dead_code)]
+use crate::model::*;
+use crate::util::*;
+use crate::system::*;
+use crate::containers::*;
+use crate::build::*;
+use crate::archive::*;
+use crate::volumes::*;
+use crate::networks::*;
+use crate::runtime::*;
+use crate::registry::{Client, Credentials, ImageRef};
+use axum::body::Body;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{StatusCode, Uri, HeaderMap};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Stdio;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use hyper_util::rt::TokioIo;
+use ddjit::{Guest, PortMap, SpawnConfig, Volume};
+
+pub(crate) async fn images_json(State(a): State<App>) -> Json<Value> {
+    let imgs: Vec<Value> = a.inner.lock().await.images.iter().map(|i| {
+        let size = image_size(&i.rootfs, &i.name);
+        json!({
+        "Id": format!("sha256:{}", fake_id(&i.name)), "RepoTags": [repo_tag(&i.name)],
+        "Created": 0, "Size": size,
+        // Fields required by the Docker `ImageSummary` schema (strict clients like bollard reject the
+        // object if any are absent). `VirtualSize` is a required i64 in API <=1.43 models (no serde
+        // default), so it must be present; dd has no parent/registry-digest/shared-size accounting yet,
+        // so the rest take the Docker "not calculated" sentinels (-1) or empties.
+        "VirtualSize": size, "ParentId": "", "RepoDigests": [], "SharedSize": -1, "Labels": {}, "Containers": -1})
+    }).collect();
+    Json(json!(imgs))
+}
+
+/// `GET /images/{name}/history` — `docker history`. dd squashes images to a single rootfs, so we
+/// report one synthetic layer.
+pub(crate) async fn image_history(State(a): State<App>, Path(name): Path<String>) -> Response {
+    let g = a.inner.lock().await;
+    match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
+        Some(i) => Json(json!([{
+            "Id": format!("sha256:{}", fake_id(&i.name)), "Created": 0,
+            "CreatedBy": "dd import", "Tags": [repo_tag(&i.name)],
+            "Size": image_size(&i.rootfs, &i.name), "Comment": ""}])).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response(),
+    }
+}
+
+/// `GET /images/search` — `docker search`. dd has no search index; return an empty result set with
+/// the correct shape rather than 404.
+pub(crate) async fn image_search() -> Json<Value> {
+    Json(json!([]))
+}
+
+/// `POST /images/prune` — `docker image prune`. dd does not track dangling images; report nothing
+/// reclaimed (correct shape so `docker system prune` succeeds).
+pub(crate) async fn images_prune() -> Json<Value> {
+    Json(json!({"ImagesDeleted": [], "SpaceReclaimed": 0}))
+}
+
+/// `GET /distribution/{name}/json` — registry manifest probe. Minimal conformant descriptor.
+pub(crate) async fn distribution_inspect(Path(name): Path<String>) -> Response {
+    Json(json!({
+        "Descriptor": {"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "digest": format!("sha256:{}", fake_id(&name)), "size": 0},
+        "Platforms": [{"architecture": "arm64", "os": "linux"}]})).into_response()
+}
+
+/// GET /images/:name/json — `docker image inspect` / `docker run`'s local-image probe. Returns the
+/// image config (Cmd/Entrypoint/Env) so the CLI doesn't treat the image as missing and re-pull.
+pub(crate) async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Response {
+    let g = a.inner.lock().await;
+    match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
+        Some(i) => {
+            let tag = repo_tag(&i.name);
+            let size = image_size(&i.rootfs, &i.name);
+            // The image stores ENTRYPOINT separately; Docker reports a missing entrypoint as null
+            // (not []), and `docker inspect` clients distinguish the two.
+            let entrypoint = if i.entrypoint.is_empty() { Value::Null } else { json!(i.entrypoint) };
+            // Use the image's recorded ENV; fall back to a sane PATH so containers run by a client
+            // that copies Config.Env verbatim still resolve binaries.
+            let env: Vec<String> = if i.env.is_empty() {
+                vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()]
+            } else { i.env.clone() };
+            Json(json!({
+                "Id": format!("sha256:{}", fake_id(&i.name)),
+                "RepoTags": [tag.clone()], "RepoDigests": [],
+                "Architecture": docker_arch(i.arch),
+                "Os": i.arch.os(),
+                // dd has no image-creation timestamp yet (see report); the epoch keeps the RFC3339
+                // shape strict clients expect.
+                "Size": size, "VirtualSize": size, "Created": "1970-01-01T00:00:00Z",
+                "Config": {
+                    "Image": tag,
+                    "Cmd": i.cmd,
+                    "Entrypoint": entrypoint,
+                    "Env": env,
+                    "WorkingDir": i.workdir,
+                    "Labels": {},
+                },
+                "RootFS": {"Type": "layers", "Layers": []}})).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ImageCreateQ {
+    #[serde(rename = "fromImage")] from_image: Option<String>,
+    #[serde(rename = "tag")] tag: Option<String>,
+    platform: Option<String>,
+}
+
+/// POST /images/create -- `docker pull`. If the image isn't local (for the requested platform), pull it
+/// from its registry (any registry) and unpack it into a rootfs, then register it.
+pub(crate) async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>, headers: axum::http::HeaderMap) -> Response {
+    let name = q.from_image.unwrap_or_default();
+    let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
+    if name.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"}))).into_response(); }
+    // "already local" must match the FULL reference (registry/repo:tag) AND the requested --platform arch:
+    // distinct images can share a short name across registries, and arm64/amd64 of one image are distinct.
+    let want = image_ref(&name, &tag).short();
+    let want_arch = platform_arch(q.platform.as_deref());
+    if a.inner.lock().await.images.iter()
+        .any(|i| repo_tag(&i.name) == want && want_arch.map_or(true, |a| docker_arch(i.arch) == a))
+    {
+        return pull_progress(&name, &tag, Ok(true));
+    }
+    let creds = registry_auth(&headers);
+    let archs = platform_archs(q.platform.as_deref());
+    let (dir, nm, tg) = (a.images_dir.clone(), name.clone(), tag.clone());
+    let res = tokio::task::spawn_blocking(move || pull_image(&dir, &nm, &tg, creds, &archs)).await
+        .unwrap_or_else(|e| Err(format!("pull task crashed: {e}")));
+    match res {
+        Ok(img) => {
+            let mut g = a.inner.lock().await;
+            g.images.retain(|i| repo_tag(&i.name) != want); // a re-pull (e.g. a new platform) replaces the old
+            g.images.push(img);
+            pull_progress(&name, &tag, Ok(false))
+        }
+        Err(e) => pull_progress(&name, &tag, Err(e)),
+    }
+}
+
+
+/// Decode the CLI's `X-Registry-Auth` header (base64 JSON credentials) into [`Credentials`].
+pub(crate) fn registry_auth(headers: &axum::http::HeaderMap) -> Credentials {
+    headers.get("X-Registry-Auth").and_then(|v| v.to_str().ok())
+        .and_then(Credentials::from_x_registry_auth).unwrap_or_default()
+}
+
+
+/// docker-style pull progress: a stream of JSON status lines the CLI renders.
+pub(crate) fn pull_progress(name: &str, tag: &str, result: Result<bool, String>) -> Response {
+    let body = match result {
+        Ok(true) => format!("{}\r\n", json!({ "status": format!("Status: Image is up to date for {name}:{tag}") })),
+        Ok(false) => [
+            json!({ "status": format!("Pulling from {}", image_ref(name, tag).repository) }).to_string(),
+            json!({ "status": "Verifying Checksum" }).to_string(),
+            json!({ "status": "Download complete" }).to_string(),
+            json!({ "status": "Pull complete" }).to_string(),
+            json!({ "status": format!("Status: Downloaded newer image for {name}:{tag}") }).to_string(),
+        ].join("\r\n") + "\r\n",
+        Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
+    };
+    (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
+}
+
+
+/// Build an [`ImageRef`] from docker's separate `fromImage` + `tag` params (tag overrides any in the ref).
+pub(crate) fn image_ref(from_image: &str, tag: &str) -> ImageRef {
+    let mut r = ImageRef::parse(from_image);
+    if !tag.is_empty() { r.tag = tag.to_string(); }
+    r
+}
+
+
+/// Pull an image from its registry (any registry) and unpack it under `<images_dir>/<safe>/rootfs`,
+/// preferring the linux/arm64 variant (native; falls back to amd64). Returns the registered [`Image`].
+pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials, archs: &[&str]) -> Result<Image, String> {
+    let iref = image_ref(from_image, tag);
+    let rootfs = std::path::PathBuf::from(format!("{images_dir}/{}/rootfs", safe_name(&iref)));
+    let pulled = Client::new(iref.clone(), creds).pull(&rootfs, archs)?;
+    let arch = detect_arch(&rootfs).ok_or("could not detect the image architecture")?;
+    let darwin = arch.os() == "darwin";
+    // A pulled macOS image's `dd-image.json` sidecar doesn't survive the registry round-trip and its
+    // userland shell lives on the in-jail PATH (`/profile/bin/bash`), not `/bin/sh` — so default a
+    // darwin image to a bare `bash` (resolved via PATH by the darwinjail) rather than `/bin/sh`.
+    let cmd = config_cmd(&pulled.config)
+        .unwrap_or_else(|| if darwin { vec!["bash".into()] } else { default_shell(&rootfs) });
+    let name = iref.short();
+    // Record name + cmd (+ os for darwin) so the image keeps its identity across a daemon restart (the
+    // dir name alone doesn't round-trip -- e.g. "docker.io_library_alpine_latest").
+    let mut meta = json!({ "name": name.clone(), "cmd": cmd.clone() });
+    if darwin { meta["os"] = json!("darwin"); }
+    let _ = std::fs::write(format!("{images_dir}/{}/dd-image.json", safe_name(&iref)), meta.to_string());
+    Ok(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, ..Default::default() })
+}
+
+
+/// A `repository:tag` string with exactly one tag — discovered images carry a bare name (`busybox`),
+/// pulled ones already include the tag (`busybox:latest`); append `:latest` only when absent.
+pub(crate) fn repo_tag(name: &str) -> String {
+    let last = name.rsplit('/').next().unwrap_or(name);
+    if last.contains(':') { name.to_string() } else { format!("{name}:latest") }
+}
+
+
+/// A filesystem-safe directory name for an image reference.
+pub(crate) fn safe_name(r: &ImageRef) -> String { r.canonical().replace(['/', ':'], "_") }
+
+
+/// The image's default command from its OCI config blob (Entrypoint ++ Cmd), if present.
+pub(crate) fn config_cmd(config: &Value) -> Option<Vec<String>> {
+    let strs = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
+    let entry = strs(&config["config"]["Entrypoint"]).unwrap_or_default();
+    let cmd = strs(&config["config"]["Cmd"]).unwrap_or_default();
+    let argv: Vec<String> = entry.into_iter().chain(cmd).collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
+/// Fallback default command for an image whose config has no Cmd: prefer /bin/sh, else /bin/bash.
+pub(crate) fn default_shell(rootfs: &std::path::Path) -> Vec<String> {
+    for sh in ["/bin/sh", "/bin/bash"] {
+        if rootfs.join(sh.trim_start_matches('/')).exists() { return vec![sh.to_string()]; }
+    }
+    vec!["/bin/sh".to_string()]
+}
+
+
+// ---- image management: tag / rmi / push -------------------------------------
+#[derive(Deserialize)]
+pub(crate) struct TagQ { repo: Option<String>, tag: Option<String> }
+
+/// POST /images/:name/tag -- alias an image under a new repo[:tag] (same rootfs). Honors both the
+/// `repo` and `tag` query params (`docker tag src dst:v2` -> repo=dst, tag=v2).
+pub(crate) async fn image_tag(State(a): State<App>, Path(name): Path<String>, Query(q): Query<TagQ>) -> Response {
+    let mut g = a.inner.lock().await;
+    let Some(src) = g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
+    };
+    // Keep the FULL target repository (registry + namespace), e.g. `huttarichard/ddmac` — NOT the bare
+    // name. Stripping it (ref_name) would later push to `library/<name>` and be denied. docker sends the
+    // repo without a tag and the tag separately.
+    let repo = q.repo.unwrap_or_default();
+    if repo.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "repo required"}))).into_response(); }
+    let full = match q.tag.filter(|t| !t.is_empty()) { Some(t) => format!("{repo}:{t}"), None => repo };
+    if !g.images.iter().any(|i| i.name == full) {
+        g.images.push(Image { name: full, ..src });
+    }
+    StatusCode::CREATED.into_response()
+}
+
+/// DELETE /images/:name -- `docker rmi`. Reports the image's real tag in `Untagged`.
+pub(crate) async fn image_delete(State(a): State<App>, Path(name): Path<String>) -> Response {
+    let mut g = a.inner.lock().await;
+    let bare = ref_name(&name).to_string();
+    let untagged = g.images.iter().find(|i| ref_name(&i.name) == bare).map(|i| repo_tag(&i.name));
+    let before = g.images.len();
+    g.images.retain(|i| ref_name(&i.name) != bare);
+    if g.images.len() == before {
+        return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
+    }
+    let untagged = untagged.unwrap_or_else(|| format!("{bare}:latest"));
+    Json(json!([{ "Untagged": untagged }, { "Deleted": format!("sha256:{}", fake_id(&bare)) }])).into_response()
+}
+
+/// POST /images/:name/push -- dd has no registry yet (images are local), so this is a clean no-op that
+/// reports success rather than erroring. TODO(OCI): real registry push.
+/// POST /images/:name/push -- re-tar the local rootfs into a single-layer image and upload it to its
+/// registry (`docker.io/...`, `ghcr.io/...`, `localhost:5000/...`) using the CLI's credentials.
+pub(crate) async fn image_push(State(a): State<App>, Path(name): Path<String>, Query(q): Query<PushQ>, headers: axum::http::HeaderMap) -> Response {
+    // The route `name` is collapsed to the bare image (e.g. `huttarichard/ddmac` -> `ddmac`), so match on
+    // it AND the requested tag, then push to the image's FULL stored name so the registry namespace
+    // (`huttarichard/…`) is preserved — otherwise the upload targets `library/<name>` and is denied.
+    let want_tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
+    let name_tag = |n: &str| match n.rsplit_once(':') { Some((_, t)) if !t.contains('/') => t.to_string(), _ => "latest".into() };
+    let img = {
+        let g = a.inner.lock().await;
+        g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name) && name_tag(&i.name) == want_tag)
+            .or_else(|| g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)))
+            .cloned()
+    };
+    let Some(img) = img else {
+        return push_progress(&name, Err(format!("No such image: {name}"))).into_response();
+    };
+    let tag = want_tag;
+    let iref = image_ref(&img.name, &tag);
+    let arch = docker_arch(img.arch).to_string();
+    let os = img.arch.os().to_string(); // "darwin" for mac images, else "linux"
+    let creds = registry_auth(&headers);
+    let work = std::path::PathBuf::from(format!("{}/.push-{}", a.images_dir, std::process::id()));
+    let res = tokio::task::spawn_blocking(move || {
+        Client::new(iref, creds).push(std::path::Path::new(&img.rootfs), &img.cmd, &arch, &os, &work)
+    }).await.unwrap_or_else(|e| Err(format!("push task crashed: {e}")));
+    push_progress(&name, res).into_response()
+}
+
+
+#[derive(Deserialize)]
+pub(crate) struct PushQ { tag: Option<String> }
+
+/// docker arch label for a guest target.
+pub(crate) fn docker_arch(g: Guest) -> &'static str { if g.arch() == "x86_64" { "amd64" } else { "arm64" } }
+
+/// A docker `--platform` value ("linux/amd64", "arm64", …) mapped to dd's arch label, if recognized.
+pub(crate) fn platform_arch(platform: Option<&str>) -> Option<&'static str> {
+    match platform?.rsplit('/').next().unwrap_or("") {
+        "amd64" | "x86_64" => Some("amd64"),
+        "arm64" | "aarch64" => Some("arm64"),
+        _ => None,
+    }
+}
+
+/// Preferred arch list when pulling for a given platform: the requested one, else native-arm64 first.
+pub(crate) fn platform_archs(platform: Option<&str>) -> Vec<&'static str> {
+    match platform_arch(platform) { Some(a) => vec![a], None => vec!["arm64", "amd64"] }
+}
+
+
+/// docker-style push progress (a stream of JSON status lines, or an error line).
+pub(crate) fn push_progress(name: &str, result: Result<String, String>) -> Response {
+    let body = match result {
+        Ok(digest) => [
+            json!({ "status": format!("The push refers to repository [{name}]") }).to_string(),
+            json!({ "status": "Pushed" }).to_string(),
+            json!({ "status": format!("latest: digest: {digest}") }).to_string(),
+        ].join("\r\n") + "\r\n",
+        Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
+    };
+    (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
+}

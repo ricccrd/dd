@@ -402,9 +402,11 @@ mod http {
         run_curl(&with_auth(vec!["-X".into(), "POST".into(), url.into()], None, token))
     }
     pub fn put_file(url: &str, file: &Path, content_type: &str, token: Option<&str>) -> Result<Resp, String> {
+        // `-T` (upload-file) STREAMS the body from disk and sets Content-Length from the file size —
+        // unlike `--data-binary @file`, which buffers the entire file in memory (OOMs on multi-GB layers).
         let args = with_auth(vec![
             "-X".into(), "PUT".into(), "-H".into(), format!("Content-Type: {content_type}"),
-            "--data-binary".into(), format!("@{}", file.display()), url.into()], None, token);
+            "-T".into(), file.display().to_string(), url.into()], None, token);
         run_curl(&args)
     }
     pub fn put_bytes(url: &str, body: &[u8], content_type: &str, token: Option<&str>) -> Result<Resp, String> {
