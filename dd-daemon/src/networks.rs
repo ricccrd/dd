@@ -31,11 +31,73 @@ use ddjit::{Guest, PortMap, SpawnConfig, Volume};
 
 // ---- networks --------------------------------------------------------------
 
+/// CIDR prefix length of a subnet ("172.18.0.0/16" -> 16), defaulting to /16.
+fn subnet_prefix(subnet: &str) -> u32 { subnet.split('/').nth(1).and_then(|p| p.parse().ok()).unwrap_or(16) }
+
+/// Deterministic MAC for an IPv4 (Docker convention): `02:42:` + the four address bytes. Cosmetic.
+pub(crate) fn ip_mac(ip: &str) -> String {
+    let o: Vec<u8> = ip.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    if o.len() == 4 { format!("02:42:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3]) } else { "02:42:00:00:00:00".into() }
+}
+
+/// Pick the next free `/16` from the `172.18.0.0/12` pool, skipping subnets already in use. Returns
+/// `(subnet, gateway)`. `bridge` is special-cased to `172.17.0.0/16` by the caller.
+pub(crate) fn alloc_subnet(nets: &[Net]) -> (String, String) {
+    for o in 18u32..=31 {
+        let sub = format!("172.{o}.0.0/16");
+        if !nets.iter().any(|n| n.subnet == sub) { return (sub, format!("172.{o}.0.1")); }
+    }
+    ("172.18.0.0/16".into(), "172.18.0.1".into()) // pool exhausted — degrade rather than fail
+}
+
+/// Next free host address in a network's subnet (`.1` reserved for the gateway, hosts start at `.2`).
+/// Assumes a `/16` "172.B.0.0" subnet — IPs are handed out as `172.B.0.N`.
+pub(crate) fn alloc_ip(net: &Net) -> String {
+    let base = net.subnet.split('/').next().unwrap_or("172.18.0.0");
+    let p: Vec<&str> = base.split('.').collect();
+    let (a, b) = (p.first().copied().unwrap_or("172"), p.get(1).copied().unwrap_or("18"));
+    let used: std::collections::HashSet<&str> = net.endpoints.values().map(|e| e.ip.as_str()).collect();
+    for k in 2u32..=254 {
+        let ip = format!("{a}.{b}.0.{k}");
+        if !used.contains(ip.as_str()) { return ip; }
+    }
+    format!("{a}.{b}.0.2")
+}
+
+/// Join container `cid` (reporting as `cname`) to the network named `net_name` in `nets`: lazily
+/// allocate the subnet if absent (e.g. for `bridge` from old state), assign a fresh endpoint IP, and
+/// add the cid to the membership list. Idempotent — re-joining returns the existing IP. Returns the IP.
+pub(crate) fn join_network(nets: &mut [Net], net_name: &str, cid: &str, cname: &str) -> Option<String> {
+    let idx = nets.iter().position(|n| n.name == net_name)?;
+    if nets[idx].subnet.is_empty() {
+        let (sub, gw) = if net_name == "bridge" { ("172.17.0.0/16".into(), "172.17.0.1".into()) } else { alloc_subnet(nets) };
+        nets[idx].subnet = sub;
+        nets[idx].gateway = gw;
+    }
+    let n = &mut nets[idx];
+    if let Some(e) = n.endpoints.get(cid) { return Some(e.ip.clone()); }
+    let ip = alloc_ip(n);
+    if !n.containers.iter().any(|c| c == cid) { n.containers.push(cid.to_string()); }
+    n.endpoints.insert(cid.to_string(), Endpoint { name: cname.to_string(), ip: ip.clone() });
+    Some(ip)
+}
+
+/// Drop a container from a network (membership + endpoint IP). Frees the IP for reuse.
+pub(crate) fn leave_network(n: &mut Net, cid: &str) {
+    n.containers.retain(|c| c != cid);
+    n.endpoints.remove(cid);
+}
+
 pub(crate) fn net_json(n: &Net) -> Value {
-    let containers: HashMap<String, Value> = n.containers.iter().map(|c| (c.clone(), json!({"Name": &c[..12.min(c.len())]}))).collect();
+    let prefix = subnet_prefix(&n.subnet);
+    let containers: HashMap<String, Value> = n.endpoints.iter()
+        .map(|(cid, e)| (cid.clone(), json!({"Name": e.name, "EndpointID": cid, "MacAddress": ip_mac(&e.ip),
+            "IPv4Address": format!("{}/{}", e.ip, prefix), "IPv6Address": ""})))
+        .collect();
+    let config = if n.subnet.is_empty() { json!([]) } else { json!([{"Subnet": n.subnet, "Gateway": n.gateway}]) };
     json!({"Id": n.id, "Name": n.name, "Driver": n.driver, "Scope": n.scope,
         "Containers": containers, "Created": fmt_rfc3339(n.created), "EnableIPv6": false, "Internal": false,
-        "IPAM": {"Driver": "default", "Config": []}})
+        "IPAM": {"Driver": "default", "Config": config}})
 }
 
 pub(crate) async fn networks_list(State(a): State<App>) -> Json<Value> {
@@ -52,7 +114,9 @@ pub(crate) async fn networks_create(State(a): State<App>, Json(body): Json<NetCr
     if let Some(n) = g.networks.iter().find(|n| n.name == name) {
         return (StatusCode::CONFLICT, Json(json!({"message": format!("network {name} already exists"), "Id": n.id}))).into_response();
     }
-    let n = Net { id: fake_id(&format!("net-{name}")), name, driver: body.driver.unwrap_or_else(|| "bridge".into()), scope: "local".into(), containers: vec![], created: now_secs() };
+    let (subnet, gateway) = alloc_subnet(&g.networks);
+    let n = Net { id: fake_id(&format!("net-{name}")), name, driver: body.driver.unwrap_or_else(|| "bridge".into()),
+        scope: "local".into(), containers: vec![], created: now_secs(), subnet, gateway, endpoints: HashMap::new() };
     let id = n.id.clone();
     g.networks.push(n);
     save_state(&g, &a.state_path);
@@ -80,21 +144,31 @@ pub(crate) async fn network_delete(State(a): State<App>, Path(id): Path<String>)
 pub(crate) struct NetAttachBody { #[serde(rename = "Container")] container: Option<String> }
 
 pub(crate) async fn network_connect(State(a): State<App>, Path(id): Path<String>, Json(b): Json<NetAttachBody>) -> Response {
-    let cid = b.container.unwrap_or_default();
+    let req = b.container.unwrap_or_default();
     let mut g = a.inner.lock().await;
-    let r = match g.networks.iter_mut().find(|n| net_matches(n, &id)) {
-        Some(n) => { if !n.containers.contains(&cid) { n.containers.push(cid); } StatusCode::OK.into_response() }
-        None => return network_404(&id),
+    // Resolve to a full container id + its reported name before mutating networks (avoids borrowing
+    // `g.networks` mutably while `g.containers` is borrowed immutably).
+    let (cid, cname) = match resolve_cid(&g, &req).and_then(|f| g.containers.get(&f).map(|c| (f.clone(), endpoint_name(c)))) {
+        Some(t) => t,
+        None => (req.clone(), req.clone()),
     };
+    let net_name = match g.networks.iter().find(|n| net_matches(n, &id)) { Some(n) => n.name.clone(), None => return network_404(&id) };
+    join_network(&mut g.networks, &net_name, &cid, &cname);
     save_state(&g, &a.state_path);
-    r
+    StatusCode::OK.into_response()
+}
+
+/// The name a container is reported by on a network: its `--name`, or the 12-char short id.
+pub(crate) fn endpoint_name(c: &Container) -> String {
+    if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() }
 }
 
 pub(crate) async fn network_disconnect(State(a): State<App>, Path(id): Path<String>, Json(b): Json<NetAttachBody>) -> Response {
-    let cid = b.container.unwrap_or_default();
+    let req = b.container.unwrap_or_default();
     let mut g = a.inner.lock().await;
+    let cid = resolve_cid(&g, &req).unwrap_or(req);
     let r = match g.networks.iter_mut().find(|n| net_matches(n, &id)) {
-        Some(n) => { n.containers.retain(|c| c != &cid); StatusCode::OK.into_response() }
+        Some(n) => { leave_network(n, &cid); StatusCode::OK.into_response() }
         None => return network_404(&id),
     };
     save_state(&g, &a.state_path);
@@ -118,6 +192,11 @@ pub(crate) fn default_networks() -> Vec<Net> {
         id: fake_id(&format!("net-{name}")), name: name.to_string(),
         driver: if *name == "bridge" { "bridge".into() } else { name.to_string() }, created: 0,
         scope: "local".into(), containers: vec![],
+        // bridge is the default network a container without `--network` lands on, so it gets the
+        // canonical 172.17.0.0/16; host/none carry no L3 identity.
+        subnet: if *name == "bridge" { "172.17.0.0/16".into() } else { String::new() },
+        gateway: if *name == "bridge" { "172.17.0.1".into() } else { String::new() },
+        endpoints: HashMap::new(),
     }).collect()
 }
 

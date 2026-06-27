@@ -111,6 +111,15 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         network_mode: hc.as_ref().and_then(|h| h.network_mode.clone()).unwrap_or_default(),
         status: "created".into(), ..Default::default()
     };
+    // Join the network now (fixes the bug where `docker run --network X` never added the container to
+    // the network's membership/IPAM): pick the target network from --network, defaulting to `bridge`.
+    let cname = endpoint_name(&c);
+    let net_name = match c.network_mode.as_str() {
+        "" | "default" | "bridge" => "bridge",
+        "host" | "none" => "",          // no L3 identity
+        other => other,                 // a user-defined network by name
+    };
+    if !net_name.is_empty() { join_network(&mut g.networks, net_name, &id, &cname); }
     g.containers.insert(id.clone(), c);
     save_state(&g, &a.state_path);
     (StatusCode::CREATED, Json(json!({"Id": id, "Warnings": []}))).into_response()
@@ -470,11 +479,16 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
     let g = a.inner.lock().await;
     match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {
         Some(c) => {
-            // Networks the container has joined -> NetworkSettings.Networks (membership reporting).
+            // Networks the container has joined -> NetworkSettings.Networks, with the IPAM-assigned
+            // identity (IP/gateway/mac) per network.
             let networks: serde_json::Map<String, Value> = g.networks.iter()
-                .filter(|n| n.containers.iter().any(|x| x == &c.id))
-                .map(|n| (n.name.clone(), json!({"NetworkID": n.id, "IPAddress": "", "Gateway": ""})))
+                .filter_map(|n| n.endpoints.get(&c.id).map(|e| (n.name.clone(), json!({
+                    "NetworkID": n.id, "IPAddress": e.ip, "Gateway": n.gateway,
+                    "IPPrefixLen": n.subnet.split('/').nth(1).and_then(|p| p.parse::<i64>().ok()).unwrap_or(16),
+                    "MacAddress": ip_mac(&e.ip)}))))
                 .collect();
+            // Top-level NetworkSettings.IPAddress = the primary endpoint IP (first joined network).
+            let primary = g.networks.iter().find_map(|n| n.endpoints.get(&c.id).map(|e| (e.ip.clone(), n.gateway.clone()))).unwrap_or_default();
             Json(json!({"Id": c.id, "Image": c.image, "Created": fmt_rfc3339(c.created),
             "Name": format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() }),
             "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": c.status == "running" || c.status == "paused", "Paused": c.status == "paused"},
@@ -482,7 +496,7 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
             "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
             "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit},
             // NetworkSettings present so `docker port` (reads .NetworkSettings.Ports) doesn't panic.
-            "NetworkSettings": {"Ports": ports_map_json(&c.publish), "IPAddress": "", "Gateway": "",
+            "NetworkSettings": {"Ports": ports_map_json(&c.publish), "IPAddress": primary.0, "Gateway": primary.1,
                 "Networks": Value::Object(networks)}})).into_response()
         }
         None => no_such(&id) }
@@ -525,7 +539,7 @@ pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<Strin
     let full = match resolve_cid(&g, &id) { Some(f) => f, None => return no_such(&id) };
     if g.containers.remove(&full).is_some() {
         // Drop the container from any network membership too.
-        for n in g.networks.iter_mut() { n.containers.retain(|c| c != &full); }
+        for n in g.networks.iter_mut() { leave_network(n, &full); }
         save_state(&g, &a.state_path);
         StatusCode::NO_CONTENT.into_response()
     } else { no_such(&id) }
