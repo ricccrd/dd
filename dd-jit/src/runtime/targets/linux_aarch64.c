@@ -238,6 +238,10 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
                 g_nvols++;
             }
         }
+        // docker -w / initial working directory: start the guest in DD_CWD (must be reachable inside the
+        // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.
+        const char *icwd = getenv("DD_CWD");
+        if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
     }
     const char *prog = argv[0];
 

@@ -126,6 +126,10 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
         }
     }
     if (g_rootfs) chdir(g_rootfs); // container model: guest cwd "/" maps to the rootfs root
+    // docker -w / initial working directory: start the guest in DD_CWD (must be reachable inside the
+    // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.
+    const char *icwd = getenv("DD_CWD");
+    if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
     const char *prog = argv[0];
 
     if (pthread_key_create(&g_cpu_key, NULL) != 0) {

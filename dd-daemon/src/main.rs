@@ -65,6 +65,10 @@ struct Container {
     tty: bool,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    working_dir: String,
+    #[serde(default)]
+    network_mode: String,
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]
     arch: Option<Guest>,
@@ -309,25 +313,38 @@ async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Respon
     }
 }
 #[derive(Deserialize)]
-struct ImageCreateQ { #[serde(rename = "fromImage")] from_image: Option<String>, #[serde(rename = "tag")] tag: Option<String> }
-/// POST /images/create -- `docker pull`. If the image isn't local, pull it from Docker Hub (real OCI
-/// registry: token -> manifest -> layers) and unpack it into a rootfs, then register it.
+struct ImageCreateQ {
+    #[serde(rename = "fromImage")] from_image: Option<String>,
+    #[serde(rename = "tag")] tag: Option<String>,
+    platform: Option<String>,
+}
+/// POST /images/create -- `docker pull`. If the image isn't local (for the requested platform), pull it
+/// from its registry (any registry) and unpack it into a rootfs, then register it.
 async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>, headers: axum::http::HeaderMap) -> Response {
     let name = q.from_image.unwrap_or_default();
     let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
     if name.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"}))).into_response(); }
-    // "already local" must compare the FULL reference (registry/repo:tag) -- two images can share a short
-    // name across registries (docker.io/busybox vs quay.io/quay/busybox), and those are distinct images.
+    // "already local" must match the FULL reference (registry/repo:tag) AND the requested --platform arch:
+    // distinct images can share a short name across registries, and arm64/amd64 of one image are distinct.
     let want = image_ref(&name, &tag).short();
-    if a.inner.lock().await.images.iter().any(|i| repo_tag(&i.name) == want) {
+    let want_arch = platform_arch(q.platform.as_deref());
+    if a.inner.lock().await.images.iter()
+        .any(|i| repo_tag(&i.name) == want && want_arch.map_or(true, |a| docker_arch(i.arch) == a))
+    {
         return pull_progress(&name, &tag, Ok(true));
     }
     let creds = registry_auth(&headers);
+    let archs = platform_archs(q.platform.as_deref());
     let (dir, nm, tg) = (a.images_dir.clone(), name.clone(), tag.clone());
-    let res = tokio::task::spawn_blocking(move || pull_image(&dir, &nm, &tg, creds)).await
+    let res = tokio::task::spawn_blocking(move || pull_image(&dir, &nm, &tg, creds, &archs)).await
         .unwrap_or_else(|e| Err(format!("pull task crashed: {e}")));
     match res {
-        Ok(img) => { a.inner.lock().await.images.push(img); pull_progress(&name, &tag, Ok(false)) }
+        Ok(img) => {
+            let mut g = a.inner.lock().await;
+            g.images.retain(|i| repo_tag(&i.name) != want); // a re-pull (e.g. a new platform) replaces the old
+            g.images.push(img);
+            pull_progress(&name, &tag, Ok(false))
+        }
         Err(e) => pull_progress(&name, &tag, Err(e)),
     }
 }
@@ -363,10 +380,10 @@ fn image_ref(from_image: &str, tag: &str) -> ImageRef {
 
 /// Pull an image from its registry (any registry) and unpack it under `<images_dir>/<safe>/rootfs`,
 /// preferring the linux/arm64 variant (native; falls back to amd64). Returns the registered [`Image`].
-fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials) -> Result<Image, String> {
+fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials, archs: &[&str]) -> Result<Image, String> {
     let iref = image_ref(from_image, tag);
     let rootfs = std::path::PathBuf::from(format!("{images_dir}/{}/rootfs", safe_name(&iref)));
-    let pulled = Client::new(iref.clone(), creds).pull(&rootfs, &["arm64", "amd64"])?;
+    let pulled = Client::new(iref.clone(), creds).pull(&rootfs, archs)?;
     let arch = detect_arch(&rootfs).ok_or("could not detect the image architecture")?;
     let cmd = config_cmd(&pulled.config).unwrap_or_else(|| default_shell(&rootfs));
     Ok(Image { name: iref.short(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd })
@@ -405,6 +422,7 @@ struct CreateBody {
     #[serde(rename = "Entrypoint")] entrypoint: Option<Vec<String>>,
     #[serde(rename = "Hostname")] hostname: Option<String>,
     #[serde(rename = "Tty")] tty: Option<bool>,
+    #[serde(rename = "WorkingDir")] working_dir: Option<String>,
     #[serde(rename = "HostConfig")] host_config: Option<HostConfig>,
 }
 #[derive(Deserialize)]
@@ -413,6 +431,7 @@ struct HostConfig {
     #[serde(rename = "Memory")] memory: Option<i64>,
     #[serde(rename = "PidsLimit")] pids_limit: Option<i64>,
     #[serde(rename = "PortBindings")] port_bindings: Option<HashMap<String, Vec<PortBinding>>>,
+    #[serde(rename = "NetworkMode")] network_mode: Option<String>,
 }
 #[derive(Deserialize, Clone)]
 struct PortBinding { #[serde(rename = "HostPort")] host_port: Option<String> }
@@ -426,11 +445,18 @@ fn publish_str(pb: &HashMap<String, Vec<PortBinding>>) -> String {
 }
 
 #[derive(Deserialize)]
-struct CreateQ { name: Option<String> }
+struct CreateQ { name: Option<String>, platform: Option<String> }
 async fn containers_create(State(a): State<App>, Query(cq): Query<CreateQ>, Json(body): Json<CreateBody>) -> Response {
     let image = body.image.unwrap_or_default();
     let mut g = a.inner.lock().await;
-    let img = match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&image)).cloned() {
+    // Match the image by name and, when --platform is given, by arch. A platform mismatch returns 404 so
+    // the docker CLI pulls the right arch (its default --pull=missing won't re-pull otherwise) and retries.
+    let want_arch = platform_arch(cq.platform.as_deref());
+    let img = match g.images.iter()
+        .filter(|i| ref_name(&i.name) == ref_name(&image))
+        .find(|i| want_arch.map_or(true, |a| docker_arch(i.arch) == a))
+        .cloned()
+    {
         Some(i) => i,
         None => return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {image}")}))).into_response(),
     };
@@ -454,6 +480,8 @@ async fn containers_create(State(a): State<App>, Query(cq): Query<CreateQ>, Json
         publish: hc.as_ref().and_then(|h| h.port_bindings.as_ref()).map(publish_str).unwrap_or_default(),
         created: now_secs(), tty,
         name: cq.name.unwrap_or_default().trim_start_matches('/').to_string(),
+        working_dir: body.working_dir.unwrap_or_default(),
+        network_mode: hc.as_ref().and_then(|h| h.network_mode.clone()).unwrap_or_default(),
         status: "created".into(), ..Default::default()
     };
     g.containers.insert(id.clone(), c);
@@ -683,6 +711,18 @@ async fn image_push(State(a): State<App>, Path(name): Path<String>, Query(q): Qu
 struct PushQ { tag: Option<String> }
 /// docker arch label for a guest target.
 fn docker_arch(g: Guest) -> &'static str { if g.arch() == "x86_64" { "amd64" } else { "arm64" } }
+/// A docker `--platform` value ("linux/amd64", "arm64", …) mapped to dd's arch label, if recognized.
+fn platform_arch(platform: Option<&str>) -> Option<&'static str> {
+    match platform?.rsplit('/').next().unwrap_or("") {
+        "amd64" | "x86_64" => Some("amd64"),
+        "arm64" | "aarch64" => Some("arm64"),
+        _ => None,
+    }
+}
+/// Preferred arch list when pulling for a given platform: the requested one, else native-arm64 first.
+fn platform_archs(platform: Option<&str>) -> Vec<&'static str> {
+    match platform_arch(platform) { Some(a) => vec![a], None => vec!["arm64", "amd64"] }
+}
 
 /// docker-style push progress (a stream of JSON status lines, or an error line).
 fn push_progress(name: &str, result: Result<String, String>) -> Response {
@@ -967,12 +1007,15 @@ fn default_networks() -> Vec<Net> {
 /// was built for the image's arch.
 fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol]) -> Option<(String, Vec<String>)> {
     let guest = c.arch.unwrap_or(Guest::LinuxAarch64);
-    let mut cfg = SpawnConfig::new(String::new(), c.rootfs.clone()); // absolute paths -> no work_dir cd
+    let mut cfg = SpawnConfig::new(String::new(), c.rootfs.clone()); // work_dir is the HOST cwd; leave empty
     cfg.argv = c.cmd.clone();
+    // `-w DIR` (WorkingDir): the guest's initial cwd, read as DD_CWD by the runtime at startup.
+    if !c.working_dir.is_empty() { cfg.env.push(("DD_CWD".into(), c.working_dir.clone())); }
     cfg.hostname = (!c.hostname.is_empty()).then(|| c.hostname.clone());
     cfg.mem_max = c.memory.max(0) as u64;
     cfg.pids_max = c.pids_limit.max(0) as u32;
-    cfg.netns = Some(c.id[..c.id.len().min(40)].to_string());
+    // `--network host` shares the host network (no per-container netns); otherwise isolate in one.
+    cfg.netns = (c.network_mode != "host").then(|| c.id[..c.id.len().min(40)].to_string());
     cfg.volumes = c.binds.iter().filter_map(|b| b.split_once(':').map(|(host, dst)| {
         // A bind whose source isn't an absolute path is a named volume.
         let host = if host.starts_with('/') {
