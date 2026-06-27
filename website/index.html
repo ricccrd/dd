@@ -240,20 +240,20 @@
         <div class="compare"><table>
           <thead><tr><th>Workload</th><th>VM&nbsp;(qemu)</th><th class="dd">dd</th><th>dd vs VM</th></tr></thead>
           <tbody>
-            <tr><td class="axis">int sieve</td><td class="vm">1.32s</td><td class="dd">0.96s</td><td><span class="yes">1.37× faster</span></td></tr>
-            <tr><td class="axis">float n-body</td><td class="vm">5.44s</td><td class="dd">0.26s</td><td><span class="yes">21× faster</span></td></tr>
-            <tr><td class="axis">SHA-256</td><td class="vm">2.73s</td><td class="dd">2.38s</td><td><span class="yes">1.15× faster</span></td></tr>
-            <tr><td class="axis">SQLite</td><td class="vm">—</td><td class="dd">—</td><td>not yet</td></tr>
+            <tr><td class="axis">int sieve</td><td class="vm">1.32s</td><td class="dd">0.97s</td><td><span class="yes">1.36× faster</span></td></tr>
+            <tr><td class="axis">float n-body</td><td class="vm">5.42s</td><td class="dd">0.26s</td><td><span class="yes">21× faster</span></td></tr>
+            <tr><td class="axis">SHA-256</td><td class="vm">2.74s</td><td class="dd">2.39s</td><td><span class="yes">1.15× faster</span></td></tr>
+            <tr><td class="axis">SQLite</td><td class="vm">2.97s</td><td class="dd">0.94s</td><td><span class="yes">3.16× faster</span></td></tr>
           </tbody>
         </table></div>
       </div>
     </div>
     <p class="section-lead" style="margin-top:34px;font-weight:600;color:var(--text)">The goal is to beat
       the VM on <em>every</em> benchmark — parity-or-better everywhere. Where dd is still behind
-      (syscall-heavy arm64 SQLite, a few x86 opcodes) is exactly the optimization frontier.</p>
+      (syscall-heavy arm64 SQLite) is exactly the optimization frontier.</p>
     <p class="disclaimer">Compute micro-benchmarks (<code>make bench</code>). arm64 SQLite is syscall- and
       allocation-heavy, so the userspace-kernel tax shows (~2× slower); a Rosetta-backed VM would narrow
-      the x86 gap; and x86 SQLite hits an SSE opcode dd's x86 JIT doesn't implement yet.</p>
+      the x86 gap.</p>
   </div>
 </section>
 

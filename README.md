@@ -78,7 +78,7 @@ VFS *is* the host filesystem behind a path jail.
 
 > **Honest trade-off:** a userspace kernel is only as complete as the syscalls it implements, and today
 > dd runs as a single process — great for *trusted* images. A VM still gives a harder isolation boundary
-> for untrusted code; dd's sentry split ([`docs/PLAN.md`](docs/PLAN.md)) is the roadmap answer there.
+> for untrusted code; dd's sentry process-split is the roadmap answer there.
 
 ## Performance
 
@@ -105,22 +105,21 @@ it either way):
 
 | Workload | VM (qemu) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
-| int sieve | 1.32s | 0.96s | 1.37× faster |
-| float n-body | 5.44s | 0.26s | **21× faster** |
-| SHA-256 | 2.73s | 2.38s | 1.15× faster |
-| SQLite | — | — | not yet — see note |
+| int sieve | 1.32s | 0.97s | 1.36× faster |
+| float n-body | 5.42s | 0.26s | **21× faster** |
+| SHA-256 | 2.74s | 2.39s | 1.15× faster |
+| SQLite (600k rows) | 2.97s | 0.94s | **3.16× faster** |
 
-dd's JIT beats qemu-user emulation on every workload, dramatically on floating-point. (A Rosetta-backed
-VM would narrow the gap; the x86 SQLite binary hits an SSE opcode jit86 doesn't implement yet — see
-[`docs/PLAN.md`](docs/PLAN.md).)
+dd's JIT beats qemu-user emulation on **every** workload, dramatically on floating-point. (A
+Rosetta-backed VM would narrow the gap.)
 
 These are *compute* micro-benchmarks — they don't even capture dd's structural wins (no VM to boot, no
 resident RAM, direct host-filesystem I/O). Reproduce: `make bench`.
 
-> **The goal is to beat the VM on *every* benchmark.** dd already wins most x86-64 workloads and matches
-> or beats native arm64; the places it's still behind — syscall/allocation-heavy arm64 SQLite, and x86
-> opcodes jit86 doesn't implement yet — are exactly the optimization frontier (the tier-2 trace
-> optimizer and the jit86 work in [`docs/PLAN.md`](docs/PLAN.md)). Parity-or-better everywhere is the bar.
+> **The goal is to beat the VM on *every* benchmark.** dd already wins every x86-64 workload above and
+> matches or beats native arm64; where it's still behind — syscall/allocation-heavy arm64 SQLite, and
+> squeezing more out of the x86 translator — is exactly the optimization frontier (the tier-2 trace
+> optimizer and the jit86 perf work). Parity-or-better everywhere is the bar.
 
 ## How it works
 
@@ -229,19 +228,8 @@ prebuilt fixtures. Each case runs on every engine it has a guest for.
 - **Host:** macOS **arm64** (Apple Silicon). The JIT needs `clang` + `codesign` (Xcode CLT).
 - **Containers:** rootfs + overlay image layers (copy-up/whiteout), bind volumes, port publishing
   (`-p`), private-loopback netns, cgroup memory+pids limits, UTS/PID/USER namespaces.
-- **Roadmap** ([`docs/PLAN.md`](docs/PLAN.md)): OCI registry pull/unpack, the jit86 dedup onto the
-  shared engine, a full external netstack, and the sentry split for untrusted images.
-
-## Documentation
-
-- [Docker compatibility](docs/DOCKER.md) — the Docker-CLI surface that works, and the honest gaps.
-- [Syscalls](docs/SYSCALLS.md) — the Linux ABI surface implemented against macOS.
-- [Optimizations](docs/OPTIMIZATIONS.md) — the JIT's idiom rewrites and fast paths.
-- [GUI rendering](docs/RENDERING.md) — rendering Linux/macOS GUI apps to the Mac screen (design).
-- [Roadmap](docs/PLAN.md) — the work-list of what's missing.
-
-The runtime's internals — the engine/frontend/OS-personality split and the cpu-interface contract —
-are documented in [`dd-jit/README.md`](dd-jit/README.md).
+- **Roadmap:** OCI registry pull/unpack, the jit86 dedup onto the shared engine, a full external
+  netstack, and the sentry split for untrusted images. See `docs/` for the detailed write-ups.
 
 ## Author
 

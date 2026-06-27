@@ -25,10 +25,18 @@ binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-cli
 5. **Tier-2 trace optimizer.** Trace formation over `PROF`, cross-trace register allocation (removes the
    per-block spill — the main remaining overhead), monomorphic-comparator inlining, purity-gate
    memoization. Constraint: do not use dead-register §B scratch (unsafe); don't drop the §B gsp check.
+6. **Optimize the x86 (jit86) translator toward native.** dd already beats qemu-user emulation on every
+   benchmark (`make bench`: int 1.36×, FP 21×, SHA-256 1.15×, SQLite 3.16×), but x86→arm64 translation
+   still trails *native* arm on compute (SHA-256 is only ~1.15× over qemu, vs the aarch64 engine running
+   at native speed). Close the gap: elide flag synthesis (materialize only the EFLAGS bits a consumer
+   actually reads), tighter SSE/x87 lowering, and — once the engine dedup (#1) lands — inherit the
+   aarch64 engine's block-chaining / IBTC / §B optimizations plus the tier-2 optimizer (#5). Target: x86
+   compute approaching native, beating any VM path (qemu *or* Rosetta), to hold the "beat the VM
+   everywhere" bar.
 
 ## Docker CLI gaps (`dd-daemon`)
 OCI registry **pull/push now works against any registry** — Docker Hub, `ghcr.io`, `quay.io`, ECR, a
-plain `localhost:5000` (`dd-daemon/src/registry.rs`; see [`DOCKER.md`](DOCKER.md), 38/38 scenarios). So
+plain `localhost:5000` (`dd-daemon/src/registry.rs`; 38/38 docker-CLI scenarios pass). So
 `DD_IMAGES` no longer has to point at a pre-extracted rootfs. What is still missing:
 - **`docker build`** — needs a BuildKit-compatible builder.
 - **`docker cp`** — the `/archive` tar endpoints aren't implemented.

@@ -1495,6 +1495,10 @@ static void *translate_block(uint64_t gpc) {
                     }
                     // INS vd.H[lane], Wsrc  (imm5 = lane<<2 | 0b10 selects H)
                     emit32(0x4E001C00u | ((((unsigned)lane << 2) | 2u) << 16) | (src << 5) | vd);
+                } else if (op == 0xC5) { // pextrw: extract xmm H-lane (imm8 & 7) -> r32, zero-extended (reg src only)
+                    int lane = (int)I.imm & 7;
+                    // UMOV Wreg, Vm.H[lane]  (imm5 = lane<<2 | 0b10 selects H; zero-extends into the GPR)
+                    emit32(0x0E003C00u | ((((unsigned)lane << 2) | 2u) << 16) | (vm << 5) | I.reg);
                 } else if (op == 0xC2) { // cmpps/pd/ss/sd: FP compare with predicate imm -> all-1s/0 mask
                     int packed = !I.repne && !I.rep;
                     int s = vm;
