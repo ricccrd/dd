@@ -49,6 +49,7 @@
 #include "../os/linux/thread.c"
 // signal delivery
 #include "../os/linux/signal.c"
+#include "../frontend/aarch64/sigframe.c" // per-arch rt_sigframe build/restore (uses signal.c state)
 // path jail + overlay + /proc synth
 #include "../os/linux/container/vfs.c"
 // termios + NET-ns loopback
