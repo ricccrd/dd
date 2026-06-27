@@ -75,6 +75,8 @@ fn system() -> Group {
         src("signals", "signals.c").out("signal got=12\n"),       // SIGUSR2 = 12
         src("sysinfo", "sysinfo.c").has("sys=Linux pid_ok=1"),    // uname + getpid
         src("shm", "shm.c").out("SHM-ROUNDTRIP-OK\n"),            // SysV shared memory get/at/dt/ctl
+        src("sem", "sem.c").out("SEM v=0 w=1\n"),                 // SysV semaphores get/op/ctl
+        src("msg", "msg.c").out("MSG=MSG-PAYLOAD\n"),             // SysV message queues get/snd/rcv/ctl
     ])
 }
 

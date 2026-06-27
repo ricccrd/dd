@@ -7,6 +7,16 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/sem.h>
+#include <sys/msg.h>
+// Map a Linux `semctl` cmd to the macOS one: the GET*/SET* values differ (Linux GETVAL=12/SETVAL=16,
+// macOS GETVAL=5/SETVAL=8); IPC_RMID/SET/STAT (0/1/2) are the same.
+static int sem_cmd_l2m(int c) {
+    switch (c) {
+        case 11: return 4;  case 12: return 5;  case 13: return 6;  case 14: return 3;
+        case 15: return 7;  case 16: return 8;  case 17: return 9;  default: return c;
+    }
+}
 // SysV IPC: namespace a key by the container (DD_NETNS) so two containers don't collide on the same key
 // -- the per-IPC-ns isolation. IPC_PRIVATE stays private; --network host shares the host IPC.
 static key_t ipc_ns_key(key_t k) {
@@ -2414,6 +2424,55 @@ static void service(struct cpu *c) {
     case 195: { // shmctl(shmid, cmd, buf): IPC_RMID supported; STAT/SET deferred (macOS struct differs)
         if ((int)a1 == IPC_RMID) {
             int r = shmctl((int)a0, IPC_RMID, NULL);
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        } else {
+            G_RET(c) = (uint64_t)(-ENOSYS);
+        }
+        break;
+    }
+
+    // ===================== SysV semaphores =====================
+    case 190: { // semget(key, nsems, semflg)
+        int r = semget(ipc_ns_key((key_t)a0), (int)a1, (int)a2);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+    case 192: // semtimedop -> semop (glibc routes semop() through it; macOS has no timed variant)
+    case 193: { // semop(semid, sops, nsops) -- struct sembuf is layout-compatible with the guest's
+        int r = semop((int)a0, (struct sembuf *)a1, (size_t)a2);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        break;
+    }
+    case 191: { // semctl(semid, semnum, cmd, arg)
+        int lc = (int)a2, mc = sem_cmd_l2m(lc), r;
+        union semun_ { int val; struct semid_ds *buf; unsigned short *array; } arg;
+        if (lc == 16) { arg.val = (int)a3; r = semctl((int)a0, (int)a1, mc, arg); }                       // SETVAL
+        else if (lc == 13 || lc == 17) { arg.array = (unsigned short *)a3; r = semctl((int)a0, (int)a1, mc, arg); } // GET/SETALL
+        else if (lc == 0 || lc == 11 || lc == 12 || lc == 14 || lc == 15) { r = semctl((int)a0, (int)a1, mc); }    // RMID/GETPID/GETVAL/GETNCNT/GETZCNT
+        else { G_RET(c) = (uint64_t)(-ENOSYS); break; }                                                   // IPC_STAT/SET: struct differs
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+
+    // ===================== SysV message queues =====================
+    case 186: { // msgget(key, msgflg)
+        int r = msgget(ipc_ns_key((key_t)a0), (int)a1);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+    case 189: { // msgsnd(msqid, msgp, msgsz, msgflg) -- msgbuf {long mtype; char mtext[]} is compatible
+        int r = msgsnd((int)a0, (const void *)a1, (size_t)a2, (int)a3);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        break;
+    }
+    case 188: { // msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)
+        ssize_t r = msgrcv((int)a0, (void *)a1, (size_t)a2, (long)a3, (int)a4);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+    case 187: { // msgctl(msqid, cmd, buf): IPC_RMID supported; STAT/SET deferred (macOS struct differs)
+        if ((int)a1 == IPC_RMID) {
+            int r = msgctl((int)a0, IPC_RMID, NULL);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         } else {
             G_RET(c) = (uint64_t)(-ENOSYS);
