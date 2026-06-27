@@ -2772,6 +2772,36 @@ static void service(struct cpu *c) {
     }
     case 164: G_RET(c) = 0; break; // setrlimit -> accepted
 
+    // clock_adjtime(clk_id, timex): container has no CAP_SYS_TIME -> EPERM (mirrors clock_settime case 112)
+    case 266: G_RET(c) = (uint64_t)(-1); break;
+    // sched_getattr(pid, attr, size, flags): report a SCHED_OTHER profile. Zero the caller's struct, then
+    // fill size + sched_policy=SCHED_OTHER(0); nice/priority stay 0. (sched_setattr is case 274, ignored.)
+    case 275: {
+        if (a1) {
+            size_t sz = (size_t)a2;
+            if (sz == 0 || sz > 48) sz = 48; // kernel struct sched_attr is 48+ bytes; cap to a sane size
+            memset((void *)a1, 0, sz);
+            *(uint32_t *)(a1 + 0) = (uint32_t)sz; // sched_attr.size
+            *(uint32_t *)(a1 + 4) = 0;            // sched_attr.sched_policy = SCHED_OTHER
+        }
+        G_RET(c) = 0;
+        break;
+    }
+    // mlock2(addr, len, flags): no macOS equivalent for "keep resident"; safe no-op (like mlockall)
+    case 284: G_RET(c) = 0; break;
+    // rt_tgsigqueueinfo(tgid, tid, sig, siginfo): thread-targeted sibling of rt_sigqueueinfo (case 138).
+    // Carry si_code + si_value to the guest handler's siginfo, then raise the signal to the guest.
+    case 240: {
+        int sig = (int)a2;
+        if (sig >= 1 && sig <= 64 && a3) {
+            g_sigcode[sig] = *(int *)(a3 + 8);     // siginfo.si_code
+            g_sigval[sig] = *(uint64_t *)(a3 + 24); // siginfo.si_value (sival_int/ptr)
+        }
+        raise_guest_signal(c, sig);
+        G_RET(c) = 0;
+        break;
+    }
+
     // ===================== unhandled =====================
     default:
         fprintf(stderr, "[jit] unhandled syscall %llu (a0=%llx a1=%llx) at pc=%llx\n", (unsigned long long)nr,
