@@ -901,11 +901,26 @@ fn no_such(id: &str) -> Response {
 #[derive(serde::Deserialize)]
 struct ArchiveQ { path: String }
 
-/// Map a container path to its host path inside `rootfs`, lexically clamping `..` so it can't escape.
-fn archive_host_path(rootfs: &str, path: &str) -> std::path::PathBuf {
-    let root = std::path::Path::new(rootfs).to_path_buf();
+/// Map a container path to its host path. A path inside a bind volume maps to the host volume dir (so
+/// `docker cp` to e.g. ddcli's mounted cwd hits the real files); otherwise it lands in the container
+/// rootfs (the overlay upper). `..` is lexically clamped inside whichever base so it can't escape.
+fn archive_host_path(rootfs: &str, binds: &[String], path: &str) -> std::path::PathBuf {
+    // bind volumes first (host:container with an absolute host source), same precedence as the JIT jail
+    for b in binds {
+        if let Some((host, cont)) = b.split_once(':') {
+            if host.starts_with('/') && (path == cont || path.strip_prefix(cont).is_some_and(|r| r.starts_with('/'))) {
+                return clamp_join(host, &path[cont.len()..]);
+            }
+        }
+    }
+    clamp_join(rootfs, path)
+}
+
+/// Join `rel` onto `base`, dropping `.`/`..` so the result stays within `base`.
+fn clamp_join(base: &str, rel: &str) -> std::path::PathBuf {
+    let root = std::path::Path::new(base).to_path_buf();
     let mut out = root.clone();
-    for part in path.split('/') {
+    for part in rel.split('/') {
         match part {
             "" | "." => {}
             ".." => { if out != root { out.pop(); } }
@@ -955,17 +970,17 @@ fn base64_std(data: &[u8]) -> String {
 async fn archive_head(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
     let g = a.inner.lock().await;
     let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-    match path_stat_b64(&archive_host_path(&c.rootfs, &q.path)) {
+    match path_stat_b64(&archive_host_path(&c.rootfs, &c.binds, &q.path)) {
         Some(stat) => (StatusCode::OK, [("X-Docker-Container-Path-Stat", stat)]).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(),
     }
 }
 
 async fn archive_get(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
-    let rootfs = { let g = a.inner.lock().await;
+    let (rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-        c.rootfs.clone() };
-    let host = archive_host_path(&rootfs, &q.path);
+        (c.rootfs.clone(), c.binds.clone()) };
+    let host = archive_host_path(&rootfs, &binds, &q.path);
     let Some(stat) = path_stat_b64(&host) else {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(); };
     let parent = host.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
@@ -979,10 +994,10 @@ async fn archive_get(State(a): State<App>, Path(id): Path<String>, Query(q): Que
 }
 
 async fn archive_put(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>, body: axum::body::Bytes) -> Response {
-    let rootfs = { let g = a.inner.lock().await;
+    let (rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-        c.rootfs.clone() };
-    let host = archive_host_path(&rootfs, &q.path);
+        (c.rootfs.clone(), c.binds.clone()) };
+    let host = archive_host_path(&rootfs, &binds, &q.path);
     if !host.is_dir() {
         return (StatusCode::BAD_REQUEST, Json(json!({"message": format!("extraction point {} is not a directory", q.path)}))).into_response(); }
     let tmp = std::env::temp_dir().join(format!("dd-cp-{}.tar", std::process::id()));
