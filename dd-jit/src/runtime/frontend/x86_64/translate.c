@@ -122,6 +122,27 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
     } // merge low w bytes
 }
 
+// LOCK-prefixed read-modify-write to a memory operand, done ATOMICALLY via an LSE op (x17 = EA already
+// computed). `rs` is the operand value register. `k` is the alu kind (0 add, 1 or, 4 and, 5 sub, 6 xor).
+// x86 flags are set from (old OP operand); x19/x20 are scratch. Returns 1 if it emitted an atomic, 0 if
+// `k` has no atomic form here (caller falls back to the non-atomic load-op-store).
+static int lock_rmw(int k, int w, int rs) {
+    int sf = (w == 8);
+    uint32_t lse;
+    int rsu = rs;
+    switch (k) {
+    case 0: lse = LSE_LDADD; break;
+    case 5: e_rrr(A_SUB, 20, 31, rs, sf, 0); rsu = 20; lse = LSE_LDADD; break; // sub: atomic add(-v)
+    case 1: lse = LSE_LDSET; break;                                            // or
+    case 6: lse = LSE_LDEOR; break;                                            // xor
+    case 4: e_rrr(A_ORN, 20, 31, rs, sf, 0); rsu = 20; lse = LSE_LDCLR; break; // and: clear ~v
+    default: return 0;
+    }
+    e_lse(lse, w, rsu, 19, 17); // x19 = old; [x17] op= rsu  (acquire-release)
+    do_alu(k, -1, 19, rs, w);   // x86 flags from (old OP original-operand)
+    return 1;
+}
+
 // x86 condition (opcode low nibble) -> ARM cond, or -1 if unsupported (parity).
 static int x86cc_to_arm(int cc) {
     // x86 PF (parity, idx 10/11) -> ARM V flag: our FP compares (comis*/fcomi) leave V=1 on
@@ -258,8 +279,10 @@ static void *translate_block(uint64_t gpc) {
                     } else
                         do_alu(k, I.reg, I.reg, rmv, w);
                 } else { // dst = r/m
-                    do_alu(k, (k == 7) ? -1 : 16, rmv, regv, w);
-                    if (k != 7) rm_store(&I, w, 16);
+                    if (!(I.lock && mem && k != 7 && lock_rmw(k, w, regv))) {
+                        do_alu(k, (k == 7) ? -1 : 16, rmv, regv, w);
+                        if (k != 7) rm_store(&I, w, 16);
+                    }
                 }
                 gpc = next;
                 continue;
@@ -279,7 +302,14 @@ static void *translate_block(uint64_t gpc) {
                 int k = I.reg & 7, w = op == 0x80 ? 1 : I.opsize, mem;
                 if (!((k == 2 || k == 3) && w < 4)) {     // ADC/SBB ok for 32/64-bit
                     int rmv = rm_load(&I, next, w, &mem); // mem -> x16 (val), x17 (EA)
-                    e_movconst(19, (uint64_t)I.imm);      // imm in x19 (x16 holds the loaded value)
+                    if (I.lock && mem && k != 7) {        // LOCK op [mem], imm -> atomic (e.g. lock add $1)
+                        e_movconst(21, (uint64_t)I.imm);  // operand in x21 (x19/x20 are lock_rmw scratch)
+                        if (lock_rmw(k, w, 21)) {
+                            gpc = next;
+                            continue;
+                        }
+                    }
+                    e_movconst(19, (uint64_t)I.imm); // imm in x19 (x16 holds the loaded value)
                     // compute into scratch x16, then rm_store -> correct dest (handles mem + hi/lo byte regs)
                     do_alu(k, (k == 7) ? -1 : 16, rmv, 19, w);
                     if (k != 7) rm_store(&I, w, 16);
@@ -528,9 +558,10 @@ static void *translate_block(uint64_t gpc) {
                 int w = (op & 1) ? I.opsize : 1, mem;
                 if (I.is_mem) {
                     emit_ea(&I, next);
-                    e_load(w, 16, 17);                                   // x16 = old [mem]
                     int sv = (w == 1) ? byte_val(&I, I.reg, 19) : I.reg; // reg->mem: handle ah/bh/ch/dh
-                    e_store(w, sv, 17);
+                    // xchg with memory is IMPLICITLY atomic on x86 (no LOCK needed) -> SWP, not load+store.
+                    // glibc's mutex fast-path acquires the lock with xchg, so this must be a real atomic.
+                    e_lse(LSE_SWP, w, sv, 16, 17); // x16 = old [mem]; [mem] = sv (atomic swap)
                     if (w >= 4)
                         e_mov_rr(I.reg, 16, w == 8);
                     else if (w == 1)
@@ -1812,7 +1843,7 @@ static void *translate_block(uint64_t gpc) {
         break;
     }
     map_put(start, host, body);
-    patch_links_to(start, body);
+    if (!g_threaded) patch_links_to(start, body); // chaining mutates live blocks -> off when threaded
     return host;
 }
 

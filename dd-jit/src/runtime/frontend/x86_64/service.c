@@ -1123,7 +1123,7 @@ static void service(struct cpu *c) {
     case 116: ret = 0; break; // setgroups -> ok (no-op, container root)
     case 110: ret = (uint64_t)getppid(); break;
     case 186: ret = (uint64_t)getpid(); break; // gettid
-    case 202: ret = 0; break;                  // futex (stub: single-thread)
+    case 202: ret = (uint64_t)futex_op((int *)a0, (int)a1 & 0x7f, (int)a2, (const struct timespec *)a3); break; // futex
     case 217: {                                // getdents64
         int gfd = (int)a0;
         if (g_nlower && gfd >= 0 && gfd < 1024 && g_ovldir[gfd][0]) { // OVERLAY: merged listing across layers
@@ -1207,10 +1207,10 @@ static void service(struct cpu *c) {
     case 57:
     case 58:   // fork / vfork
     case 56: { // clone (process fork; threads unsupported)
-        if (nr == 56 && (a0 & 0x100)) {
-            ret = (uint64_t)(-38);
+        if (nr == 56 && (a0 & 0x100)) { // CLONE_VM -> a real guest thread (x86 args: flags,stack,ptid,ctid,tls)
+            ret = (uint64_t)spawn_thread(c, a0, a1, a4, a2, a3);
             break;
-        }                 // CLONE_VM (thread) -> ENOSYS
+        }
         pid_t p = fork(); // host fork: COW-dup guest mem + JIT cache
         if (p < 0) {
             ret = (uint64_t)(-errno);
@@ -1490,8 +1490,10 @@ static void service(struct cpu *c) {
         ret = (uint64_t)(-38);
         break; // ENOSYS
     }
-    // network/socket syscalls report raw host (Darwin) errno -> map to Linux for the guest
-    if (((nr >= 41 && nr <= 55) || nr == 288) && (int64_t)ret < 0 && (int64_t)ret >= -134)
+    // syscalls that surface a raw host (Darwin) errno -> map to Linux: sockets, plus futex(202) and
+    // clone/fork(56-58) whose shared thread layer returns host EAGAIN/ENOMEM.
+    if (((nr >= 41 && nr <= 55) || nr == 288 || nr == 202 || (nr >= 56 && nr <= 58)) && (int64_t)ret < 0 &&
+        (int64_t)ret >= -134)
         ret = (uint64_t)(-derr((int)(-(int64_t)ret)));
     c->r[RAX] = ret;
     if (g_trace)

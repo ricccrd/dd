@@ -19,3 +19,7 @@
 #define G_SP(c) ((c)->r[4])                // rsp
 #define G_TLS(c) ((c)->fs_base)            // x86 TLS base (arch_prctl SET_FS)
 #define G_SHADOW_RESET(c) ((void)0)        // no §B shadow stack on the x86 frontend
+
+// Child thread resume PC: x86 pre-advances rip past `syscall` before servicing, so the copy is correct.
+#define G_THREAD_RESUME(child, parent) ((void)0)
+

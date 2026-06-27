@@ -27,3 +27,7 @@
 #define G_SP(c) ((c)->sp)
 #define G_TLS(c) ((c)->tls)
 #define G_SHADOW_RESET(c) ((c)->ssp = 0) // reset the §B shadow stack (fork/exec); no-op on engines without it
+
+// Child thread resume PC: aarch64 services a syscall with pc still at the SVC, so advance +4.
+#define G_THREAD_RESUME(child, parent) ((child)->pc = (parent)->pc + 4)
+

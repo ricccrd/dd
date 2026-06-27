@@ -58,8 +58,8 @@ fn libc() -> Group {
 /// Threads, signals, syscalls.
 fn system() -> Group {
     group("system", vec![
-        src("threads", "threads.c").out("threads sum=800000\n").xfail(&[Engine::LinuxX86_64]), // jit86: no thread support yet (clone CLONE_VM=ENOSYS, futex stub)
-        src("atomics", "atomics.c").out("atomic v=1000000\n").xfail(&[Engine::LinuxX86_64]),   // jit86: no thread support yet (clone CLONE_VM=ENOSYS, futex stub)
+        src("threads", "threads.c").out("threads sum=800000\n"),
+        src("atomics", "atomics.c").out("atomic v=1000000\n"),
         src("signals", "signals.c").out("signal got=12\n"),       // SIGUSR2 = 12
         src("sysinfo", "sysinfo.c").has("sys=Linux pid_ok=1"),    // uname + getpid
     ])

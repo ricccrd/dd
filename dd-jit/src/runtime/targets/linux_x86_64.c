@@ -51,6 +51,7 @@
 #include <sys/event.h> // kqueue: backs epoll/timerfd/inotify on macOS
 #include <dirent.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <libkern/OSCacheControl.h>
 
 #include "../include/cpu_x86_64.h"
@@ -60,6 +61,8 @@
 #include "../frontend/x86_64/decode.c"    // x86-64 decoder
 #include "../frontend/x86_64/translate.c" // translate_block + trampolines
 #include "../frontend/x86_64/container.c" // rootfs/socket/netns/portmap/signal/overlay
+#include "../frontend/x86_64/abi.h"        // cpu-interface seam (G_* contract) for the shared thread machinery
+#include "../os/linux/thread.c"               // SHARED: clone->pthread, per-thread cpu, futex (cpu-agnostic)
 #include "../frontend/x86_64/service.c"   // the syscall layer
 #include "../frontend/x86_64/dispatch.c"  // run_guest dispatcher
 #include "../frontend/x86_64/elf.c"       // ELF loader + stack

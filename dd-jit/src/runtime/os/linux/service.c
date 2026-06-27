@@ -1,3 +1,5 @@
+// brk arena
+static uint64_t brk_lo, brk_cur, brk_hi;
 // dd/runtime/os/linux -- service(): the Linux syscall layer (the "kernel" the guest talks to).
 // Dispatches the guest syscall number to the host, translating the ABI (errno, struct layouts, flags,
 // fd semantics); every path argument is resolved through the container VFS jail. One sorted switch,

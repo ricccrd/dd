@@ -1,9 +1,6 @@
 // dd/runtime/os/linux -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
 // ---------------- syscalls ----------------
-// brk arena
-static uint64_t brk_lo, brk_cur, brk_hi;
-
 // ---------------- threads & futex ----------------
 // fwd: thread trampoline runs the dispatcher
 static void run_guest(struct cpu *c);
@@ -79,16 +76,16 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     if (!child) return -12;
     *child = *parent;
     // child sees clone return 0
-    child->x[0] = 0;
-    child->sp = stack_top;
+    G_RET(child) = 0;
+    G_SP(child) = stack_top;
     // resume just after the clone svc
-    child->pc = parent->pc + 4;
+    G_THREAD_RESUME(child, parent);
     // §B: child starts with an EMPTY shadow stack (no parent frames)
-    child->ssp = 0;
+    G_SHADOW_RESET(child);
     child->exited = 0;
     child->redirect = 0;
     // CLONE_SETTLS
-    if (flags & 0x00080000) child->tls = tls;
+    if (flags & 0x00080000) G_TLS(child) = tls;
     int tid = __sync_add_and_fetch(&g_next_tid, 1);
     // CLONE_PARENT_SETTID
     if ((flags & 0x00100000) && ptid) *(int *)ptid = tid;

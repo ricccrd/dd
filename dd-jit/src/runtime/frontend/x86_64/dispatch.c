@@ -34,9 +34,17 @@ static void run_guest(struct cpu *c) {
                     (unsigned long long)c->r[6]);
             g_w8v = *g_w8;
         }
+        // Cache mutation (translate / flush / chain / IBTC fill) is serialized under g_jit_lock once a
+        // guest thread exists. Single-threaded skips the lock entirely. W^X is per-thread on Apple
+        // Silicon, so a peer executing cached code is unaffected by this thread's write window.
+        if (g_threaded) pthread_mutex_lock(&g_jit_lock);
         void *code = map_host(c->rip);
         if (!code) {
             if (g_cp + (1u << 16) > g_cache + CACHE_SZ) {
+                if (g_threaded) { // can't flush while peers may be executing the cache we'd drop
+                    fprintf(stderr, "[jit86] code cache full with threads (unsupported)\n");
+                    _exit(70);
+                }
                 pthread_jit_write_protect_np(0);
                 g_cp = g_cache;
                 memset(g_map, 0, sizeof g_map);
@@ -51,15 +59,20 @@ static void run_guest(struct cpu *c) {
             sys_icache_invalidate(g_emit_start, (size_t)(g_cp - g_emit_start));
         }
         if (c->ic_miss) { // IBTC: an indirect branch missed -> cache {target -> body}
-            void *body = map_body(c->rip);
-            if (body) {
-                uint32_t h = (uint32_t)((c->rip >> 2) & (IBTC_N - 1));
-                g_ibtc[h].target = c->rip;
-                g_ibtc[h].body = body;
-                g_ibtc_fill++;
+            // The IBTC probe in emitted code reads g_ibtc unlocked; a concurrent torn fill -> wrong body.
+            // Skip the fill when threaded (indirect branches fall to the locked dispatcher: correct, slower).
+            if (!g_threaded) {
+                void *body = map_body(c->rip);
+                if (body) {
+                    uint32_t h = (uint32_t)((c->rip >> 2) & (IBTC_N - 1));
+                    g_ibtc[h].target = c->rip;
+                    g_ibtc[h].body = body;
+                    g_ibtc_fill++;
+                }
             }
             c->ic_miss = 0;
         }
+        if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
         if (g_trace) { // x86 flags derived from cpu->nzcv (convention: stored C = NOT x86 CF)
             unsigned nz = (unsigned)c->nzcv;
             int CF = !((nz >> 29) & 1), ZF = (nz >> 30) & 1, SF = (nz >> 31) & 1, OF = (nz >> 28) & 1;

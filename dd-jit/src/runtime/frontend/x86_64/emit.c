@@ -298,7 +298,11 @@ static void e_cas(int sz, int rs, int rt, int rn) { // casal Rs(old/cmp), Rt(new
     uint32_t b = sz == 8 ? 0xC8E0FC00u : sz == 4 ? 0x88E0FC00u : sz == 2 ? 0x48E0FC00u : 0x08E0FC00u;
     emit32(b | (rs << 16) | (rn << 5) | rt);
 }
-#define LSE_LDADD 0xB8E00000u // ldaddal
+#define LSE_LDADD 0xB8E00000u // ldaddal  ([m] += rs)
+#define LSE_LDCLR 0xB8E01000u // ldclral  ([m] &= ~rs)
+#define LSE_LDEOR 0xB8E02000u // ldeoral  ([m] ^= rs)
+#define LSE_LDSET 0xB8E03000u // ldsetal  ([m] |= rs)
+#define LSE_SWP 0xB8E08000u   // swpal    (x = [m]; [m] = rs)
 
 static int64_t sext(uint64_t v, int bits) {
     uint64_t m = 1ull << (bits - 1);
@@ -339,7 +343,7 @@ static void emit_exit_const(uint64_t rip, uint64_t reason) {
 // Direct-branch chaining: if target already translated, single `b body`; else a full
 // exit whose first insn is remembered and back-patched to `b body` later. (from jit.c)
 static void emit_chain_exit(uint64_t target) {
-    if (g_trace || g_nochain) {
+    if (g_trace || g_nochain || g_threaded) {
         emit_exit_const(target, R_BRANCH);
         return;
     } // debug: no chaining -> exact rip per block
