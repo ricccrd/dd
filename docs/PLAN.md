@@ -50,23 +50,33 @@ JIT:
       intermittent fork+exec crash (below).
 
 ## Next work (priority order) — large subsystems
-1. **Finish the jit86 engine dedup.** *Half done.* The x86-64 guest **already shares the entire
-   `os/linux/` personality** through the cpu-interface seam (`frontend/x86_64/abi.h` `G_*` + `sysmap.h`).
-   **What's left is the host `jit/` engine:** x86_64 still carries its own
-   `frontend/x86_64/{cache,emit,dispatch}.c` instead of the shared `jit/{cache,emit_arm64,dispatch}.c`
-   that aarch64 uses. Lift it on via cpu-access accessors so the code cache + dispatcher are cpu-agnostic
-   (the cpu struct and the x86 decoder stay genuinely per-arch). Payoff: one engine, two thin frontends.
-2. **Networking Phase-2b — userspace netstack.** A real TCP/IP stack for *external* traffic with NET-ns
-   interfaces/routes + tunnel egress. Loopback isolation + port-map already cover the common case.
-3. **Untrusted-guest isolation — the sentry process-split.** Seccomp/Seatbelt-locked sandbox task +
-   trusted sentry over a syscall ring. Required only for untrusted images.
-4. **Tier-2 trace optimizer.** Trace formation over `PROF`, cross-trace register allocation (removes the
-   per-block spill — the main remaining overhead), monomorphic-comparator inlining, purity-gate
-   memoization. Constraint: do not use dead-register §B scratch (unsafe); don't drop the §B gsp check.
-5. **Optimize the x86 (jit86) translator toward native.** Close the gap to native arm on compute: elide
-   flag synthesis (materialize only the EFLAGS bits a consumer reads), tighter SSE/x87 lowering, and —
-   once the engine dedup (#1) lands — inherit the aarch64 engine's block-chaining / IBTC / §B optimizations
-   plus the tier-2 optimizer (#4).
+**Each now has an executable design + first-PR roadmap in `docs/design/` (deep code investigation, the
+exact seams/files, a safety argument, and the smallest matrix-green first PR). Execute the first PRs one
+at a time with the cross-engine matrix as the regression gate.**
+
+1. **Finish the jit86 engine dedup.** → **`docs/design/engine-dedup.md`**. *Half done* (x86 shares all of
+   `os/linux/`; what's left is the host `jit/` engine). Design: `cache.c` is the clean first merge
+   (`G_GPC_HASH_SHIFT` + lock-aliasing + the dormant `is_bl` path), `dispatch.c` needs 4 frontend hooks
+   (IBTC `ic_site` vs `ic_miss`, post-`run_block` reason switch, the two trampolines, x86 debug), `emit`
+   stays per-arch. **First PR:** lift `cache.c`, aarch64 binary bit-identical.
+2. **Networking Phase-2b — userspace netstack.** → **`docs/design/netstack.md`**. Reframing: external
+   egress already works root-free (a guest socket *is* a host socket); the real gap is L3 **identity**
+   (per-container IP) — what breaks `docker-net.sh` (3/7). **First PR:** daemon-only IPAM (`172.18/12`) +
+   identity reporting → 5/7, no JIT change; later, a per-network AF_UNIX virtual switch → 7/7.
+3. **Untrusted-guest isolation — the sentry process-split.** → **`docs/design/sentry-split.md`**. The trust
+   boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on `g_untrusted`.
+   `service()` splits by authority (compute/mem local, fs/net/proc → sentry over an SPSC ring); deny-default
+   Seatbelt. **First PR:** ring + read/write/open family behind the flag, lockdown stubbed.
+4. **Tier-2 trace optimizer.** → **`docs/design/tier2-optimizer.md`**. Corrected premise: chains already
+   avoid the per-block spill; the real win is killing the **stolen-register mangle** (x18/x28/x30) via
+   trace-local allocation. §B-safe (own x9–x17 only in call-free spans; never drop the `gsp` check). PROF
+   needs loop-back heat. **First PR:** degenerate 2-block identity trace behind `TIER2`, matrix-green off.
+5. **Optimize the x86 (jit86) translator toward native.** → **`docs/design/x86-perf.md`**. The flag model
+   keeps an ARM-NZCV substrate but wastes a mem+sysreg round-trip per op (`e_nzcv_save`/`_load`); the live
+   NZCV already survives producer→consumer, so a `cmp;je` is 6 host instrs where 2 suffice (−67%). Design:
+   a translate-time pending-flags state machine + cc-mapping, boundary materialize keeps the cross-block
+   flag ABI byte-identical (intra-block-only = safe). Warts: `pmovmskb` (48→8 NEON), x87 `fptop`. **First
+   PR:** the `sub/cmp→Jcc` fast path only (~3 sites, revertible). Inherits #1's optimizations + #4 once they land.
 
 ## Smaller remaining items
 - **`docker build` BuildKit cache** — layer/step caching (today every build re-runs from the base).
