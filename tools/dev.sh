@@ -20,6 +20,13 @@ mkdir -p "$HOME/.dd/run" "$IMAGES" "$BIN"
 echo "==> building dd-daemon + ddcli (release) ..."
 cargo build --release -p dd-daemon -p dd-cli
 
+echo "==> building the macOS-container userland (for 'ddcli mac') ..."
+if DD_IMAGES="$IMAGES" bash "$ROOT/tools/mac-userland.sh" >/dev/null 2>&1; then
+  echo "    macos image ready in $IMAGES/macos"
+else
+  echo "    (skipped -- needs a nix arm64 toolchain; 'ddcli mac' will be unavailable)"
+fi
+
 echo "==> putting ddcli on your PATH ($BIN/ddcli)"
 ln -sf "$ROOT/target/release/ddcli" "$BIN/ddcli"
 # Ensure ~/.local/bin is on PATH for future shells. zsh is the macOS default; cover bash too.
