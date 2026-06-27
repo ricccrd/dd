@@ -125,14 +125,14 @@ impl Client {
 
     /// Push `rootfs` to the registry as a single-layer image under `self.image`. Returns the manifest
     /// digest. Requires credentials for a registry that demands auth.
-    pub fn push(&mut self, rootfs: &Path, cmd: &[String], arch: &str, work: &Path) -> Result<String, String> {
+    pub fn push(&mut self, rootfs: &Path, cmd: &[String], arch: &str, os: &str, work: &Path) -> Result<String, String> {
         reset_dir(work)?;
         let layer = work.join("layer.tar.gz");
         let (layer_digest, layer_size) = tar_gzip(rootfs, &layer)?; // compressed digest = blob id
         let diff_id = gunzip_sha256(&layer)?; // uncompressed digest = rootfs diff_id
 
         let config = json!({
-            "architecture": arch, "os": "linux",
+            "architecture": arch, "os": os, // os=darwin for mac containers; the manifest is os/arch-tagged
             "config": { "Cmd": cmd },
             "rootfs": { "type": "layers", "diff_ids": [diff_id] },
         });

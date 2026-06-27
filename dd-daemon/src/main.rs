@@ -710,10 +710,11 @@ async fn image_push(State(a): State<App>, Path(name): Path<String>, Query(q): Qu
     let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
     let iref = image_ref(&name, &tag);
     let arch = docker_arch(img.arch).to_string();
+    let os = img.arch.os().to_string(); // "darwin" for mac images, else "linux"
     let creds = registry_auth(&headers);
     let work = std::path::PathBuf::from(format!("{}/.push-{}", a.images_dir, std::process::id()));
     let res = tokio::task::spawn_blocking(move || {
-        Client::new(iref, creds).push(std::path::Path::new(&img.rootfs), &img.cmd, &arch, &work)
+        Client::new(iref, creds).push(std::path::Path::new(&img.rootfs), &img.cmd, &arch, &os, &work)
     }).await.unwrap_or_else(|e| Err(format!("push task crashed: {e}")));
     push_progress(&name, res).into_response()
 }
