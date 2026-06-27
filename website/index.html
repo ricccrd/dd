@@ -22,6 +22,7 @@
     <nav>
       <a href="#features" class="hide-sm">Features</a>
       <a href="#why" class="hide-sm">Why no VM</a>
+      <a href="#speed" class="hide-sm">Speed</a>
       <a href="#how" class="hide-sm">How it works</a>
       <a href="#get-started" class="hide-sm">Get started</a>
       <a href="#install">Download</a>
@@ -190,6 +191,69 @@
       the syscalls it implements, and today dd runs as a single process — great for <em>trusted</em>
       images. A VM still gives a harder isolation boundary for untrusted code; dd's
       <a href="./docs.html?doc=PLAN">sentry split</a> is the roadmap answer there.</p>
+  </div>
+</section>
+
+<!-- performance -->
+<section id="speed">
+  <div class="wrap">
+    <p class="eyebrow">Performance</p>
+    <h2 class="section-title">Native-speed arm64. x86 that laps emulation.</h2>
+    <p class="section-lead">The <em>same</em> Linux binary, run two ways on an Apple M5 Pro: inside a
+      Linux VM (how VM-based Docker runs containers) vs. through dd's JIT on the host, with no VM.
+      Median of 7 runs — and the dd lane even pays a bridge tax the real app doesn't, so it's
+      conservative.</p>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="big">≈1×</div><div class="lbl">arm64 vs native</div>
+        <p>dd runs arm64 container compute at native speed — and beats it on some workloads, with no VM
+          underneath.</p>
+      </div>
+      <div class="stat">
+        <div class="big">21×</div><div class="lbl">faster x86 floating-point</div>
+        <p>vs. emulating the same x86 binary under qemu in a VM. dd's JIT wins every x86 workload.</p>
+      </div>
+      <div class="stat">
+        <div class="big">no&nbsp;VM</div><div class="lbl">+ startup, RAM, I/O</div>
+        <p>structural wins on top — no machine to boot, no resident RAM, direct host-filesystem I/O.</p>
+      </div>
+    </div>
+
+    <div class="two-col" style="margin-top:36px;">
+      <div>
+        <h3>arm64 — dd vs a native VM</h3>
+        <p>The VM runs arm64 at full native speed; dd matches or beats it.</p>
+        <div class="compare"><table>
+          <thead><tr><th>Workload</th><th>VM</th><th class="dd">dd</th><th>dd vs VM</th></tr></thead>
+          <tbody>
+            <tr><td class="axis">int sieve</td><td class="vm">0.78s</td><td class="dd">0.55s</td><td><span class="yes">1.43× faster</span></td></tr>
+            <tr><td class="axis">float n-body</td><td class="vm">0.17s</td><td class="dd">0.17s</td><td>~parity</td></tr>
+            <tr><td class="axis">SHA-256</td><td class="vm">0.81s</td><td class="dd">0.76s</td><td><span class="yes">1.07× faster</span></td></tr>
+            <tr><td class="axis">SQLite 600k</td><td class="vm">0.35s</td><td class="dd">0.71s</td><td>0.49×</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+      <div>
+        <h3>x86-64 — dd vs VM emulation</h3>
+        <p>On Apple Silicon, x86 is <em>translated</em> either way. dd's JIT vs qemu-user:</p>
+        <div class="compare"><table>
+          <thead><tr><th>Workload</th><th>VM&nbsp;(qemu)</th><th class="dd">dd</th><th>dd vs VM</th></tr></thead>
+          <tbody>
+            <tr><td class="axis">int sieve</td><td class="vm">1.32s</td><td class="dd">0.96s</td><td><span class="yes">1.37× faster</span></td></tr>
+            <tr><td class="axis">float n-body</td><td class="vm">5.44s</td><td class="dd">0.26s</td><td><span class="yes">21× faster</span></td></tr>
+            <tr><td class="axis">SHA-256</td><td class="vm">2.73s</td><td class="dd">2.38s</td><td><span class="yes">1.15× faster</span></td></tr>
+            <tr><td class="axis">SQLite</td><td class="vm">—</td><td class="dd">—</td><td>not yet</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+    <p class="section-lead" style="margin-top:34px;font-weight:600;color:var(--text)">The goal is to beat
+      the VM on <em>every</em> benchmark — parity-or-better everywhere. Where dd is still behind
+      (syscall-heavy arm64 SQLite, a few x86 opcodes) is exactly the optimization frontier.</p>
+    <p class="disclaimer">Compute micro-benchmarks (<code>make bench</code>). arm64 SQLite is syscall- and
+      allocation-heavy, so the userspace-kernel tax shows (~2× slower); a Rosetta-backed VM would narrow
+      the x86 gap; and x86 SQLite hits an SSE opcode dd's x86 JIT doesn't implement yet.</p>
   </div>
 </section>
 

@@ -3,3 +3,4 @@
 *.o
 /website/docs/
 dd.sock
+**/.bench-cache/

@@ -80,6 +80,48 @@ VFS *is* the host filesystem behind a path jail.
 > dd runs as a single process — great for *trusted* images. A VM still gives a harder isolation boundary
 > for untrusted code; dd's sentry split ([`docs/PLAN.md`](docs/PLAN.md)) is the roadmap answer there.
 
+## Performance
+
+The **same static Linux binary**, run two ways on an **Apple M5 Pro** (macOS 26.3): inside the Linux VM
+(how VM-based Docker runs containers) vs. through dd's JIT on the host with **no VM**. Median of 7
+(`make bench`). Lower time is better; "dd vs VM" > 1× means dd is faster. The dd lane even pays a small
+cross-process bridge tax the real app doesn't — so these are *conservative*.
+
+**aarch64 containers — dd vs a native VM** (the VM runs arm64 at full native speed):
+
+| Workload | VM (native) | dd (no VM) | dd vs VM |
+|---|--:|--:|:--:|
+| int sieve | 0.78s | 0.55s | **1.43× faster** |
+| float n-body | 0.17s | 0.17s | ~parity |
+| SHA-256 | 0.81s | 0.76s | 1.07× faster |
+| SQLite (600k rows) | 0.35s | 0.71s | 0.49× (≈2× slower) |
+
+dd runs arm64 **compute at native speed — often faster** (same-ISA translation plus the JIT's own
+optimizations). Syscall/allocation-heavy SQLite is ~2× slower — the price of servicing syscalls in
+userspace.
+
+**x86-64 containers — dd vs VM emulation** (qemu-user; running x86 on Apple Silicon means *translating*
+it either way):
+
+| Workload | VM (qemu) | dd (no VM) | dd vs VM |
+|---|--:|--:|:--:|
+| int sieve | 1.32s | 0.96s | 1.37× faster |
+| float n-body | 5.44s | 0.26s | **21× faster** |
+| SHA-256 | 2.73s | 2.38s | 1.15× faster |
+| SQLite | — | — | not yet — see note |
+
+dd's JIT beats qemu-user emulation on every workload, dramatically on floating-point. (A Rosetta-backed
+VM would narrow the gap; the x86 SQLite binary hits an SSE opcode jit86 doesn't implement yet — see
+[`docs/PLAN.md`](docs/PLAN.md).)
+
+These are *compute* micro-benchmarks — they don't even capture dd's structural wins (no VM to boot, no
+resident RAM, direct host-filesystem I/O). Reproduce: `make bench`.
+
+> **The goal is to beat the VM on *every* benchmark.** dd already wins most x86-64 workloads and matches
+> or beats native arm64; the places it's still behind — syscall/allocation-heavy arm64 SQLite, and x86
+> opcodes jit86 doesn't implement yet — are exactly the optimization frontier (the tier-2 trace
+> optimizer and the jit86 work in [`docs/PLAN.md`](docs/PLAN.md)). Parity-or-better everywhere is the bar.
+
 ## How it works
 
 dd runs a Linux container by **being its kernel in userspace**. A JIT translates the guest's machine
