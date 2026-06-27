@@ -44,12 +44,10 @@ plain `localhost:5000` (`dd-daemon/src/registry.rs`; 41/41 docker-CLI scenarios 
   path that falls inside a bind volume isn't redirected to the host volume dir yet.
 
 ## Bugs found by the test harness
-- **jit86 (x86-64) translator/service bugs (xfail in dd-tests)** — surfaced by running the aarch64 test
-  programs on the x86 engine via the cross-compiler: `math`/`floatmath` (float/libm codegen → crash),
-  `heap` (malloc churn → crash), `threads`/`atomics` (hang). Plus the known `base32` (NEON) and
-  `sha256sum`. The aarch64 engine passes all; these are jit86-specific.
 - **jitdarwin: adrp/`__cstring` literal not relocated under the segment slide** — a guest that reads a
-  string literal (via adrp) gets zeros; stack/SP-relative data works. (Found by dd-tests darwin group.)
+  string literal (via adrp) gets zeros; stack/SP-relative data works. (Found by dd-tests darwin group;
+  the test deliberately builds its string on the stack to dodge this.) Low priority: jitdarwin is the
+  research DBT — native macOS containers use `darwinjail` (real binaries jailed), not the DBT.
 
 ## Remaining JIT gaps
 - **ET_EXEC loader** (non-PIE static) — platform-blocked by macOS `__PAGEZERO`; needs a fixed-vaddr map.
