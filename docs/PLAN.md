@@ -5,12 +5,16 @@ binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-cli
 `dd-cli`). This file is the **work list only** — what is missing or not yet implemented.
 
 ## Next work (priority order)
-1. **Dedup jit86 onto the shared layer.** The x86-64 guest is brought in whole (`frontend/x86_64/jit86.c`)
-   with its own cpu struct + a *basic* container layer (no overlay/cgroup/jail). Lift it onto the shared
-   `jit/` + `os/linux/` via (a) cpu-access accessors (`SYSARG0..5(c)`, `SYSRET(c,v)`, PC/SP getters) so
-   the syscall + dispatch logic is cpu-agnostic, and (b) a syscall-number→canonical-id map per frontend
-   (x86 `read`=0 vs aarch64 63). Then decompose it the way aarch64 is. Payoff: one runtime, two thin
-   frontends; jit86 gains overlay/cgroup/jail for free.
+1. **Finish the jit86 engine dedup.** *Half done.* The x86-64 guest **already shares the entire
+   `os/linux/` personality** — `service.c` (the syscall layer), the container overlay/jail/cgroup/netns
+   (`container/vfs.c`+`netns.c`+`state.c`), `signal.c`, `thread.c`, `fscache.c` — through the
+   cpu-interface seam (`frontend/x86_64/abi.h` `G_*` contract + the `sysmap.h` syscall-number→canonical
+   map). Its old duplicate `service.c`+`container.c` are deleted, so it has overlay/cgroup/jail already.
+   **What's left is the host `jit/` engine:** x86_64 still carries its own
+   `frontend/x86_64/{cache,emit,dispatch}.c` instead of the shared `jit/{cache,emit_arm64,dispatch}.c`
+   that aarch64 uses. Lift it on via cpu-access accessors so the code cache + dispatcher are
+   cpu-agnostic (the cpu struct and the x86 decoder stay genuinely per-arch). Payoff: one engine, two
+   thin frontends.
 2. **Rare fork/command-sub `Bus error`.** ~1/15 intermittent fault in the fork + nested command-sub path
    under full container flags (pre-existing in the engine). Likely a shadow-stack/teardown race;
    reproduce under load and fix.

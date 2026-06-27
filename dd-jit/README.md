@@ -49,11 +49,14 @@ src/runtime/
 
 - **linux/aarch64** — fully decomposed into `jit/` + `os/linux/` + `frontend/aarch64/`; syscalls are one
   sorted `service.c` (no `.inc` fragments); clang-formatted, comments above the code.
-- **linux/x86_64 (jit86)** — decomposed into `frontend/x86_64/` modules (mirrors the aarch64 split), but
-  still carries its *own* cpu struct + container/syscall layer (it isn't yet sharing `jit/` + `os/linux/`).
+- **linux/x86_64 (jit86)** — decomposed into `frontend/x86_64/` modules (mirrors the aarch64 split) and
+  **already sharing the whole `os/linux/` personality** (`service.c`, the container overlay/jail/cgroup/
+  netns, `signal.c`, `thread.c`, `fscache.c`) through the `abi.h` `G_*` seam + the `sysmap.h`
+  syscall-number→canonical map. It still carries its *own* cpu struct (genuinely per-ISA) and its *own*
+  engine (`frontend/x86_64/{cache,emit,dispatch}.c`) rather than the shared `jit/`.
 - **darwin/aarch64 (jitdarwin)** — minimal POC, brought in *whole* under `os/darwin/`.
 
-**Dedup (the remaining refactor):** lift jit86 and jitdarwin onto the shared `jit/` engine + (for jit86)
-`os/linux/` via cpu-access accessors + a syscall-number→canonical-id map per frontend. The aarch64 host
-codegen is identical across all three — only the decoder, the OS personality, and the syscall numbers
-differ. End state: one engine, thin per-target frontends.
+**Dedup (the remaining refactor):** the `os/linux/` half is done for jit86; what's left is lifting its
+engine onto the shared `jit/` (and jitdarwin onto `jit/` + a darwin personality) via cpu-access
+accessors. The aarch64 host codegen is identical across all three — only the decoder, the OS
+personality, and the syscall numbers differ. End state: one engine, thin per-target frontends.
