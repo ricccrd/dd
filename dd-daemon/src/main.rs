@@ -1148,6 +1148,8 @@ fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol]) -> Option<(String, 
     cfg.pids_max = c.pids_limit.max(0) as u32;
     // `--network host` shares the host network (no per-container netns); otherwise isolate in one.
     cfg.netns = (c.network_mode != "host").then(|| c.id[..c.id.len().min(40)].to_string());
+    // `--network none`: no external egress -- the JIT refuses non-loopback connects (DD_NET_ISOLATE).
+    if c.network_mode == "none" { cfg.env.push(("DD_NET_ISOLATE".into(), "1".into())); }
     cfg.volumes = c.binds.iter().filter_map(|b| b.split_once(':').map(|(host, dst)| {
         // A bind whose source isn't an absolute path is a named volume.
         let host = if host.starts_with('/') {

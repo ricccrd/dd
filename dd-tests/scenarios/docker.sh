@@ -150,6 +150,10 @@ has "cp-dir-out" "$(ls "$ROOT/cp-etc" 2>/dev/null)" "alpine-release"
 d rm "$cpc" >/dev/null
 rm -rf "$ROOT/cp-in.txt" "$ROOT/cp-back.txt" "$ROOT/cp-rel.txt" "$ROOT/cp-etc"
 
+echo "== --network none blocks external egress (loopback still allowed) =="
+# deterministic: with no network, a non-loopback connect always fails with ENETUNREACH
+has "egress-none-blocked" "$(d run --rm --network none alpine sh -c 'nc -w3 1.1.1.1 80 </dev/null >/dev/null 2>&1; echo rc=$?')" "rc=1"
+
 echo ""
 echo "scenarios: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

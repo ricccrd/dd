@@ -1945,7 +1945,16 @@ static void service(struct cpu *c) {
     }
     // connect
     case 203: {
+        // --network none: no external egress (DD_NET_ISOLATE). Loopback is redirected by the lo_* path
+        // below; any non-127/8 AF_INET destination is refused, matching docker's null network.
+        static int net_isolate = -1;
+        if (net_isolate < 0) net_isolate = getenv("DD_NET_ISOLATE") != NULL;
         uint8_t *sa = (uint8_t *)a1;
+        if (net_isolate && sa && (socklen_t)a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET &&
+            (ntohl(*(uint32_t *)(sa + 4)) >> 24) != 127) {
+            G_RET(c) = (uint64_t)(-ENETUNREACH);
+            break;
+        }
         if (lo_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
             // private loopback
             lo_is(sa, (socklen_t)a2)) {
