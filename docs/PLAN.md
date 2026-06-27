@@ -201,7 +201,7 @@ Remaining — what still needs to be figured out / built (priority):
 
 | Area | What needs work | Pri |
 |------|-----------------|:---:|
-| `docker inspect` (container) | ~~`NetworkSettings` (ports → fixes `docker port`, + network membership)~~ **done**; still: `Name`, `Mounts`, `State.{Pid,StartedAt,FinishedAt}`, full `Config` — **`docker compose` depends on it** | P1 |
+| `docker inspect` (container) | ~~`NetworkSettings` (ports → fixes `docker port`, + membership), `Name`, `Mounts`, `Config.Image/Env`~~ **done**; still: `State.{Pid,StartedAt,FinishedAt}` (not tracked yet) | P1 |
 | `docker logs` | `-f`/follow, `--tail`/`--since`/`--timestamps`; emit a **raw** stream for `-t` (today always framed → garbled TTY logs) | P1 |
 | `docker ps` | `--filter`/`--size`; human `Status` (`Up 3 minutes`); `Labels`/`ImageID`/network info | P1 |
 | `docker exec` | apply `-e`/`-u`/`-w`/`--privileged`; `exec -d` must return 200 (today 101-hijacks → hangs) | P1 |
