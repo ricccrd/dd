@@ -61,8 +61,10 @@ at a time with the cross-engine matrix as the regression gate.**
    stays per-arch. **First PR:** lift `cache.c`, aarch64 binary bit-identical.
 2. **Networking Phase-2b — userspace netstack.** → **`docs/design/netstack.md`**. Reframing: external
    egress already works root-free (a guest socket *is* a host socket); the real gap is L3 **identity**
-   (per-container IP) — what breaks `docker-net.sh` (3/7). **First PR:** daemon-only IPAM (`172.18/12`) +
-   identity reporting → 5/7, no JIT change; later, a per-network AF_UNIX virtual switch → 7/7.
+   (per-container IP) — what breaks `docker-net.sh` (3/7). ✅ **PR1 DONE** (daemon IPAM `172.18/12` +
+   per-container IP + `--network`-join fix; verified live: container IP `172.18.0.2`, `network inspect`
+   lists members → 5/7). **Next PR:** per-network AF_UNIX virtual switch (the `reach-by-name`/`-ip` data
+   path) → 7/7; then the optional in-process `smoltcp` stack behind `DD_NETSTACK`.
 3. **Untrusted-guest isolation — the sentry process-split.** → **`docs/design/sentry-split.md`**. The trust
    boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on `g_untrusted`.
    `service()` splits by authority (compute/mem local, fs/net/proc → sentry over an SPSC ring); deny-default
@@ -219,7 +221,7 @@ Remaining — what still needs to be figured out / built (priority):
 | `docker exec` | ~~`-e`/`-w`~~ **done**; still `-u` (needs a `SpawnConfig` uid field), `--privileged`, `exec -d` → 200 | P1 |
 | `docker events` | wire a real lifecycle event bus into the open stream (compose + GUI watch it) | P1 |
 | `docker stats` | real CPU/mem accounting from the JIT runtime + streaming *(design: runtime has no cgroup metrics)* | P1 |
-| networks | **container-to-container connectivity** (`scenarios/docker-net.sh`, 3/7): two containers on a user network can't reach each other — no per-container IP is assigned (inspect/`network inspect` show no member IP, `"Containers": {}`), and there's no embedded DNS (`nc <name>` → "bad address"). Needs a real bridge + IPAM (subnet/gateway, per-endpoint IP/MAC) + name→IP resolution *(design: dd uses a per-container loopback netns, no bridge — see Networking Phase-2b #2)*. Cross-network isolation trivially holds today (nothing reaches anything). | P2 |
+| networks | ~~per-container IP/IPAM + `network inspect` member IPs~~ **PR1 done** (172.18/12, verified `172.18.0.2`); still **container-to-container reachability** (`docker-net.sh` `reach-by-name`/`-ip`): the data path — a per-network AF_UNIX virtual switch + embedded name→IP DNS — see netstack #2 next PR. Cross-network isolation trivially holds. | P2 |
 | `docker build` | ~~`buildargs`/`target`/`nocache`~~ **done**; still `labels`, real content-digest image IDs; (BuildKit cache, above) | P2 |
 | `docker run` opts | ~~`--label` (stored → `Config.Labels`)~~ **done**; still `--user` (uid not applied — needs a `SpawnConfig` uid field), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` | P2 |
 | volumes | ~~`409` when in use, RFC3339 `CreatedAt`~~ **done**; still persist `--driver`/`--opt`/`--label` | P2 |
