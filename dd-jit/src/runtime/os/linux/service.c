@@ -6,6 +6,9 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 // grouped by category. See docs/SYSCALLS.md for the per-syscall table.
 
 static void service(struct cpu *c) {
+    // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
+    // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
+    if (G_NORMALIZE(c)) return;
     uint64_t nr = G_NR(c), a0 = G_A0(c), a1 = G_A1(c), a2 = G_A2(c), a3 = G_A3(c), a4 = G_A4(c), a5 = G_A5(c);
     if (g_trace)
         fprintf(stderr, "[sys] %llu (%llx,%llx,%llx)\n", (unsigned long long)nr, (unsigned long long)a0,
@@ -1244,6 +1247,10 @@ static void service(struct cpu *c) {
     // =====================
     // brk
     case 214: {
+        if (!G_BRK_GROWABLE) { // fixed, non-growable break -> glibc/musl fall back to their mmap allocator
+            G_RET(c) = brk_lo;
+            break;
+        }
         if (a0 == 0) {
             G_RET(c) = brk_cur;
             break;
@@ -1305,14 +1312,23 @@ static void service(struct cpu *c) {
                 break;
             }
         }
-        void *r = mmap((void *)a0, (size_t)a1, (int)a2, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
+        // glibc's vectorized string ops over-read up to 16 bytes past a buffer's logical end; on Darwin
+        // that hits an unmapped page -> SIGBUS. Map a 64KB guard tail on non-fixed anon maps so the
+        // over-read lands in mapped zero memory (x86 glibc relies on this; harmless for aarch64).
+        size_t guard = (!(a3 & 0x10) && (a3 & 0x20)) ? 0x10000 : 0;
+        void *r = mmap((void *)a0, (size_t)a1 + guard, (int)a2, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4,
+                       (off_t)a5);
         // refund
         if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
         G_RET(c) = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // mprotect
-    case 226: G_RET(c) = (uint64_t)mprotect((void *)a0, (size_t)a1, (int)a2); break;
+    case 226: // mprotect: NO-OP. The JIT translates guest code and never executes guest pages, so it does
+        // not enforce guest page protection. Actually calling mprotect is harmful on macOS -- it would make
+        // a region truly read-only and then fault the guest's own legitimate writes to it (e.g. RELRO).
+        G_RET(c) = 0;
+        break;
     case 228:
     case 229:
         G_RET(c) = 0;
@@ -1606,7 +1622,7 @@ static void service(struct cpu *c) {
         brk_lo = brk_cur = (uint64_t)heap;
         brk_hi = brk_lo + (256u << 20);
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
-        memset(c->x, 0, sizeof c->x);
+        G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;
         G_SP(c) = sp;

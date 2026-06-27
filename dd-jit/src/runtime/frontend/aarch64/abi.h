@@ -31,3 +31,12 @@
 // Child thread resume PC: aarch64 services a syscall with pc still at the SVC, so advance +4.
 #define G_THREAD_RESUME(child, parent) ((child)->pc = (parent)->pc + 4)
 
+
+// aarch64 guests already use canonical (*at) syscalls -> nothing to normalize.
+#define G_NORMALIZE(c) 0
+
+// Zero the integer register file (execve). aarch64 = x[31].
+#define G_RESET_REGS(c) memset((c)->x, 0, sizeof (c)->x)
+
+// brk policy: aarch64 grows a real brk heap (works on macOS).
+#define G_BRK_GROWABLE 1

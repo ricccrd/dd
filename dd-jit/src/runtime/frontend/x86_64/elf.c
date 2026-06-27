@@ -13,10 +13,7 @@ static uint64_t rd64(const uint8_t *p) {
     return v;
 }
 
-struct loaded {
-    uint64_t entry, phdr, base;
-    int phent, phnum;
-};
+// struct loaded is defined by the shared os/linux (container/netns.c).
 
 static int elf_interp(const char *path, char *out, size_t n) {
     int fd = open(path, O_RDONLY);

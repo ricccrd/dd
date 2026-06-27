@@ -6,13 +6,19 @@ static uint8_t *g_cache, *g_cp;
 static uint8_t *g_emit_start;
 static int g_trace, g_prof, g_noibtc, g_itrace; // g_itrace: 1 instruction per block (per-insn register dump)
 static uint64_t g_disp_n, g_ibtc_fill;          // PROF: dispatcher round-trips, IBTC fills
+static uint64_t g_prof_cross, g_prof_sys, g_prof_miss, g_prof_xlate, g_lse_n; // aarch64-shaped PROF counters (unused here)
 static uint64_t g_tracecap;                     // if >0 under trace: stop after this many blocks (runaway guard)
 int g_diag;                                     // diagnostics (FAULT_ON): print LOADED bases etc.
 static int g_nochain;                           // WATCH file: disable chaining (exact per-block rip attribution)
 static pthread_mutex_t g_jit_lock = PTHREAD_MUTEX_INITIALIZER; // serialize cache mutation once threaded
 static int g_threaded;          // a guest thread exists -> take g_jit_lock + stop chaining/IBTC fills
-static int g_pids_max = 0;      // cgroup pids.max (0 = unlimited)
-static _Atomic int g_pids_cur = 1; // live task count (cgroup pids.current)
+#define CLK                                                                                                            \
+    int _th = g_threaded;                                                                                              \
+    if (_th) pthread_mutex_lock(&g_jit_lock)
+#define CUL                                                                                                            \
+    do {                                                                                                               \
+        if (_th) pthread_mutex_unlock(&g_jit_lock);                                                                    \
+    } while (0)
 static uint64_t g_loadbase;                     // main program load base (for file-offset mapping)
 static uint8_t *g_w8;
 static uint8_t g_w8v;       // debug byte-watchpoint (armed via magic syscall 500)

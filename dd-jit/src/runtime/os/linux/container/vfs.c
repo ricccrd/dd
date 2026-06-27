@@ -70,6 +70,22 @@ struct vol {
 };
 static struct vol g_vols[32];
 static int g_nvols;
+static void add_vol(const char *spec) { // "guestpath:hostdir" -> a confined bind-mount volume
+    if (g_nvols >= 32) return;
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s", spec);
+    char *col = strchr(tmp, ':');
+    if (!col || tmp[0] != '/') return;
+    *col = 0;
+    struct vol *v = &g_vols[g_nvols];
+    snprintf(v->guest, sizeof v->guest, "%s", tmp);
+    v->glen = strlen(v->guest);
+    while (v->glen > 1 && v->guest[v->glen - 1] == '/') v->guest[--v->glen] = 0;
+    if (!realpath(col + 1, v->hcanon)) return;
+    v->hlen = strlen(v->hcanon);
+    if ((v->fd = open(v->hcanon, O_RDONLY | O_DIRECTORY)) < 0) return;
+    g_nvols++;
+}
 // Pick the jail (rootfs or a volume) for an absolute guest path; *rel = the path within that jail.
 static int jail_pick(const char *abs, const char **canon, size_t *clen, const char **rel) {
     for (int i = 0; i < g_nvols; i++)

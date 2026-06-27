@@ -51,29 +51,42 @@
 #include <sys/event.h> // kqueue: backs epoll/timerfd/inotify on macOS
 #include <dirent.h>
 #include <signal.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 #include <stdatomic.h>
 #include <libkern/OSCacheControl.h>
 
 #include "../include/cpu_x86_64.h"
+#include "../frontend/x86_64/abi.h"          // cpu-interface seam (G_* contract + sysmap + normalize)
+#include "../frontend/x86_64/fill_stat.c"    // per-arch struct-stat layout os/linux fills
 
-#include "../frontend/x86_64/cache.c"     // code cache + block map
-#include "../frontend/x86_64/emit.c"      // arm64 emitters + SSE + x87
-#include "../frontend/x86_64/decode.c"    // x86-64 decoder
-#include "../frontend/x86_64/translate.c" // translate_block + trampolines
-#include "../frontend/x86_64/container.c" // rootfs/socket/netns/portmap/signal/overlay
-#include "../frontend/x86_64/abi.h"        // cpu-interface seam (G_* contract) for the shared thread machinery
-#include "../os/linux/thread.c"               // SHARED: clone->pthread, per-thread cpu, futex (cpu-agnostic)
-#include "../frontend/x86_64/service.c"   // the syscall layer
-#include "../frontend/x86_64/dispatch.c"  // run_guest dispatcher
-#include "../frontend/x86_64/elf.c"       // ELF loader + stack
+#include "../os/linux/container/state.c"     // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
+#include "../frontend/x86_64/cache.c"        // x86 engine: code cache + block map
+#include "../frontend/x86_64/emit.c"         // x86 engine: arm64 emitters + SSE + x87
+#include "../frontend/x86_64/decode.c"       // x86-64 decoder
+#include "../frontend/x86_64/translate.c"    // x86-64 translate_block + trampolines
+#include "../os/linux/thread.c"              // SHARED: clone->pthread, per-thread cpu, futex
+#include "../os/linux/signal.c"              // SHARED: signal delivery driver + translation
+#include "../frontend/x86_64/sigframe.c"     // x86-64 rt_sigframe build/restore (uses signal.c state)
+#include "../frontend/x86_64/legacy.c"       // x86 legacy-syscall -> *at normalization (G_NORMALIZE)
+#include "../os/linux/container/vfs.c"       // SHARED: rootfs jail, overlay, /proc synth, stat
+#include "../os/linux/container/netns.c"     // SHARED: sockets, loopback netns, termios
+#include "../os/linux/fscache.c"             // SHARED: fd/path cache
+#include "../os/linux/service.c"             // SHARED: the canonical syscall layer
+#include "../frontend/x86_64/x86_ops.c"        // x86 cpuid + x87 m80 block-exit helpers
+#include "../frontend/x86_64/dispatch.c"     // x86 run_guest dispatcher
+#include "../frontend/x86_64/elf.c"      // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
 
 // ---- entry + main ----
 // ---------------- entry ----------------
 int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return 2;
-    if (rootfs && rootfs[0]) g_rootfs = (char *)rootfs;
-    g_hostuid = getuid();
-    g_hostgid = getgid(); // capture before syscalls fake container root
+    if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
+        g_rootfs = (char *)rootfs;
+        if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
+        g_rootfs_canon_len = strlen(g_rootfs_canon);
+        g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
+    }
     {
         const char *ns = getenv("JIT86_NETNS"); // private-loopback dir: inherit across exec, else create one
         if (ns && ns[0])
@@ -177,7 +190,7 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     g_exe_path = prog;
 
     char pb[4200];
-    const char *prog_host = xresolve(prog, pb, sizeof pb);
+    const char *prog_host = xresolve_exec(prog, pb, sizeof pb);
     struct loaded lm;
     load_elf(prog_host, &lm);
     g_loadbase = lm.base;
@@ -186,7 +199,7 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     char interp[256];
     if (elf_interp(prog_host, interp, sizeof interp) == 0) {
         char ib[4200];
-        const char *ihost = xlate(interp, ib, sizeof ib);
+        const char *ihost = xresolve_exec(interp, ib, sizeof ib);
         struct loaded li;
         load_elf(ihost, &li);
         jump = li.entry;

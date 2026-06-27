@@ -23,3 +23,13 @@
 // Child thread resume PC: x86 pre-advances rip past `syscall` before servicing, so the copy is correct.
 #define G_THREAD_RESUME(child, parent) ((void)0)
 
+
+// Syscall normalization: x86 rewrites legacy syscalls to their *at form (frontend/x86_64/legacy.c).
+#define G_NORMALIZE(c) x86_normalize(c)
+
+// Zero the integer register file (execve). x86 = r[16].
+#define G_RESET_REGS(c) memset((c)->r, 0, sizeof (c)->r)
+
+// brk policy: x86 reports a fixed break so glibc uses its mmap allocator -- a brk heap the guest then
+// mmap/mprotects cannot be split on the macOS VM. (jit86 learned this the hard way.)
+#define G_BRK_GROWABLE 0
