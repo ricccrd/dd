@@ -9,6 +9,8 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 #include <sys/shm.h>
 #include <sys/sem.h>
 #include <sys/msg.h>
+#include <dirent.h>
+#include <stdlib.h>
 // Map a Linux `semctl` cmd to the macOS one: the GET*/SET* values differ (Linux GETVAL=12/SETVAL=16,
 // macOS GETVAL=5/SETVAL=8); IPC_RMID/SET/STAT (0/1/2) are the same.
 static int sem_cmd_l2m(int c) {
@@ -27,6 +29,36 @@ static key_t ipc_ns_key(key_t k) {
     for (const char *p = ns; *p; p++) { salt ^= (uint8_t)*p; salt = salt * 16777619u; }
     key_t hk = (key_t)((uint32_t)k ^ (salt & 0x7fffffffu));
     return hk == IPC_PRIVATE ? hk + 1 : hk;
+}
+// list a directory's entries (minus . / ..) as a newline-joined, NUL-terminated malloc'd string (for the
+// inotify-on-a-directory diff). NULL on error.
+static char *dir_snapshot(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return NULL;
+    size_t cap = 256, len = 0;
+    char *s = malloc(cap);
+    if (!s) { closedir(d); return NULL; }
+    s[0] = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        size_t nl = strlen(e->d_name);
+        if (len + nl + 2 > cap) { cap = (len + nl + 2) * 2; char *n = realloc(s, cap); if (!n) break; s = n; }
+        memcpy(s + len, e->d_name, nl); len += nl; s[len++] = '\n'; s[len] = 0;
+    }
+    closedir(d);
+    return s;
+}
+// is `name` present as a line in the newline-joined snapshot?
+static int snap_has(const char *snap, const char *name, size_t nl) {
+    if (!snap) return 0;
+    for (const char *p = snap; *p;) {
+        const char *e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == nl && !memcmp(p, name, nl)) return 1;
+        p = e ? e + 1 : p + l;
+    }
+    return 0;
 }
 static void service(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
@@ -82,23 +114,47 @@ static void service(struct cpu *c) {
             }
             uint8_t *out = (uint8_t *)a1;
             size_t off = 0;
-            for (int i = 0; i < n && off + 16 <= a2; i++) {
-                uint32_t f = kv[i].fflags, m = 0;
-                // IN_MODIFY
-                if (f & (NOTE_WRITE | NOTE_EXTEND)) m |= 0x2;
-                // IN_ATTRIB
-                if (f & NOTE_ATTRIB) m |= 0x4;
-                // IN_DELETE_SELF
-                if (f & NOTE_DELETE) m |= 0x400;
-                // IN_MOVE_SELF
-                if (f & NOTE_RENAME) m |= 0x800;
-                // wd
-                *(int32_t *)(out + off) = (int32_t)kv[i].ident;
-                *(uint32_t *)(out + off + 4) = m;
-                *(uint32_t *)(out + off + 8) = 0;
-                // mask,cookie,len
-                *(uint32_t *)(out + off + 12) = 0;
-                off += 16;
+            for (int i = 0; i < n; i++) {
+                int wd = (int)kv[i].ident;
+                if (wd >= 0 && wd < 1024 && g_inotify_wpath[wd][0]) {
+                    // directory watch: diff current entries against the snapshot -> IN_CREATE/IN_DELETE+name
+                    char *cur = dir_snapshot(g_inotify_wpath[wd]);
+                    char *old = g_inotify_snap[wd];
+                    for (int pass = 0; pass < 2; pass++) {            // pass 0 = created, pass 1 = deleted
+                        const char *src = pass == 0 ? cur : old, *other = pass == 0 ? old : cur;
+                        uint32_t mask = pass == 0 ? 0x100u : 0x200u;  // IN_CREATE / IN_DELETE
+                        for (const char *p = src ? src : ""; *p;) {
+                            const char *e = strchr(p, '\n');
+                            size_t l = e ? (size_t)(e - p) : strlen(p);
+                            if (l && !snap_has(other, p, l)) {
+                                size_t nlen = (l + 1 + 15) & ~(size_t)15; // padded name field
+                                if (off + 16 + nlen > a2) break;
+                                *(int32_t *)(out + off) = wd;
+                                *(uint32_t *)(out + off + 4) = mask;
+                                *(uint32_t *)(out + off + 8) = 0;               // cookie
+                                *(uint32_t *)(out + off + 12) = (uint32_t)nlen; // len
+                                memcpy(out + off + 16, p, l);
+                                memset(out + off + 16 + l, 0, nlen - l);
+                                off += 16 + nlen;
+                            }
+                            p = e ? e + 1 : p + l;
+                        }
+                    }
+                    free(old);
+                    g_inotify_snap[wd] = cur;
+                } else {
+                    if (off + 16 > a2) break;
+                    uint32_t f = kv[i].fflags, m = 0;
+                    if (f & (NOTE_WRITE | NOTE_EXTEND)) m |= 0x2;  // IN_MODIFY
+                    if (f & NOTE_ATTRIB) m |= 0x4;                 // IN_ATTRIB
+                    if (f & NOTE_DELETE) m |= 0x400;               // IN_DELETE_SELF
+                    if (f & NOTE_RENAME) m |= 0x800;               // IN_MOVE_SELF
+                    *(int32_t *)(out + off) = wd;
+                    *(uint32_t *)(out + off + 4) = m;
+                    *(uint32_t *)(out + off + 8) = 0;
+                    *(uint32_t *)(out + off + 12) = 0;
+                    off += 16;
+                }
             }
             G_RET(c) = (uint64_t)off;
             break;
@@ -118,14 +174,40 @@ static void service(struct cpu *c) {
             G_RET(c) = 8;
             break;
         }
+        // eventfd read: return the accumulated counter, reset it, drain the readiness pipe
+        if (rfd >= 0 && rfd < 1024 && g_eventfd_peer[rfd]) {
+            if (a2 < 8) { G_RET(c) = (uint64_t)(-EINVAL); break; }
+            if (g_eventfd_count[rfd] == 0) {
+                if (fcntl(rfd, F_GETFL) & O_NONBLOCK) { G_RET(c) = (uint64_t)(-EAGAIN); break; }
+                char b; if (read(rfd, &b, 1) < 0) {} // block until a writer signals 0->positive
+            }
+            uint64_t v = g_eventfd_count[rfd];
+            g_eventfd_count[rfd] = 0;
+            int fl = fcntl(rfd, F_GETFL); // drain any readiness bytes so poll() clears
+            fcntl(rfd, F_SETFL, fl | O_NONBLOCK);
+            char buf[64]; while (read(rfd, buf, sizeof buf) > 0) {}
+            fcntl(rfd, F_SETFL, fl);
+            if (a1) *(uint64_t *)a1 = v;
+            G_RET(c) = 8;
+            break;
+        }
         ssize_t r = read(rfd, (void *)a1, (size_t)a2);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 64: {
         int wfd = (int)a0;
-        // eventfd -> pipe
-        if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) wfd = g_eventfd_peer[wfd] - 1;
+        // eventfd write: ADD to the counter (not a raw pipe write); signal the pipe readable on 0->positive.
+        if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) {
+            if (a2 < 8) { G_RET(c) = (uint64_t)(-EINVAL); break; }
+            uint64_t add = *(uint64_t *)a1;
+            if (add == 0xffffffffffffffffULL) { G_RET(c) = (uint64_t)(-EINVAL); break; }
+            uint64_t old = g_eventfd_count[wfd];
+            g_eventfd_count[wfd] = old + add;
+            if (old == 0 && add > 0) { char b = 1; if (write(g_eventfd_peer[wfd] - 1, &b, 1) < 0) {} }
+            G_RET(c) = 8;
+            break;
+        }
         fd_evict(wfd);
         ssize_t r = write(wfd, (void *)a1, (size_t)a2);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -1352,6 +1434,10 @@ static void service(struct cpu *c) {
         // a region truly read-only and then fault the guest's own legitimate writes to it (e.g. RELRO).
         G_RET(c) = 0;
         break;
+    case 227: // msync: stores through a MAP_SHARED mapping are already in the unified page cache, so the
+        // file is coherent without an explicit flush; treat as success (avoids a spurious -ENOSYS).
+        G_RET(c) = 0;
+        break;
     case 228:
     case 229:
         G_RET(c) = 0;
@@ -1907,6 +1993,7 @@ static void service(struct cpu *c) {
             // private loopback
             lo_is(sa, (socklen_t)a2)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
+            if (p == 0) p = lo_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
             char up[200];
             lo_path(p, up, sizeof up);
             if (lo_swap((int)a0) < 0) {
@@ -2270,6 +2357,13 @@ static void service(struct cpu *c) {
             G_RET(c) = (uint64_t)(-(int64_t)e);
             break;
         }
+        // a directory watch: remember the path + a snapshot so read() can diff into IN_CREATE/IN_DELETE+name
+        struct stat dst;
+        if (wfd >= 0 && wfd < 1024 && stat(p, &dst) == 0 && S_ISDIR(dst.st_mode)) {
+            snprintf(g_inotify_wpath[wfd], sizeof g_inotify_wpath[wfd], "%s", p);
+            free(g_inotify_snap[wfd]);
+            g_inotify_snap[wfd] = dir_snapshot(p);
+        }
         G_RET(c) = (uint64_t)wfd;
         break;
     // watch descriptor = the watched fd
@@ -2281,6 +2375,14 @@ static void service(struct cpu *c) {
         kevent((int)a0, &kv, 1, NULL, 0, NULL);
         close((int)a1);
         G_RET(c) = 0;
+        break;
+    }
+    case 72: { // pselect6(nfds, readfds, writefds, exceptfds, timeout(timespec), sigmask) -> pselect.
+        // The Linux/macOS fd_set byte-layout is identical (bit N at byte N/8), so pass the sets through.
+        struct timespec ts, *tsp = NULL;
+        if (a4) { ts = *(struct timespec *)a4; tsp = &ts; }
+        int r = pselect((int)a0, (fd_set *)a1, (fd_set *)a2, (fd_set *)a3, tsp, NULL);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 73: {

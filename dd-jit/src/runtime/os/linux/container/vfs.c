@@ -54,10 +54,16 @@ static char g_fdpath[1024][192];
 static char g_ovldir[1024][192];
 // eventfd(read-end) -> pipe write-end + 1 (0 = not an eventfd)
 static int g_eventfd_peer[1024];
+// eventfd accumulating counter: write() adds, read() returns + resets (the pipe is only readiness)
+static uint64_t g_eventfd_count[1024];
 // fd is a timerfd (a kqueue with an EVFILT_TIMER) -> read() drains it
 static uint8_t g_timerfd[1024];
 // fd is an inotify (a kqueue with EVFILT_VNODE watches) -> read() drains it
 static uint8_t g_inotify[1024];
+// inotify-on-a-directory emulation: kqueue says "the dir changed" but not which entry, so we keep the
+// watched dir's path + a snapshot of its names and diff on read() to synthesize IN_CREATE/IN_DELETE+name.
+static char g_inotify_wpath[1024][512];
+static char *g_inotify_snap[1024]; // newline-joined entry names of the last snapshot (malloc'd)
 // pinned O_DIRECTORY fd to the rootfs (set at startup)
 static int g_root_fd = -1;
 // Bind-mount volumes: a guest path prefix -> a host directory, each its own confined jail root.
