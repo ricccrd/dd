@@ -2,7 +2,7 @@
 # dd-tests/scenarios/docker.sh -- end-to-end Docker-CLI scenarios against dd-daemon.
 #
 # Starts dd-daemon on a private socket, drives it with the real `docker` CLI through the full container
-# lifecycle (images, run, logs, ps, inspect, exec-less wait, rm, volumes, networks), asserts each result,
+# lifecycle (images, run, logs, ps, inspect, exec, stop, kill, rm, volumes, networks), asserts each result,
 # then tears the daemon down. Run after `make jit` (the daemon + JIT binaries must be built).
 #
 #   bash dd-tests/scenarios/docker.sh
@@ -48,6 +48,7 @@ has "images-ubuntu" "$imgs" "ubuntu"
 echo "== run -> logs -> wait -> inspect -> rm (the core lifecycle) =="
 cid="$(d run -d alpine sh -c 'echo scenario-line1; echo scenario-line2; id -u')"
 has "run-returns-id" "$cid" "$(echo "$cid" | head -c 8)"
+d wait "$cid" >/dev/null  # -d is async (like real docker); await exit before reading the full logs
 logs="$(d logs "$cid")"
 has "logs-line1" "$logs" "scenario-line1"
 has "logs-line2" "$logs" "scenario-line2"
@@ -64,7 +65,7 @@ d rm "$cid2" >/dev/null
 
 echo "== a guest with a real exit code =="
 cid3="$(d run -d alpine sh -c 'exit 7')"
-ok "exit-code-propagates" "$(d inspect --format '{{.State.ExitCode}}' "$cid3")" "7"
+ok "exit-code-propagates" "$(d wait "$cid3")" "7"   # `docker wait` returns the exit code
 d rm "$cid3" >/dev/null
 
 echo "== pull (download / ensure the image) =="
@@ -79,6 +80,7 @@ d rm -f "$cidk" >/dev/null
 
 echo "== non-default image (ubuntu) + image inspect =="
 ucid="$(d run -d ubuntu /bin/bash -c 'echo ubuntu-bash; head -1 /etc/os-release')"
+d wait "$ucid" >/dev/null
 has "run-ubuntu"    "$(d logs "$ucid")" "ubuntu-bash"
 d rm -f "$ucid" >/dev/null
 has "image-inspect" "$(d image inspect ubuntu --format '{{.Os}}' 2>&1)" "linux"
@@ -93,7 +95,7 @@ echo "== run -i interactive (stdin) =="
 has "run-it"        "$(printf 'echo it-line\nexit\n' | d run -i --rm alpine sh)" "it-line"
 
 echo "== exec in a running container =="
-xcid="$(d run -d alpine sh -c 'sleep 20')"
+xcid="$(d run -d alpine sh -c 'sleep 8')"
 has "exec"          "$(d exec "$xcid" echo exec-out)" "exec-out"
 d rm -f "$xcid" >/dev/null
 

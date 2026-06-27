@@ -117,13 +117,24 @@ struct Net {
     created: i64,
 }
 
+/// A `docker exec` invocation: a command to run in a container's rootfs. dd runs it as a fresh JIT
+/// process sharing the container's rootfs + volumes (the same files; a distinct process namespace).
+#[derive(Clone)]
+struct Exec {
+    container_id: String,
+    cmd: Vec<String>,
+    tty: bool,
+    started: bool,
+}
+
 #[derive(Default)]
 struct Inner {
     containers: HashMap<String, Container>,
     images: Vec<Image>,
     volumes: Vec<Vol>,
     networks: Vec<Net>,
-    live: HashMap<String, Arc<Live>>, // running containers' IO plumbing (not persisted)
+    live: HashMap<String, Arc<Live>>, // running containers' (and execs') IO plumbing (not persisted)
+    execs: HashMap<String, Exec>,     // exec id -> its spec
 }
 
 /// The serializable slice of [`Inner`] written to `DD_STATE`.
@@ -186,6 +197,9 @@ async fn main() {
         .route("/containers/:id/wait", post(containers_wait))
         .route("/containers/:id/logs", get(containers_logs))
         .route("/containers/:id/json", get(containers_inspect))
+        .route("/containers/:id/exec", post(exec_create))
+        .route("/exec/:id/start", post(exec_start))
+        .route("/exec/:id/json", get(exec_inspect))
         .route("/containers/:id", delete(containers_delete))
         .route("/volumes", get(volumes_list))
         .route("/volumes/create", post(volumes_create))
@@ -386,32 +400,23 @@ async fn containers_restart(a: State<App>, id: Path<String>) -> Response { conta
 /// POST /containers/:id/attach -- hijack the connection and stream the guest's IO. `docker run` (no -d)
 /// and `docker run -it` use this: stdout/stderr come back framed (raw in TTY mode), and the client's
 /// stdin (for -i) is fed to the guest. The hijacked stream closes when the guest exits.
-async fn containers_attach(State(a): State<App>, Path(id): Path<String>, req: Request) -> Response {
-    let (full, tty) = {
-        let g = a.inner.lock().await;
-        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
-        let tty = g.containers.get(&full).map(|c| c.tty).unwrap_or(false);
-        (full, tty)
-    };
-    let live = { let mut g = a.inner.lock().await; g.live.entry(full).or_insert_with(|| Live::new(tty)).clone() };
+/// Drive a hijacked docker stream against a Live: fan guest stdout/stderr to the client (docker
+/// multiplexed frames, or raw bytes in TTY mode) and feed the client's stdin into the guest. Shared by
+/// container attach and exec. `rx` is subscribed synchronously so no output is missed if the guest
+/// starts producing before the upgrade completes.
+fn spawn_hijack_io(on_upgrade: hyper::upgrade::OnUpgrade, live: Arc<Live>, tty: bool) {
     let mut rx = live.out.subscribe();
     let mut exit_rx = live.exit_rx.clone();
     let live_in = live.clone();
-    let dbg = std::env::var("DD_DEBUG").is_ok();
-    if dbg { eprintln!("[attach] entered, awaiting upgrade"); }
-    let on_upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
-        let upgraded = match on_upgrade.await { Ok(u) => u, Err(e) => { if dbg { eprintln!("[attach] upgrade err: {e}"); } return; } };
-        if dbg { eprintln!("[attach] upgraded"); }
+        let Ok(upgraded) = on_upgrade.await else { return };
         let (mut rd, mut wr) = tokio::io::split(TokioIo::new(upgraded));
-        // guest stdout/stderr -> client (framed unless TTY)
         let writer = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
                     m = rx.recv() => match m {
                         Ok((kind, chunk)) => {
-                            if dbg { eprintln!("[attach] chunk kind={kind} len={}", chunk.len()); }
                             let f = if tty { chunk } else { log_frame(kind, &chunk) };
                             if wr.write_all(&f).await.is_err() { return; }
                         }
@@ -419,7 +424,6 @@ async fn containers_attach(State(a): State<App>, Path(id): Path<String>, req: Re
                         Err(broadcast::error::RecvError::Closed) => break,
                     },
                     _ = exit_rx.changed() => {
-                        if dbg { eprintln!("[attach] exit signalled, draining+closing"); }
                         while let Ok((kind, chunk)) = rx.try_recv() {
                             let f = if tty { chunk } else { log_frame(kind, &chunk) };
                             let _ = wr.write_all(&f).await;
@@ -430,27 +434,91 @@ async fn containers_attach(State(a): State<App>, Path(id): Path<String>, req: Re
             }
             let _ = wr.flush().await;
             let _ = wr.shutdown().await;
-            if dbg { eprintln!("[attach] writer closed"); }
         });
-        // client stdin -> guest stdin (via the channel, which buffers until start connects it)
         let mut buf = [0u8; 8192];
         loop {
             match rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if live_in.stdin_tx.send(buf[..n].to_vec()).await.is_err() { break; }
-                }
+                Ok(n) => { if live_in.stdin_tx.send(buf[..n].to_vec()).await.is_err() { break; } }
             }
         }
-        let _ = live_in.stdin_tx.send(Vec::new()).await; // EOF sentinel -> close the guest's stdin
+        let _ = live_in.stdin_tx.send(Vec::new()).await; // EOF -> close guest stdin
         let _ = writer.await;
     });
-    Response::builder().status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("Content-Type", "application/vnd.docker.raw-stream")
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "tcp")
-        .body(Body::empty())
-        .unwrap()
+}
+
+const HIJACK_HEADERS: [(&str, &str); 3] =
+    [("Content-Type", "application/vnd.docker.raw-stream"), ("Connection", "Upgrade"), ("Upgrade", "tcp")];
+fn hijack_response() -> Response {
+    let mut b = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (k, v) in HIJACK_HEADERS { b = b.header(k, v); }
+    b.body(Body::empty()).unwrap()
+}
+
+async fn containers_attach(State(a): State<App>, Path(id): Path<String>, req: Request) -> Response {
+    let (full, tty) = {
+        let g = a.inner.lock().await;
+        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+        let tty = g.containers.get(&full).map(|c| c.tty).unwrap_or(false);
+        (full, tty)
+    };
+    let live = { let mut g = a.inner.lock().await; g.live.entry(full).or_insert_with(|| Live::new(tty)).clone() };
+    spawn_hijack_io(hyper::upgrade::on(req), live, tty);
+    hijack_response()
+}
+
+#[derive(Deserialize)]
+struct ExecCreateBody {
+    #[serde(rename = "Cmd")] cmd: Option<Vec<String>>,
+    #[serde(rename = "Tty")] tty: Option<bool>,
+}
+/// POST /containers/:id/exec -- create an exec (record the command). Run it with /exec/:id/start.
+async fn exec_create(State(a): State<App>, Path(id): Path<String>, Json(body): Json<ExecCreateBody>) -> Response {
+    let mut g = a.inner.lock().await;
+    let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+    let cmd = body.cmd.unwrap_or_default();
+    if cmd.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"message": "No exec command specified"}))).into_response();
+    }
+    let exec_id = new_id(&format!("exec-{full}"));
+    g.execs.insert(exec_id.clone(), Exec { container_id: full, cmd, tty: body.tty.unwrap_or(false), started: false });
+    (StatusCode::CREATED, Json(json!({"Id": exec_id}))).into_response()
+}
+/// POST /exec/:id/start -- run the exec command as a fresh JIT in the container's rootfs and stream its
+/// IO over the hijacked connection (same path as attach).
+async fn exec_start(State(a): State<App>, Path(id): Path<String>, req: Request) -> Response {
+    let (temp, vols, live, tty) = {
+        let mut g = a.inner.lock().await;
+        let Some(exec) = g.execs.get(&id).cloned() else {
+            return (StatusCode::NOT_FOUND, Json(json!({"message": format!("no such exec: {id}")}))).into_response();
+        };
+        let Some(c) = g.containers.get(&exec.container_id).cloned() else { return no_such(&exec.container_id) };
+        let mut temp = c; // share the container's rootfs/volumes/arch; distinct id -> own process+netns
+        temp.id = id.clone();
+        temp.cmd = exec.cmd.clone();
+        temp.tty = exec.tty;
+        let live = Live::new(exec.tty);
+        g.live.insert(id.clone(), live.clone());
+        if let Some(e) = g.execs.get_mut(&id) { e.started = true; }
+        (temp, g.volumes.clone(), live, exec.tty)
+    };
+    spawn_hijack_io(hyper::upgrade::on(req), live.clone(), tty); // subscribe before spawning
+    spawn_live(&a, &temp, &vols, live).await;
+    hijack_response()
+}
+/// GET /exec/:id/json -- exec inspect (Running / ExitCode), how the CLI learns the exec's result.
+async fn exec_inspect(State(a): State<App>, Path(id): Path<String>) -> Response {
+    let g = a.inner.lock().await;
+    let Some(exec) = g.execs.get(&id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(json!({"message": format!("no such exec: {id}")}))).into_response();
+    };
+    let (running, code) = match g.live.get(&id) {
+        Some(l) => match *l.exit_rx.borrow() { Some(c) => (false, c), None => (true, 0) },
+        None => (false, 0),
+    };
+    Json(json!({"ID": id, "Running": running, "ExitCode": code, "ContainerID": exec.container_id,
+        "ProcessConfig": {"tty": exec.tty, "entrypoint": exec.cmd.first().cloned().unwrap_or_default(),
+            "arguments": exec.cmd.get(1..).map(|s| s.to_vec()).unwrap_or_default()}})).into_response()
 }
 
 /// POST /containers/:id/wait -- block until the container exits, then return {"StatusCode": n}. CRITICAL:
