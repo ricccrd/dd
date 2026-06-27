@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dd — Documentation</title>
+<meta name="description" content="dd documentation: architecture, syscalls, optimizations, structure, rendering and roadmap." />
+<link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon.png" />
+<link rel="apple-touch-icon" href="./assets/apple-touch-icon.png" />
+<link rel="stylesheet" href="./styles.css" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css" />
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="./index.html"><img src="./assets/logo.png" alt="dd logo" /> dd</a>
+    <nav>
+      <a href="./index.html#features" class="hide-sm">Features</a>
+      <a href="./index.html#how" class="hide-sm">How it works</a>
+      <a href="./index.html#install">Install</a>
+      <a href="./docs.html">Docs</a>
+      <a class="btn btn-ghost" href="https://github.com/ricccrd/dd">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="docs-shell">
+    <aside class="docs-side">
+      <h4>Documentation</h4>
+      <nav id="doc-nav"></nav>
+    </aside>
+    <article class="markdown" id="doc-content">
+      <p style="color:var(--muted)">Loading…</p>
+    </article>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap footer-inner">
+    <span class="brand"><img src="./assets/logo.png" alt="dd" /> dd</span>
+    <span style="color:var(--muted-2)">Linux containers on macOS, no VM. MIT licensed.</span>
+    <nav>
+      <a href="./index.html">Home</a>
+      <a href="https://github.com/ricccrd/dd">GitHub</a>
+      <a href="mailto:huttarichard@gmail.com">Contact</a>
+    </nav>
+  </div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script>
+// Docs registry. Each file is copied next to this page (./docs/*.md) by the Pages workflow.
+const DOCS = [
+  { id: "README",        file: "README.md",        title: "Overview" },
+  { id: "ARCHITECTURE",  file: "ARCHITECTURE.md",  title: "Architecture" },
+  { id: "STRUCTURE",     file: "STRUCTURE.md",     title: "Code structure" },
+  { id: "SYSCALLS",      file: "SYSCALLS.md",      title: "Syscalls" },
+  { id: "OPTIMIZATIONS", file: "OPTIMIZATIONS.md", title: "Optimizations" },
+  { id: "RENDERING",     file: "RENDERING.md",     title: "GUI rendering" },
+  { id: "PLAN",          file: "PLAN.md",          title: "Roadmap" },
+];
+
+const nav = document.getElementById("doc-nav");
+const content = document.getElementById("doc-content");
+
+DOCS.forEach(d => {
+  const a = document.createElement("a");
+  a.textContent = d.title;
+  a.href = "?doc=" + d.id;
+  a.dataset.id = d.id;
+  nav.appendChild(a);
+});
+
+marked.setOptions({
+  highlight: (code, lang) => {
+    try {
+      if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
+      return hljs.highlightAuto(code).value;
+    } catch (e) { return code; }
+  },
+});
+
+function current() {
+  const q = new URLSearchParams(location.search).get("doc");
+  return DOCS.find(d => d.id === q) || DOCS[0];
+}
+
+async function render() {
+  const doc = current();
+  document.querySelectorAll("#doc-nav a").forEach(a =>
+    a.classList.toggle("active", a.dataset.id === doc.id));
+  document.title = "dd — " + doc.title;
+  try {
+    const res = await fetch("./docs/" + doc.file);
+    if (!res.ok) throw new Error(res.status);
+    let md = await res.text();
+    // README links to ./dd-jit/... etc. — point those at the GitHub repo.
+    content.innerHTML = marked.parse(md);
+    content.querySelectorAll("pre code").forEach(b => { try { hljs.highlightElement(b); } catch (e) {} });
+    window.scrollTo(0, 0);
+  } catch (e) {
+    content.innerHTML = "<h1>" + doc.title + "</h1><p style='color:var(--muted)'>Could not load <code>"
+      + doc.file + "</code>. View it on <a href='https://github.com/ricccrd/dd/tree/master/docs'>GitHub</a>.</p>";
+  }
+}
+
+window.addEventListener("popstate", render);
+document.getElementById("doc-nav").addEventListener("click", e => {
+  const a = e.target.closest("a"); if (!a) return;
+  e.preventDefault(); history.pushState({}, "", a.href); render();
+});
+render();
+</script>
+</body>
+</html>

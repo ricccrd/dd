@@ -1,0 +1,93 @@
+name: Release (build DMG + publish)
+
+# Builds the macOS app + DMG via the Nix dev shell on an Apple-Silicon runner and
+# attaches the .dmg to a GitHub Release.
+#
+# Trigger by pushing a version tag:
+#     git tag v0.1.0 && git push origin v0.1.0
+# or run it manually from the Actions tab (workflow_dispatch) with a version.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 0.1.0). Defaults to the tag."
+        required: false
+        default: "0.1.0"
+
+permissions:
+  contents: write   # create the release + upload assets
+
+jobs:
+  dmg:
+    # macos-14 = Apple Silicon (arm64). dd only targets arm64 macOS.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          REF="${GITHUB_REF#refs/tags/}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${REF#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building dd $V"
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: dmg-${{ steps.ver.outputs.version }}
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Cache the Nix store (GTK4 dev shell)
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Warm the dev shell (fetch GTK4 + tools)
+        run: nix develop "path:$PWD/nix" --command true
+
+      - name: Build the DMG
+        run: make dmg VERSION=${{ steps.ver.outputs.version }}
+
+      - name: Locate the DMG
+        id: dmg
+        run: |
+          DMG="$(ls target/dist/*.dmg | head -1)"
+          [ -n "$DMG" ] || { echo "no .dmg produced" >&2; exit 1; }
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
+          shasum -a 256 "$DMG"
+
+      - name: Upload DMG as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.dmg.outputs.name }}
+          path: ${{ steps.dmg.outputs.path }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: dd ${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: ${{ steps.dmg.outputs.path }}
+          body: |
+            ## dd ${{ steps.ver.outputs.version }}
+
+            Linux containers on macOS, with no VM. Apple-Silicon (arm64), macOS 12+.
+
+            ### Install
+            1. Download the `.dmg` below and drag **dd** to Applications.
+            2. The DMG is unsigned (ad-hoc). On first launch right-click the app → **Open**, or run
+               `xattr -dr com.apple.quarantine /Applications/dd-app.app` (`dd doctor` prints this too).
+            3. Open a terminal: `dd install` then `dd app`.

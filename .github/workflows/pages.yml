@@ -1,0 +1,52 @@
+name: Deploy website (GitHub Pages)
+
+# Builds the static site in website/ and publishes it to GitHub Pages.
+# The project docs (docs/*.md + README) are copied in so docs.html can render them.
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "website/**"
+      - "docs/**"
+      - "README.md"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; cancel in-progress runs of older commits.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage docs into the site
+        run: |
+          mkdir -p website/docs
+          cp docs/*.md website/docs/ 2>/dev/null || true
+          cp README.md website/docs/README.md
+          ls -la website website/docs
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
