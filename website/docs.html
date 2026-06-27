@@ -1,50 +1,72 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="scroll-smooth">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>dd — Documentation</title>
-<meta name="description" content="dd documentation: architecture, syscalls, optimizations, structure, rendering and roadmap." />
+<meta name="description" content="dd documentation: CLI, syscalls, optimizations, rendering and roadmap." />
 <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon.png" />
 <link rel="apple-touch-icon" href="./assets/apple-touch-icon.png" />
-<link rel="stylesheet" href="./styles.css" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: { ink:'#0c1322', panel:'#131c30', panel2:'#18233b', edge:'#25324d', blue1:'#97cdff', blue3:'#4f88ff', txt:'#e8eefc', muted:'#9fb0cd', muted2:'#7286a8' },
+    maxWidth: { wrap:'64rem' },
+  }}}
+</script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css" />
+<style>
+  /* prose styling for the marked.js output (Play CDN has no typography plugin) */
+  .md h1{font-size:1.9rem;font-weight:800;letter-spacing:-.02em;margin:0 0 .8rem;padding-bottom:.6rem;border-bottom:1px solid #25324d}
+  .md h2{font-size:1.4rem;font-weight:700;margin:2rem 0 .6rem}
+  .md h3{font-size:1.15rem;font-weight:600;margin:1.5rem 0 .5rem}
+  .md p,.md li{color:#9fb0cd;line-height:1.7}
+  .md a{color:#81b5ff}.md a:hover{text-decoration:underline}
+  .md ul,.md ol{padding-left:1.3rem;margin:.6rem 0}
+  .md code{background:#0a101e;padding:.1rem .35rem;border-radius:.35rem;font-family:ui-monospace,Menlo,monospace;font-size:.85em;color:#d7e3fa}
+  .md pre{background:#0a101e;border:1px solid #25324d;border-radius:.7rem;padding:1rem;overflow-x:auto;margin:1rem 0}
+  .md pre code{background:none;padding:0;color:#d7e3fa}
+  .md table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.9rem;display:block;overflow-x:auto}
+  .md th,.md td{border:1px solid #25324d;padding:.5rem .75rem;text-align:left;white-space:nowrap}
+  .md th{background:#131c30}
+  .md blockquote{border-left:3px solid #4a81ff;background:#131c30;margin:1rem 0;padding:.3rem 1rem;border-radius:0 .5rem .5rem 0}
+  .md img{max-width:100%}.md strong{color:#e8eefc}
+</style>
 </head>
-<body>
+<body class="bg-ink text-txt font-sans antialiased">
 
-<header class="nav">
-  <div class="wrap nav-inner">
-    <a class="brand" href="./index.html"><img src="./assets/logo.png" alt="dd logo" /> dd</a>
-    <nav>
-      <a href="./index.html#features" class="hide-sm">Features</a>
-      <a href="./index.html#how" class="hide-sm">How it works</a>
-      <a href="./index.html#install">Install</a>
-      <a href="./docs.html">Docs</a>
-      <a class="btn btn-ghost" href="https://github.com/ricccrd/dd">GitHub</a>
+<header class="sticky top-0 z-20 border-b border-edge bg-ink/70 backdrop-blur-md">
+  <div class="mx-auto flex h-14 max-w-wrap items-center gap-4 px-5">
+    <a href="./index.html" class="flex items-center gap-2 font-bold text-lg"><img src="./assets/logo.png" alt="" class="h-7 w-7 rounded-md" /> dd</a>
+    <nav class="ml-auto flex items-center gap-5 text-sm">
+      <a href="./index.html#features" class="hidden text-muted hover:text-txt sm:inline">Features</a>
+      <a href="./index.html#speed" class="hidden text-muted hover:text-txt sm:inline">Speed</a>
+      <a href="./index.html#start" class="text-muted hover:text-txt">Get&nbsp;started</a>
+      <a href="https://github.com/ricccrd/dd" class="rounded-lg border border-edge px-3 py-1.5 font-semibold hover:border-blue3">GitHub</a>
     </nav>
   </div>
 </header>
 
-<div class="wrap">
-  <div class="docs-shell">
-    <aside class="docs-side">
-      <h4>Documentation</h4>
-      <nav id="doc-nav"></nav>
+<div class="mx-auto max-w-wrap px-5 py-8">
+  <div class="grid gap-8 md:grid-cols-[13rem_1fr]">
+    <aside class="md:sticky md:top-20 md:self-start">
+      <h4 class="mb-3 hidden text-xs font-semibold uppercase tracking-wider text-muted2 md:block">Documentation</h4>
+      <nav id="doc-nav" class="flex gap-2 overflow-x-auto pb-2 md:flex-col md:gap-1 md:overflow-visible md:pb-0"></nav>
     </aside>
-    <article class="markdown" id="doc-content">
-      <p style="color:var(--muted)">Loading…</p>
+    <article id="doc-content" class="md min-w-0">
+      <p class="text-muted">Loading…</p>
     </article>
   </div>
 </div>
 
-<footer>
-  <div class="wrap footer-inner">
-    <span class="brand"><img src="./assets/logo.png" alt="dd" /> dd</span>
-    <span style="color:var(--muted-2)">Linux containers on macOS, no VM. MIT licensed.</span>
-    <nav>
-      <a href="./index.html">Home</a>
-      <a href="https://github.com/ricccrd/dd">GitHub</a>
-      <a href="mailto:huttarichard@gmail.com">Contact</a>
+<footer class="border-t border-edge px-5 py-10 text-muted2">
+  <div class="mx-auto flex max-w-wrap flex-wrap items-center gap-4">
+    <span class="flex items-center gap-2 font-bold text-txt"><img src="./assets/logo.png" alt="" class="h-6 w-6 rounded-md" /> dd</span>
+    <span class="text-sm">Linux containers on macOS, no VM. MIT licensed.</span>
+    <nav class="flex gap-5 text-sm sm:ml-auto">
+      <a href="./index.html" class="text-muted hover:text-txt">Home</a>
+      <a href="https://github.com/ricccrd/dd" class="text-muted hover:text-txt">GitHub</a>
+      <a href="mailto:huttarichard@gmail.com" class="text-muted hover:text-txt">Contact</a>
     </nav>
   </div>
 </footer>
@@ -65,12 +87,14 @@ const DOCS = [
 
 const nav = document.getElementById("doc-nav");
 const content = document.getElementById("doc-content");
+const baseLink = "flex-none whitespace-nowrap rounded-lg px-3 py-1.5 text-sm md:block";
 
 DOCS.forEach(d => {
   const a = document.createElement("a");
   a.textContent = d.title;
   a.href = "?doc=" + d.id;
   a.dataset.id = d.id;
+  a.className = baseLink;
   nav.appendChild(a);
 });
 
@@ -90,25 +114,26 @@ function current() {
 
 async function render() {
   const doc = current();
-  document.querySelectorAll("#doc-nav a").forEach(a =>
-    a.classList.toggle("active", a.dataset.id === doc.id));
+  document.querySelectorAll("#doc-nav a").forEach(a => {
+    const on = a.dataset.id === doc.id;
+    a.className = baseLink + (on ? " bg-panel2 text-txt" : " text-muted hover:bg-panel hover:text-txt");
+  });
   document.title = "dd — " + doc.title;
   try {
     const res = await fetch("./docs/" + doc.file);
     if (!res.ok) throw new Error(res.status);
-    let md = await res.text();
-    // README links to ./dd-jit/... etc. — point those at the GitHub repo.
+    const md = await res.text();
     content.innerHTML = marked.parse(md);
     content.querySelectorAll("pre code").forEach(b => { try { hljs.highlightElement(b); } catch (e) {} });
     window.scrollTo(0, 0);
   } catch (e) {
-    content.innerHTML = "<h1>" + doc.title + "</h1><p style='color:var(--muted)'>Could not load <code>"
-      + doc.file + "</code>. View it on <a href='https://github.com/ricccrd/dd/tree/main/docs'>GitHub</a>.</p>";
+    content.innerHTML = "<h1>" + doc.title + "</h1><p>Could not load <code>" + doc.file
+      + "</code>. View it on <a href='https://github.com/ricccrd/dd/tree/main/docs'>GitHub</a>.</p>";
   }
 }
 
 window.addEventListener("popstate", render);
-document.getElementById("doc-nav").addEventListener("click", e => {
+nav.addEventListener("click", e => {
   const a = e.target.closest("a"); if (!a) return;
   e.preventDefault(); history.pushState({}, "", a.href); render();
 });
