@@ -481,6 +481,21 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
     // fallback: realpath-confine the last hop
     return buf;
 }
+
+// Resolve a bare program name (no '/') against the container PATH, like execvp -- docker passes `sh`,
+// not `/bin/sh`. Returns a guest path ("/bin/sh") that exists in the rootfs, or `prog` unchanged.
+static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
+    if (!prog || strchr(prog, '/')) return prog;
+    static const char *const dirs[] = {"/usr/local/sbin", "/usr/local/bin", "/usr/sbin",
+                                       "/usr/bin",        "/sbin",          "/bin", NULL};
+    char hb[4200];
+    for (int i = 0; dirs[i]; i++) {
+        snprintf(gbuf, n, "%s/%s", dirs[i], prog);
+        if (access(xresolve_exec(gbuf, hb, sizeof hb), X_OK) == 0) return gbuf;
+    }
+    snprintf(gbuf, n, "/bin/%s", prog); // not found anywhere: let the loader report the error against /bin
+    return gbuf;
+}
 // TOCTOU-FREE confinement. Resolve `guest` (absolute) one component at a time on PINNED dir-fds,
 // never following a symlink out of the jail. Returns a fresh dir-fd to the confined parent (caller
 // closes) + the final component in `final`. -1 on escape/error. No check/use gap: each step

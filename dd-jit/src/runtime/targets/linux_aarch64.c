@@ -289,6 +289,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
 
     g_trace = getenv("JT") != NULL;
     g_prof = getenv("PROF") != NULL;
+    char gb[1024];
+    prog = find_in_path(prog, gb, sizeof gb); // bare "sh" (docker) -> "/bin/sh" via the container PATH
     g_exe_path = prog;
     char pb[4200];
     const char *prog_host =

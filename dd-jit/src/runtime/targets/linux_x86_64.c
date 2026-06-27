@@ -187,6 +187,8 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGBUS, &sa, NULL);
     }
+    char gb[1024];
+    prog = find_in_path(prog, gb, sizeof gb); // bare "sh" (docker) -> "/bin/sh" via the container PATH
     g_exe_path = prog;
 
     char pb[4200];
