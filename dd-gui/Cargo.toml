@@ -1,0 +1,30 @@
+[package]
+name = "dd-gui"
+version = "0.1.0"
+edition = "2021"
+description = "dd-app — a GTK4/libadwaita desktop UI for the dd VM-less container runtime."
+license = "MIT"
+
+[[bin]]
+name = "dd-app"
+path = "src/main.rs"
+
+[dependencies]
+dd-client = { path = "../dd-client" }
+# GUI stack (GTK4 via Relm4). Needs pkg-config + the GTK4 dev libs at build time, which only
+# exist on the macOS host (via the Nix devShell in ./nix) — that's why dd-gui is excluded from
+# the workspace default-members. Build with `make app` there.
+#
+# NOTE: libadwaita is intentionally NOT used: its `appstream` dependency fails to build under
+# nixpkgs on aarch64-darwin. GTK4 ships the Adwaita *theme* internally, so the UI still looks
+# native without the libadwaita *library*.
+relm4 = "0.9"
+gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+tokio = { version = "1", features = ["time", "process"] }
+
+# Native AppKit shim to give the window a unified macOS title bar (full-size content view +
+# transparent titlebar) so the traffic lights float over our content — no separate title bar.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWindow", "NSResponder", "NSView"] }

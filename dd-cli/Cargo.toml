@@ -1,0 +1,17 @@
+[package]
+name = "dd-cli"
+version = "0.1.0"
+edition = "2021"
+description = "The `dd` command — launch the dd-app GUI and install the daemon + docker context without root."
+license = "MIT"
+
+[[bin]]
+name = "dd"
+path = "src/main.rs"
+
+[dependencies]
+dd-client = { path = "../dd-client" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+sha2 = "0.10"

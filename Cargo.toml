@@ -1,4 +1,11 @@
 # dd — VM-less Linux container runtime on macOS. Cargo workspace.
 [workspace]
 resolver = "2"
-members = ["dd-jit", "dd-daemon", "dd-tests"]
+members = ["dd-jit", "dd-daemon", "dd-tests", "dd-client", "dd-cli", "dd-gui"]
+# dd-gui pulls in GTK4/libadwaita (pkg-config), which isn't present on the Linux dev host.
+# Keep it out of the default set so a bare `cargo build` works everywhere; build it
+# explicitly with `cargo build -p dd-gui` (or `make app`) on the macOS host.
+default-members = ["dd-jit", "dd-daemon", "dd-tests", "dd-client", "dd-cli"]
+
+[profile.release]
+opt-level = 2

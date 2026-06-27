@@ -46,15 +46,24 @@ impl Guest {
         }
     }
 
-    /// Absolute path to the JIT binary, or `None` if `build.rs` couldn't build it (missing toolchain /
-    /// `mac` bridge). Baked in at compile time.
-    pub fn jit_path(self) -> Option<&'static str> {
+    /// Absolute path to the JIT binary, or `None` if it can't be located.
+    ///
+    /// Resolution order: a runtime `$DDJIT_DIR/ddjit-<target>` (used by the packaged `.app`, whose
+    /// LaunchAgent points `DDJIT_DIR` at `Contents/Resources`), then the path `build.rs` baked in at
+    /// compile time (the dev/`cargo` layout). Returns `None` if neither exists.
+    pub fn jit_path(self) -> Option<String> {
+        if let Ok(dir) = std::env::var("DDJIT_DIR") {
+            let cand = format!("{dir}/ddjit-{}", self.target());
+            if Path::new(&cand).exists() {
+                return Some(cand);
+            }
+        }
         let p = match self {
             Guest::LinuxAarch64 => env!("DDJIT_LINUX_AARCH64"),
             Guest::LinuxX86_64 => env!("DDJIT_LINUX_X86_64"),
             Guest::DarwinAarch64 => env!("DDJIT_DARWIN_AARCH64"),
         };
-        if p.is_empty() { None } else { Some(p) }
+        if p.is_empty() { None } else { Some(p.to_string()) }
     }
 }
 
@@ -162,7 +171,7 @@ impl SpawnConfig {
 
 /// True if the JIT binary for `guest` was built and exists.
 pub fn available(guest: Guest) -> bool {
-    guest.jit_path().map(|p| Path::new(p).exists()).unwrap_or(false)
+    guest.jit_path().map(|p| Path::new(&p).exists()).unwrap_or(false)
 }
 
 #[cfg(test)]

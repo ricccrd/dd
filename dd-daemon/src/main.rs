@@ -34,6 +34,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use hyper_util::rt::TokioIo;
 
+mod registry;
+use registry::{Client, Credentials, ImageRef};
+
 const API_VERSION: &str = "1.43";
 
 #[derive(Clone)]
@@ -309,20 +312,27 @@ async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Respon
 struct ImageCreateQ { #[serde(rename = "fromImage")] from_image: Option<String>, #[serde(rename = "tag")] tag: Option<String> }
 /// POST /images/create -- `docker pull`. If the image isn't local, pull it from Docker Hub (real OCI
 /// registry: token -> manifest -> layers) and unpack it into a rootfs, then register it.
-async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>) -> Response {
+async fn images_create(State(a): State<App>, Query(q): Query<ImageCreateQ>, headers: axum::http::HeaderMap) -> Response {
     let name = q.from_image.unwrap_or_default();
     let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
     if name.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"}))).into_response(); }
     if a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name)) {
         return pull_progress(&name, &tag, Ok(true));
     }
+    let creds = registry_auth(&headers);
     let (dir, nm, tg) = (a.images_dir.clone(), name.clone(), tag.clone());
-    let res = tokio::task::spawn_blocking(move || pull_image(&dir, &nm, &tg)).await
+    let res = tokio::task::spawn_blocking(move || pull_image(&dir, &nm, &tg, creds)).await
         .unwrap_or_else(|e| Err(format!("pull task crashed: {e}")));
     match res {
         Ok(img) => { a.inner.lock().await.images.push(img); pull_progress(&name, &tag, Ok(false)) }
         Err(e) => pull_progress(&name, &tag, Err(e)),
     }
+}
+
+/// Decode the CLI's `X-Registry-Auth` header (base64 JSON credentials) into [`Credentials`].
+fn registry_auth(headers: &axum::http::HeaderMap) -> Credentials {
+    headers.get("X-Registry-Auth").and_then(|v| v.to_str().ok())
+        .and_then(Credentials::from_x_registry_auth).unwrap_or_default()
 }
 
 /// docker-style pull progress: a stream of JSON status lines the CLI renders.
@@ -341,74 +351,37 @@ fn pull_progress(name: &str, tag: &str, result: Result<bool, String>) -> Respons
     (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
 }
 
-/// Normalize a docker reference to (Hub repo path, tag): `ubuntu` -> (`library/ubuntu`, `latest`);
-/// `user/app:1` -> (`user/app`, `1`); strips a `docker.io/` prefix.
-fn normalize_repo(name: &str, default_tag: &str) -> (String, String) {
-    let s = name.strip_prefix("docker.io/").unwrap_or(name);
-    let (path, tag) = match s.rsplit_once(':') {
-        Some((p, t)) if !t.contains('/') => (p.to_string(), t.to_string()),
-        _ => (s.to_string(), default_tag.to_string()),
-    };
-    let repo = if path.contains('/') { path } else { format!("library/{path}") };
-    (repo, tag)
+/// Build an [`ImageRef`] from docker's separate `fromImage` + `tag` params (tag overrides any in the ref).
+fn image_ref(from_image: &str, tag: &str) -> ImageRef {
+    let mut r = ImageRef::parse(from_image);
+    if !tag.is_empty() { r.tag = tag.to_string(); }
+    r
 }
 
-/// GET a registry URL with curl and parse the JSON body.
-fn curl_json(url: &str, headers: &[&str]) -> Result<Value, String> {
-    let mut c = std::process::Command::new("curl");
-    c.arg("-sSL").arg("--max-time").arg("120");
-    for h in headers { c.arg("-H").arg(h); }
-    c.arg(url);
-    let out = c.output().map_err(|e| format!("curl: {e}"))?;
-    if !out.status.success() { return Err(format!("curl {url}: {}", String::from_utf8_lossy(&out.stderr))); }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("bad JSON from {url}: {e}"))
+/// Pull an image from its registry (any registry) and unpack it under `<images_dir>/<safe>/rootfs`,
+/// preferring the linux/arm64 variant (native; falls back to amd64). Returns the registered [`Image`].
+fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials) -> Result<Image, String> {
+    let iref = image_ref(from_image, tag);
+    let rootfs = std::path::PathBuf::from(format!("{images_dir}/{}/rootfs", safe_name(&iref)));
+    let pulled = Client::new(iref.clone(), creds).pull(&rootfs, &["arm64", "amd64"])?;
+    let arch = detect_arch(&rootfs).ok_or("could not detect the image architecture")?;
+    let cmd = config_cmd(&pulled.config).unwrap_or_else(|| default_shell(&rootfs));
+    Ok(Image { name: iref.canonical(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd })
 }
 
-/// Pull `name:tag` from Docker Hub and unpack it into `<images_dir>/<safe>/rootfs`. Picks the
-/// linux/arm64 variant of a multi-arch image (the native arch; falls back to amd64). curl + tar, so no
-/// extra crates. Whiteouts (`.wh.*`) are applied per layer.
-fn pull_image(images_dir: &str, name: &str, tag: &str) -> Result<Image, String> {
-    let (repo, tag) = normalize_repo(name, tag);
-    let tok = curl_json(
-        &format!("https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"), &[])?;
-    let token = tok["token"].as_str().ok_or("registry returned no token")?;
-    let auth = format!("Authorization: Bearer {token}");
-    let accept = "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json";
-    let mut man = curl_json(&format!("https://registry-1.docker.io/v2/{repo}/manifests/{tag}"), &[&auth, accept])?;
-    if let Some(list) = man["manifests"].as_array().cloned() {
-        let pick = |arch: &str| list.iter().find(|m| m["platform"]["architecture"] == arch && m["platform"]["os"] == "linux")
-            .and_then(|m| m["digest"].as_str().map(str::to_string));
-        let digest = pick("arm64").or_else(|| pick("amd64"))
-            .ok_or("no linux/arm64 or linux/amd64 in the manifest list")?;
-        man = curl_json(&format!("https://registry-1.docker.io/v2/{repo}/manifests/{digest}"), &[&auth, accept])?;
-    }
-    let layers = man["layers"].as_array().ok_or("manifest has no layers")?.clone();
-    if layers.is_empty() { return Err("manifest has no layers".into()); }
-    let safe = name.replace(['/', ':'], "_");
-    let imgdir = format!("{images_dir}/{safe}");
-    let rootfs = format!("{imgdir}/rootfs");
-    let _ = std::fs::remove_dir_all(&imgdir);
-    std::fs::create_dir_all(&rootfs).map_err(|e| format!("mkdir {rootfs}: {e}"))?;
-    for layer in &layers {
-        let digest = layer["digest"].as_str().ok_or("layer missing digest")?;
-        let url = format!("https://registry-1.docker.io/v2/{repo}/blobs/{digest}");
-        // stream the gzipped-tar layer straight into the rootfs, then apply this layer's whiteouts
-        let script = format!(
-            "set -o pipefail; curl -sSL --max-time 600 -H '{auth}' '{url}' | tar xz -C '{rootfs}' 2>/dev/null; \
-             find '{rootfs}' -name '.wh.*' 2>/dev/null | while IFS= read -r w; do \
-               d=$(dirname \"$w\"); b=$(basename \"$w\"); \
-               if [ \"$b\" = .wh..wh..opq ]; then rm -f \"$w\"; else rm -rf \"$d/${{b#.wh.}}\"; rm -f \"$w\"; fi; done");
-        let st = std::process::Command::new("sh").arg("-c").arg(&script).status().map_err(|e| format!("extract: {e}"))?;
-        if !st.success() { return Err(format!("failed to unpack layer {digest}")); }
-    }
-    let arch = detect_arch(std::path::Path::new(&rootfs)).ok_or("could not detect the image architecture")?;
-    let cmd = image_default_cmd(std::path::Path::new(&rootfs));
-    Ok(Image { name: name.to_string(), rootfs, arch, cmd })
-}
+/// A filesystem-safe directory name for an image reference.
+fn safe_name(r: &ImageRef) -> String { r.canonical().replace(['/', ':'], "_") }
 
-/// Best-effort default command for a freshly pulled image (the registry config blob isn't fetched yet):
-/// prefer /bin/sh, else /bin/bash.
-fn image_default_cmd(rootfs: &std::path::Path) -> Vec<String> {
+/// The image's default command from its OCI config blob (Entrypoint ++ Cmd), if present.
+fn config_cmd(config: &Value) -> Option<Vec<String>> {
+    let strs = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
+    let entry = strs(&config["config"]["Entrypoint"]).unwrap_or_default();
+    let cmd = strs(&config["config"]["Cmd"]).unwrap_or_default();
+    let argv: Vec<String> = entry.into_iter().chain(cmd).collect();
+    (!argv.is_empty()).then_some(argv)
+}
+/// Fallback default command for an image whose config has no Cmd: prefer /bin/sh, else /bin/bash.
+fn default_shell(rootfs: &std::path::Path) -> Vec<String> {
     for sh in ["/bin/sh", "/bin/bash"] {
         if rootfs.join(sh.trim_start_matches('/')).exists() { return vec![sh.to_string()]; }
     }
@@ -678,12 +651,39 @@ async fn image_delete(State(a): State<App>, Path(name): Path<String>) -> Respons
 }
 /// POST /images/:name/push -- dd has no registry yet (images are local), so this is a clean no-op that
 /// reports success rather than erroring. TODO(OCI): real registry push.
-async fn image_push(State(a): State<App>, Path(name): Path<String>) -> Response {
-    let found = a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name));
-    if !found { return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response(); }
-    let body = format!("{}\r\n{}\r\n",
-        json!({ "status": format!("The push refers to repository [{name}]") }),
-        json!({ "status": "dd: local-only image (no registry configured); nothing to push" }));
+/// POST /images/:name/push -- re-tar the local rootfs into a single-layer image and upload it to its
+/// registry (`docker.io/...`, `ghcr.io/...`, `localhost:5000/...`) using the CLI's credentials.
+async fn image_push(State(a): State<App>, Path(name): Path<String>, Query(q): Query<PushQ>, headers: axum::http::HeaderMap) -> Response {
+    let img = a.inner.lock().await.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)).cloned();
+    let Some(img) = img else {
+        return push_progress(&name, Err(format!("No such image: {name}"))).into_response();
+    };
+    let tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
+    let iref = image_ref(&name, &tag);
+    let arch = docker_arch(img.arch).to_string();
+    let creds = registry_auth(&headers);
+    let work = std::path::PathBuf::from(format!("{}/.push-{}", a.images_dir, std::process::id()));
+    let res = tokio::task::spawn_blocking(move || {
+        Client::new(iref, creds).push(std::path::Path::new(&img.rootfs), &img.cmd, &arch, &work)
+    }).await.unwrap_or_else(|e| Err(format!("push task crashed: {e}")));
+    push_progress(&name, res).into_response()
+}
+
+#[derive(Deserialize)]
+struct PushQ { tag: Option<String> }
+/// docker arch label for a guest target.
+fn docker_arch(g: Guest) -> &'static str { if g.arch() == "x86_64" { "amd64" } else { "arm64" } }
+
+/// docker-style push progress (a stream of JSON status lines, or an error line).
+fn push_progress(name: &str, result: Result<String, String>) -> Response {
+    let body = match result {
+        Ok(digest) => [
+            json!({ "status": format!("The push refers to repository [{name}]") }).to_string(),
+            json!({ "status": "Pushed" }).to_string(),
+            json!({ "status": format!("latest: digest: {digest}") }).to_string(),
+        ].join("\r\n") + "\r\n",
+        Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
+    };
     (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
 }
 
