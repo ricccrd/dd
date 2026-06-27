@@ -1406,6 +1406,7 @@ static void service(struct cpu *c) {
     case 215: {
         // munmap
         int r = munmap((void *)a0, (size_t)a1);
+        if (r == 0) gmap_del(a0); // drop from the execve() teardown registry
         if (r == 0 && g_mem_max) {
             // uncharge (clamp >=0)
             uint64_t cur = atomic_load(&g_mem_charged), d = (uint64_t)a1;
@@ -1448,6 +1449,7 @@ static void service(struct cpu *c) {
                        (off_t)a5);
         // refund
         if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
+        if (r != MAP_FAILED) gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
         G_RET(c) = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -1735,6 +1737,18 @@ static void service(struct cpu *c) {
                 ac = ni;
             }
         }
+        // Tear down the inherited guest address space before loading the new image: a post-fork exec
+        // otherwise keeps the parent's DENSE layout, and load_elf must bias a non-PIE ET_EXEC off its
+        // fixed vaddr (__PAGEZERO blocks the low 4 GB) -> its baked absolute refs collide -> SIGSEGV.
+        // argv + path live in guest memory we're about to munmap, so copy them to the host heap first.
+        char *xpath = strdup(p);
+        char *xargv[256];
+        for (int i = 0; i < ac && i < 255; i++) xargv[i] = strdup(argv[i]);
+        xargv[ac < 255 ? ac : 255] = NULL;
+        gmap_reset_all();
+        p = xpath;
+        for (int i = 0; i < ac && i < 255; i++) argv[i] = xargv[i];
+        argv[ac < 255 ? ac : 255] = NULL;
         struct loaded lm;
         load_elf(p, &lm);
         uint64_t jump = lm.entry, at_base = 0;
@@ -1756,9 +1770,12 @@ static void service(struct cpu *c) {
         // execve: drop IBTC + §B shadow (old image)
         G_SHADOW_RESET(c);
         uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        gmap_add((uint64_t)heap, 256u << 20);
         brk_lo = brk_cur = (uint64_t)heap;
         brk_hi = brk_lo + (256u << 20);
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
+        free(xpath);
+        for (int i = 0; i < ac && i < 255; i++) free(xargv[i]);
         G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;

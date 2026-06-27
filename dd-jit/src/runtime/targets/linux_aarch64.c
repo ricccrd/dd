@@ -199,10 +199,15 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     // USER ns (process.user)
     }
     if (getenv("CRASHDBG")) {
+        // SA_ONSTACK + an alternate signal stack so the handler survives a corrupted/overflowed guest
+        // stack (otherwise diag_crash double-faults and the process is signal-killed before it can report).
+        static char altstk[64 * 1024];
+        stack_t ss = {.ss_sp = altstk, .ss_size = sizeof altstk, .ss_flags = 0};
+        sigaltstack(&ss, NULL);
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
         sa.sa_sigaction = diag_crash;
-        sa.sa_flags = SA_SIGINFO;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGBUS, &sa, NULL);
         install_mach_exc();
@@ -317,6 +322,7 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     }
 
     uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    gmap_add((uint64_t)heap, 256u << 20); // track so a later execve() can reclaim the inherited heap
     brk_lo = brk_cur = (uint64_t)heap;
     brk_hi = brk_lo + (256u << 20);
 

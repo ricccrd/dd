@@ -74,6 +74,7 @@ static void load_elf(const char *path, struct loaded *out) {
         perror("mmap base");
         exit(1);
     }
+    gmap_add((uint64_t)base, span); // track so execve() can reclaim the inherited image
     uint64_t bias = (uint64_t)base - basepage;
     for (int i = 0; i < phnum; i++) {
         uint8_t *ph = f + phoff + (uint64_t)i * phentsize;
@@ -113,6 +114,7 @@ static char *g_guest_env[] = {
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base) {
     size_t SZ = 8u << 20;
     uint8_t *stk = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    gmap_add((uint64_t)stk, SZ); // track so execve() can reclaim the inherited stack
     uint8_t *top = stk + SZ;
     uint64_t argp[256], envp_[256];
     int envc = 0;

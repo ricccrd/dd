@@ -57,6 +57,28 @@ static int g_eventfd_peer[1024];
 // eventfd accumulating counter: write() adds, read() returns + resets (the pipe is only readiness)
 static uint64_t g_eventfd_count[1024];
 static uint8_t g_eventfd_sema[1024]; // EFD_SEMAPHORE: read() returns 1 and decrements by 1, not the whole counter
+
+// Guest address-space registry. Every guest mapping (ELF image, interp, heap, stack, anon/file mmap) is
+// tracked so execve() can tear the inherited space down before loading the new image. Without this a
+// post-fork exec keeps the PARENT's dense layout, and load_elf must bias a non-PIE ET_EXEC off its fixed
+// vaddr (macOS __PAGEZERO reserves the low 4 GB) -> the image's baked absolute refs collide with the
+// densely-packed inherited maps -> SIGSEGV. Resetting reproduces the clean fresh-exec layout that works.
+static struct { uint64_t addr, len; } g_gmap[1024];
+static int g_ngmap;
+static void gmap_add(uint64_t addr, uint64_t len) {
+    if (!addr || addr == (uint64_t)-1 || len == 0 || g_ngmap >= 1024) return;
+    g_gmap[g_ngmap].addr = addr;
+    g_gmap[g_ngmap].len = len;
+    g_ngmap++;
+}
+static void gmap_del(uint64_t addr) {
+    for (int i = 0; i < g_ngmap; i++)
+        if (g_gmap[i].addr == addr) { g_gmap[i] = g_gmap[--g_ngmap]; return; }
+}
+static void gmap_reset_all(void) { // munmap every tracked guest mapping; the caller reloads fresh
+    for (int i = 0; i < g_ngmap; i++) munmap((void *)g_gmap[i].addr, (size_t)g_gmap[i].len);
+    g_ngmap = 0;
+}
 // fd is a timerfd (a kqueue with an EVFILT_TIMER) -> read() drains it
 static uint8_t g_timerfd[1024];
 // fd is an inotify (a kqueue with EVFILT_VNODE watches) -> read() drains it

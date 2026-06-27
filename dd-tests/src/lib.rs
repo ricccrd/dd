@@ -43,10 +43,19 @@ impl Engine {
 
 /// How a case's guest binary is obtained for a given engine.
 pub enum Bin {
-    /// Compile a Linux/aarch64 C source under `guests/` (native gcc -static-pie).
+    /// Compile a Linux C source under `guests/` (gcc -static-pie, per Linux arch). Linux engines only.
     Source(&'static str),
+    /// A portable POSIX C source under `guests/` built for *every* engine: gcc -static-pie for the two
+    /// Linux engines, clang (full libSystem) Mach-O for darwin. The one source proves the behaviour is
+    /// identical on Linux (JIT-emulated) and macOS (native under darwinjail) — so coverage isn't
+    /// Linux-only. Checks must be golden (deterministic stdout/exit), since darwin has no native oracle.
+    Portable(&'static str),
     /// Compile a macOS/aarch64 Mach-O C source under `guests/darwin/` (mac clang).
     DarwinSource(&'static str),
+    /// A macOS-only C source (path relative to `guests/`, e.g. `darwin/kqueue.c`) built with the full
+    /// libSystem (normal C runtime + main) and run on the darwin engine. For BSD/Mach-only APIs
+    /// (kqueue, sysctl, mach_*) that have no Linux form — the darwin counterpart to a Linux-only `src`.
+    DarwinLibc(&'static str),
     /// Prebuilt fixture binaries, one per engine that has one.
     Fixture(&'static [(Engine, &'static str)]),
     /// The guest program is already inside the rootfs; `args[0]` names it (e.g. `/bin/sh`).
@@ -86,7 +95,9 @@ pub fn group(name: &'static str, cases: Vec<Case>) -> Group { Group { name, case
 fn base(name: &'static str, bin: Bin) -> Case {
     let engines = match &bin {
         Bin::Source(_) => vec![Engine::LinuxAarch64, Engine::LinuxX86_64], // same source, both Linux engines
+        Bin::Portable(_) => Engine::ALL.to_vec(),                          // every engine: Linux x2 + darwin
         Bin::DarwinSource(_) => vec![Engine::DarwinAarch64],
+        Bin::DarwinLibc(_) => vec![Engine::DarwinAarch64],
         Bin::Fixture(fx) => fx.iter().map(|(e, _)| *e).collect(),
         Bin::InRootfs => vec![Engine::LinuxAarch64], // container rootfs fixtures are aarch64 today
     };
@@ -94,8 +105,14 @@ fn base(name: &'static str, bin: Bin) -> Case {
 }
 /// A case whose guest is compiled from a Linux/aarch64 C source under `guests/`.
 pub fn src(name: &'static str, source: &'static str) -> Case { base(name, Bin::Source(source)) }
+/// A case whose guest is a portable POSIX source under `guests/`, run on EVERY engine (Linux x2 +
+/// darwin). Use golden checks — the same deterministic output must appear on Linux and macOS.
+pub fn port(name: &'static str, source: &'static str) -> Case { base(name, Bin::Portable(source)) }
 /// A case whose guest is compiled from a macOS/aarch64 Mach-O C source under `guests/darwin/`.
 pub fn darwin_src(name: &'static str, source: &'static str) -> Case { base(name, Bin::DarwinSource(source)) }
+/// A macOS-only case (source path relative to `guests/`, e.g. `darwin/kqueue.c`), full-libSystem, run
+/// on the darwin engine only. For BSD/Mach APIs with no Linux equivalent. Golden-checked.
+pub fn darwin_libc(name: &'static str, source: &'static str) -> Case { base(name, Bin::DarwinLibc(source)) }
 /// A case whose guest is a prebuilt fixture, per engine.
 pub fn fixture(name: &'static str, fx: &'static [(Engine, &'static str)]) -> Case { base(name, Bin::Fixture(fx)) }
 /// A case that runs a program already inside the rootfs (e.g. busybox); `a` is the full argv.
@@ -196,8 +213,14 @@ fn provision(ctx: &Ctx, c: &Case, e: Engine) -> Result<Option<String>, String> {
     match &c.bin {
         Bin::Source(s) if e.can_compile() => compile(ctx, s, e).map(Some),
         Bin::Source(_) => Ok(None),
+        // portable POSIX: Linux engines via gcc (same as Source), darwin via clang+libSystem.
+        Bin::Portable(s) if e.can_compile() => compile(ctx, s, e).map(Some),
+        Bin::Portable(s) if e == Engine::DarwinAarch64 => compile_darwin_libc(ctx, s).map(Some),
+        Bin::Portable(_) => Ok(None),
         Bin::DarwinSource(s) if e == Engine::DarwinAarch64 => compile_darwin(ctx, s).map(Some),
         Bin::DarwinSource(_) => Ok(None),
+        Bin::DarwinLibc(s) if e == Engine::DarwinAarch64 => compile_darwin_libc(ctx, s).map(Some),
+        Bin::DarwinLibc(_) => Ok(None),
         Bin::Fixture(fx) => Ok(fx.iter().find(|(fe, _)| *fe == e).map(|(_, p)| resolve(ctx, p))),
         Bin::InRootfs => Ok(Some(String::new())), // nothing to build; argv[0] is in-rootfs
     }
@@ -219,6 +242,24 @@ fn compile_darwin(ctx: &Ctx, source: &str) -> Result<String, String> {
                 else { Command::new("mac").arg("bash").arg("-lc").arg(&script).output() }
             .map_err(|e| format!("mac clang spawn: {e}"))?;
         if !o.status.success() { return Err(format!("compile darwin/{source}: {}", String::from_utf8_lossy(&o.stderr).trim())); }
+    }
+    Ok(out.to_string_lossy().into_owned())
+}
+/// Compile a *portable* guest from `guests/<source>` as a normal macOS/arm64 Mach-O linked against the
+/// full libSystem (real C runtime + main), cached under cache/darwin/. Runs natively under darwinjail —
+/// so the same POSIX source that runs on the Linux engines also runs (un-emulated) on macOS.
+fn compile_darwin_libc(ctx: &Ctx, source: &str) -> Result<String, String> {
+    let src = ctx.guests.join(source);
+    let out = ctx.cache.join("darwin").join(source.trim_end_matches(".c"));
+    std::fs::create_dir_all(out.parent().unwrap()).ok();
+    let fresh = std::fs::metadata(&out).and_then(|m| m.modified()).ok()
+        >= std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+    if !out.exists() || !fresh {
+        let script = format!("clang -arch arm64 -O2 -o '{}' '{}'", out.display(), src.display());
+        let o = if cfg!(target_os = "macos") { Command::new("bash").arg("-lc").arg(&script).output() }
+                else { Command::new("mac").arg("bash").arg("-lc").arg(&script).output() }
+            .map_err(|e| format!("mac clang spawn: {e}"))?;
+        if !o.status.success() { return Err(format!("compile darwin(libc) {source}: {}", String::from_utf8_lossy(&o.stderr).trim())); }
     }
     Ok(out.to_string_lossy().into_owned())
 }
@@ -263,7 +304,13 @@ pub fn run(ctx: &Ctx, c: &Case, e: Engine) -> Status {
     let stdout = strip_noise(&out.stdout);
     let code = out.status.code().unwrap_or(-1);
     for chk in &c.checks {
-        if let Err(msg) = eval(chk, &stdout, code, &guest, &c.args, e) { return fail(msg); }
+        if let Err(msg) = eval(chk, &stdout, code, &guest, &c.args, e) {
+            if std::env::var("CRASHDBG").is_ok() {
+                eprintln!("[crashdbg {}] code={code} stderr={}", e.label(),
+                    String::from_utf8_lossy(&out.stderr).trim());
+            }
+            return fail(msg);
+        }
     }
     if c.xfail.contains(&e) { Status::Xpass } else { Status::Pass }
 }
