@@ -2690,6 +2690,28 @@ static void service(struct cpu *c) {
         G_RET(c) = setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0
                        ? (uint64_t)(-errno) : 0;
         break;
+    case 84: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break; // sync_file_range -> fsync
+    case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
+    case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
+    case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
+    case 152: G_RET(c) = (uint64_t)cgid(); break; // setfsgid -> previous fsgid
+    case 168: // getcpu(cpu, node, tcache) -> cpu 0 / node 0
+        if (a0) *(unsigned *)a0 = 0;
+        if (a1) *(unsigned *)a1 = 0;
+        G_RET(c) = 0; break;
+    case 213: G_RET(c) = 0; break; // readahead: advisory, no-op
+    case 274: G_RET(c) = 0; break; // sched_setattr -> ok (ignored)
+    // preadv2/pwritev2: flags (a5) ignored; offset in a3 (pos_high a4 is 0 on LP64)
+    case 286: {
+        ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+    case 287: {
+        ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
 
     // ===================== unhandled =====================
     default:
