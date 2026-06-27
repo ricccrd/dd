@@ -163,6 +163,9 @@ impl SpawnConfig {
         } else {
             let jit = guest.jit_path()?;
             let mut env = String::new();
+            // The `mac` bridge drops the ambient env, so forward CRASHDBG explicitly when the host sets it
+            // (the JIT installs its crash diagnostics on getenv("CRASHDBG")).
+            if std::env::var("CRASHDBG").is_ok() { env += "CRASHDBG=1 "; }
             if !self.volumes.is_empty() {
                 let v = self.volumes.iter().map(|v| format!("{}:{}", v.container, v.host)).collect::<Vec<_>>().join(",");
                 env += &format!("DDVOL={} ", shq(&v));

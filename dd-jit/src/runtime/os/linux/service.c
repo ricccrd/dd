@@ -1662,6 +1662,14 @@ static void service(struct cpu *c) {
             G_SHADOW_RESET(c); // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
             g_ndirs = 0;       // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
                                // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
+#ifdef DD_HAS_MACH_EXC
+            // The CRASHDBG Mach exception port + its receiver thread do NOT survive fork, so a crash in the
+            // child silently dies. Clear the inherited task exception port so a fault falls through to the
+            // POSIX diag_crash handler (which IS inherited) and reports fault=/pc=.
+            if (getenv("CRASHDBG"))
+                task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION,
+                                         MACH_PORT_NULL, EXCEPTION_DEFAULT, 0);
+#endif
         }
         // parent: pid, child: 0
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;

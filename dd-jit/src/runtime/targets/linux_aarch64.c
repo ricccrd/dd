@@ -26,6 +26,7 @@
 #include <dirent.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#define DD_HAS_MACH_EXC 1 // service.c gates its CRASHDBG fork-child Mach re-arm on this
 #include <dlfcn.h>
 #include <sys/event.h>
 #include <termios.h>
