@@ -895,6 +895,19 @@ static void service(struct cpu *c) {
         if (lf & G_O_DIRECTORY) mf |= O_DIRECTORY;
         if (lf & 0x80000) mf |= O_CLOEXEC;
         {
+            // POSIX shm: glibc shm_open opens /dev/shm/<name>; the rootfs has no tmpfs, so back it with a
+            // real host file (MAP_SHARED + fork share it). Flatten any subdirs into the single filename.
+            const char *rp = (const char *)a1;
+            if (rp && !strncmp(rp, "/dev/shm/", 9)) {
+                char hp[300];
+                int n = snprintf(hp, sizeof hp, "/tmp/.ddshm-%s", rp + 9);
+                for (int i = 12; i < n; i++) if (hp[i] == '/') hp[i] = '_';
+                int d = open(hp, mf, (mode_t)a3);
+                G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
+                break;
+            }
+        }
+        {
             // pty: /dev/ptmx -> posix_openpt; /dev/pts/N -> slave
             const char *rp = (const char *)a1;
             if (rp && !strcmp(rp, "/dev/ptmx")) {
@@ -2601,6 +2614,17 @@ static void service(struct cpu *c) {
         } else {
             G_RET(c) = (uint64_t)(-ENOSYS);
         }
+        break;
+    }
+
+    case 279: { // memfd_create(name, flags) -> an anonymous file: a tmpfile, unlinked immediately
+        char tn[] = "/tmp/.ddmemfdXXXXXX";
+        int fd = mkstemp(tn);
+        if (fd >= 0) {
+            unlink(tn);
+            if (a1 & 1) fcntl(fd, F_SETFD, FD_CLOEXEC); // MFD_CLOEXEC
+        }
+        G_RET(c) = fd < 0 ? (uint64_t)(-errno) : (uint64_t)fd;
         break;
     }
 
