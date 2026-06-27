@@ -43,40 +43,20 @@ G_RET(c)           the syscall return register    (lvalue)
 the reference). A frontend whose guest uses different numbers (x86-64) maps them to canonical in
 `G_NR`. So one `service()` serves every Linux guest; the frontend only supplies the mapping.
 
-## Dedup state
+## Dedup state — DONE for Linux
 
-- **linux/aarch64** is the **canonical reference**: fully decomposed, and `os/linux/service.c` is written
-  against the cpu-interface contract (`frontend/aarch64/abi.h`) — it names no aarch64 register. This is
-  the shared Linux personality.
-- **linux/x86_64 (jit86)** is decomposed into `frontend/x86_64/` but still carries **parallel copies** of
-  the OS layer (`service.c`, `container.c`, `cache.c`, `elf.c`). Wiring it onto the shared `os/linux/` is
-  the remaining dedup (next section).
-- **darwin/aarch64 (jitdarwin)** is a minimal POC, whole-imported under `os/darwin/`.
+- **linux/aarch64** and **linux/x86_64** now **share the entire `os/linux/` personality** (`service.c`,
+  `container/`, `signal.c`, `fscache.c`). Each frontend supplies only what is genuinely per-arch:
+  - the engine + decoder (`cache/emit/decode/translate/dispatch`, x86-only by nature),
+  - `abi.h` (the cpu-interface seam + the x86→canonical syscall map `sysmap.h`),
+  - `sigframe.c` (rt_sigframe register layout), `fill_stat.c` (struct-stat byte layout),
+  - `legacy.c` (`G_NORMALIZE`: legacy→`*at` rewrite + arch_prctl), `x86_ops.c` (cpuid/x87), `elf.c`.
+  - jit86's old `service.c` + `container.c` (2277 lines) are **deleted**.
+- **darwin/aarch64 (jitdarwin)** is a minimal POC, whole-imported under `os/darwin/` — the same pattern
+  would lift it onto the shared `jit/` engine next.
 
-## Dedup — foundation complete
+The contract (`G_*`) that makes one `os/linux/` serve both: `NR/A0..A5/RET` (syscall ABI), `PC/SP/TLS`
+(named registers), `SHADOW_RESET`/`THREAD_RESUME` (§B + thread entry), `RESET_REGS` (execve),
+`NORMALIZE` (legacy-syscall rewrite), `BRK_GROWABLE` (brk policy). Three macOS-isms live in the shared
+service, harmless to aarch64: mprotect is a no-op, anon mmaps get a guard tail, brk is non-growable on x86.
 
-The cpu-interface SEAM is built and verified:
-- `os/linux/service.c` is fully cpu-agnostic (the `G_NR/A0..A5/RET/PC/SP/TLS/SHADOW_RESET` contract; 0
-  raw register/field references) — the shared Linux syscall layer.
-- `frontend/aarch64/abi.h` + `frontend/x86_64/abi.h` implement the contract for each guest.
-- `frontend/x86_64/sysmap.h` maps x86 syscall numbers -> the canonical (aarch64) numbers.
-
-## Finishing the dedup (the concrete remaining work)
-
-The seam is done (above). The remaining swap, to make x86-64 *use* shared `os/linux/` instead of its copy:
-
-1. **Legacy-syscall shim** — x86-64 has 58 legacy syscalls aarch64 lacks (`open`/`stat`/`pipe`/`access`/
-   `dup2`/`getdents`/`rename`/`mkdir`/…). A thin x86 entry translates each to its `*at` canonical form
-   (e.g. `open(p,fl,m)` → `openat(AT_FDCWD,p,fl,m)`) before delegating to the shared `service()`.
-2. **Per-arch struct fills** — move `fill_linux_stat` (+ statx/sigaction) out of the shared layer into
-   each frontend (both already define it with the same signature, just different layouts).
-3. **Wire** `targets/linux_x86_64.c` to shared `os/linux/` + `jit/` + only x86-specific
-   `frontend/x86_64/{cpu,decode,translate,emit,abi,sysmap,sigframe}`; delete the x86 service/container/
-   cache/elf copies.
-
-**The verification gate is now satisfied:** the dense matrix (x86 cross-compiler + qemu oracle) runs
-the same ~25 guest programs on x86, exercising the common syscall + struct-fill paths — so the swap is
-checked, not hopeful. (The 5 `xfail`'d jit86 codegen bugs are orthogonal and stay tracked.)
-
-The same pattern lifts **jitdarwin** onto the shared `jit/` engine — it already shares the entire
-aarch64 host codegen; only the Mach-O loader, the Darwin syscall map, and Mach traps are darwin-specific.
