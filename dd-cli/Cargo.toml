@@ -2,7 +2,7 @@
 name = "dd-cli"
 version = "0.1.0"
 edition = "2021"
-description = "The `dd` command — launch the dd-app GUI and install the daemon + docker context without root."
+description = "The `ddcli` command — run dd containers with easy-access defaults and manage the daemon, without root."
 license = "MIT"
 
 [[bin]]

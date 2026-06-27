@@ -10,7 +10,7 @@ drives the *real* `docker` binary against the daemon and asserts every step — 
 | area | commands |
 |---|---|
 | **images** | `images`, `image inspect`, `pull` (real, any registry), `tag`, `rmi`, `push` (real upload) |
-| **run** | `run` (foreground, streams stdout/stderr), `run -d`, `run -i`, `run -it`, `run --name`, `--entrypoint` |
+| **run** | foreground (streams stdout/stderr), `-d`, `-i`, `-it`, `--name`, `--entrypoint`, `--platform`, `-w`, `-v`, `--network host` |
 | **exec** | `exec`, `exec -i`, `exec -it` (runs in the container's rootfs) |
 | **inspect/logs** | `inspect` (container + image), `logs`, `wait`, `ps`, `ps -a`, `top`, `stats` |
 | **lifecycle** | `stop`, `kill`, `restart`, `pause`, `unpause`, `rename`, `rm` |

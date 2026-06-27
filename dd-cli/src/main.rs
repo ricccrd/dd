@@ -1,21 +1,25 @@
-//! `dd` — the user-facing command for the dd VM-less container runtime.
+//! `ddcli` — the user-facing command for the dd VM-less container runtime.
 //!
-//! It launches the `dd-app` GUI, runs/controls the per-user daemon LaunchAgent, and wires up a
-//! `docker context` so the stock `docker` CLI can talk to dd — all without root.
+//! Run containers with easy-access defaults (the current directory mounted + the working dir, host
+//! networking, an interactive shell), and manage the per-user daemon — all without root.
 //!
-//!   dd install        # set up ~/.dd, load the daemon agent, create the docker context
-//!   dd app            # open the GUI
-//!   dd doctor         # check everything is healthy
+//!   ddcli ubuntu                       # drop into a shell in an ubuntu container, here in this dir
+//!   ddcli run alpine echo hi           # run a one-off command
+//!   ddcli run ubuntu --platform linux/amd64   # force amd64 (runs via the x86-64 JIT)
+//!   ddcli mac                          # a macOS container (experimental)
+//!   ddcli install                      # set up the daemon agent + docker context
+//!   ddcli doctor                       # check everything is healthy
 
 mod agent;
 mod context;
 mod paths;
+mod run;
 
 use clap::{Parser, Subcommand};
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "dd", version, about = "dd — VM-less containers on macOS")]
+#[command(name = "ddcli", version, about = "ddcli — VM-less containers on macOS")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -23,6 +27,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run a container: current dir mounted + working dir, host networking, interactive shell.
+    ///
+    /// Usage: ddcli run [--platform P] [--isolated] [--keep] <image> [command…]
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Start a macOS container (experimental — the host macOS in a darwin jail).
+    Mac {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Launch the dd-app GUI.
     App,
     /// Run or control the background daemon.
@@ -45,6 +61,9 @@ enum Cmd {
     },
     /// Diagnose the install (socket, agent, context, app quarantine).
     Doctor,
+    /// `ddcli <image> [command…]` — shorthand for `ddcli run <image> …`.
+    #[command(external_subcommand)]
+    Image(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -78,6 +97,9 @@ enum ContextCmd {
 fn main() {
     let cli = Cli::parse();
     let code = match cli.cmd {
+        Cmd::Run { args } => cmd_run(args),
+        Cmd::Mac { args } => run::mac(args),
+        Cmd::Image(args) => cmd_run(args),
         Cmd::App => cmd_app(),
         Cmd::Daemon { action } => cmd_daemon(action),
         Cmd::Install => cmd_install(),
@@ -86,6 +108,33 @@ fn main() {
         Cmd::Doctor => cmd_doctor(),
     };
     std::process::exit(code);
+}
+
+/// `ddcli run …` and the bare-image shorthand both land here.
+fn cmd_run(raw: Vec<String>) -> i32 {
+    match run::parse(raw) {
+        Ok(args) => run::run(args),
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+/// Ensure the daemon socket answers; if not, try to (re)start the agent and wait briefly for it.
+fn ensure_daemon() -> Result<(), String> {
+    let sock = paths::socket();
+    if ping_socket(&sock) {
+        return Ok(());
+    }
+    let _ = ensure_agent(); // best-effort: load the LaunchAgent (macOS)
+    for _ in 0..40 {
+        if ping_socket(&sock) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(format!("no daemon listening at {}", sock.display()))
 }
 
 /// Launch the installed GUI bundle (or a dev `dd-app` sibling binary).
@@ -165,7 +214,7 @@ fn cmd_install() -> i32 {
     println!("\nIf you don't use `docker context`, add this to your shell:");
     println!("    export DOCKER_HOST={}", paths::docker_host());
     warn_quarantine();
-    println!("\nDone. Try:  dd doctor");
+    println!("\nDone. Try:  ddcli ubuntu   (a shell in an ubuntu container, here)  ·  ddcli doctor");
     0
 }
 
@@ -227,7 +276,7 @@ fn cmd_doctor() -> i32 {
     }
 
     if !ok {
-        println!("\nSome checks failed. `dd install` sets up the agent + context.");
+        println!("\nSome checks failed. `ddcli install` sets up the agent + context.");
         println!("If the GUI renders oddly, try:  GSK_RENDERER=cairo open {}", paths::APP_BUNDLE);
     }
     if ok {

@@ -236,7 +236,7 @@
     <h2 class="section-title">Install once, then it's just Docker</h2>
     <p class="section-lead">Download the app, drop it in Applications, and run a single setup command.
       dd registers a background daemon and a <code>docker</code> context for you — no VM, no
-      <code>sudo</code>. The <code>dd</code> command-line tool ships inside the app.</p>
+      <code>sudo</code>. The <code>ddcli</code> command-line tool ships inside the app.</p>
 
     <div class="steps">
       <div class="step">
@@ -246,46 +246,54 @@
       </div>
       <div class="step">
         <div class="num">2</div>
-        <div><h4>Set it up</h4><p>Launch <strong>dd</strong> once (or run <code>dd install</code>). It
+        <div><h4>Set it up</h4><p>Launch <strong>dd</strong> once (or run <code>ddcli install</code>). It
           starts a per-user background daemon and adds a <code>docker</code> context — all under your
           home folder, never <code>sudo</code>.</p></div>
       </div>
       <div class="step">
         <div class="num">3</div>
-        <div><h4>Run containers</h4><p>Point <code>docker</code> at the <code>dd</code> context, or use
-          the app's UI. Your existing images and commands just work.</p></div>
+        <div><h4>Run containers</h4><p><code>ddcli ubuntu</code> drops you straight into a shell in this
+          folder — or point <code>docker</code> at the <code>dd</code> context. Your images and commands just work.</p></div>
       </div>
       <div class="step">
         <div class="num">4</div>
-        <div><h4>Check it's healthy</h4><p><code>dd doctor</code> verifies the socket, daemon and
+        <div><h4>Check it's healthy</h4><p><code>ddcli doctor</code> verifies the socket, daemon and
           context and prints a fix for anything that needs attention.</p></div>
       </div>
     </div>
 
     <div class="two-col" style="margin-top:34px;">
       <div>
-        <h3>Run containers — just Docker</h3>
-        <p>dd registers a <code>dd</code> context, so every ordinary flag flows straight through.</p>
+        <h3>The easy way — <code>ddcli</code></h3>
+        <p>One word drops you into a shell in any image, right here in your current directory (mounted),
+          on the host network. Arch is detected automatically.</p>
         <div class="code">
           <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="label">bash</span></div>
-<pre><span class="c"># publish a port, cap memory, run a shell</span>
-<span class="p">$</span> docker --context dd run -p 8080:80 -m 256m alpine \
-      sh -c <span class="s">'echo hi from $(hostname)'</span>
+<pre><span class="c"># a shell in ubuntu, here in this folder</span>
+<span class="p">$</span> ddcli ubuntu
 
-<span class="p">$</span> docker --context dd ps
-<span class="p">$</span> docker --context dd images
-<span class="p">$</span> docker --context dd run --rm -it ubuntu bash</pre>
+<span class="c"># a one-off command</span>
+<span class="p">$</span> ddcli run alpine echo hi
+
+<span class="c"># force amd64 (runs via the x86-64 JIT)</span>
+<span class="p">$</span> ddcli run ubuntu --platform linux/amd64
+
+<span class="c"># a macOS container</span>
+<span class="p">$</span> ddcli mac</pre>
         </div>
       </div>
       <div>
-        <h3>Manage dd</h3>
-        <p>The <code>dd</code> tool is the control surface for the app and its background daemon.</p>
+        <h3>…or plain Docker</h3>
+        <p>dd registers a <code>dd</code> context, so every ordinary <code>docker</code> flag flows
+          straight through. <code>ddcli</code> manages the daemon.</p>
         <div class="code">
           <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="label">bash</span></div>
-<pre><span class="p">$</span> dd install        <span class="c"># daemon + docker context (no sudo)</span>
-<span class="p">$</span> dd app            <span class="c"># open the desktop app</span>
-<span class="p">$</span> dd doctor         <span class="c"># health check + fixes</span>
-<span class="p">$</span> dd daemon status  <span class="c"># start | stop | restart | logs</span></pre>
+<pre><span class="p">$</span> docker --context dd run -p 8080:80 alpine \
+      sh -c <span class="s">'echo hi from $(hostname)'</span>
+<span class="p">$</span> docker --context dd pull ubuntu   <span class="c"># real registry pull</span>
+
+<span class="p">$</span> ddcli install     <span class="c"># daemon + docker context (no sudo)</span>
+<span class="p">$</span> ddcli doctor      <span class="c"># health check + fixes</span></pre>
         </div>
       </div>
     </div>
@@ -303,7 +311,7 @@
     <p><a class="btn btn-primary" href="https://github.com/ricccrd/dd/releases/latest">Download the latest&nbsp;.dmg</a></p>
     <p class="note" style="max-width:640px;margin:18px auto 0;">The download isn't notarized yet, so on
       first launch macOS Gatekeeper asks before opening it: right-click <strong>dd</strong> →
-      <strong>Open</strong> once, and it runs normally thereafter. <code>dd doctor</code> can clear this
+      <strong>Open</strong> once, and it runs normally thereafter. <code>ddcli doctor</code> can clear this
       for you too.</p>
   </div>
 </section>

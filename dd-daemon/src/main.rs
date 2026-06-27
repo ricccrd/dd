@@ -304,8 +304,8 @@ async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Respon
         Some(i) => Json(json!({
             "Id": format!("sha256:{}", fake_id(&i.name)),
             "RepoTags": [repo_tag(&i.name)], "RepoDigests": [],
-            "Architecture": if i.arch.arch() == "x86_64" { "amd64" } else { "arm64" },
-            "Os": "linux", "Size": 0, "Created": "1970-01-01T00:00:00Z",
+            "Architecture": docker_arch(i.arch),
+            "Os": i.arch.os(), "Size": 0, "Created": "1970-01-01T00:00:00Z",
             "Config": {"Cmd": i.cmd, "Entrypoint": Value::Null, "Env": [
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"], "WorkingDir": ""},
             "RootFS": {"Type": "layers", "Layers": []}})).into_response(),
@@ -1194,6 +1194,14 @@ fn discover_images(images_dir: &str) -> Vec<Image> {
         let name = raw.trim_end_matches("-bundle").split("__").next().unwrap_or("img").rsplit('_').next().unwrap_or("img").to_string();
         let arch = detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64);
         out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd: vec!["/bin/sh".into()] });
+    }
+    // A built-in `macos` image for `ddcli mac`: the host macOS filesystem in a darwin jail, run by the
+    // darwin JIT. Offered only when that engine is built; the jail root is DD_MAC_ROOTFS (default "/").
+    if ddjit::available(Guest::DarwinAarch64) {
+        let rootfs = std::env::var("DD_MAC_ROOTFS").unwrap_or_else(|_| "/".into());
+        if std::path::Path::new(&rootfs).is_dir() {
+            out.push(Image { name: "macos".into(), rootfs, arch: Guest::DarwinAarch64, cmd: vec!["/bin/zsh".into()] });
+        }
     }
     out
 }

@@ -41,7 +41,7 @@ rm -rf "$APP"
 mkdir -p "$MACOS" "$RES" "$FW"
 cp "$ROOT/target/release/dd-app" "$MACOS/dd-app"
 cp "$ROOT/target/release/dd-daemon" "$RES/dd-daemon"
-[ -f "$ROOT/target/release/dd" ] && cp "$ROOT/target/release/dd" "$RES/dd" # the `dd` CLI (installed to PATH from the GUI)
+[ -f "$ROOT/target/release/ddcli" ] && cp "$ROOT/target/release/ddcli" "$RES/ddcli" # the `ddcli` CLI (installed to PATH from the GUI)
 printf 'APPL????' > "$C/PkgInfo"
 sed "s/@VERSION@/$VERSION/g" "$ROOT/packaging/Info.plist.in" > "$C/Info.plist"
 [ -f "$ROOT/packaging/dd-app.icns" ] && cp "$ROOT/packaging/dd-app.icns" "$RES/dd-app.icns" || true
@@ -113,7 +113,7 @@ done
 for b in dd-daemon ddjit-linux_aarch64 ddjit-linux_x86_64 ddjit-darwin_aarch64; do
   [ -f "$RES/$b" ] && codesign -s - -f --entitlements "$ENT" "$RES/$b" >/dev/null 2>&1 || true
 done
-[ -f "$RES/dd" ] && codesign -s - -f "$RES/dd" >/dev/null 2>&1 || true
+[ -f "$RES/ddcli" ] && codesign -s - -f "$RES/ddcli" >/dev/null 2>&1 || true
 codesign -s - -f "$MACOS/dd-app" >/dev/null 2>&1 || true
 codesign -s - -f "$APP" >/dev/null 2>&1 || true
 
