@@ -47,7 +47,7 @@
       <span class="badge">Apple Silicon</span>
       <span class="badge">No VM · No daemon-in-a-VM</span>
       <span class="badge">Docker Engine API</span>
-      <span class="badge">aarch64 + x86-64 guests</span>
+      <span class="badge">Linux + macOS guests</span>
       <span class="badge">Installs without root</span>
     </div>
   </div>
@@ -82,9 +82,9 @@
       </div>
       <div class="card">
         <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 12l10 5 10-5"/><path d="M2 17l10 5 10-5"/></svg></div>
-        <h3>aarch64 and x86-64 guests</h3>
-        <p>Run native arm64 Linux images, or x86-64 images via a JIT that decodes x86, synthesizes its
-          flags, and lowers SSE/x87 onto NEON. glibc-class binaries run.</p>
+        <h3>Linux <em>and</em> macOS guests</h3>
+        <p>Run native arm64 Linux images, or x86-64 images via the JIT — <strong>and macOS guest
+          binaries too</strong>, all natively, no VM. One runtime, both worlds.</p>
       </div>
       <div class="card">
         <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.4 8.6-8 11-4.6-2.4-8-6-8-11V5l8-3z"/><path d="M8.5 12l2.3 2.3 4.7-4.6"/></svg></div>
@@ -189,7 +189,7 @@
     <p class="disclaimer"><strong>Honest trade-off:</strong> a userspace kernel is only as complete as
       the syscalls it implements, and today dd runs as a single process — great for <em>trusted</em>
       images. A VM still gives a harder isolation boundary for untrusted code; dd's
-      <a href="./docs.html?doc=ARCHITECTURE">sentry split</a> is the roadmap answer there.</p>
+      <a href="./docs.html?doc=PLAN">sentry split</a> is the roadmap answer there.</p>
   </div>
 </section>
 
@@ -197,35 +197,36 @@
 <section id="how" class="alt">
   <div class="wrap">
     <p class="eyebrow">How it works</p>
-    <h2 class="section-title">Be the kernel, in userspace</h2>
-    <p class="section-lead">dd runs a Linux container by being its kernel. A JIT translates the guest's
-      machine code and traps every syscall instruction; the trap handler is the Linux syscall ABI,
-      implemented against macOS. Everything a real kernel owns becomes state in this one process.</p>
+    <h2 class="section-title">Your container runs <em>natively (no VM)</em></h2>
+    <p class="section-lead">A virtual machine emulates a whole computer and boots a Linux kernel inside
+      it. dd doesn't. Your container's code runs directly as native Apple-Silicon instructions, and dd
+      acts as its kernel in userspace — handling system calls as they happen. No hypervisor, no Linux
+      kernel, nothing to boot.</p>
     <div class="steps">
       <div class="step">
         <div class="num">1</div>
-        <div><h4>Load the ELF</h4><p>Map the guest's Linux ELF (static-PIE, or dynamic via its
-          <code>ld.so</code>) and build the initial stack with the container's uid/gid.</p></div>
+        <div><h4>Native execution — no VM</h4><p>The container's code runs as native arm64 instructions
+          at full speed. Only its system calls are handled in userspace, so there's no virtual-machine
+          tax on the work your container actually does.</p></div>
       </div>
       <div class="step">
         <div class="num">2</div>
-        <div><h4>Translate &amp; dispatch</h4><p>Look up the guest PC; on a miss, JIT-translate the
-          block. Same-ISA code is mostly transliterated; x86-64 is decoded and re-emitted on arm64.</p></div>
+        <div><h4>Runs your images as-is</h4><p>arm64 Linux images run directly; x86-64 images are
+          translated on the fly. Overlay layers, volumes, namespaces, cgroups and port publishing all
+          behave like the real thing.</p></div>
       </div>
       <div class="step">
         <div class="num">3</div>
-        <div><h4>Run natively</h4><p>The translated block executes as native host code until a
-          terminator — a chained branch, an inline-cached indirect jump, or a syscall.</p></div>
+        <div><h4>It's just Docker</h4><p>dd speaks the Docker Engine API, so the ordinary
+          <code>docker</code> CLI drives it — or use <code>ddcli</code> for a one-word shell into any
+          image.</p></div>
       </div>
       <div class="step">
         <div class="num">4</div>
-        <div><h4>Service the syscall</h4><p>Exit to <code>service()</code> — the Linux ABI on macOS.
-          Every path passes through the container VFS jail; namespaces &amp; cgroups are just state.</p></div>
+        <div><h4>macOS containers too</h4><p>The same idea runs <strong>macOS</strong> guest binaries
+          natively and without a VM — not just Linux. One runtime, both worlds.</p></div>
       </div>
     </div>
-    <p class="section-lead" style="margin-top:34px;margin-bottom:0">Read the full
-      <a href="./docs.html?doc=ARCHITECTURE">Architecture</a> and
-      <a href="./docs.html?doc=SYSCALLS">Syscalls</a> write-ups in the docs.</p>
   </div>
 </section>
 
@@ -254,11 +255,6 @@
         <div class="num">3</div>
         <div><h4>Run containers</h4><p><code>ddcli ubuntu</code> drops you straight into a shell in this
           folder — or point <code>docker</code> at the <code>dd</code> context. Your images and commands just work.</p></div>
-      </div>
-      <div class="step">
-        <div class="num">4</div>
-        <div><h4>Check it's healthy</h4><p><code>ddcli doctor</code> verifies the socket, daemon and
-          context and prints a fix for anything that needs attention.</p></div>
       </div>
     </div>
 

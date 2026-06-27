@@ -2,35 +2,11 @@
 
 Companion to [`RENDERING.md`](RENDERING.md) (the architecture). That doc says *what* the display layer
 is; this one is the *how* — the DDP wire spec, exact API sequences, per-rung steps, the seam edits, and
-the validation order. Grounded in the dd source and a verified technical research pass (sources at end).
+the validation order. Grounded in the dd source and a verified technical research pass.
 
 Status: **plan, no code yet.** Locked decisions (from `RENDERING.md`): unified internal **DDP**;
 separate host renderer `dd-display` (Rust + Smithay, structural fork of `cocoa-way`); **GPU rung 3 =
 Vulkan-level forwarding** committed; MVP = `weston-simple-shm` → SDL2.
-
----
-
-## 0. Corrections this research forced (read first)
-
-1. **GPU: forward Vulkan, not Metal — and Venus already runs without a VM.** Mesa **Venus** serializes
-   guest Vulkan (SPIR-V passed through untranspiled → near-native), and **virglrenderer's `vtest`
-   backend carries it over a plain Unix socket** (`VN_DEBUG=vtest`), bypassing KVM/virtqueue. That is
-   our transport. Host replays onto a real Vulkan driver — on macOS, **KosmicKrisp** (Vulkan→Metal,
-   upstream Mesa, Apple-Silicon/macOS 26+) with **MoltenVK** as the broader fallback. [mesa venus;
-   collabora; lunarg]
-2. **`cocoa-way` is a structural reference, not a drop-in.** It marries Cocoa↔Wayland through **winit's
-   event loop** (drive Smithay from `Event::AboutToWait`; main-thread via `Resumed`+`MainThreadMarker`),
-   **not** a calloop↔CFRunLoop bridge. It also uses **waypipe** as transport and has **no XWayland**.
-   We keep its winit-loop + Smithay-as-protocol-only structure and its per-window `CAMetalLayer` Metal
-   present; we drop waypipe (we're same-host, the guest connects to a local socket directly). [cocoa-way]
-3. **macOS-guest windows are adoptable** via the documented **CAContext + CALayerHost** path (Chromium
-   "delegated rendering"): the guest exports a `CAContextID`; `dd-display` hosts it with a `CALayerHost`
-   in an NSView. Pixels travel as an **IOSurface ID**. `CAPortalLayer` is a private higher-capability
-   alternative; the `contextId`↔windowserver linkage is undocumented — use CAContext/CALayerHost as the
-   baseline. [chromium mac-delegated-rendering; teamdev]
-4. **shm present can start as a copy.** cocoa-way doesn't zero-copy shm — it `replaceRegion`s guest
-   pixels into a fresh `BGRA8Unorm` texture. That's the correct MVP; swap in `makeBuffer(bytesNoCopy:)`
-   zero-copy later. [cocoa-way]
 
 ---
 
@@ -99,7 +75,7 @@ case 279: { // memfd_create(name, flags)
 The returned fd is `ftruncate`-able and `mmap(MAP_SHARED)`-able (both already handled: `ftruncate`
 case 46; `mmap` case 222 → `mmap_flags()` maps `MAP_SHARED`=0x01). **This single syscall unlocks
 `wl_shm`.** Validate: a guest creates an fd, `ftruncate`s it, `mmap`s it shared, writes; a second
-`mmap` of the same fd sees the bytes. [weston os-compatibility]
+`mmap` of the same fd sees the bytes.
 
 ### 2.2 AF_UNIX Wayland socket reaches `dd-display`
 Real `sun_path` `bind`/`connect` currently passes **raw** to the host (`service.c:1899/1950`), not
@@ -140,26 +116,25 @@ under `/run/dd/<ctr>/`. Headless containers set no GUI flag and are unaffected.
 Structure (following cocoa-way, corrected):
 - **Event loop = winit.** Owns the AppKit main thread; create windows on `Resumed` with
   `MainThreadMarker`. Drive Smithay client dispatch from `Event::AboutToWait`:
-  `display.dispatch_clients(&mut state)?; display.flush_clients()?;`. [cocoa-way]
+  `display.dispatch_clients(&mut state)?; display.flush_clients()?;`.
 - **Smithay = protocol only.** Use `wayland::compositor`, `shell::xdg`, `wl_shm`, `seat`, `output`;
   **do not** pull drm/gbm/libinput/udev/libseat. Inject input into the seat manually
   (`keyboard.input(...)`, `pointer.motion(...)`) from winit events. One `Display`/socket per container.
 - **Per surface → one `NSWindow` + `CAMetalLayer`** (`BGRA8Unorm`), rootless, with a bidirectional
-  `sid ↔ NSWindow` map (quartz-wm's model). [quartz-wm]
+  `sid ↔ NSWindow` map (quartz-wm's model).
 - **Thread rule:** all CoreAnimation/Metal calls on the **main thread** (CA/Metal not thread-safe);
-  marshal with `dispatch_sync` if needed. [cocoa-way; lucamignatti]
+  marshal with `dispatch_sync` if needed.
 
 ### 4.1 shm present (MVP path, then zero-copy)
 Per `SURFACE_COMMIT` with an SHM buffer:
 - **MVP (copy):** `mmap` the pool fd once (`MAP_SHARED`, keyed by pool); on commit, `texture.replace
   (region:mipmapLevel:withBytes: base+offset, bytesPerRow: stride)` into a `BGRA8Unorm` texture sized
   to the surface; handle **stride ≠ w·4** via `bytesPerRow`, and **ARGB↔BGRA** channel order. Then
-  `layer.nextDrawable` → blit → `presentDrawable` → `commit`. [cocoa-way]
+  `layer.nextDrawable` → blit → `presentDrawable` → `commit`.
 - **Zero-copy (later):** wrap the pool directly:
   `device.makeBuffer(bytesNoCopy: base, length: roundUp(size, 16384), options: .storageModeShared,
   deallocator: { munmap })`. **Hard constraints:** base **16 KB page-aligned** (mmap base is), length a
-  **page multiple**, memory in a **single VM region**. Then a blit/compute pass to the drawable. [apple
-  makeBuffer]
+  **page multiple**, memory in a **single VM region**. Then a blit/compute pass to the drawable.
 
 ### 4.2 IOSurface present (rungs 2–3)
 `device.makeTexture(descriptor:, iosurface:, plane: 0)` → an `MTLTexture` aliasing the IOSurface, zero
@@ -167,20 +142,20 @@ copy; set as a layer's content or blit to the drawable. IOSurface pixel format *
 `BGRA8Unorm`. Use `IOSurfaceAlignProperty()` for stride/allocSize (don't hand-compute). Cross-process
 handoff: producer `IOSurfaceCreateMachPort(s)` → send the port name in DDP → `dd-display`
 `IOSurfaceLookupFromMachPort(port)`; **`mach_port_deallocate()` on both sides or the surface leaks.**
-Never `kIOSurfaceIsGlobal` (deprecated, insecure). [apple makeTexture; chromium io_surface; russbishop]
+Never `kIOSurfaceIsGlobal` (deprecated, insecure).
 
 ### 4.3 input (NSEvent → DDP → xkb)
 - **Keymap:** build once with xkbcommon (`xkb_keymap_new_from_names` → `xkb_keymap_get_as_string
   (XKB_KEYMAP_FORMAT_TEXT_V1)`), write to an fd, send via DDP `KEYMAP`; the Wayland frontend hands it to
-  `wl_keyboard.keymap` and the client `mmap`s it. [wayland-book; eyelash]
+  `wl_keyboard.keymap` and the client `mmap`s it.
 - **Keycodes:** map `NSEvent.keyCode` (`kVK_*`/`CGKeyCode`) → Linux `KEY_*` (evdev). **Send raw evdev
   in DDP; the Wayland frontend feeds xkbcommon with `+8`** (X11 reserves 0–7). The `kVK_*→KEY_*` table
-  is **unbuilt** — port from XQuartz `quartzKeyboard` / SDL cocoa. [eyelash; axelkar; SDL]
+  is **unbuilt** — port from XQuartz `quartzKeyboard` / SDL cocoa.
 - **Modifiers:** `NSEventModifierFlags` → `depressed/latched/locked/group` → DDP `MODIFIERS` →
-  `xkb_state_update_mask`. Decide Command/Option semantics (map ⌘→Super or Ctrl). [eyelash]
+  `xkb_state_update_mask`. Decide Command/Option semantics (map ⌘→Super or Ctrl).
 - **Pointer/scroll:** buttons → `BTN_LEFT/RIGHT/MIDDLE`; `scrollingDeltaX/Y` +
   `hasPreciseScrollingDeltas`/momentum → `wl_pointer` axis `value120` + `axis_source` (wheel vs finger)
-  + momentum phase. Mapping is **unbuilt**; HiDPI via the window backing scale. [research §3]
+  + momentum phase. Mapping is **unbuilt**; HiDPI via the window backing scale.
 
 ---
 
@@ -194,7 +169,7 @@ pixels:
 - For each guest top-level: create a `CAContext`, host the window's layer tree, export its
   **`CAContextID`** → emit DDP `SURFACE_CREATE` + the contextID; `dd-display` renders it via a
   **`CALayerHost`** in an NSView (`wantsLayer=YES`). Pixels stay in an IOSurface (its ID/port in DDP).
-  [chromium mac-delegated-rendering; teamdev; avaidyam]
+
 - Route DDP input back into the guest's event queue; relocate/label/isolate windows in `dd-display`'s
   space. Full AppKit fidelity is a long tail — start with one toplevel + its IOSurface + lifecycle.
 - **Risk:** the `contextId`↔windowserver linkage is undocumented; `CAPortalLayer` (private) is the
@@ -211,29 +186,29 @@ once, host-side), reusing Venus.
 - Ship Mesa's **Venus** Vulkan ICD in the guest image; select it with **`VN_DEBUG=vtest`** so its
   transport is the **vtest Unix-socket protocol**, not virtgpu — **no real `/dev/dri` needed** for the
   command path. (GL apps: **Zink → Venus**; `MESA_LOADER_DRIVER_OVERRIDE=zink`,
-  `EGL_PLATFORM=surfaceless`.) [mesa venus; mesa zink; lucamignatti]
+  `EGL_PLATFORM=surfaceless`.)
 - Some clients still probe `/dev/dri` — synthesize a node if needed (Zink "Penny"/`VK_KHR_surfaceless`
-  brings up Zink with no DRI/DRM). [mesa zink]
+  brings up Zink with no DRI/DRM).
 
 **Host side (`dd-display` or a sibling `dd-gpu` service it owns):**
 - Run the **vtest server with the Venus backend** (virglrenderer `-Dvenus=true`,
   `virgl_test_server --venus`) replaying serialized Vulkan onto a **host Vulkan driver = KosmicKrisp**
   (Apple Silicon/macOS 26+) **or MoltenVK** (broader), runtime-selected. Borrow **gfxstream's**
-  ring-buffer + **1:1 encoder/decoder threading**. [mesa venus; collabora; android gfxstream; lunarg]
+  ring-buffer + **1:1 encoder/decoder threading**.
 - **Re-implement Venus's memory model for no-VM macOS:** Venus assumes virtio-gpu **blob resources** +
   `VK_EXT_image_drm_format_modifier` + dma-buf/`KVM_SET_USER_MEMORY_REGION` host-visible mapping —
   **none exist here.** Map instead onto: host-visible memory = shared shm regions (we already share
   memory); presentable render targets = **IOSurface-backed `MTLTexture`s** (§4.2), so a guest swapchain
   image *is* the thing `dd-display` composites — zero readback. **This memory-model port is the single
-  largest and riskiest piece of the project.** [mesa venus]
+  largest and riskiest piece of the project.**
 
 **The fork, decided:** Vulkan-level, because (a) SPIR-V passes through untranspiled (near-native), (b)
 there is **no mature serialization protocol at the Metal level**, (c) the host NIR→MSL happens once in
-KosmicKrisp. The most reusable transport is virglrenderer `vtest --venus` over a Unix socket. [research §1]
+KosmicKrisp. The most reusable transport is virglrenderer `vtest --venus` over a Unix socket.
 
 **Unknown to spike:** does **virglrenderer build on macOS** with venus + a Metal-backed host Vulkan?
 The vtest/venus path is proven on Linux; this port is unproven. Keep **llvmpipe** (software GL, runs on
-arm64) as the standing correctness fallback throughout. [mesa llvmpipe]
+arm64) as the standing correctness fallback throughout.
 
 ---
 
@@ -280,17 +255,3 @@ arm64) as the standing correctness fallback throughout. [mesa llvmpipe]
 
 XWayland (after software Wayland), clipboard/drag-drop, multi-output/HiDPI polish, PI/robust edge cases,
 full AppKit fidelity for macOS guests, and the in-process same-address-space fast path (optimization).
-
----
-
-## Sources (verified research pass; 24/25 voted claims survived, 1 killed)
-
-Mesa: venus, zink, kosmickrisp, llvmpipe driver docs. Collabora virglrenderer/Venus blogs. Android
-gfxstream README. LunarG "State of Vulkan on Apple" + XDC-2025 KosmicKrisp. Apple docs:
-`makeBuffer(bytesNoCopy:)`, `makeTexture(descriptor:iosurface:plane:)`. Chromium `ui/gfx/mac/
-io_surface.cc` + mac-delegated-rendering design doc. `J-x-Z/cocoa-way`. `XQuartz/quartz-wm`. xkb:
-wayland-book, `eyelash/tutorials` wayland-input.c, axelkar gist. SDL cocoa keyboard (deepwiki).
-IOSurface handoff: russbishop cross-process-rendering, fdiv.net, Apple forums #18958. CALayer
-cross-process: teamdev jxbrowser, avaidyam CAPortalLayer + SecretLife_CoreAnimation. lucamignatti
-Zink/KosmicKrisp gist. **Killed claim:** Chromium `mach_make_memory_entry_64` IOSurface path is
-iOS-only; macOS uses `IOSurfaceCreateMachPort`/`LookupFromMachPort`.

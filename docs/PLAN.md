@@ -60,14 +60,6 @@ Host OS × host ISA × guest ISA × guest OS. The decomposition isolates each:
 `frontend/<arch>` (aarch64 + x86_64 built), `os/<os>` (linux built). Eventual targets: linux→darwin,
 darwin→linux, linux→linux (docker copy), darwin→darwin.
 
-## Build / packaging — done
-- `make jit` (= `cargo build --release`) builds both JIT binaries via `build.rs` and the crates.
-- `make fmt` runs clang-format on the decomposed C (skips the whole-imported jit86.c).
-- `make app` / `make dmg` build the codesigned `.app` + distributable `.dmg` inside the Nix dev shell,
-  and `make install` installs it per-user (no root). CI is wired up too:
-  `.github/workflows/release.yml` builds the DMG on an Apple-Silicon runner and publishes it to a GitHub
-  Release on a version tag; `.github/workflows/pages.yml` deploys the website + docs to GitHub Pages.
-
 ## Final goal
 A fully Docker-CLI-compatible daemon: `docker run <image>` pulls/unpacks (done), composes the overlay,
 picks the guest arch, launches in the JIT, and behaves like any other container — with resource limits,

@@ -206,11 +206,3 @@ bind-mount the socket; gate on a `--gui` flag / label so headless containers are
 
 XWayland (after software Wayland), clipboard/drag-drop, multi-output/HiDPI polish, GPU rung 3, the
 in-process same-address-space fast path (optimization only), and full AppKit fidelity for macOS guests.
-
-## Sources
-
-cocoa-way (`github.com/J-x-Z/cocoa-way`), Owl (`owl-compositor/owl`), quartz-wm (`XQuartz/quartz-wm`),
-Smithay (`Smithay/smithay`), wprs (`wayland-transpositor/wprs`), Asahi muvm X11 bridging, Apple
-`makeBuffer(bytesNoCopy:)` / `kIOSurfaceIsGlobal` / IOSurface docs, Mesa Zink ("Penny") + llvmpipe
-docs, LunarG KosmicKrisp announcement, Weston `os-compatibility` memfd fallback, hello-wayland
-(`emersion/hello-wayland`). Full verified claim set: the deep-research report this doc summarizes.

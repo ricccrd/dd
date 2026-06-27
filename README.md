@@ -78,8 +78,7 @@ VFS *is* the host filesystem behind a path jail.
 
 > **Honest trade-off:** a userspace kernel is only as complete as the syscalls it implements, and today
 > dd runs as a single process — great for *trusted* images. A VM still gives a harder isolation boundary
-> for untrusted code; dd's sentry split ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)) is the roadmap
-> answer there.
+> for untrusted code; dd's sentry split ([`docs/PLAN.md`](docs/PLAN.md)) is the roadmap answer there.
 
 ## How it works
 
@@ -93,8 +92,6 @@ code and traps every syscall instruction; the trap handler — `service()` in `d
 3. **Run** the translated block as native host code until a terminator (branch / indirect jump / syscall).
 4. **Service** the syscall — every path passes through the container VFS jail; namespaces and cgroups
    are just process state.
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture.
 
 ## Examples
 
@@ -195,12 +192,14 @@ prebuilt fixtures. Each case runs on every engine it has a guest for.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — the one idea, the layers, the execution flow.
-- [Code structure](docs/STRUCTURE.md) — what lives where, and why.
+- [Docker compatibility](docs/DOCKER.md) — the Docker-CLI surface that works, and the honest gaps.
 - [Syscalls](docs/SYSCALLS.md) — the Linux ABI surface implemented against macOS.
 - [Optimizations](docs/OPTIMIZATIONS.md) — the JIT's idiom rewrites and fast paths.
-- [GUI rendering](docs/RENDERING.md) — rendering Linux GUI apps to macOS (design).
-- [Roadmap](docs/PLAN.md) — the work-list.
+- [GUI rendering](docs/RENDERING.md) — rendering Linux/macOS GUI apps to the Mac screen (design).
+- [Roadmap](docs/PLAN.md) — the work-list of what's missing.
+
+The runtime's internals — the engine/frontend/OS-personality split and the cpu-interface contract —
+are documented in [`dd-jit/README.md`](dd-jit/README.md).
 
 ## Author
 
