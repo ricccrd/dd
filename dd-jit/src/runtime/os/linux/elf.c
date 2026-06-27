@@ -67,18 +67,17 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     uint64_t basepage = minv & ~0xFFFull;
     uint64_t span = (maxv - basepage + 0xFFFF) & ~0xFFFFull;
-    // NULL: non-colliding (main + interp)
-    uint8_t *base = mmap(NULL, span, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    int etype = rd16(f + 16);
+    // NULL: non-colliding (main + interp). A non-PIE ET_EXEC gets biased here; the dispatcher redirects its
+    // absolute code jumps (g_nonpie_*) but its absolute DATA refs to the low link vaddr still fault (xfail).
+    uint8_t *base = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (base == MAP_FAILED) {
         perror("mmap base");
         exit(1);
     }
     gmap_add((uint64_t)base, span); // track so execve() can reclaim the inherited image
     uint64_t bias = (uint64_t)base - basepage;
-    // ET_EXEC (non-PIE): record the un-biased link span so the dispatcher can redirect absolute jumps that
-    // land on the (unmapped) low link vaddr into the biased image. ET_DYN/PIE leaves it (the interp is PIE).
-    if (rd16(f + 16) == 2) { g_nonpie_lo = basepage; g_nonpie_hi = basepage + span; g_nonpie_bias = bias; }
+    if (etype == 2) { g_nonpie_lo = basepage; g_nonpie_hi = basepage + span; g_nonpie_bias = bias; }
     for (int i = 0; i < phnum; i++) {
         uint8_t *ph = f + phoff + (uint64_t)i * phentsize;
         if (rd32(ph) != 1) continue;
