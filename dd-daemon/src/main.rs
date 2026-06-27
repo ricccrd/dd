@@ -30,6 +30,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::process::Stdio;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use hyper_util::rt::TokioIo;
@@ -92,6 +94,7 @@ struct Live {
     exit_rx: watch::Receiver<Option<i64>>,
     started: std::sync::atomic::AtomicBool, // start() spawns the process exactly once
     tty: bool,
+    pty_master: std::sync::Mutex<Option<RawFd>>, // the PTY master fd (tty containers) for /resize
 }
 impl Live {
     fn new(tty: bool) -> Arc<Self> {
@@ -100,7 +103,8 @@ impl Live {
         let (stdin_tx, stdin_rx) = mpsc::channel(256);
         Arc::new(Live { out, stdin_tx, stdin_rx: Mutex::new(Some(stdin_rx)), stdout_buf: Mutex::new(Vec::new()),
             stderr_buf: Mutex::new(Vec::new()), exit, exit_rx,
-            started: std::sync::atomic::AtomicBool::new(false), tty })
+            started: std::sync::atomic::AtomicBool::new(false), tty,
+            pty_master: std::sync::Mutex::new(None) })
     }
 }
 
@@ -781,10 +785,21 @@ async fn containers_stats(State(a): State<App>, Path(id): Path<String>) -> Respo
         "networks": {}, "blkio_stats": {} })).into_response()
 }
 
-/// POST /containers/:id/resize and /exec/:id/resize -- TTY window size. dd pipes the guest's stdio rather
-/// than allocating a real PTY, so there's no kernel winsize to set; accept it (200) so `docker run -t`
-/// doesn't print "failed to resize tty".
-async fn resize() -> Response { StatusCode::OK.into_response() }
+#[derive(Deserialize)]
+struct ResizeQ { h: Option<u16>, w: Option<u16> }
+/// POST /containers/:id/resize and /exec/:id/resize -- set the PTY window size (TIOCSWINSZ) for a tty
+/// container/exec. Always 200 so `docker run -t` never prints "failed to resize tty".
+async fn resize(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ResizeQ>) -> Response {
+    let g = a.inner.lock().await;
+    let key = resolve_cid(&g, &id).unwrap_or(id);
+    if let Some(live) = g.live.get(&key) {
+        if let Some(fd) = *live.pty_master.lock().unwrap() {
+            let ws = libc::winsize { ws_row: q.h.unwrap_or(24), ws_col: q.w.unwrap_or(80), ws_xpixel: 0, ws_ypixel: 0 };
+            unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws); }
+        }
+    }
+    StatusCode::OK.into_response()
+}
 
 /// POST /containers/:id/wait -- block until the container exits, then return {"StatusCode": n}. CRITICAL:
 /// the docker `run` CLI sends this BEFORE /start and reads it concurrently, so we must flush the response
@@ -1053,35 +1068,10 @@ async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc<Live>) -> 
         return true; // already started
     }
     let Some((prog, args)) = spawn_cfg(c, &app.volumes_dir, vols) else { return false };
-    let mut child = match tokio::process::Command::new(prog).args(args)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-        Ok(ch) => ch,
-        Err(e) => {
-            let _ = live.out.send((2, format!("jit exec failed: {e}\n").into_bytes()));
-            *live.stderr_buf.lock().await = format!("jit exec failed: {e}\n").into_bytes();
-            let _ = live.exit.send(Some(127));
-            if let Some(cc) = app.inner.lock().await.containers.get_mut(&c.id) { cc.status = "exited".into(); cc.exit_code = 127; }
-            return false;
-        }
-    };
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    // Feed the guest's stdin from the channel attach writes to (buffered until now). An empty Vec is the
-    // stdin-EOF sentinel: close the guest's stdin so a shell reading to EOF can finish.
-    if let Some(mut child_in) = child.stdin.take() {
-        if let Some(mut rx) = live.stdin_rx.lock().await.take() {
-            tokio::spawn(async move {
-                while let Some(chunk) = rx.recv().await {
-                    if chunk.is_empty() { break; }
-                    if child_in.write_all(&chunk).await.is_err() { break; }
-                    let _ = child_in.flush().await;
-                }
-                drop(child_in); // EOF to the guest
-            });
-        }
-    }
+    let mut cmd = tokio::process::Command::new(prog);
+    cmd.args(args);
 
-    // pump one stream: broadcast each chunk to attached clients + accumulate for `docker logs`.
+    // pump one piped stream: broadcast each chunk to attached clients + accumulate for `docker logs`.
     async fn pump(mut r: impl AsyncReadExt + Unpin, kind: u8, live: Arc<Live>) {
         let mut buf = [0u8; 8192];
         loop {
@@ -1096,10 +1086,99 @@ async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc<Live>) -> 
             }
         }
     }
-    let lo = live.clone();
-    let h_out = tokio::spawn(async move { pump(stdout, 1, lo).await; });
-    let le = live.clone();
-    let h_err = tokio::spawn(async move { pump(stderr, 2, le).await; });
+
+    // tty=true gives the guest a real PTY -- an interactive shell sees a terminal (prompt, line editing),
+    // and stdout/stderr merge into one raw stream. Otherwise stdio is piped (the multiplexed-frame path).
+    let (mut child, io_handles): (tokio::process::Child, Vec<tokio::task::JoinHandle<()>>) = if c.tty {
+        let (master, slave) = match open_pty() {
+            Ok(p) => p,
+            Err(e) => return live_fail(app, &c.id, &live, format!("openpty: {e}")).await,
+        };
+        let slave_fd = slave.as_raw_fd();
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        // SAFETY: in the forked child, login_tty makes the slave the controlling terminal + stdin/out/err.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::login_tty(slave_fd) != 0 { return Err(std::io::Error::last_os_error()); }
+                Ok(())
+            });
+        }
+        let child = match cmd.spawn() {
+            Ok(ch) => ch,
+            Err(e) => return live_fail(app, &c.id, &live, format!("jit exec failed: {e}")).await,
+        };
+        drop(slave); // the child dup'd it via login_tty; close the parent's copy
+        set_nonblocking(master.as_raw_fd());
+        *live.pty_master.lock().unwrap() = Some(master.as_raw_fd());
+        let afd = match AsyncFd::new(master) {
+            Ok(a) => Arc::new(a),
+            Err(e) => return live_fail(app, &c.id, &live, format!("asyncfd: {e}")).await,
+        };
+        // client stdin -> PTY master
+        if let Some(mut rx) = live.stdin_rx.lock().await.take() {
+            let w = afd.clone();
+            tokio::spawn(async move {
+                while let Some(chunk) = rx.recv().await {
+                    if chunk.is_empty() { break; }
+                    let mut off = 0;
+                    while off < chunk.len() {
+                        let Ok(mut g) = w.writable().await else { return };
+                        match g.try_io(|i| pty_write(i.as_raw_fd(), &chunk[off..])) {
+                            Ok(Ok(n)) => off += n,
+                            Ok(Err(_)) => return,
+                            Err(_would_block) => continue,
+                        }
+                    }
+                }
+            });
+        }
+        // PTY master -> broadcast (kind 1) + log buffer
+        let r = afd.clone();
+        let lr = live.clone();
+        let reader = tokio::spawn(async move {
+            loop {
+                let Ok(mut g) = r.readable().await else { break };
+                let mut buf = [0u8; 8192];
+                match g.try_io(|i| pty_read(i.as_raw_fd(), &mut buf)) {
+                    Ok(Ok(0)) | Ok(Err(_)) => break, // EOF / EIO when the guest exits
+                    Ok(Ok(n)) => {
+                        let chunk = buf[..n].to_vec();
+                        let _ = lr.out.send((1, chunk.clone()));
+                        lr.stdout_buf.lock().await.extend_from_slice(&chunk);
+                    }
+                    Err(_would_block) => continue,
+                }
+            }
+        });
+        (child, vec![reader])
+    } else {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(ch) => ch,
+            Err(e) => return live_fail(app, &c.id, &live, format!("jit exec failed: {e}")).await,
+        };
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        // Feed the guest's stdin from the channel attach writes to (buffered until now). An empty Vec is
+        // the stdin-EOF sentinel: close the guest's stdin so a shell reading to EOF can finish.
+        if let Some(mut child_in) = child.stdin.take() {
+            if let Some(mut rx) = live.stdin_rx.lock().await.take() {
+                tokio::spawn(async move {
+                    while let Some(chunk) = rx.recv().await {
+                        if chunk.is_empty() { break; }
+                        if child_in.write_all(&chunk).await.is_err() { break; }
+                        let _ = child_in.flush().await;
+                    }
+                    drop(child_in); // EOF to the guest
+                });
+            }
+        }
+        let lo = live.clone();
+        let h_out = tokio::spawn(async move { pump(stdout, 1, lo).await; });
+        let le = live.clone();
+        let h_err = tokio::spawn(async move { pump(stderr, 2, le).await; });
+        (child, vec![h_out, h_err])
+    };
 
     let app = app.clone();
     let cid = c.id.clone();
@@ -1107,8 +1186,8 @@ async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc<Live>) -> 
     tokio::spawn(async move {
         let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1) as i64;
         if dbg { eprintln!("[live] {} exited code={code}", &cid[..12]); }
-        let _ = h_out.await;
-        let _ = h_err.await;
+        for h in io_handles { let _ = h.await; }
+        *live.pty_master.lock().unwrap() = None;
         {
             let mut g = app.inner.lock().await;
             if let Some(cc) = g.containers.get_mut(&cid) {
@@ -1122,6 +1201,38 @@ async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc<Live>) -> 
         let _ = live.exit.send(Some(code));
     });
     true
+}
+
+/// Record the failure on a Live and finalize the container as exit 127. Returns false (spawn failed).
+async fn live_fail(app: &App, cid: &str, live: &Arc<Live>, msg: String) -> bool {
+    let _ = live.out.send((2, format!("{msg}\n").into_bytes()));
+    *live.stderr_buf.lock().await = format!("{msg}\n").into_bytes();
+    let _ = live.exit.send(Some(127));
+    if let Some(cc) = app.inner.lock().await.containers.get_mut(cid) { cc.status = "exited".into(); cc.exit_code = 127; }
+    false
+}
+
+/// Allocate a pseudo-terminal; returns (master, slave) owned fds.
+fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let (mut m, mut s): (RawFd, RawFd) = (-1, -1);
+    // termios/winsize are *mut on macOS, *const on linux; null_mut() coerces to both.
+    let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    if r != 0 { return Err(std::io::Error::last_os_error()); }
+    Ok(unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) })
+}
+fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+}
+fn pty_read(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+fn pty_write(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
 // ---- persistence -----------------------------------------------------------
