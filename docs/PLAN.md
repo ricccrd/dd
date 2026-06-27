@@ -41,8 +41,11 @@ What is still missing on `docker build`:
 - the **BuildKit cache** (layer/step caching — today every build re-runs from the base).
 
 ## Remaining JIT gaps
-- **IPC namespace** — SysV/POSIX shm/sem/msg per IPC-ns. (The JIT doesn't implement SysV IPC at all yet,
-  so this is *implement it + namespace the keys*, not just isolation.)
+- **IPC namespace** — SysV **shared memory** works (shmget/shmat/shmdt/shmctl(IPC_RMID), keys namespaced
+  per-container by `DD_NETNS` so containers don't collide; tested on both engines). Still missing:
+  **semaphores** (semget/semop/semctl) and **message queues** (msgget/msgsnd/msgrcv/msgctl), and
+  `shmctl(IPC_STAT/SET)` (the macOS `shmid_ds` layout differs from the guest's). All return ENOSYS today
+  (graceful — the guest falls back).
 
 ### Platform limitations (macOS host — need Linux primitives the host can't provide; off the work-list)
 Non-PIE **ET_EXEC** (macOS `__PAGEZERO` reserves the low 4 GB the fixed vaddr needs), **cpu/io throttling**

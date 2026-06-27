@@ -5,6 +5,19 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 // fd semantics); every path argument is resolved through the container VFS jail. One sorted switch,
 // grouped by category. See docs/SYSCALLS.md for the per-syscall table.
 
+#include <sys/ipc.h>
+#include <sys/shm.h>
+// SysV IPC: namespace a key by the container (DD_NETNS) so two containers don't collide on the same key
+// -- the per-IPC-ns isolation. IPC_PRIVATE stays private; --network host shares the host IPC.
+static key_t ipc_ns_key(key_t k) {
+    if (k == IPC_PRIVATE) return k;
+    const char *ns = getenv("DD_NETNS");
+    if (!ns || !ns[0]) return k;
+    uint32_t salt = 2166136261u;
+    for (const char *p = ns; *p; p++) { salt ^= (uint8_t)*p; salt = salt * 16777619u; }
+    key_t hk = (key_t)((uint32_t)k ^ (salt & 0x7fffffffu));
+    return hk == IPC_PRIVATE ? hk + 1 : hk;
+}
 static void service(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
@@ -2381,6 +2394,32 @@ static void service(struct cpu *c) {
         G_RET(c) = (uint64_t)(-ENOSYS);
         // rseq -> ENOSYS (glibc falls back)
         break;
+
+    // ===================== SysV shared memory (per-container key namespace) =====================
+    case 194: { // shmget(key, size, shmflg)
+        int r = shmget(ipc_ns_key((key_t)a0), (size_t)a1, (int)a2);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        break;
+    }
+    case 196: { // shmat(shmid, shmaddr, shmflg) -- the guest runs in-process so the host map is usable
+        void *p = shmat((int)a0, (const void *)a1, (int)a2);
+        G_RET(c) = (p == (void *)-1) ? (uint64_t)(-errno) : (uint64_t)p;
+        break;
+    }
+    case 197: { // shmdt(shmaddr)
+        int r = shmdt((const void *)a0);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        break;
+    }
+    case 195: { // shmctl(shmid, cmd, buf): IPC_RMID supported; STAT/SET deferred (macOS struct differs)
+        if ((int)a1 == IPC_RMID) {
+            int r = shmctl((int)a0, IPC_RMID, NULL);
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        } else {
+            G_RET(c) = (uint64_t)(-ENOSYS);
+        }
+        break;
+    }
 
     // ===================== unhandled =====================
     default:
