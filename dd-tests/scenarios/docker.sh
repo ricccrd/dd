@@ -150,6 +150,16 @@ has "cp-dir-out" "$(ls "$ROOT/cp-etc" 2>/dev/null)" "alpine-release"
 d rm "$cpc" >/dev/null
 rm -rf "$ROOT/cp-in.txt" "$ROOT/cp-back.txt" "$ROOT/cp-rel.txt" "$ROOT/cp-etc"
 
+echo "== docker build (FROM / RUN / COPY / CMD) =="
+bdir="$ROOT/scen-bctx"; rm -rf "$bdir"; mkdir -p "$bdir"
+printf 'FROM alpine\nRUN echo BUILT-OK > /b.txt\nCOPY c.txt /c.txt\nCMD ["cat","/b.txt","/c.txt"]\n' > "$bdir/Dockerfile"
+echo "CTX-OK" > "$bdir/c.txt"
+d build -t scen-built "$bdir" >/dev/null 2>&1
+bout="$(d run --rm scen-built 2>&1)"
+has "build-run-modified-rootfs" "$bout" "BUILT-OK"
+has "build-copy-from-context"   "$bout" "CTX-OK"
+d rmi scen-built >/dev/null 2>&1; rm -rf "$bdir" "$IMAGES/scen-built"
+
 echo "== --network none blocks external egress (loopback still allowed) =="
 # deterministic: with no network, a non-loopback connect always fails with ENETUNREACH
 has "egress-none-blocked" "$(d run --rm --network none alpine sh -c 'nc -w3 1.1.1.1 80 </dev/null >/dev/null 2>&1; echo rc=$?')" "rc=1"

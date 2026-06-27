@@ -203,6 +203,7 @@ async fn main() {
         .route("/images/json", get(images_json)).route("/images/create", post(images_create))
         .route("/images/:name/json", get(image_inspect))
         .route("/images/:name/push", post(image_push))
+        .route("/build", post(images_build))
         .route("/images/:name/tag", post(image_tag))
         .route("/images/:name", delete(image_delete))
         .route("/containers/json", get(containers_json))
@@ -904,6 +905,169 @@ async fn containers_delete(State(a): State<App>, Path(id): Path<String>) -> Resp
 }
 fn no_such(id: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such container: {id}")}))).into_response()
+}
+
+// ===================== docker build — a minimal Dockerfile builder =====================
+// Not BuildKit: we copy the base image's rootfs, run each RUN in the JIT (writes persist in the new
+// rootfs), COPY from the build context, track ENV/WORKDIR/CMD/ENTRYPOINT, and register the result as an
+// image. Reuses pull (base must be local), the JIT spawn, the archive path-mapper, and image registration.
+#[derive(Deserialize)]
+struct BuildQ { t: Option<String>, dockerfile: Option<String> }
+
+/// Parse a Dockerfile into (INSTRUCTION, args) pairs, honoring `\` line-continuations and `#` comments.
+fn parse_dockerfile(text: &str) -> Vec<(String, String)> {
+    let (mut out, mut acc) = (Vec::new(), String::new());
+    for line in text.lines() {
+        let l = line.trim_end();
+        let t = l.trim_start();
+        if acc.is_empty() && (t.is_empty() || t.starts_with('#')) { continue; }
+        if let Some(s) = l.strip_suffix('\\') { acc.push_str(s.trim_start()); acc.push(' '); continue; }
+        acc.push_str(t);
+        if let Some((inst, args)) = acc.trim().split_once(char::is_whitespace) {
+            out.push((inst.to_uppercase(), args.trim().to_string()));
+        }
+        acc.clear();
+    }
+    out
+}
+
+/// A `CMD`/`ENTRYPOINT` value: JSON-array exec form `["a","b"]` or a shell string (wrapped in sh -c).
+fn parse_exec_form(args: &str) -> Vec<String> {
+    let a = args.trim();
+    if a.starts_with('[') {
+        if let Ok(Value::Array(v)) = serde_json::from_str::<Value>(a) {
+            return v.into_iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+    }
+    vec!["/bin/sh".into(), "-c".into(), a.to_string()]
+}
+
+fn build_stream(lines: Vec<String>) -> Response {
+    (StatusCode::OK, [("Content-Type", "application/json")], lines.join("\n") + "\n").into_response()
+}
+fn build_err(mut lines: Vec<String>, msg: String) -> Response {
+    lines.push(json!({"errorDetail": {"message": msg.clone()}, "error": msg}).to_string());
+    build_stream(lines)
+}
+
+async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum::body::Bytes) -> Response {
+    let raw_tag = q.t.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| "built:latest".into());
+    let name = ref_name(&raw_tag);
+    let dfname = q.dockerfile.filter(|d| !d.is_empty()).unwrap_or_else(|| "Dockerfile".into());
+    let mut log: Vec<String> = Vec::new();
+
+    // unpack the build context (a tar in the request body)
+    let ctx = std::path::PathBuf::from(format!("{}/.build-ctx-{}", a.images_dir, std::process::id()));
+    let _ = std::fs::remove_dir_all(&ctx);
+    if std::fs::create_dir_all(&ctx).is_err() { return build_err(log, "cannot create build dir".into()); }
+    let ctar = ctx.join(".context.tar");
+    let cleanup = |ctx: &std::path::Path| { let _ = std::fs::remove_dir_all(ctx); };
+    if std::fs::write(&ctar, &body).is_err() { cleanup(&ctx); return build_err(log, "cannot write context".into()); }
+    if !matches!(std::process::Command::new("tar").arg("xf").arg(&ctar).arg("-C").arg(&ctx).status(), Ok(s) if s.success()) {
+        cleanup(&ctx); return build_err(log, "cannot unpack build context".into());
+    }
+    let dockerfile = match std::fs::read_to_string(ctx.join(&dfname)) {
+        Ok(d) => d, Err(_) => { cleanup(&ctx); return build_err(log, format!("Cannot locate specified Dockerfile: {dfname}")); }
+    };
+    let steps = parse_dockerfile(&dockerfile);
+    let total = steps.len();
+
+    // the new image's rootfs dir under DD_IMAGES
+    let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    let img_dir = std::path::PathBuf::from(format!("{}/{}", a.images_dir, safe));
+    let _ = std::fs::remove_dir_all(&img_dir);
+    let rootfs = img_dir.join("rootfs");
+
+    let (mut arch, mut cmd, mut workdir, mut env, mut from_done) =
+        (Guest::LinuxAarch64, Vec::<String>::new(), String::new(), Vec::<(String, String)>::new(), false);
+
+    for (i, (inst, args)) in steps.iter().enumerate() {
+        log.push(json!({"stream": format!("Step {}/{} : {} {}\n", i + 1, total, inst, args)}).to_string());
+        match inst.as_str() {
+            "FROM" => {
+                let base = args.split_whitespace().next().unwrap_or("");
+                let found = { let g = a.inner.lock().await;
+                    g.images.iter().find(|im| ref_name(&im.name) == ref_name(base)).map(|im| (im.rootfs.clone(), im.arch)) };
+                let Some((base_rootfs, base_arch)) = found else {
+                    cleanup(&ctx); return build_err(log, format!("base image '{base}' not found locally — pull it first")); };
+                arch = base_arch;
+                std::fs::create_dir_all(&img_dir).ok();
+                if !matches!(std::process::Command::new("cp").arg("-a").arg(&base_rootfs).arg(&rootfs).status(), Ok(s) if s.success()) {
+                    cleanup(&ctx); return build_err(log, "failed to copy base image rootfs".into()); }
+                from_done = true;
+            }
+            _ if !from_done => { cleanup(&ctx); return build_err(log, "no FROM before the first instruction".into()); }
+            "RUN" => {
+                let mut cfg = SpawnConfig::new(workdir.clone(), rootfs.to_string_lossy().into_owned());
+                cfg.env = env.clone();
+                cfg.argv = vec!["/bin/sh".into(), "-c".into(), args.clone()];
+                let Some((prog, cargs)) = cfg.command(arch) else { cleanup(&ctx); return build_err(log, "JIT not available for this arch".into()); };
+                match tokio::process::Command::new(prog).args(cargs).output().await {
+                    Ok(o) => {
+                        if !o.stdout.is_empty() { log.push(json!({"stream": String::from_utf8_lossy(&o.stdout)}).to_string()); }
+                        if !o.stderr.is_empty() { log.push(json!({"stream": String::from_utf8_lossy(&o.stderr)}).to_string()); }
+                        if !o.status.success() {
+                            cleanup(&ctx); return build_err(log, format!("The command '/bin/sh -c {}' returned a non-zero code: {}", args, o.status.code().unwrap_or(-1))); }
+                    }
+                    Err(e) => { cleanup(&ctx); return build_err(log, format!("RUN failed to start: {e}")); }
+                }
+            }
+            "COPY" | "ADD" => {
+                let parts: Vec<&str> = args.split_whitespace().filter(|p| !p.starts_with("--")).collect();
+                if parts.len() < 2 { cleanup(&ctx); return build_err(log, format!("{inst} needs a source and destination")); }
+                let dst = parts[parts.len() - 1];
+                let dst_guest = if dst.starts_with('/') { dst.to_string() } else { format!("{}/{}", workdir.trim_end_matches('/'), dst) };
+                let dst_host = archive_host_path(&rootfs.to_string_lossy(), &[], &dst_guest);
+                let into_dir = dst.ends_with('/') || parts.len() > 2;
+                if into_dir { std::fs::create_dir_all(&dst_host).ok(); } else if let Some(p) = dst_host.parent() { std::fs::create_dir_all(p).ok(); }
+                for src in &parts[..parts.len() - 1] {
+                    let src_host = ctx.join(src);
+                    if !matches!(std::process::Command::new("cp").arg("-a").arg(&src_host).arg(&dst_host).status(), Ok(s) if s.success()) {
+                        cleanup(&ctx); return build_err(log, format!("{inst} {src}: no such file in the build context")); }
+                }
+            }
+            "ENV" => {
+                // `ENV K V` or `ENV K=V [K2=V2 …]`
+                if let Some((k, v)) = args.split_once('=') {
+                    env.push((k.trim().to_string(), v.split_whitespace().next().unwrap_or("").trim_matches('"').to_string()));
+                } else if let Some((k, v)) = args.split_once(char::is_whitespace) {
+                    env.push((k.trim().to_string(), v.trim().trim_matches('"').to_string()));
+                }
+            }
+            "WORKDIR" => {
+                workdir = if args.starts_with('/') { args.clone() } else { format!("{}/{}", workdir.trim_end_matches('/'), args) };
+                let wh = archive_host_path(&rootfs.to_string_lossy(), &[], &workdir);
+                std::fs::create_dir_all(&wh).ok();
+            }
+            "CMD" => cmd = parse_exec_form(args),
+            "ENTRYPOINT" => cmd = parse_exec_form(args),
+            _ => {} // EXPOSE/LABEL/ARG/MAINTAINER/USER/VOLUME/HEALTHCHECK — no rootfs effect in this builder
+        }
+    }
+    if !from_done { cleanup(&ctx); return build_err(log, "Dockerfile had no FROM".into()); }
+    cleanup(&ctx);
+
+    // register the built image
+    if cmd.is_empty() { cmd = default_shell(&rootfs); }
+    std::fs::write(img_dir.join("dd-image.json"),
+        format!("{{\"name\":{:?},\"cmd\":{}}}", name, serde_json::to_string(&cmd).unwrap_or_else(|_| "[]".into()))).ok();
+    let id = format!("{:x}", md5_like(&safe));
+    {
+        let mut g = a.inner.lock().await;
+        g.images.retain(|im| ref_name(&im.name) != name);
+        g.images.push(Image { name: name.to_string(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd });
+    }
+    log.push(json!({"stream": format!("Successfully built {}\n", &id[..12.min(id.len())])}).to_string());
+    log.push(json!({"stream": format!("Successfully tagged {raw_tag}\n")}).to_string());
+    log.push(json!({"aux": {"ID": format!("sha256:{id}")}}).to_string());
+    build_stream(log)
+}
+
+/// A cheap, stable hex id for a built image (not a real digest — just a handle for the CLI).
+fn md5_like(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
 }
 
 // ===================== docker cp — the /archive tar endpoints =====================
