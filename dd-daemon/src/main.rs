@@ -95,6 +95,7 @@ struct Live {
     started: std::sync::atomic::AtomicBool, // start() spawns the process exactly once
     tty: bool,
     pty_master: std::sync::Mutex<Option<RawFd>>, // the PTY master fd (tty containers) for /resize
+    pid: std::sync::Mutex<Option<u32>>,          // the live JIT process pid (for pause = SIGSTOP/SIGCONT)
 }
 impl Live {
     fn new(tty: bool) -> Arc<Self> {
@@ -104,7 +105,7 @@ impl Live {
         Arc::new(Live { out, stdin_tx, stdin_rx: Mutex::new(Some(stdin_rx)), stdout_buf: Mutex::new(Vec::new()),
             stderr_buf: Mutex::new(Vec::new()), exit, exit_rx,
             started: std::sync::atomic::AtomicBool::new(false), tty,
-            pty_master: std::sync::Mutex::new(None) })
+            pty_master: std::sync::Mutex::new(None), pid: std::sync::Mutex::new(None) })
     }
 }
 
@@ -212,7 +213,7 @@ async fn main() {
         .route("/containers/:id/kill", post(containers_stop))
         .route("/containers/:id/restart", post(containers_restart))
         .route("/containers/:id/pause", post(containers_pause))
-        .route("/containers/:id/unpause", post(containers_pause))
+        .route("/containers/:id/unpause", post(containers_unpause))
         .route("/containers/:id/rename", post(containers_rename))
         .route("/containers/:id/top", get(containers_top))
         .route("/containers/:id/stats", get(containers_stats))
@@ -753,9 +754,20 @@ fn push_progress(name: &str, result: Result<String, String>) -> Response {
 // ---- container control: pause / rename / top / stats ------------------------
 /// POST /containers/:id/(un)pause -- dd runs a container as one process group with no freezer cgroup;
 /// accept and no-op so the CLI verbs succeed.
-async fn containers_pause(State(a): State<App>, Path(id): Path<String>) -> Response {
-    let g = a.inner.lock().await;
-    match resolve_cid(&g, &id) { Some(_) => StatusCode::NO_CONTENT.into_response(), None => no_such(&id) }
+async fn containers_pause(State(a): State<App>, Path(id): Path<String>) -> Response { freeze(a, id, true).await }
+async fn containers_unpause(State(a): State<App>, Path(id): Path<String>) -> Response { freeze(a, id, false).await }
+/// docker pause/unpause. macOS has no freezer cgroup, but SIGSTOP/SIGCONT on the container's JIT process
+/// freezes it (and its threads) just the same -- single-process / threaded containers (the common case)
+/// freeze fully; a guest that forked separate host processes pauses its main process (best-effort).
+async fn freeze(a: App, id: String, pause: bool) -> Response {
+    let mut g = a.inner.lock().await;
+    let Some(full) = resolve_cid(&g, &id) else { return no_such(&id); };
+    if let Some(pid) = g.live.get(&full).and_then(|l| *l.pid.lock().unwrap()) {
+        unsafe { libc::kill(pid as i32, if pause { libc::SIGSTOP } else { libc::SIGCONT }); }
+    }
+    if let Some(c) = g.containers.get_mut(&full) { c.status = if pause { "paused".into() } else { "running".into() }; }
+    save_state(&g, &a.state_path);
+    StatusCode::NO_CONTENT.into_response()
 }
 #[derive(Deserialize)]
 struct RenameQ { name: Option<String> }
@@ -862,7 +874,7 @@ async fn containers_inspect(State(a): State<App>, Path(id): Path<String>) -> Res
     let g = a.inner.lock().await;
     match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {
         Some(c) => Json(json!({"Id": c.id, "Image": c.image, "Created": fmt_rfc3339(c.created),
-            "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": c.status == "running"},
+            "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": c.status == "running" || c.status == "paused", "Paused": c.status == "paused"},
             "Config": {"Cmd": c.cmd, "Hostname": c.hostname},
             "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit}})).into_response(),
         None => no_such(&id) }
@@ -1317,6 +1329,7 @@ async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc<Live>) -> 
         (child, vec![h_out, h_err])
     };
 
+    *live.pid.lock().unwrap() = child.id(); // remember the pid so pause can SIGSTOP/SIGCONT it
     let app = app.clone();
     let cid = c.id.clone();
     let dbg = std::env::var("DD_DEBUG").is_ok();

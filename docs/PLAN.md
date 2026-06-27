@@ -15,22 +15,19 @@ binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-cli
    that aarch64 uses. Lift it on via cpu-access accessors so the code cache + dispatcher are
    cpu-agnostic (the cpu struct and the x86 decoder stay genuinely per-arch). Payoff: one engine, two
    thin frontends.
-2. **Rare fork/command-sub `Bus error`.** ~1/15 intermittent fault in the fork + nested command-sub path
-   under full container flags (pre-existing in the engine). Likely a shadow-stack/teardown race;
-   reproduce under load and fix.
-3. **Networking Phase-2b — userspace netstack.** A real TCP/IP stack for *external* traffic with NET-ns
+2. **Networking Phase-2b — userspace netstack.** A real TCP/IP stack for *external* traffic with NET-ns
    interfaces/routes + tunnel egress. Loopback isolation + port-map already cover the common case.
-4. **Untrusted-guest isolation — the sentry process-split.** Seccomp/Seatbelt-locked sandbox task +
+3. **Untrusted-guest isolation — the sentry process-split.** Seccomp/Seatbelt-locked sandbox task +
    trusted sentry over a syscall ring. Required only for untrusted images.
-5. **Tier-2 trace optimizer.** Trace formation over `PROF`, cross-trace register allocation (removes the
+4. **Tier-2 trace optimizer.** Trace formation over `PROF`, cross-trace register allocation (removes the
    per-block spill — the main remaining overhead), monomorphic-comparator inlining, purity-gate
    memoization. Constraint: do not use dead-register §B scratch (unsafe); don't drop the §B gsp check.
-6. **Optimize the x86 (jit86) translator toward native.** dd already beats qemu-user emulation on every
+5. **Optimize the x86 (jit86) translator toward native.** dd already beats qemu-user emulation on every
    benchmark (`make bench`: int 1.36×, FP 21×, SHA-256 1.15×, SQLite 3.16×), but x86→arm64 translation
    still trails *native* arm on compute (SHA-256 is only ~1.15× over qemu, vs the aarch64 engine running
    at native speed). Close the gap: elide flag synthesis (materialize only the EFLAGS bits a consumer
    actually reads), tighter SSE/x87 lowering, and — once the engine dedup (#1) lands — inherit the
-   aarch64 engine's block-chaining / IBTC / §B optimizations plus the tier-2 optimizer (#5). Target: x86
+   aarch64 engine's block-chaining / IBTC / §B optimizations plus the tier-2 optimizer (#4). Target: x86
    compute approaching native, beating any VM path (qemu *or* Rosetta), to hold the "beat the VM
    everywhere" bar.
 
@@ -39,7 +36,6 @@ OCI registry **pull/push now works against any registry** — Docker Hub, `ghcr.
 plain `localhost:5000` (`dd-daemon/src/registry.rs`; 42/42 docker-CLI scenarios pass). So
 `DD_IMAGES` no longer has to point at a pre-extracted rootfs. What is still missing:
 - **`docker build`** — needs a BuildKit-compatible builder.
-- **freezer `pause`/`unpause`** — accepted but no-ops (dd has no freezer cgroup on macOS).
 
 ## Remaining JIT gaps
 - **ET_EXEC loader** (non-PIE static) — platform-blocked by macOS `__PAGEZERO`; needs a fixed-vaddr map.

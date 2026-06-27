@@ -182,7 +182,9 @@ impl SpawnConfig {
             }
             // A bare static-PIE guest needs no rootfs; omit the flag so it runs un-jailed.
             if !self.rootfs.is_empty() { f += &format!("--rootfs {} ", shq(&self.rootfs)); }
-            format!("{env}{jit} {f}{argv}")
+            // `exec env …` so the JIT REPLACES the wrapper shell -- it becomes the process the daemon
+            // tracks (live.pid), so `docker pause` (SIGSTOP/SIGCONT) hits the JIT, not a dead bash parent.
+            format!("exec env {env}{jit} {f}{argv}")
         };
         Some(format!("{cd}{body}"))
     }
