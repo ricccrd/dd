@@ -60,7 +60,9 @@ at a time with the cross-engine matrix as the regression gate.**
    (IBTC `ic_site` vs `ic_miss`, post-`run_block` reason switch, the two trampolines, x86 debug), `emit`
    stays per-arch. ✅ **PR1 DONE** (x86 lifted onto shared `jit/cache.c` via `G_GPC_HASH_SHIFT` + a new
    `engine_glue.c`; aarch64 bit-identical; **matrix 240 green both engines**). **Next PR:** the 4 dispatch
-   hooks → lift `dispatch.c` (PRs 2-4 in the design).
+   hooks → lift `dispatch.c`. ✅ **PR2 DONE** (dispatch.c hook seam: G_DISPATCH_DEBUG/SHADOW_CLEAR/IBTC_FILL/
+   DISPATCH_REASON in a new aarch64 `dispatch_hooks.h`; aarch64 bit-identical, matrix 240). **Next:** PR3/4
+   (x86 hook defs + the dispatch swap; also hook the 5th divergence, the per-block g_trace dump).
 2. **Networking Phase-2b — userspace netstack.** → **`docs/design/netstack.md`**. Reframing: external
    egress already works root-free (a guest socket *is* a host socket); the real gap is L3 **identity**
    (per-container IP) — what breaks `docker-net.sh` (3/7). ✅ **PR1 DONE** (daemon IPAM `172.18/12` +
