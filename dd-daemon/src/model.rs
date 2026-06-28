@@ -44,6 +44,35 @@ pub(crate) struct Image {
 }
 
 
+/// `--restart` policy (HostConfig.RestartPolicy). `name` is one of "" / "no" / "always" /
+/// "unless-stopped" / "on-failure"; `max_retry` caps `on-failure` restarts. Serde-renamed so it both
+/// deserializes from the create body and round-trips verbatim back through inspect HostConfig.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct RestartPolicy {
+    #[serde(rename = "Name", default)] pub(crate) name: String,
+    #[serde(rename = "MaximumRetryCount", default)] pub(crate) max_retry: i64,
+}
+
+/// `--device` mapping (HostConfig.Devices[]). Metadata only — the JIT does not enforce device cgroups —
+/// stored and reported verbatim in inspect.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct DeviceMapping {
+    #[serde(rename = "PathOnHost", default)] pub(crate) path_on_host: String,
+    #[serde(rename = "PathInContainer", default)] pub(crate) path_in_container: String,
+    #[serde(rename = "CgroupPermissions", default)] pub(crate) cgroup_permissions: String,
+}
+
+/// `--mount` spec (HostConfig.Mounts[]). `typ` is "bind" or "volume"; `source` is a host path (bind) or
+/// volume name (volume); `target` is the in-container path. `read_only` is metadata (the JIT's Volume
+/// mechanism can't mark a mount read-only). Wired into the rootfs via the same path as `-v`/Binds.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Mount {
+    #[serde(rename = "Type", default)] pub(crate) typ: String,
+    #[serde(rename = "Source", default)] pub(crate) source: String,
+    #[serde(rename = "Target", default)] pub(crate) target: String,
+    #[serde(rename = "ReadOnly", default)] pub(crate) read_only: bool,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Container {
     pub(crate) id: String,
@@ -76,6 +105,21 @@ pub(crate) struct Container {
     pub(crate) started_at: i64, // unix secs, set on start (inspect State.StartedAt)
     #[serde(default)]
     pub(crate) finished_at: i64, // unix secs, set on stop/natural exit (inspect State.FinishedAt)
+    // ---- HostConfig fidelity (docker run extras) ----
+    #[serde(default)]
+    pub(crate) restart_policy: RestartPolicy, // `--restart` (supervisor restarts on exit per policy)
+    #[serde(default)]
+    pub(crate) restart_count: i64, // restarts performed so far (caps `on-failure:N`; inspect RestartCount)
+    #[serde(default)]
+    pub(crate) cap_add: Vec<String>, // `--cap-add` — metadata (JIT doesn't enforce Linux capabilities)
+    #[serde(default)]
+    pub(crate) cap_drop: Vec<String>, // `--cap-drop` — metadata
+    #[serde(default)]
+    pub(crate) devices: Vec<DeviceMapping>, // `--device` — metadata
+    #[serde(default)]
+    pub(crate) mounts: Vec<Mount>, // `--mount` (wired into the rootfs alongside `-v`/Binds)
+    #[serde(default)]
+    pub(crate) privileged: bool, // `--privileged` — metadata; relaxes daemon-side guards (none currently)
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]
     pub(crate) arch: Option<Guest>,
@@ -99,6 +143,7 @@ pub(crate) struct Live {
     pub(crate) exit: watch::Sender<Option<i64>>, // Some(code) once exited
     pub(crate) exit_rx: watch::Receiver<Option<i64>>,
     pub(crate) started: std::sync::atomic::AtomicBool, // start() spawns the process exactly once
+    pub(crate) stop_requested: std::sync::atomic::AtomicBool, // set by stop/kill/rm so the RestartPolicy supervisor won't auto-restart a deliberately-stopped container
     pub(crate) tty: bool,
     pub(crate) pty_master: std::sync::Mutex<Option<RawFd>>, // the PTY master fd (tty containers) for /resize
     pub(crate) pid: std::sync::Mutex<Option<u32>>,          // the live JIT process pid (for pause = SIGSTOP/SIGCONT)
@@ -111,7 +156,8 @@ impl Live {
         let (stdin_tx, stdin_rx) = mpsc::channel(256);
         Arc::new(Live { out, stdin_tx, stdin_rx: Mutex::new(Some(stdin_rx)), stdout_buf: Mutex::new(Vec::new()),
             stderr_buf: Mutex::new(Vec::new()), exit, exit_rx,
-            started: std::sync::atomic::AtomicBool::new(false), tty,
+            started: std::sync::atomic::AtomicBool::new(false),
+            stop_requested: std::sync::atomic::AtomicBool::new(false), tty,
             pty_master: std::sync::Mutex::new(None), pid: std::sync::Mutex::new(None) })
     }
 }
@@ -175,6 +221,9 @@ pub(crate) struct Exec {
     pub(crate) env: Vec<String>,
     pub(crate) working_dir: String,
     pub(crate) user: String,
+    /// `docker exec --privileged` — metadata only (the JIT doesn't enforce Linux caps); accepted
+    /// without error and surfaced in exec inspect, mirroring the container-level `privileged`.
+    pub(crate) privileged: bool,
 }
 
 

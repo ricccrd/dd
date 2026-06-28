@@ -37,9 +37,23 @@ use ddjit::{Guest, PortMap, SpawnConfig, Volume};
 pub(crate) struct ArchiveQ { path: String }
 
 
-/// Map a container path to its host path. A path inside a bind volume maps to the host volume dir (so
-/// `docker cp` to e.g. ddcli's mounted cwd hits the real files); otherwise it lands in the container
-/// rootfs (the overlay upper). `..` is lexically clamped inside whichever base so it can't escape.
+/// Render a container's `--mount`/Mounts as `-v`-style "source:target" bind strings so they can be fed
+/// to [`archive_host_path`] alongside the real `-v`/Binds (which it resolves identically). A `type=bind`
+/// mount's Source is an absolute host path; a `type=volume` mount's Source is a NAME that
+/// `archive_host_path` then roots at `<volumes_dir>/<name>` (the local driver's mountpoint). Keeping the
+/// binds-string contract means cp sees exactly the mount layout the guest does, without a wider signature
+/// (build.rs reuses the same helper for COPY/ADD with no mounts). Empty-target/source mounts are skipped.
+pub(crate) fn mounts_as_binds(mounts: &[Mount]) -> Vec<String> {
+    mounts.iter().filter(|m| !m.target.is_empty() && !m.source.is_empty())
+        .map(|m| format!("{}:{}", m.source, m.target)).collect()
+}
+
+
+/// Map a container path to its host path. A path inside a bind/volume mount maps to its host source dir
+/// (so `docker cp` to e.g. ddcli's mounted cwd, or a `-v name:/mnt` mount, hits the real files);
+/// otherwise it lands in the container rootfs (the overlay upper). `..` is lexically clamped inside
+/// whichever base so it can't escape. `binds` is "host:container" — for `--mount`/Mounts coverage the
+/// caller appends [`mounts_as_binds`] (the local-driver volume name resolves to `<volumes_dir>/<name>`).
 pub(crate) fn archive_host_path(rootfs: &str, binds: &[String], volumes_dir: &str, path: &str) -> std::path::PathBuf {
     // bind volumes first (host:container), same precedence as the JIT jail. The most specific
     // (longest container-dest) bind wins so nested binds resolve to the right source; a requested path
@@ -112,7 +126,8 @@ pub(crate) fn path_stat_b64(host: &std::path::Path) -> Option<String> {
 pub(crate) async fn archive_head(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
     let g = a.inner.lock().await;
     let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-    match path_stat_b64(&archive_host_path(&c.rootfs, &c.binds, &a.volumes_dir, &q.path)) {
+    let binds: Vec<String> = c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect();
+    match path_stat_b64(&archive_host_path(&c.rootfs, &binds, &a.volumes_dir, &q.path)) {
         Some(stat) => (StatusCode::OK, [("X-Docker-Container-Path-Stat", stat)]).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(),
     }
@@ -122,7 +137,7 @@ pub(crate) async fn archive_head(State(a): State<App>, Path(id): Path<String>, Q
 pub(crate) async fn archive_get(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
     let (rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-        (c.rootfs.clone(), c.binds.clone()) };
+        (c.rootfs.clone(), c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect::<Vec<_>>()) };
     let host = archive_host_path(&rootfs, &binds, &a.volumes_dir, &q.path);
     let Some(stat) = path_stat_b64(&host) else {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(); };
@@ -140,7 +155,7 @@ pub(crate) async fn archive_get(State(a): State<App>, Path(id): Path<String>, Qu
 pub(crate) async fn archive_put(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>, body: axum::body::Bytes) -> Response {
     let (rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-        (c.rootfs.clone(), c.binds.clone()) };
+        (c.rootfs.clone(), c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect::<Vec<_>>()) };
     let host = archive_host_path(&rootfs, &binds, &a.volumes_dir, &q.path);
     if !host.is_dir() {
         return (StatusCode::BAD_REQUEST, Json(json!({"message": format!("extraction point {} is not a directory", q.path)}))).into_response(); }

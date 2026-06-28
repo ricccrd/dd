@@ -52,6 +52,13 @@ pub(crate) struct HostConfig {
     #[serde(rename = "PidsLimit")] pids_limit: Option<i64>,
     #[serde(rename = "PortBindings")] port_bindings: Option<HashMap<String, Vec<PortBinding>>>,
     #[serde(rename = "NetworkMode")] network_mode: Option<String>,
+    // HostConfig fidelity extras (parsed + persisted; round-tripped back through inspect).
+    #[serde(rename = "RestartPolicy")] restart_policy: Option<RestartPolicy>,
+    #[serde(rename = "CapAdd")] cap_add: Option<Vec<String>>,
+    #[serde(rename = "CapDrop")] cap_drop: Option<Vec<String>>,
+    #[serde(rename = "Devices")] devices: Option<Vec<DeviceMapping>>,
+    #[serde(rename = "Mounts")] mounts: Option<Vec<Mount>>,
+    #[serde(rename = "Privileged")] privileged: Option<bool>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -113,6 +120,16 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         user: body.user.unwrap_or_default(),
         labels: body.labels.unwrap_or_default(),
         network_mode: hc.as_ref().and_then(|h| h.network_mode.clone()).unwrap_or_default(),
+        // HostConfig fidelity extras: parse + persist verbatim (surfaced back in inspect HostConfig).
+        // `--mount` entries (bind/volume) are additionally wired into the rootfs in spawn_cfg via the
+        // same Volume mechanism as `-v`/Binds. CapAdd/CapDrop/Devices/Privileged are metadata (the JIT
+        // doesn't enforce Linux capabilities/devices); RestartPolicy drives the spawn-time supervisor.
+        restart_policy: hc.as_ref().and_then(|h| h.restart_policy.clone()).unwrap_or_default(),
+        cap_add: hc.as_ref().and_then(|h| h.cap_add.clone()).unwrap_or_default(),
+        cap_drop: hc.as_ref().and_then(|h| h.cap_drop.clone()).unwrap_or_default(),
+        devices: hc.as_ref().and_then(|h| h.devices.clone()).unwrap_or_default(),
+        mounts: hc.as_ref().and_then(|h| h.mounts.clone()).unwrap_or_default(),
+        privileged: hc.as_ref().and_then(|h| h.privileged).unwrap_or(false),
         status: "created".into(), ..Default::default()
     };
     // Join the network now (fixes the bug where `docker run --network X` never added the container to
@@ -183,7 +200,11 @@ async fn do_stop(a: &App, id: &str, sig: i32, t: i64) -> Response {
     let (full, pid) = {
         let g = a.inner.lock().await;
         let Some(full) = resolve_cid(&g, id) else { return no_such(id) };
-        let pid = g.live.get(&full).and_then(|l| *l.pid.lock().unwrap());
+        // Mark a deliberate stop so the RestartPolicy supervisor won't auto-restart this container.
+        let pid = g.live.get(&full).map(|l| {
+            l.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+            *l.pid.lock().unwrap()
+        }).flatten();
         (full, pid)
     };
     if let Some(pid) = pid {
@@ -222,8 +243,9 @@ pub(crate) async fn containers_kill(State(a): State<App>, Path(id): Path<String>
     let mut g = a.inner.lock().await;
     let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
     let sig = q.signal.as_deref().map(|s| parse_signal(s, libc::SIGKILL)).unwrap_or(libc::SIGKILL);
-    if let Some(pid) = g.live.get(&full).and_then(|l| *l.pid.lock().unwrap()) {
-        unsafe { libc::kill(pid as i32, sig); }                  // mirror of freeze()'s libc::kill
+    if let Some(l) = g.live.get(&full) {
+        l.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst); // deliberate stop: no auto-restart
+        if let Some(pid) = *l.pid.lock().unwrap() { unsafe { libc::kill(pid as i32, sig); } } // mirror of freeze()'s libc::kill
     }
     if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
     crate::events::emit_event(&a.events, "container", "kill", &full, json!({}));
@@ -231,12 +253,34 @@ pub(crate) async fn containers_kill(State(a): State<App>, Path(id): Path<String>
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// restart: stop the live process (real signal, via the new stop path) then re-run it in place.
+/// restart: stop the live process (real signal, via the stop path) then spawn a FRESH `Live` so the
+/// guest truly re-runs. We can't reuse `containers_start` here: its `g.live.entry(..).or_insert_with`
+/// would return the OLD, spent `Live` (whose `started` flag is already set), and `spawn_live` no-ops on
+/// an already-started `Live` — so the container would never actually re-spawn. `do_stop` set
+/// `stop_requested` on that old `Live`, so when its process dies the RestartPolicy supervisor skips it
+/// (a deliberate `docker restart` must not be double-counted as a crash); this handler owns the respawn.
+/// The new `Live` starts with `stop_requested=false`, so a *future* crash still follows `--restart`.
 pub(crate) async fn containers_restart(State(a): State<App>, Path(id): Path<String>, Query(q): Query<StopQ>) -> Response {
     let sig = q.signal.as_deref().map(|s| parse_signal(s, libc::SIGTERM)).unwrap_or(libc::SIGTERM);
     let t = q.t.unwrap_or(10).max(0);
+    // Stop the running process (if any). `do_stop` blocks until the old reaper flips status to "exited"
+    // (or the container had no live process), so its state writes are done before we install the new Live.
     let _ = do_stop(&a, &id, sig, t).await;
-    containers_start(State(a), Path(id)).await
+    let (c, vols, live) = {
+        let mut g = a.inner.lock().await;
+        let full = match resolve_cid(&g, &id) { Some(f) => f, None => return no_such(&id) };
+        let c = match g.containers.get(&full).cloned() { Some(c) => c, None => return no_such(&id) };
+        // Replace the spent Live with a fresh one (mirrors maybe_restart / start's spawn).
+        let live = Live::new(c.tty);
+        g.live.insert(full.clone(), live.clone());
+        if let Some(cc) = g.containers.get_mut(&full) { cc.status = "running".into(); cc.started_at = now_secs(); }
+        (c, g.volumes.clone(), live)
+    };
+    if std::env::var("DD_DEBUG").is_ok() { eprintln!("[restart] {} cmd={:?}", &c.id[..12], c.cmd); }
+    spawn_live(&a, &c, &vols, live).await;
+    crate::events::emit_event(&a.events, "container", "start", &c.id, json!({"name": c.name, "image": c.image}));
+    crate::events::emit_event(&a.events, "container", "restart", &c.id, json!({"name": c.name}));
+    StatusCode::NO_CONTENT.into_response()
 }
 
 
@@ -321,6 +365,7 @@ pub(crate) struct ExecCreateBody {
     #[serde(rename = "Env")] env: Option<Vec<String>>,
     #[serde(rename = "WorkingDir")] working_dir: Option<String>,
     #[serde(rename = "User")] user: Option<String>,
+    #[serde(rename = "Privileged")] privileged: Option<bool>,
 }
 
 /// POST /containers/:id/exec -- create an exec (record the command). Run it with /exec/:id/start.
@@ -334,7 +379,10 @@ pub(crate) async fn exec_create(State(a): State<App>, Path(id): Path<String>, Js
     let exec_id = new_id(&format!("exec-{full}"));
     g.execs.insert(exec_id.clone(), Exec { container_id: full, cmd, tty: body.tty.unwrap_or(false), started: false,
         env: body.env.unwrap_or_default(), working_dir: body.working_dir.unwrap_or_default(),
-        user: body.user.unwrap_or_default() });
+        user: body.user.unwrap_or_default(),
+        // `--privileged`: metadata only (no Linux-cap enforcement in the JIT). Accept + record it so
+        // exec inspect reflects it; the spawn path is unchanged (mirrors -e/-w/-u being plain fields).
+        privileged: body.privileged.unwrap_or(false) });
     (StatusCode::CREATED, Json(json!({"Id": exec_id}))).into_response()
 }
 
@@ -400,7 +448,8 @@ pub(crate) async fn exec_inspect(State(a): State<App>, Path(id): Path<String>) -
         None => (false, 0),
     };
     Json(json!({"ID": id, "Running": running, "ExitCode": code, "ContainerID": exec.container_id,
-        "ProcessConfig": {"tty": exec.tty, "entrypoint": exec.cmd.first().cloned().unwrap_or_default(),
+        "ProcessConfig": {"tty": exec.tty, "privileged": exec.privileged,
+            "entrypoint": exec.cmd.first().cloned().unwrap_or_default(),
             "arguments": exec.cmd.get(1..).map(|s| s.to_vec()).unwrap_or_default()}})).into_response()
 }
 
@@ -837,8 +886,17 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
             "State": {"Status": c.status, "ExitCode": c.exit_code, "Running": running, "Paused": c.status == "paused",
                 "Pid": pid, "StartedAt": started_at, "FinishedAt": finished_at},
             "Config": {"Cmd": c.cmd, "Hostname": c.hostname, "Image": c.image, "Env": c.env, "Labels": c.labels},
-            "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
-            "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit},
+            "RestartCount": c.restart_count,
+            // Top-level resolved Mounts: the `-v`/Binds path (Type=bind) plus any `--mount` specs (their
+            // declared bind/volume Type), honoring ReadOnly (RW=false) for the mount specs.
+            "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind", "RW": true})))
+                .chain(c.mounts.iter().map(|m| json!({"Type": m.typ, "Source": m.source, "Destination": m.target, "RW": !m.read_only})))
+                .collect::<Vec<_>>(),
+            // HostConfig round-trips the fidelity extras verbatim so docker clients diff them cleanly.
+            "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit,
+                "RestartPolicy": {"Name": c.restart_policy.name, "MaximumRetryCount": c.restart_policy.max_retry},
+                "CapAdd": c.cap_add, "CapDrop": c.cap_drop, "Devices": c.devices, "Mounts": c.mounts,
+                "Privileged": c.privileged},
             // NetworkSettings present so `docker port` (reads .NetworkSettings.Ports) doesn't panic.
             "NetworkSettings": {"Ports": ports_map_json(&c.publish), "IPAddress": primary.0, "Gateway": primary.1,
                 "Networks": Value::Object(networks)}})).into_response()
@@ -977,6 +1035,8 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
 pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<String>) -> Response {
     let mut g = a.inner.lock().await;
     let full = match resolve_cid(&g, &id) { Some(f) => f, None => return no_such(&id) };
+    // Removing a container cancels any pending RestartPolicy restart.
+    if let Some(l) = g.live.get(&full) { l.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst); }
     if let Some(dc) = g.containers.remove(&full) {
         crate::events::emit_event(&a.events, "container", "destroy", &full, json!({"name": dc.name, "image": dc.image}));
         // Drop the container from any network membership too.

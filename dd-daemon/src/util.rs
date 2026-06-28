@@ -96,6 +96,13 @@ pub(crate) fn dd_home() -> PathBuf {
 }
 
 
+/// `~/.dd/buildcache` — the `docker build` layer cache root (one dir per cached step under `layers/`).
+/// Distinct from `~/.dd/pcache` (the JIT translated-code cache surfaced as `system df` BuilderSize).
+pub(crate) fn buildcache_dir() -> PathBuf {
+    dd_home().join("buildcache")
+}
+
+
 pub(crate) fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }

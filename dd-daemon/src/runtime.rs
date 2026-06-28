@@ -29,6 +29,43 @@ use hyper_util::rt::TokioIo;
 use ddjit::{Guest, PortMap, SpawnConfig, Volume};
 
 
+/// Resolve a docker `--user`/`Config.User` spec to a numeric `(uid, gid)` against the container's
+/// rootfs. Accepts every docker form: `uid`, `name`, `uid:gid`, `name:group`, `uid:group`, `name:gid`.
+/// A numeric component is taken verbatim (no file access needed — keeps the numeric path independent of
+/// the rootfs contents); a NAME is looked up in `<rootfs>/etc/passwd` (user) or `<rootfs>/etc/group`
+/// (group). When no group is given the user's primary gid from /etc/passwd is used (falling back to the
+/// uid when the user isn't in passwd). Returns `None` if a name component can't be resolved, so the
+/// caller leaves the guest's default identity (matching the prior "skip unknown user" behavior).
+fn resolve_user(rootfs: &str, spec: &str) -> Option<(u32, u32)> {
+    let (us, gs) = spec.split_once(':').map_or((spec, None), |(u, g)| (u, Some(g)));
+    // passwd line: name:passwd:uid:gid:gecos:home:shell  — return (uid, primary gid) for a name match.
+    let lookup_passwd = |name: &str| -> Option<(u32, u32)> {
+        let passwd = std::fs::read_to_string(format!("{rootfs}/etc/passwd")).ok()?;
+        passwd.lines().find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 4 && f[0] == name).then(|| Some((f[2].parse().ok()?, f[3].parse().ok()?)))?
+        })
+    };
+    // group line: name:passwd:gid:members — return the gid for a name match.
+    let lookup_group = |name: &str| -> Option<u32> {
+        let group = std::fs::read_to_string(format!("{rootfs}/etc/group")).ok()?;
+        group.lines().find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 3 && f[0] == name).then(|| f[2].parse().ok())?
+        })
+    };
+    let (uid, primary_gid) = match us.parse::<u32>() {
+        Ok(n) => (n, None),
+        Err(_) => { let (u, g) = lookup_passwd(us)?; (u, Some(g)) }
+    };
+    let gid = match gs {
+        None => primary_gid.unwrap_or(uid), // no `:group`: the passwd primary gid, else mirror the uid
+        Some(g) => g.parse().ok().or_else(|| lookup_group(g))?,
+    };
+    Some((uid, gid))
+}
+
+
 /// Translate the container into a typed [`SpawnConfig`] and run it in the matching guest's JIT.
 /// Named-volume binds (`name:/path`, no leading `/`) are resolved against `volumes_dir`.
 /// Build the (program, args) that launches this container in the matching guest's JIT. `None` if no JIT
@@ -66,29 +103,41 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
     if c.network_mode == "none" { cfg.env.push(("DD_NET_ISOLATE".into(), "1".into())); }
     // netstack PR2 — per-network AF_UNIX virtual switch: container<->container TCP for in-subnet peers.
     if let Some((netid, ip)) = bridge { cfg.env.push(("DD_NETBR".into(), netid)); cfg.env.push(("DD_IP".into(), ip)); }
-    // `docker run --user U[:G]` / `docker exec -u U[:G]`: surface the requested uid/gid to the JIT, which
-    // makes the guest observe them via getuid/getgid/setuid. Only numeric ids are honored; a `name` we
-    // can't resolve (no passwd lookup here) is skipped (the guest then keeps its default identity). When
-    // no group is given, the gid mirrors the uid (the common rootless case for this DBT).
+    // `docker run --user U[:G]` / `docker exec -u U[:G]` (and an image's `Config.User`): surface the
+    // requested uid/gid to the JIT, which makes the guest observe them via getuid/getgid/setuid. A NAME
+    // (e.g. `postgres`) is resolved against the rootfs's /etc/passwd|/etc/group; an unresolvable name is
+    // skipped (the guest keeps its default identity). This is what lets the postgres entrypoint see
+    // `id -u != 0` and skip its `gosu` re-exec (B4 — avoids the non-PIE gosu binary entirely).
     if !c.user.is_empty() {
-        let (us, gs) = c.user.split_once(':').map_or((c.user.as_str(), None), |(u, g)| (u, Some(g)));
-        if let Ok(uid) = us.parse::<u32>() {
-            let gid = gs.and_then(|g| g.parse::<u32>().ok()).unwrap_or(uid);
+        if let Some((uid, gid)) = resolve_user(&c.rootfs, &c.user) {
             cfg.env.push(("DD_UID".into(), uid.to_string()));
             cfg.env.push(("DD_GID".into(), gid.to_string()));
         }
     }
-    cfg.volumes = c.binds.iter().filter_map(|b| b.split_once(':').map(|(host, dst)| {
-        // A bind whose source isn't an absolute path is a named volume.
-        let host = if host.starts_with('/') {
-            host.to_string()
-        } else if let Some(v) = vols.iter().find(|v| v.name == host) {
+    // Resolve a mount source to a host path: an absolute path is a bind; anything else is a named
+    // volume, resolved to its registered mountpoint or a dir under `volumes_dir`. Shared by `-v`/Binds
+    // and `--mount` so both go through the SAME (single) volume mechanism.
+    let resolve_src = |src: &str| -> String {
+        if src.starts_with('/') {
+            src.to_string()
+        } else if let Some(v) = vols.iter().find(|v| v.name == src) {
             v.mountpoint.clone()
         } else {
-            PathBuf::from(volumes_dir).join(host).to_string_lossy().into_owned()
-        };
-        Volume { container: dst.into(), host }
+            PathBuf::from(volumes_dir).join(src).to_string_lossy().into_owned()
+        }
+    };
+    cfg.volumes = c.binds.iter().filter_map(|b| b.split_once(':').map(|(host, dst)| {
+        Volume { container: dst.into(), host: resolve_src(host) }
     })).collect();
+    // `--mount` / HostConfig.Mounts: wire bind/volume mounts into the rootfs via the same Volume list.
+    // type=bind -> Source is a host path; type=volume -> Source is a named volume (resolved like `-v`).
+    // ReadOnly is metadata only (ddjit's Volume can't mark a mount read-only), so it's not enforced here.
+    for m in &c.mounts {
+        if m.target.is_empty() { continue; }
+        let host = if m.typ == "bind" { m.source.clone() } else { resolve_src(&m.source) };
+        if host.is_empty() { continue; }
+        cfg.volumes.push(Volume { container: m.target.clone(), host });
+    }
     cfg.publish = c.publish.split(',').filter(|s| !s.is_empty()).filter_map(|p| p.split_once(':'))
         .filter_map(|(h, cc)| Some(PortMap { host: h.parse().ok()?, container: cc.parse().ok()? })).collect();
     // macOS containers (darwinjail): the userland (nix arm64 tools) is on PATH at /profile/bin, and the
@@ -298,9 +347,59 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
             save_state(&g, &app.state_path);
         }
         let _ = live.exit.send(Some(code));
+        // RestartPolicy supervisor: re-run the container per `--restart` unless it was deliberately
+        // stopped (stop/kill/rm set stop_requested). A no-op for the default `no`/empty policy, so the
+        // common `docker run` path is untouched.
+        if !live.stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            maybe_restart(&app, &cid, code).await;
+        }
     });
     true
 }
+
+
+/// Apply the container's `--restart` policy after an exit. Restarts on `always`/`unless-stopped`
+/// (any exit) or `on-failure` (non-zero exit, up to MaximumRetryCount). `no`/empty never restarts.
+/// A short backoff avoids a tight crash-loop. Spawns a fresh [`Live`] (the old one is spent) and
+/// re-enters [`spawn_live`], whose reaper re-applies this policy on the next exit.
+fn maybe_restart<'a>(app: &'a App, cid: &'a str, code: i64)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> { Box::pin(async move {
+    let (name, max_retry, count, c, vols) = {
+        let g = app.inner.lock().await;
+        let Some(c) = g.containers.get(cid) else { return };
+        // Don't restart a container that's already been removed or re-started elsewhere.
+        if c.status != "exited" { return; }
+        (c.restart_policy.name.clone(), c.restart_policy.max_retry, c.restart_count, c.clone(), g.volumes.clone())
+    };
+    let should = match name.as_str() {
+        "always" | "unless-stopped" => true,
+        "on-failure" => code != 0 && (max_retry <= 0 || count < max_retry),
+        _ => false, // "no" / "" / unknown
+    };
+    if !should { return; }
+    // Backoff (capped) so a container that exits immediately doesn't spin the daemon.
+    let backoff = (100u64 << (count.clamp(0, 6) as u32)).min(10_000);
+    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+    // Install a fresh Live (the prior one is "started"/spent), mark running, bump the restart count.
+    let live = Live::new(c.tty);
+    {
+        let mut g = app.inner.lock().await;
+        match g.containers.get(cid) {
+            // Re-check: a stop/rm may have raced in during the backoff.
+            Some(cc) if cc.status == "exited" => {}
+            _ => return,
+        }
+        g.live.insert(cid.to_string(), live.clone());
+        if let Some(cc) = g.containers.get_mut(cid) {
+            cc.status = "running".into();
+            cc.started_at = now_secs();
+            cc.restart_count += 1;
+        }
+        save_state(&g, &app.state_path);
+    }
+    crate::events::emit_event(&app.events, "container", "restart", cid, serde_json::json!({"name": c.name}));
+    spawn_live(app, &c, &vols, live).await;
+    }) }
 
 
 /// Record the failure on a Live and finalize the container as exit 127. Returns false (spawn failed).

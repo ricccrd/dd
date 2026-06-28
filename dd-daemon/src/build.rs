@@ -41,7 +41,7 @@ pub(crate) struct BuildQ {
     buildargs: Option<String>,
     // `docker build --target <stage>` -> stop after this stage in a multi-stage build
     target: Option<String>,
-    // `docker build --no-cache` -> "1"/"true"; dd has no layer cache so this is a parsed no-op
+    // `docker build --no-cache` -> "1"/"true"; bypasses the build layer cache entirely (see images_build)
     nocache: Option<String>,
     // `docker build --label K=V` -> a URL-encoded JSON object, e.g. {"team":"infra"}; applied over
     // any `LABEL` instructions in the Dockerfile.
@@ -178,6 +178,98 @@ fn rootfs_digest(rootfs: &std::path::Path) -> String {
 }
 
 
+// ===================== build layer cache =====================
+// A conservative, content-addressed reimplementation of Docker's classic build cache. Each step gets a
+// `cache id` = sha256(parent step's cache id + a normalized descriptor of the instruction). For COPY/ADD
+// the descriptor folds in a content+metadata digest of the source files, so changed context invalidates;
+// for everything else it is the (ARG-substituted) instruction text. The rootfs produced AFTER a step is
+// snapshotted under ~/.dd/buildcache/layers/<cache-id>/rootfs (filesystem-mutating steps only) alongside a
+// meta.json capturing the cumulative image config, so a future rebuild can REUSE the snapshot+config
+// instead of re-running. CORRECTNESS RULE: a hit replays the exact rootfs a prior run of the identical
+// (parent+instruction[+context]) step recorded — bit-identical to that run; anything we cannot prove
+// identical misses and re-runs. The first miss invalidates the cache for the rest of the stage (Docker
+// semantics — and the content-chained ids enforce it automatically).
+
+/// Instructions that mutate the rootfs (so their cache layer needs a full snapshot). Everything else is
+/// config-only (ENV/CMD/ENTRYPOINT/LABEL/EXPOSE/USER/...) and stores just metadata.
+fn is_fs_inst(inst: &str) -> bool { matches!(inst, "RUN" | "COPY" | "ADD" | "WORKDIR") }
+
+fn bc_layer_dir(cache_id: &str) -> PathBuf { crate::util::buildcache_dir().join("layers").join(cache_id) }
+
+/// Deterministic content+metadata digest of a file or directory subtree at `p` (absolute host path):
+/// type, mode and size of every entry plus the sha256 of each regular file's contents, sorted so it is
+/// independent of fs iteration order. Used to make COPY/ADD cache keys content-addressed. Returns "" on
+/// failure (the caller then forces a miss rather than risk serving a stale layer).
+fn path_digest(p: &std::path::Path) -> String {
+    let script = format!(
+        "p='{}'; if [ -d \"$p\" ]; then cd \"$p\" 2>/dev/null || exit 0; \
+            {{ find . -printf '%y %m %s %p\\n' 2>/dev/null | LC_ALL=C sort; \
+               find . -type f -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null; }} | sha256sum; \
+         elif [ -e \"$p\" ]; then {{ stat -c '%F %a %s' \"$p\" 2>/dev/null; sha256sum \"$p\" 2>/dev/null; }} | sha256sum; \
+         else echo missing; fi",
+        p.display());
+    match std::process::Command::new("sh").arg("-c").arg(&script).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Chain hash for a step's cache id: sha256(parent + descriptor), falling back to a stable non-crypto id
+/// if `sha256sum` is unavailable so the cache still keys deterministically (never an empty/colliding id).
+fn cache_id(parent: &str, descriptor: &str) -> String {
+    let seed = format!("{parent}\n{descriptor}");
+    let h = sha256_hex(seed.as_bytes());
+    if h.len() == 64 { h } else { fake_id(&seed) }
+}
+
+/// Load a cache layer's metadata iff it is present AND complete (an fs layer's rootfs snapshot must
+/// exist). Returns None on any miss so a partial/corrupt layer is never served as a hit.
+fn load_layer(id: &str) -> Option<Value> {
+    let dir = bc_layer_dir(id);
+    let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+    if meta.get("fs").and_then(|v| v.as_bool()).unwrap_or(false) && !dir.join("rootfs").is_dir() { return None; }
+    Some(meta)
+}
+
+/// Materialize a cached fs layer's rootfs snapshot into `dst` (the live stage rootfs), replacing it.
+/// Returns false on failure — the caller aborts the build rather than continue on a wrong rootfs.
+fn materialize(id: &str, dst: &std::path::Path) -> bool {
+    let src = bc_layer_dir(id).join("rootfs");
+    if !src.is_dir() { return false; }
+    let _ = std::fs::remove_dir_all(dst);
+    if let Some(parent) = dst.parent() { let _ = std::fs::create_dir_all(parent); }
+    matches!(std::process::Command::new("cp").arg("-a").arg(&src).arg(dst).status(), Ok(s) if s.success())
+}
+
+/// Persist a freshly executed step as a cache layer: a full rootfs snapshot for filesystem-mutating
+/// instructions, plus a meta.json sidecar capturing the cumulative image config so a future hit can
+/// restore it without re-running. Atomic & best-effort: the snapshot is written first and meta.json LAST,
+/// so a layer only becomes loadable once complete; a failed snapshot leaves no (false-hit) layer behind.
+#[allow(clippy::too_many_arguments)]
+fn store_layer(id: &str, parent: &str, inst: &str, args: &str, rootfs: &std::path::Path,
+               cmd: &[String], entrypoint: &[String], workdir: &str, env: &[String],
+               labels: &HashMap<String, String>) {
+    let dir = bc_layer_dir(id);
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let fs = is_fs_inst(inst);
+    if fs {
+        let lr = dir.join("rootfs");
+        if !matches!(std::process::Command::new("cp").arg("-a").arg(rootfs).arg(&lr).status(), Ok(s) if s.success()) {
+            let _ = std::fs::remove_dir_all(&dir); return;
+        }
+    }
+    let meta = json!({"v": 1, "parent": parent, "inst": inst, "args": args, "fs": fs,
+        "created": now_secs(), "cmd": cmd, "entrypoint": entrypoint, "workdir": workdir,
+        "env": env, "labels": labels});
+    let tmp = dir.join(".meta.json.tmp");
+    if std::fs::write(&tmp, meta.to_string()).is_ok() && std::fs::rename(&tmp, dir.join("meta.json")).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
 pub(crate) fn build_stream(lines: Vec<String>) -> Response {
     (StatusCode::OK, [("Content-Type", "application/json")], lines.join("\n") + "\n").into_response()
 }
@@ -202,8 +294,10 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
         .unwrap_or_default();
     // --target: name of the stage to stop at (empty = build every stage, as before).
     let target = q.target.clone().unwrap_or_default();
-    // nocache: dd has no layer cache yet, every build is already from-scratch — parse & ignore.
-    let _nocache = matches!(q.nocache.as_deref(), Some("1") | Some("true"));
+    // --no-cache: bypass the build layer cache entirely (never read, never write) — a from-scratch build
+    // identical to the pre-cache behavior. Otherwise the per-step layer cache is active (see below).
+    let nocache = matches!(q.nocache.as_deref(), Some("1") | Some("true"));
+    let use_cache = !nocache;
 
     // unpack the build context (a tar in the request body)
     let ctx = std::path::PathBuf::from(format!("{}/.build-ctx-{}", a.images_dir, std::process::id()));
@@ -241,14 +335,106 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
     // set once the --target stage has been fully built, so the next FROM stops the build.
     let mut target_built = false;
 
+    // --- build layer cache chain state (reset at each FROM) ---
+    let mut parent_id = String::new();        // cache id of the previous step (seeded from the base at FROM)
+    let mut cache_ok = false;                 // false after the first miss: no more hits this stage (Docker rule)
+    let mut pending_fs: Option<String> = None; // a cache-hit fs layer whose rootfs restore is deferred (lazy)
+    // a per-build nonce, mixed into a COPY/ADD key only when its source digest is unavailable, so we force
+    // a miss instead of risking a stale layer we cannot prove identical.
+    let nonce = format!("nonce:{}", SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+
     for (i, (inst, args)) in steps.iter().enumerate() {
         // expand ${ARG}/$ARG using the merged map before logging or executing the step.
         let args = substitute_args(args, &args_map);
         log.push(json!({"stream": format!("Step {}/{} : {} {}\n", i + 1, total, inst, args)}).to_string());
+
+        // ----- build layer cache: try to reuse this step's recorded layer -----
+        // `current_cid` is set when we are going to EXECUTE the step (a miss) and must store the result.
+        let mut current_cid: Option<String> = None;
+        if use_cache && from_done && inst != "FROM" {
+            // descriptor = normalized instruction; COPY/ADD fold in a content digest of each source so a
+            // changed build context invalidates; ARG folds in its *resolved* value so --build-arg changes
+            // invalidate the rest of the build even when the arg is unreferenced.
+            let desc = match inst.as_str() {
+                "COPY" | "ADD" => {
+                    let from_stage = args.split_whitespace().find_map(|p| p.strip_prefix("--from="));
+                    let parts: Vec<&str> = args.split_whitespace().filter(|p| !p.starts_with("--")).collect();
+                    let mut d = format!("{inst} {args}");
+                    if parts.len() >= 2 {
+                        let src_root = match from_stage {
+                            Some(s) => stage_names.get(s).map(|&idx| stages[idx].clone()),
+                            None => Some(ctx.clone()),
+                        };
+                        match src_root {
+                            Some(root) => for src in &parts[..parts.len() - 1] {
+                                let sp = if from_stage.is_some() {
+                                    archive_host_path(&root.to_string_lossy(), &[], "", src)
+                                } else { root.join(src) };
+                                let dg = path_digest(&sp);
+                                d.push('\n');
+                                d.push_str(if dg.is_empty() { &nonce } else { &dg });
+                            },
+                            None => d.push_str("\n?unknown-stage"),
+                        }
+                    }
+                    d
+                }
+                "ARG" => {
+                    let spec = args.split_whitespace().next().unwrap_or("");
+                    let kv = match spec.split_once('=') {
+                        Some((k, v)) => format!("{k}={}", buildargs.get(k).cloned().unwrap_or_else(|| v.to_string())),
+                        None => match buildargs.get(spec) { Some(v) => format!("{spec}={v}"), None => spec.to_string() },
+                    };
+                    format!("ARG {kv}")
+                }
+                _ => format!("{inst} {args}"),
+            };
+            let cid = cache_id(&parent_id, &desc);
+            if inst == "ARG" {
+                // ARG is transparent to the fs/config cache: it advances the chain but always runs (so
+                // args_map stays live for downstream substitution) and stores no layer of its own.
+                parent_id = cid;
+            } else {
+                let hit = if cache_ok { load_layer(&cid) } else { None };
+                if let Some(meta) = hit {
+                    // HIT — replay the recorded config now; defer the rootfs restore (a run of consecutive
+                    // hits costs zero copies). The rootfs is materialized on the first miss / stage finalize
+                    // from `pending_fs` (the latest hit fs layer, whose snapshot is cumulative).
+                    log.push(json!({"stream": " ---> Using cache\n"}).to_string());
+                    let arr = |k: &str| meta.get(k).and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+                    cmd = arr("cmd"); entrypoint = arr("entrypoint"); env = arr("env");
+                    workdir = meta.get("workdir").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    labels = meta.get("labels").and_then(|v| v.as_object())
+                        .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+                        .unwrap_or_default();
+                    if is_fs_inst(inst) { pending_fs = Some(cid.clone()); }
+                    parent_id = cid;
+                    continue; // skip executing the instruction
+                }
+                // MISS — invalidate the cache for the rest of the stage and restore the real rootfs (if a
+                // prior hit deferred it) before executing this step.
+                cache_ok = false;
+                if let Some(fsid) = pending_fs.take() {
+                    if !materialize(&fsid, &rootfs) {
+                        cleanup(&ctx); return build_err(log, "build cache: failed to restore a cached layer".into());
+                    }
+                }
+                current_cid = Some(cid);
+            }
+        }
+
         match inst.as_str() {
             "FROM" => {
                 // --target: the target stage is fully built; don't start any later stage.
                 if target_built { break; }
+                // finalize the previous stage's rootfs from any deferred cache layer before starting a new
+                // one, so a later COPY --from=<that stage> sees its complete contents.
+                if use_cache { if let Some(fsid) = pending_fs.take() {
+                    if !materialize(&fsid, &rootfs) {
+                        cleanup(&ctx); return build_err(log, "build cache: failed to restore a stage layer".into());
+                    }
+                }}
                 let base = args.split_whitespace().next().unwrap_or("").to_string();
                 let pick = |im: &Image| (im.rootfs.clone(), im.arch, im.cmd.clone(), im.entrypoint.clone(), im.env.clone(), im.workdir.clone());
                 let mut found = { let g = a.inner.lock().await;
@@ -286,6 +472,14 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
                 if !matches!(std::process::Command::new("cp").arg("-a").arg(&base_rootfs).arg(&rootfs).status(), Ok(s) if s.success()) {
                     cleanup(&ctx); return build_err(log, "failed to copy base image rootfs".into()); }
                 from_done = true;
+                // (re)seed the per-stage cache chain from the base image's *content* digest, so a changed
+                // base (re-pulled/rebuilt) invalidates the whole stage. cache_ok re-enables hits.
+                if use_cache {
+                    let seed = format!("FROM {base}\n{}", rootfs_digest(std::path::Path::new(&base_rootfs)));
+                    parent_id = cache_id("", &seed);
+                    cache_ok = true;
+                    pending_fs = None;
+                }
             }
             "ARG" => {
                 // `ARG NAME` or `ARG NAME=default`; --build-arg overrides the default. Allowed before FROM.
@@ -353,9 +547,21 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
             "LABEL" => for (k, v) in parse_labels(&args) { labels.insert(k, v); },
             _ => {} // EXPOSE/MAINTAINER/USER/VOLUME/HEALTHCHECK — no rootfs effect in this builder
         }
+
+        // Step executed (a cache miss): record its result as a layer for future rebuilds and advance the
+        // chain. fs-mutating steps snapshot the live rootfs; config-only steps store just their metadata.
+        if let Some(cid) = current_cid.take() {
+            store_layer(&cid, &parent_id, inst, &args, &rootfs, &cmd, &entrypoint, &workdir, &env, &labels);
+            parent_id = cid;
+        }
     }
     if !from_done { cleanup(&ctx); return build_err(log, "Dockerfile had no FROM".into()); }
     cleanup(&ctx);
+    // finalize the final stage's rootfs from any deferred cache layer (a build that ended on a run of
+    // cache hits never materialized it).
+    if use_cache { if let Some(fsid) = pending_fs.take() {
+        if !materialize(&fsid, &rootfs) { return build_err(log, "build cache: failed to restore the final layer".into()); }
+    }}
 
     // the LAST stage is the final image: move its rootfs to <img>/rootfs, drop the intermediate stages.
     let final_rootfs = stages.last().cloned().unwrap_or_else(|| rootfs.clone());
@@ -405,14 +611,26 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
     build_stream(log)
 }
 
-/// `POST /build/prune` — `docker builder prune`. dd has no build cache; report nothing reclaimed.
+/// `POST /build/prune` — `docker builder prune` / the build-cache portion of `docker system prune`.
+/// Reclaims BOTH dd build-cache slots: the new per-step layer cache (~/.dd/buildcache, populated by
+/// `docker build`) and the persistent JIT translated-code cache (~/.dd/pcache, surfaced as `system df`
+/// BuilderSize). Both are fully reclaimable — layers re-snapshot on the next build, pcache re-translates
+/// on demand — so a wholesale drop only forces a one-time recompute.
 pub(crate) async fn build_prune() -> axum::Json<serde_json::Value> {
-    // `docker builder prune` / the build-cache portion of `docker system prune`. dd has no layer build
-    // cache, but the persistent JIT translated-code cache (~/.dd/pcache) lives in this slot (see
-    // system_df) — reclaim it here. It's safe to drop wholesale: every entry rebuilds on demand, keyed by
-    // binary hash, so this only forces a one-time re-translation on the next run of each image.
-    let dir = crate::util::dd_home().join("pcache");
     let (mut deleted, mut reclaimed) = (Vec::new(), 0i64);
+    // 1) the build layer cache: one dir per cached step under ~/.dd/buildcache/layers.
+    let layers = crate::util::buildcache_dir().join("layers");
+    if let Ok(rd) = std::fs::read_dir(&layers) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let sz = crate::util::dir_size(&e.path());
+            if std::fs::remove_dir_all(e.path()).is_ok() {
+                reclaimed += sz;
+                deleted.push(format!("buildcache:{}", e.file_name().to_string_lossy()));
+            }
+        }
+    }
+    // 2) the persistent JIT translated-code cache: one <binid>.pcache file per guest binary.
+    let dir = crate::util::dd_home().join("pcache");
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.filter_map(|e| e.ok()) {
             let sz = e.metadata().ok().filter(|m| m.is_file()).map(|m| m.len() as i64);
