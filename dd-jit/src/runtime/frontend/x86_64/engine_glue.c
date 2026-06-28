@@ -35,3 +35,12 @@ static int nosseopt(void) {
     if (g_nosseopt < 0) g_nosseopt = (getenv("NOSSEOPT") != NULL);
     return g_nosseopt;
 }
+
+// ---- opt7 address-gen / memory-fold fast path (gate NOEAOPT=1) ----
+// Disabling it reverts emit_ea + the mov [base+disp] load/store fold to the exact baseline
+// codegen (movconst-built disp + base+0 load/store). Env read once, then cached.
+static int g_noeaopt = -1; // -1 = uninitialized; cached getenv("NOEAOPT")
+static int noeaopt(void) {
+    if (g_noeaopt < 0) g_noeaopt = (getenv("NOEAOPT") != NULL);
+    return g_noeaopt;
+}

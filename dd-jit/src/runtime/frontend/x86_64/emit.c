@@ -36,6 +36,25 @@ static void e_ldrs(int w, int rt, int rn) {                                 // s
     uint32_t b = w == 1 ? 0x39800000u : w == 2 ? 0x79800000u : 0xB9800000u; // ldrsb/ldrsh/ldrsw
     emit32(b | (rn << 5) | rt);
 }
+// Address-mode-folded load/store: fold a [base+disp] memory operand into ONE ldr/str.
+// Scaled unsigned-offset form (disp a multiple of w, disp/w in [0,4095]):
+static void e_load_uoff(int w, int rt, int rn, unsigned disp) { // ldr{b,h,,} rt,[rn,#disp]
+    uint32_t b = w == 1 ? 0x39400000u : w == 2 ? 0x79400000u : w == 4 ? 0xB9400000u : 0xF9400000u;
+    emit32(b | (((disp / (unsigned)w) & 0xFFF) << 10) | (rn << 5) | rt);
+}
+static void e_store_uoff(int w, int rt, int rn, unsigned disp) { // str{b,h,,} rt,[rn,#disp]
+    uint32_t b = w == 1 ? 0x39000000u : w == 2 ? 0x79000000u : w == 4 ? 0xB9000000u : 0xF9000000u;
+    emit32(b | (((disp / (unsigned)w) & 0xFFF) << 10) | (rn << 5) | rt);
+}
+// Unscaled signed-offset form (simm9 in [-256,255]) -- covers small negative disps:
+static void e_ldur(int w, int rt, int rn, int simm9) { // ldur{b,h,,} rt,[rn,#simm9]
+    uint32_t b = w == 1 ? 0x38400000u : w == 2 ? 0x78400000u : w == 4 ? 0xB8400000u : 0xF8400000u;
+    emit32(b | (((uint32_t)simm9 & 0x1FF) << 12) | (rn << 5) | rt);
+}
+static void e_stur(int w, int rt, int rn, int simm9) { // stur{b,h,,} rt,[rn,#simm9]
+    uint32_t b = w == 1 ? 0x38000000u : w == 2 ? 0x78000000u : w == 4 ? 0xB8000000u : 0xF8000000u;
+    emit32(b | (((uint32_t)simm9 & 0x1FF) << 12) | (rn << 5) | rt);
+}
 static void e_mov_rr(int rd, int rm, int sf) { // mov rd, rm  (orr rd, xzr, rm)
     emit32((sf ? 0xAA0003E0u : 0x2A0003E0u) | (rm << 16) | rd);
 }
@@ -44,6 +63,14 @@ static void e_addi(int rd, int rn, unsigned imm12, int sf) { // add rd, rn, #imm
 }
 static void e_subi(int rd, int rn, unsigned imm12, int sf) { // sub rd, rn, #imm
     emit32((sf ? 0xD1000000u : 0x51000000u) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
+}
+// add/sub immediate with optional LSL #12 (sh=1 shifts imm12 left by 12) -- lets a 24-bit
+// displacement fold into one or two ALU ops instead of materializing a 64-bit constant.
+static void e_addi_sh(int rd, int rn, unsigned imm12, int sf, int sh) {
+    emit32((sf ? 0x91000000u : 0x11000000u) | ((unsigned)(sh & 1) << 22) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
+}
+static void e_subi_sh(int rd, int rn, unsigned imm12, int sf, int sh) {
+    emit32((sf ? 0xD1000000u : 0x51000000u) | ((unsigned)(sh & 1) << 22) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
 }
 static void e_addi_s(int rd, int rn, unsigned imm12, int sf) { // adds rd, rn, #imm (sets flags)
     emit32((sf ? 0xB1000000u : 0x31000000u) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);

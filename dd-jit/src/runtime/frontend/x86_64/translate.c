@@ -356,17 +356,25 @@ static void *translate_block(uint64_t gpc) {
                 int w = (op & 1) ? I.opsize : 1;
                 int to_reg = (op & 2); // 8A/8B: dest is reg
                 if (I.is_mem) {
-                    emit_ea(&I, next);
-                    if (to_reg) { // mov reg, [mem]
-                        if (w == 1) {
-                            e_load(1, 16, 17);
+                    if (to_reg) {     // mov reg, [mem]  -- folded into one ldr when [base+disp]
+                        if (w == 1) { // byte dest: ah/bh/ch/dh -> bits 8-15; lo8 preserves upper
+                            emit_load_mem(&I, next, 1, 16);
                             byte_wb(&I, I.reg, 16);
-                        } // byte dest: ah/bh/ch/dh -> bits 8-15; lo8 preserves upper
-                        else
-                            e_load(w, I.reg, 17);
-                    } else {                                                 // mov [mem], reg
-                        int sv = (w == 1) ? byte_val(&I, I.reg, 16) : I.reg; // byte src: ah/bh/ch/dh -> bits 8-15
-                        e_store(w, sv, 17);
+                        } else
+                            emit_load_mem(&I, next, w, I.reg);
+                    } else { // mov [mem], reg  -- folded into one str when [base+disp]
+                        int rn, off, f = ea_imm_fold(&I, w, &rn, &off);
+                        if (f) {
+                            int sv = (w == 1) ? byte_val(&I, I.reg, 16) : I.reg;
+                            if (f == 1)
+                                e_store_uoff(w, sv, rn, (unsigned)off);
+                            else
+                                e_stur(w, sv, rn, off);
+                        } else {
+                            emit_ea(&I, next);                                   // may clobber x16
+                            int sv = (w == 1) ? byte_val(&I, I.reg, 16) : I.reg; // byte src: ah/bh/ch/dh -> bits 8-15
+                            e_store(w, sv, 17);
+                        }
                     }
                 } else {
                     if (to_reg)

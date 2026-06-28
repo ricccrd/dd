@@ -229,24 +229,103 @@ static int decode(uint64_t pc, struct insn *I) {
     return n;
 }
 
+// x17 += d  (signed displacement), folded into add/sub-immediate(s) instead of a 64-bit
+// movconst+add.  d is the sign-extension of an x86 disp8/disp32, so |d| <= 2^31.
+// imm12 (1 insn) covers all disp8 and small disp32; 24-bit (2 insns via LSL#12) covers most
+// disp32; only the rare >=2^24 case materializes the constant (1:1 mapping, no guest base).
+static void ea_add_disp(int64_t d) {
+    if (d == 0) return;
+    int sub = d < 0;
+    uint64_t a = sub ? (uint64_t)(-d) : (uint64_t)d;
+    if (a <= 0xFFFu) {
+        if (sub)
+            e_subi(17, 17, (unsigned)a, 1);
+        else
+            e_addi(17, 17, (unsigned)a, 1);
+    } else if (a <= 0xFFFFFFu) {
+        unsigned lo = (unsigned)(a & 0xFFF), hi = (unsigned)((a >> 12) & 0xFFF);
+        if (sub) {
+            e_subi_sh(17, 17, hi, 1, 1);
+            if (lo) e_subi(17, 17, lo, 1);
+        } else {
+            e_addi_sh(17, 17, hi, 1, 1);
+            if (lo) e_addi(17, 17, lo, 1);
+        }
+    } else {
+        e_movconst(16, (uint64_t)d);
+        e_rrr(A_ADD, 17, 17, 16, 1, 0);
+    }
+}
 // Compute the effective address of a memory operand into host scratch x17.
 // (base + index*scale + disp, + fs/gs base; RIP-relative -> a constant.)
+// Address-gen fast path: fold base, index<<scale and disp into the fewest host insns --
+// base+index in one shifted add, disp in an add/sub-immediate (no per-access constant build).
+// NOEAOPT=1 reverts to the exact baseline lowering (movconst-built disp + base+0 add).
 static void emit_ea(struct insn *I, uint64_t next_rip) {
-    if (I->rip_rel) {
-        e_movconst(17, next_rip + (uint64_t)I->disp);
-    } else {
-        if (I->m_hasbase)
-            e_mov_rr(17, I->m_base, 1);
-        else
-            e_movz(17, 0, 0);
-        if (I->m_hasindex) e_rrr(A_ADD, 17, 17, I->m_index, 1, I->m_scale); // add x17,x17,idx,lsl#scale
-        if (I->disp) {
-            e_movconst(16, (uint64_t)I->disp);
-            e_rrr(A_ADD, 17, 17, 16, 1, 0);
+    if (noeaopt()) { // exact baseline lowering
+        if (I->rip_rel) {
+            e_movconst(17, next_rip + (uint64_t)I->disp);
+        } else {
+            if (I->m_hasbase)
+                e_mov_rr(17, I->m_base, 1);
+            else
+                e_movz(17, 0, 0);
+            if (I->m_hasindex) e_rrr(A_ADD, 17, 17, I->m_index, 1, I->m_scale); // add x17,x17,idx,lsl#scale
+            if (I->disp) {
+                e_movconst(16, (uint64_t)I->disp);
+                e_rrr(A_ADD, 17, 17, 16, 1, 0);
+            }
         }
+    } else if (I->rip_rel) {
+        e_movconst(17, next_rip + (uint64_t)I->disp);
+    } else if (I->m_hasbase) {
+        if (I->m_hasindex) {
+            e_rrr(A_ADD, 17, I->m_base, I->m_index, 1, I->m_scale); // x17 = base + idx<<scale
+            ea_add_disp(I->disp);
+        } else if (I->disp >= 0 && I->disp <= 0xFFF) {
+            e_addi(17, I->m_base, (unsigned)I->disp, 1); // x17 = base + #disp   (1 insn)
+        } else if (I->disp < 0 && -I->disp <= 0xFFF) {
+            e_subi(17, I->m_base, (unsigned)(-I->disp), 1); // x17 = base - #disp  (1 insn)
+        } else {
+            e_mov_rr(17, I->m_base, 1);
+            ea_add_disp(I->disp);
+        }
+    } else if (I->m_hasindex) {
+        e_rrr(A_ADD, 17, 31, I->m_index, 1, I->m_scale); // x17 = idx<<scale   (add from xzr)
+        ea_add_disp(I->disp);
+    } else {
+        e_movconst(17, (uint64_t)I->disp); // absolute [disp]
     }
     if (I->seg) {
         e_ldr(16, 28, I->seg == 1 ? OFF_FS : OFF_GS);
         e_rrr(A_ADD, 17, 17, 16, 1, 0);
+    }
+}
+
+// Decide whether a [base+disp] (no index/seg/rip) memory operand can be folded directly
+// into one ldr/str addressing mode. Returns 0 = no fold; 1 = scaled unsigned imm; 2 = unscaled
+// signed imm. On success sets *rn = host base reg, *off = displacement to pass to the encoder.
+// NOEAOPT=1 forces 0 (no fold) -> the caller uses the baseline emit_ea + e_load/e_store.
+static int ea_imm_fold(struct insn *I, int w, int *rn, int *off) {
+    if (noeaopt()) return 0;
+    if (!(I->m_hasbase && !I->m_hasindex && !I->seg && !I->rip_rel)) return 0;
+    int64_t d = I->disp;
+    *rn = I->m_base;
+    *off = (int)d;
+    if (d >= 0 && (d % w) == 0 && (uint64_t)(d / w) <= 0xFFFu) return 1; // scaled: ldr[rn,#d]
+    if (d >= -256 && d <= 255) return 2;                                 // unscaled: ldur[rn,#d]
+    return 0;
+}
+// Single-instruction folded zero-extending load of a memory operand into rt.
+// Falls back to emit_ea + e_load for index/seg/rip/large-disp forms (identical to before).
+static void emit_load_mem(struct insn *I, uint64_t next, int w, int rt) {
+    int rn, off, f = ea_imm_fold(I, w, &rn, &off);
+    if (f == 1)
+        e_load_uoff(w, rt, rn, (unsigned)off);
+    else if (f == 2)
+        e_ldur(w, rt, rn, off);
+    else {
+        emit_ea(I, next);
+        e_load(w, rt, 17);
     }
 }
