@@ -142,18 +142,36 @@ if [ "$needgnu" = 1 ] && ! nm -gU "$FW/libiconv.2.dylib" 2>/dev/null | grep -qw 
 fi
 
 # 8. Strip + codesign, deepest first (any later edit invalidates a signature).
-log "stripping + signing (ad-hoc)"
+#    DD_SIGN_ID unset/"-" = ad-hoc (default). A "Developer ID Application: …" identity name turns on real
+#    signing with hardened runtime + secure timestamp; DD_SIGN_KEYCHAIN[/_PW] selects the keychain holding it.
+#    The JIT engines + daemon keep the allow-jit entitlement ($ENT) so they run under the hardened runtime.
+SIGN_ID="${DD_SIGN_ID:--}"
+SIGN_FLAGS=""
+if [ "$SIGN_ID" != "-" ]; then
+  SIGN_FLAGS="--options runtime --timestamp"
+  if [ -n "${DD_SIGN_KEYCHAIN:-}" ]; then
+    security unlock-keychain ${DD_SIGN_KEYCHAIN_PW:+-p "$DD_SIGN_KEYCHAIN_PW"} "$DD_SIGN_KEYCHAIN" 2>/dev/null || true
+    SIGN_FLAGS="$SIGN_FLAGS --keychain $DD_SIGN_KEYCHAIN"
+  fi
+  log "stripping + signing (Developer ID: $SIGN_ID)"
+else
+  log "stripping + signing (ad-hoc)"
+fi
 chmod -R u+w "$APP"   # data copied from the nix store is read-only; codesign needs write access
 find "$FW" "$RES/lib" -type f \( -name '*.dylib' -o -name '*.so' \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
   /usr/bin/strip -x "$f" 2>/dev/null || true
-  codesign -s - -f "$f" >/dev/null 2>&1 || true
+  codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$f" >/dev/null 2>&1 || true
 done
 for b in dd-daemon ddjit-linux_aarch64 ddjit-linux_x86_64 ddjit-darwin_aarch64; do
-  [ -f "$RES/$b" ] && codesign -s - -f --entitlements "$ENT" "$RES/$b" >/dev/null 2>&1 || true
+  [ -f "$RES/$b" ] && codesign -s "$SIGN_ID" $SIGN_FLAGS -f --entitlements "$ENT" "$RES/$b" >/dev/null 2>&1 || true
 done
-for cli in dd ddcli; do [ -f "$RES/$cli" ] && codesign -s - -f "$RES/$cli" >/dev/null 2>&1 || true; done
-codesign -s - -f "$MACOS/dd-app" >/dev/null 2>&1 || true
-codesign -s - -f "$APP" >/dev/null 2>&1 || true
+for cli in dd ddcli; do [ -f "$RES/$cli" ] && codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$RES/$cli" >/dev/null 2>&1 || true; done
+codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$MACOS/dd-app" >/dev/null 2>&1 || true
+codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$APP" >/dev/null 2>&1 || true   # outermost signed last
+if [ "$SIGN_ID" != "-" ]; then
+  codesign --verify --strict --verbose=2 "$APP" || { echo "[bundle] Developer ID signature verify FAILED" >&2; exit 1; }
+  log "signed + verified ($(codesign -dv "$APP" 2>&1 | awk -F= '/^Authority/{print $2; exit}'))"
+fi
 
 SIZE="$(du -sh "$APP" | cut -f1)"
 log "done -> $APP ($SIZE)"

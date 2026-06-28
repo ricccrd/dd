@@ -40,6 +40,22 @@ fi
 
 # create-dmg can leave a read-write scratch image behind; tidy it up.
 rm -f "$DIST"/rw.*.dmg
+
+# Sign + notarize + staple when a notarytool keychain profile is configured (DD_NOTARY_PROFILE, e.g. "dd-notary").
+# The app inside must already be Developer ID-signed with hardened runtime (tools/bundle.sh + DD_SIGN_ID).
+if [ -n "${DD_NOTARY_PROFILE:-}" ]; then
+  if [ -n "${DD_SIGN_ID:-}" ] && [ "${DD_SIGN_ID}" != "-" ]; then
+    KCFLAG=""
+    [ -n "${DD_SIGN_KEYCHAIN:-}" ] && { security unlock-keychain ${DD_SIGN_KEYCHAIN_PW:+-p "$DD_SIGN_KEYCHAIN_PW"} "$DD_SIGN_KEYCHAIN" 2>/dev/null || true; KCFLAG="--keychain $DD_SIGN_KEYCHAIN"; }
+    codesign -s "$DD_SIGN_ID" --timestamp $KCFLAG -f "$OUT"
+  fi
+  echo "[make-dmg] notarizing $OUT (profile $DD_NOTARY_PROFILE) — Apple round-trip, ~1-5 min..."
+  xcrun notarytool submit "$OUT" --keychain-profile "$DD_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$OUT"
+  xcrun stapler validate "$OUT"
+  echo "[make-dmg] notarized + stapled"
+fi
+
 # Publish a checksum alongside the dmg (handy for release notes).
 ( cd "$DIST" && shasum -a 256 "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
 echo "[make-dmg] done -> $OUT ($(du -sh "$OUT" | cut -f1))"
