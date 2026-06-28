@@ -15,9 +15,9 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
    per-block `g_trace` dump). Gate: matrix green both engines.
 2. **Networking Phase-2b — netstack** → `docs/design/netstack.md`. External egress already works; the gap is
    L3 identity + reachability. **PR1 ✅** (daemon IPAM `172.18/12`, per-container IP, `--network` join →
-   docker-net 5/7). PR2 (per-network AF_UNIX virtual switch + `/etc/hosts` reach-by-name DNS) landed but
-   **unverified** vs docker-net 7/7. **Remaining:** confirm 7/7, then the optional in-process `smoltcp`
-   stack behind `DD_NETSTACK`.
+   docker-net 5/7). PR2 (br_* AF_UNIX switch + `/etc/hosts` DNS) landed but **reach-by-name + reach-by-ip
+   still FAIL (docker-net 5/7)** — the data path isn't rendezvousing (under debug). **Remaining:** fix the
+   switch data path → 7/7, then the optional in-process `smoltcp` stack behind `DD_NETSTACK`.
 3. **Untrusted-guest isolation — sentry process-split** → `docs/design/sentry-split.md`. **No PR yet.** The
    trust boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on
    `g_untrusted`, split `service()` by authority (compute/mem local, fs/net/proc → sentry over an SPSC
