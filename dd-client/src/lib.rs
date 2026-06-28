@@ -1,9 +1,7 @@
-//! `ddclient` — a small typed [Docker Engine API v1.43] client that talks to **dd-daemon**
-//! over its Unix socket. Both the `dd` CLI and the `dd-app` GUI use this crate so the wire
-//! format lives in exactly one place.
-//!
-//! The client opens a fresh connection per request (the daemon is a local socket; this keeps
-//! the code trivial and is plenty fast for list/poll workloads). All methods are `async`.
+//! `ddclient` — the shared client both the dd GUI and CLI use to talk to **dd-daemon** over its
+//! Unix socket. The wire transport is [`bollard`] (the mature Docker-Engine-API crate); this crate
+//! wraps it behind a small façade with dd-specific view models, so the consumers depend on one
+//! place and never touch bollard's types directly.
 //!
 //! ```no_run
 //! # async fn ex() -> Result<(), ddclient::Error> {
@@ -14,58 +12,40 @@
 //! # Ok(()) }
 //! ```
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper_util::rt::TokioIo;
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+
+use bollard::container::LogOutput;
+use bollard::models::{ContainerCreateBody, NetworkCreateRequest, VolumeCreateRequest};
+use bollard::query_parameters::{
+    ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptions, ListVolumesOptions,
+    LogsOptionsBuilder, RemoveContainerOptionsBuilder, RemoveImageOptions, RemoveVolumeOptions,
+    StartContainerOptions,
+};
+use bollard::{ClientVersion, Docker};
+use futures_util::StreamExt;
 
 mod models;
 pub use models::*;
 
-/// API version prefix the daemon understands (it also accepts un-prefixed paths).
-const API: &str = "/v1.43";
-
-/// Errors surfaced by the client. Kept deliberately small and `Display`-friendly so the GUI
-/// can show them directly and the CLI can print them.
-#[derive(Debug)]
-pub enum Error {
-    /// The daemon socket could not be reached (daemon down / wrong path).
-    Connect(String),
-    /// Transport / HTTP-level failure after connecting.
-    Http(String),
-    /// The daemon answered with a non-2xx status; carries status + body message.
-    Status(u16, String),
-    /// Response body was not the JSON we expected.
-    Decode(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Connect(s) => write!(f, "cannot reach dd-daemon: {s}"),
-            Error::Http(s) => write!(f, "http error: {s}"),
-            Error::Status(c, m) => write!(f, "daemon returned {c}: {m}"),
-            Error::Decode(s) => write!(f, "bad response: {s}"),
-        }
-    }
-}
-impl std::error::Error for Error {}
-
+/// Errors surfaced by the client — bollard's, which is `Display` (the GUI shows it, the CLI prints
+/// it). Re-exported as `Error` so consumers don't name bollard directly.
+pub type Error = bollard::errors::Error;
 type Result<T> = std::result::Result<T, Error>;
 
-/// A handle to a dd-daemon reachable at `socket`.
+/// dd-daemon speaks Docker API v1.43.
+const VERSION: ClientVersion = ClientVersion { major_version: 1, minor_version: 43 };
+
+/// A handle to a dd-daemon reachable at `socket`. Cheap to clone; connects lazily per request
+/// (bollard's connector does no I/O until a call is made), matching the old per-request model.
 #[derive(Clone)]
 pub struct Client {
     socket: PathBuf,
-    timeout: Duration,
 }
 
 impl Client {
     /// Build a client for the daemon listening on `socket`. Does not connect yet.
     pub fn new(socket: impl AsRef<Path>) -> Self {
-        Client { socket: socket.as_ref().to_path_buf(), timeout: Duration::from_secs(30) }
+        Client { socket: socket.as_ref().to_path_buf() }
     }
 
     /// Resolve the default socket: `$DDOCKERD_SOCK`, else `~/.dd/run/docker.sock`.
@@ -82,210 +62,155 @@ impl Client {
         &self.socket
     }
 
+    fn docker(&self) -> Result<Docker> {
+        Docker::connect_with_unix(&self.socket.to_string_lossy(), 30, &VERSION)
+    }
+
     // ---- typed endpoints ---------------------------------------------------
 
     /// `GET /_ping` — returns `Ok(())` when the daemon is alive.
     pub async fn ping(&self) -> Result<()> {
-        self.raw(hyper::Method::GET, "/_ping", None).await.map(|_| ())
-    }
-
-    /// `GET /version`.
-    pub async fn version(&self) -> Result<Version> {
-        self.get_json("/version").await
-    }
-
-    /// `GET /info`.
-    pub async fn info(&self) -> Result<Info> {
-        self.get_json("/info").await
-    }
-
-    /// `GET /images/json`.
-    pub async fn list_images(&self) -> Result<Vec<Image>> {
-        self.get_json("/images/json").await
-    }
-
-    /// `DELETE /images/{name}`.
-    pub async fn remove_image(&self, name: &str) -> Result<()> {
-        self.raw(hyper::Method::DELETE, &format!("/images/{name}"), None).await.map(|_| ())
+        self.docker()?.ping().await.map(|_| ())
     }
 
     /// `GET /containers/json?all=1` (we always include stopped containers).
     pub async fn list_containers(&self) -> Result<Vec<Container>> {
-        self.get_json("/containers/json?all=1").await
+        let opts = ListContainersOptionsBuilder::new().all(true).build();
+        let cs = self.docker()?.list_containers(Some(opts)).await?;
+        Ok(cs.into_iter().map(Container::from).collect())
     }
 
-    /// `GET /containers/{id}/json` — full inspect.
-    pub async fn inspect_container(&self, id: &str) -> Result<serde_json::Value> {
-        self.get_json(&format!("/containers/{id}/json")).await
+    /// `GET /images/json`.
+    pub async fn list_images(&self) -> Result<Vec<Image>> {
+        let opts = ListImagesOptionsBuilder::new().build();
+        let imgs = self.docker()?.list_images(Some(opts)).await?;
+        Ok(imgs.into_iter().map(Image::from).collect())
     }
 
-    /// `POST /containers/create` — returns the new container id.
-    pub async fn create_container(&self, spec: &CreateContainer) -> Result<String> {
-        let v: serde_json::Value =
-            self.post_json("/containers/create", Some(to_value(spec)?)).await?;
-        Ok(v.get("Id").and_then(|x| x.as_str()).unwrap_or_default().to_string())
-    }
-
-    /// `POST /containers/{id}/start`.
-    pub async fn start_container(&self, id: &str) -> Result<()> {
-        self.raw(hyper::Method::POST, &format!("/containers/{id}/start"), None).await.map(|_| ())
-    }
-
-    /// `GET /containers/{id}/logs` — plain stdout+stderr bytes (the Docker multiplexed stream is
-    /// demuxed for you).
-    pub async fn container_logs(&self, id: &str) -> Result<Vec<u8>> {
-        let (_, body) =
-            self.raw(hyper::Method::GET, &format!("/containers/{id}/logs?stdout=1&stderr=1"), None)
-                .await?;
-        Ok(demux_docker_stream(&body))
-    }
-
-    /// `DELETE /containers/{id}`.
-    pub async fn remove_container(&self, id: &str) -> Result<()> {
-        self.raw(hyper::Method::DELETE, &format!("/containers/{id}"), None).await.map(|_| ())
+    /// `DELETE /images/{name}`.
+    pub async fn remove_image(&self, name: &str) -> Result<()> {
+        self.docker()?.remove_image(name, None::<RemoveImageOptions>, None).await.map(|_| ())
     }
 
     /// `GET /volumes`.
     pub async fn list_volumes(&self) -> Result<Vec<Volume>> {
-        let v: VolumeList = self.get_json("/volumes").await?;
-        Ok(v.volumes)
-    }
-
-    /// `POST /volumes/create`.
-    pub async fn create_volume(&self, name: &str) -> Result<Volume> {
-        self.post_json("/volumes/create", Some(serde_json::json!({ "Name": name }))).await
+        let resp = self.docker()?.list_volumes(None::<ListVolumesOptions>).await?;
+        Ok(resp.volumes.unwrap_or_default().into_iter().map(Volume::from).collect())
     }
 
     /// `DELETE /volumes/{name}`.
     pub async fn remove_volume(&self, name: &str) -> Result<()> {
-        self.raw(hyper::Method::DELETE, &format!("/volumes/{name}"), None).await.map(|_| ())
+        self.docker()?.remove_volume(name, None::<RemoveVolumeOptions>).await
+    }
+
+    /// `POST /volumes/create`.
+    pub async fn create_volume(&self, name: &str) -> Result<()> {
+        let body = VolumeCreateRequest { name: Some(name.to_string()), ..Default::default() };
+        self.docker()?.create_volume(body).await.map(|_| ())
     }
 
     /// `GET /networks`.
     pub async fn list_networks(&self) -> Result<Vec<Network>> {
-        self.get_json("/networks").await
+        let ns = self.docker()?.list_networks(None::<ListNetworksOptions>).await?;
+        Ok(ns.into_iter().map(Network::from).collect())
     }
 
-    /// `POST /networks/create`.
+    /// `POST /networks/create` — returns the new network id.
     pub async fn create_network(&self, name: &str) -> Result<String> {
-        let v: serde_json::Value =
-            self.post_json("/networks/create", Some(serde_json::json!({ "Name": name }))).await?;
-        Ok(v.get("Id").and_then(|x| x.as_str()).unwrap_or_default().to_string())
+        let body = NetworkCreateRequest { name: name.to_string(), ..Default::default() };
+        Ok(self.docker()?.create_network(body).await?.id)
     }
 
     /// `DELETE /networks/{id}`.
     pub async fn remove_network(&self, id: &str) -> Result<()> {
-        self.raw(hyper::Method::DELETE, &format!("/networks/{id}"), None).await.map(|_| ())
+        self.docker()?.remove_network(id).await
     }
 
-    // ---- plumbing ----------------------------------------------------------
-
-    async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let (_, body) = self.raw(hyper::Method::GET, path, None).await?;
-        decode(&body)
+    /// `POST /containers/create` — returns the new container id.
+    pub async fn create_container(&self, spec: &CreateContainer) -> Result<String> {
+        let body = ContainerCreateBody { image: Some(spec.image.clone()), ..Default::default() };
+        Ok(self.docker()?.create_container(None, body).await?.id)
     }
 
-    async fn post_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        path: &str,
-        body: Option<serde_json::Value>,
-    ) -> Result<T> {
-        let (_, b) = self.raw(hyper::Method::POST, path, body).await?;
-        if b.is_empty() {
-            // Some POSTs answer 204 with no body; decode an empty object so `()`/Value works.
-            return decode(b"{}");
+    /// `POST /containers/{id}/start`.
+    pub async fn start_container(&self, id: &str) -> Result<()> {
+        self.docker()?.start_container(id, None::<StartContainerOptions>).await
+    }
+
+    /// `POST /containers/{id}/stop`.
+    pub async fn stop_container(&self, id: &str) -> Result<()> {
+        self.docker()?.stop_container(id, None::<bollard::query_parameters::StopContainerOptions>).await
+    }
+
+    /// `POST /containers/{id}/restart`.
+    pub async fn restart_container(&self, id: &str) -> Result<()> {
+        self.docker()?.restart_container(id, None::<bollard::query_parameters::RestartContainerOptions>).await
+    }
+
+    /// `POST /containers/{id}/pause`.
+    pub async fn pause_container(&self, id: &str) -> Result<()> {
+        self.docker()?.pause_container(id).await
+    }
+
+    /// `POST /containers/{id}/unpause`.
+    pub async fn unpause_container(&self, id: &str) -> Result<()> {
+        self.docker()?.unpause_container(id).await
+    }
+
+    /// `DELETE /containers/{id}` (force, so running containers are removed too).
+    pub async fn remove_container(&self, id: &str) -> Result<()> {
+        let opts = RemoveContainerOptionsBuilder::new().force(true).build();
+        self.docker()?.remove_container(id, Some(opts)).await
+    }
+
+    /// `GET /version` + `GET /info` flattened into one [`SystemInfo`] for the System view.
+    pub async fn system(&self) -> Result<SystemInfo> {
+        let d = self.docker()?;
+        let v = d.version().await.unwrap_or_default();
+        let i = d.info().await?;
+        Ok(SystemInfo {
+            version: v.version.unwrap_or_default(),
+            api_version: v.api_version.unwrap_or_default(),
+            os: v.os.unwrap_or_default(),
+            arch: v.arch.unwrap_or_default(),
+            kernel: i.kernel_version.unwrap_or_default(),
+            driver: i.driver.unwrap_or_default(),
+            root_dir: i.docker_root_dir.unwrap_or_default(),
+            server_version: i.server_version.unwrap_or_default(),
+            ncpu: i.ncpu.unwrap_or_default(),
+            mem_total: i.mem_total.unwrap_or_default(),
+            containers: i.containers.unwrap_or_default(),
+            running: i.containers_running.unwrap_or_default(),
+            paused: i.containers_paused.unwrap_or_default(),
+            stopped: i.containers_stopped.unwrap_or_default(),
+            images: i.images.unwrap_or_default(),
+        })
+    }
+
+    /// `GET /system/df` summarized into a [`DiskUsage`].
+    pub async fn disk_usage(&self) -> Result<DiskUsage> {
+        let r = self.docker()?.df(None::<bollard::query_parameters::DataUsageOptions>).await?;
+        Ok(DiskUsage {
+            layers_size: r.image_usage.as_ref().and_then(|u| u.total_size).unwrap_or_default(),
+            images: r.image_usage.as_ref().and_then(|u| u.total_count).unwrap_or_default(),
+            containers: r.container_usage.as_ref().and_then(|u| u.total_count).unwrap_or_default(),
+            volumes: r.volume_usage.as_ref().and_then(|u| u.total_count).unwrap_or_default(),
+        })
+    }
+
+    /// `GET /containers/{id}/logs` — concatenated stdout+stderr bytes (bollard demuxes the Docker
+    /// multiplexed frames into `LogOutput` chunks for us).
+    pub async fn container_logs(&self, id: &str) -> Result<Vec<u8>> {
+        let opts = LogsOptionsBuilder::new().stdout(true).stderr(true).build();
+        let mut stream = self.docker()?.logs(id, Some(opts));
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.extend_from_slice(&log_bytes(item?));
         }
-        decode(&b)
-    }
-
-    /// Issue one request and return `(status, body)` for any 2xx; map everything else to [`Error`].
-    async fn raw(
-        &self,
-        method: hyper::Method,
-        path: &str,
-        body: Option<serde_json::Value>,
-    ) -> Result<(hyper::StatusCode, Bytes)> {
-        let fut = self.raw_inner(method, path, body);
-        match tokio::time::timeout(self.timeout, fut).await {
-            Ok(r) => r,
-            Err(_) => Err(Error::Http("request timed out".into())),
-        }
-    }
-
-    async fn raw_inner(
-        &self,
-        method: hyper::Method,
-        path: &str,
-        body: Option<serde_json::Value>,
-    ) -> Result<(hyper::StatusCode, Bytes)> {
-        let stream = tokio::net::UnixStream::connect(&self.socket)
-            .await
-            .map_err(|e| Error::Connect(format!("{} ({})", e, self.socket.display())))?;
-        let io = TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?;
-        // Drive the connection in the background; it ends when the response is done.
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-
-        let payload = match &body {
-            Some(v) => Full::new(Bytes::from(serde_json::to_vec(v).unwrap_or_default())),
-            None => Full::new(Bytes::new()),
-        };
-        let req = hyper::Request::builder()
-            .method(method)
-            .uri(format!("{API}{path}"))
-            .header(hyper::header::HOST, "dd")
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(payload)
-            .map_err(|e| Error::Http(e.to_string()))?;
-
-        let resp = sender.send_request(req).await.map_err(|e| Error::Http(e.to_string()))?;
-        let status = resp.status();
-        let bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?
-            .to_bytes();
-
-        if status.is_success() {
-            Ok((status, bytes))
-        } else {
-            let msg = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Err(Error::Status(status.as_u16(), msg))
-        }
+        Ok(out)
     }
 }
 
-/// Strip Docker's 8-byte log-frame headers (`[stream,0,0,0,len(4B BE)]`). If the body isn't framed
-/// (first byte isn't a 0/1/2 stream marker with zero padding), it's returned unchanged.
-fn demux_docker_stream(b: &[u8]) -> Vec<u8> {
-    let framed = b.len() >= 8 && b[0] <= 2 && b[1] == 0 && b[2] == 0 && b[3] == 0;
-    if !framed {
-        return b.to_vec();
-    }
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i + 8 <= b.len() && b[i] <= 2 && b[i + 1] == 0 && b[i + 2] == 0 && b[i + 3] == 0 {
-        let len = u32::from_be_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
-        i += 8;
-        let end = (i + len).min(b.len());
-        out.extend_from_slice(&b[i..end]);
-        i = end;
-    }
-    out
-}
-
-fn decode<T: for<'de> Deserialize<'de>>(b: &[u8]) -> Result<T> {
-    serde_json::from_slice(b).map_err(|e| Error::Decode(format!("{e}: {}", String::from_utf8_lossy(b))))
-}
-
-fn to_value<T: Serialize>(v: &T) -> Result<serde_json::Value> {
-    serde_json::to_value(v).map_err(|e| Error::Decode(e.to_string()))
+fn log_bytes(o: LogOutput) -> bytes::Bytes {
+    o.into_bytes()
 }

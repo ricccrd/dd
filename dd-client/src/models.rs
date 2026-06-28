@@ -1,110 +1,74 @@
-//! Wire models for the dd-daemon Docker-API surface. These mirror the JSON the daemon emits
-//! (see `dd-daemon/src/main.rs`). Fields are lenient (`#[serde(default)]`) so the client keeps
-//! working as the daemon grows new fields.
+//! View models for the dd daemon, built from [`bollard`]'s Docker-API responses. These are the
+//! shapes the dd GUI and CLI render; each has a `From<bollard::...>` conversion and the small
+//! display helpers (`short_id`, `name`, `ports_str`, …) the UI relies on.
 
-use serde::{Deserialize, Serialize};
+use bollard::models::{ContainerSummary, ImageSummary};
 
-/// `GET /version`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct Version {
-    #[serde(rename = "Version")]
-    pub version: String,
-    #[serde(rename = "ApiVersion")]
-    pub api_version: String,
-    #[serde(rename = "Os")]
-    pub os: String,
-    #[serde(rename = "Arch")]
-    pub arch: String,
-}
-
-/// `GET /info`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct Info {
-    #[serde(rename = "Containers")]
-    pub containers: u64,
-    #[serde(rename = "Images")]
-    pub images: u64,
-    #[serde(rename = "Driver")]
-    pub driver: String,
-    #[serde(rename = "OperatingSystem")]
-    pub operating_system: String,
-    #[serde(rename = "Architecture")]
-    pub architecture: String,
-    #[serde(rename = "ServerVersion")]
-    pub server_version: String,
-}
-
-/// One entry of `GET /images/json`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct Image {
-    #[serde(rename = "Id")]
+/// One entry of `GET /containers/json`.
+#[derive(Debug, Clone, Default)]
+pub struct Container {
     pub id: String,
-    #[serde(rename = "RepoTags")]
-    pub repo_tags: Vec<String>,
-    #[serde(rename = "Architecture")]
-    pub architecture: String,
-    #[serde(rename = "Size")]
-    pub size: i64,
-}
-
-impl Image {
-    /// First repo tag (e.g. `alpine:latest`), or the short id.
-    pub fn name(&self) -> String {
-        self.repo_tags.first().cloned().unwrap_or_else(|| short(&self.id))
-    }
+    pub image: String,
+    pub command: String,
+    pub names: Vec<String>,
+    pub state: String,
+    pub status: String,
+    pub created: i64,
+    pub ports: Vec<Port>,
+    pub mounts: Vec<Mount>,
+    pub exit_code: i64,
 }
 
 /// A published port from `GET /containers/json`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct Port {
-    #[serde(rename = "PrivatePort")]
     pub private_port: u16,
-    #[serde(rename = "PublicPort")]
     pub public_port: u16,
-    #[serde(rename = "Type")]
     pub typ: String,
 }
 
 /// A bind/volume mount of a container (from `Mounts`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct Mount {
-    #[serde(rename = "Source")]
     pub source: String,
-    #[serde(rename = "Destination")]
     pub destination: String,
-    #[serde(rename = "Type")]
     pub typ: String,
 }
 
-/// One entry of `GET /containers/json`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct Container {
-    #[serde(rename = "Id")]
-    pub id: String,
-    #[serde(rename = "Image")]
-    pub image: String,
-    #[serde(rename = "Command")]
-    pub command: String,
-    #[serde(rename = "Names")]
-    pub names: Vec<String>,
-    #[serde(rename = "State")]
-    pub state: String,
-    #[serde(rename = "Status")]
-    pub status: String,
-    #[serde(rename = "Created")]
-    pub created: i64,
-    #[serde(rename = "Ports")]
-    pub ports: Vec<Port>,
-    #[serde(rename = "Mounts")]
-    pub mounts: Vec<Mount>,
-    #[serde(rename = "ExitCode")]
-    pub exit_code: i64,
+impl From<ContainerSummary> for Container {
+    fn from(c: ContainerSummary) -> Self {
+        Container {
+            id: c.id.unwrap_or_default(),
+            image: c.image.unwrap_or_default(),
+            command: c.command.unwrap_or_default(),
+            names: c.names.unwrap_or_default(),
+            state: c.state.map(|s| s.to_string()).unwrap_or_default(),
+            status: c.status.unwrap_or_default(),
+            created: c.created.unwrap_or_default(),
+            ports: c
+                .ports
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| Port {
+                    private_port: p.private_port,
+                    public_port: p.public_port.unwrap_or_default(),
+                    typ: p.typ.map(|t| t.to_string()).unwrap_or_default(),
+                })
+                .collect(),
+            mounts: c
+                .mounts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| Mount {
+                    source: m.source.unwrap_or_default(),
+                    destination: m.destination.unwrap_or_default(),
+                    typ: m.typ.map(|t| t.to_string()).unwrap_or_default(),
+                })
+                .collect(),
+            // bollard's ContainerSummary carries no ExitCode; surfaced via inspect if needed.
+            exit_code: 0,
+        }
+    }
 }
 
 impl Container {
@@ -123,6 +87,10 @@ impl Container {
     /// True when the daemon considers this container running.
     pub fn running(&self) -> bool {
         self.state.eq_ignore_ascii_case("running")
+    }
+    /// True when the container is paused (SIGSTOP'd).
+    pub fn paused(&self) -> bool {
+        self.state.eq_ignore_ascii_case("paused")
     }
     /// A short status word for display (falls back to "created").
     pub fn display_status(&self) -> String {
@@ -145,42 +113,103 @@ impl Container {
     }
 }
 
-/// `GET /volumes` envelope (Docker wraps the list in `{ "Volumes": [...] }`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct VolumeList {
-    #[serde(rename = "Volumes")]
-    pub volumes: Vec<Volume>,
+/// One entry of `GET /images/json`.
+#[derive(Debug, Clone, Default)]
+pub struct Image {
+    pub id: String,
+    pub repo_tags: Vec<String>,
+    pub architecture: String,
+    pub size: i64,
+}
+
+impl From<ImageSummary> for Image {
+    fn from(i: ImageSummary) -> Self {
+        // bollard's ImageSummary has no Architecture field (the dd daemon emits it as an extra,
+        // which bollard drops). The UI only displays it, so leave it blank.
+        Image { id: i.id, repo_tags: i.repo_tags, architecture: String::new(), size: i.size }
+    }
+}
+
+impl Image {
+    /// First repo tag (e.g. `alpine:latest`), or the short id.
+    pub fn name(&self) -> String {
+        self.repo_tags.first().cloned().unwrap_or_else(|| short(&self.id))
+    }
 }
 
 /// One volume.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct Volume {
-    #[serde(rename = "Name")]
     pub name: String,
-    #[serde(rename = "Driver")]
     pub driver: String,
-    #[serde(rename = "Mountpoint")]
     pub mountpoint: String,
-    #[serde(rename = "CreatedAt")]
-    pub created_at: String,
+    pub scope: String,
+    pub labels: Vec<(String, String)>,
+    pub options: Vec<(String, String)>,
+}
+
+impl From<bollard::models::Volume> for Volume {
+    fn from(v: bollard::models::Volume) -> Self {
+        Volume {
+            name: v.name,
+            driver: v.driver,
+            mountpoint: v.mountpoint,
+            scope: v.scope.map(|s| s.to_string()).unwrap_or_default(),
+            labels: sorted_pairs(v.labels),
+            options: sorted_pairs(v.options),
+        }
+    }
 }
 
 /// One network from `GET /networks`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct Network {
-    #[serde(rename = "Id")]
     pub id: String,
-    #[serde(rename = "Name")]
     pub name: String,
-    #[serde(rename = "Driver")]
     pub driver: String,
-    #[serde(rename = "Scope")]
     pub scope: String,
-    #[serde(rename = "Containers", default)]
-    pub containers: std::collections::HashMap<String, serde_json::Value>,
+    pub subnet: String,
+    pub gateway: String,
+    pub internal: bool,
+    pub attachable: bool,
+    pub ipv6: bool,
+    pub labels: Vec<(String, String)>,
+    pub options: Vec<(String, String)>,
+    /// IDs of the containers attached to this network (from the inspect `Containers` map).
+    pub containers: Vec<String>,
+}
+
+impl From<bollard::models::Network> for Network {
+    fn from(n: bollard::models::Network) -> Self {
+        let (subnet, gateway) = n
+            .ipam
+            .and_then(|i| i.config)
+            .and_then(|c| c.into_iter().next())
+            .map(|c| (c.subnet.unwrap_or_default(), c.gateway.unwrap_or_default()))
+            .unwrap_or_default();
+        Network {
+            id: n.id.unwrap_or_default(),
+            name: n.name.unwrap_or_default(),
+            driver: n.driver.unwrap_or_default(),
+            scope: n.scope.unwrap_or_default(),
+            subnet,
+            gateway,
+            internal: n.internal.unwrap_or_default(),
+            attachable: n.attachable.unwrap_or_default(),
+            ipv6: n.enable_ipv6.unwrap_or_default(),
+            labels: sorted_pairs(n.labels.unwrap_or_default()),
+            options: sorted_pairs(n.options.unwrap_or_default()),
+            // bollard's list `Network` model carries no container map (only on inspect).
+            containers: Vec::new(),
+        }
+    }
+}
+
+/// Sort a `{k: v}` map into stable `(k, v)` display pairs.
+fn sorted_pairs(m: std::collections::HashMap<String, String>) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = m.into_iter().collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
 }
 
 impl Network {
@@ -190,40 +219,39 @@ impl Network {
     }
 }
 
-/// Body for `POST /containers/create`, built by the CLI/GUI "run" flow.
-#[derive(Debug, Clone, Default, Serialize)]
+/// Body for `create_container`, built by the CLI/GUI "run" flow. Only `image` is set today.
+#[derive(Debug, Clone, Default)]
 pub struct CreateContainer {
-    #[serde(rename = "Image")]
     pub image: String,
-    #[serde(rename = "Cmd", skip_serializing_if = "Vec::is_empty")]
-    pub cmd: Vec<String>,
-    #[serde(rename = "Hostname", skip_serializing_if = "String::is_empty")]
-    pub hostname: String,
-    #[serde(rename = "HostConfig")]
-    pub host_config: HostConfig,
 }
 
-/// Subset of Docker's HostConfig the daemon honours.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct HostConfig {
-    #[serde(rename = "Binds", skip_serializing_if = "Vec::is_empty")]
-    pub binds: Vec<String>,
-    #[serde(rename = "Memory", skip_serializing_if = "is_zero")]
-    pub memory: i64,
-    #[serde(rename = "PidsLimit", skip_serializing_if = "is_zero")]
-    pub pids_limit: i64,
-    #[serde(rename = "PortBindings", skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub port_bindings: std::collections::HashMap<String, Vec<PortBinding>>,
+/// Engine info for the System view (`/version` + `/info`, flattened).
+#[derive(Debug, Clone, Default)]
+pub struct SystemInfo {
+    pub version: String,
+    pub api_version: String,
+    pub os: String,
+    pub arch: String,
+    pub kernel: String,
+    pub driver: String,
+    pub root_dir: String,
+    pub server_version: String,
+    pub ncpu: i64,
+    pub mem_total: i64,
+    pub containers: i64,
+    pub running: i64,
+    pub paused: i64,
+    pub stopped: i64,
+    pub images: i64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct PortBinding {
-    #[serde(rename = "HostPort")]
-    pub host_port: String,
-}
-
-fn is_zero(n: &i64) -> bool {
-    *n == 0
+/// Disk usage (`/system/df`).
+#[derive(Debug, Clone, Default)]
+pub struct DiskUsage {
+    pub layers_size: i64,
+    pub images: i64,
+    pub containers: i64,
+    pub volumes: i64,
 }
 
 /// docker-style short id (first 12 hex chars).
