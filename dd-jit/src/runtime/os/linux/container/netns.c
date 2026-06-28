@@ -333,6 +333,131 @@ static void fill_inet_br(uint8_t *sa, socklen_t *l, uint32_t ip_be, uint16_t por
     if (l) *l = 16;
 }
 
+// ---- Published-port host forwarder (`docker run -p HOST:CONTAINER`) -----------------------------
+// A guest that binds+listens on a published container port does so on the AF_UNIX virtual switch
+// (br_path for a 0.0.0.0/eth0 bind, lo_path for a 127.0.0.1 bind) -- reachable by peer containers, but
+// NOT by a host process dialing localhost:HOST_PORT, because nothing on the host listens on an AF_INET
+// socket for HOST_PORT. This bridges that gap: when the guest listen()s on a published port we start a
+// REAL host AF_INET listener on 0.0.0.0:HOST_PORT (matching docker's default publish address, which the
+// daemon also reports via NetworkSettings.Ports), and for each accepted host connection we dial the
+// guest's AF_UNIX switch socket and relay bytes both ways. The guest's own accept() returns the relayed
+// connection exactly as if a peer container had connected, so container<->container, egress, the switch
+// and --network none/host are completely untouched -- this purely ADDS the host->container path.
+// (Uses g_portmap/pm_host from state.c, included before this file in the same TU.) TCP only for now;
+// published UDP is a follow-up (the guest's UDP path isn't switch-redirected today).
+
+// Is `cport` a published container port? (pm_host() returns cport on a miss, so it can't answer this.)
+static int pm_published(uint16_t cport) {
+    for (int i = 0; i < g_nportmap; i++)
+        if (g_portmap[i].cport == cport) return 1;
+    return 0;
+}
+// One relay connection: pump bytes between host TCP fd `a` and switch AF_UNIX fd `b` until either EOF.
+struct fwd_relay {
+    int a, b;
+};
+// Copy one ready direction src->dst. Returns 0 to keep going, -1 to tear the whole connection down.
+// On src EOF we half-close dst (shutdown SHUT_WR) so the peer sees the FIN and can finish its reply,
+// and mark that direction done; the connection ends only once BOTH directions have closed.
+static int fwd_pump(int src, int dst, int *src_done, char *buf, size_t cap) {
+    ssize_t n = read(src, buf, cap);
+    if (n == 0) { shutdown(dst, SHUT_WR); *src_done = 1; return 0; }
+    if (n < 0) { if (errno == EINTR || errno == EAGAIN) return 0; return -1; }
+    for (ssize_t off = 0; off < n;) {
+        ssize_t w = write(dst, buf + off, (size_t)(n - off));
+        if (w <= 0) { if (w < 0 && (errno == EINTR || errno == EAGAIN)) continue; return -1; }
+        off += w;
+    }
+    return 0;
+}
+static void *fwd_relay_thread(void *p) {
+    struct fwd_relay r = *(struct fwd_relay *)p;
+    free(p);
+    char buf[65536];
+    int a_done = 0, b_done = 0; // host->guest / guest->host directions closed
+    while (!a_done || !b_done) {
+        struct pollfd pf[2] = {{r.a, a_done ? 0 : POLLIN, 0}, {r.b, b_done ? 0 : POLLIN, 0}};
+        if (poll(pf, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+        if (!a_done && (pf[0].revents & (POLLIN | POLLHUP | POLLERR)))
+            if (fwd_pump(r.a, r.b, &a_done, buf, sizeof buf) < 0) break;
+        if (!b_done && (pf[1].revents & (POLLIN | POLLHUP | POLLERR)))
+            if (fwd_pump(r.b, r.a, &b_done, buf, sizeof buf) < 0) break;
+    }
+    close(r.a);
+    close(r.b);
+    return NULL;
+}
+struct fwd_listen {
+    uint16_t hport;
+    char upath[200]; // full switch path; truncated into sun_path exactly as the guest's bind did
+};
+static void *fwd_listen_thread(void *p) {
+    struct fwd_listen fl = *(struct fwd_listen *)p;
+    free(p);
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) return NULL;
+    int on = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(fl.hport);
+    sin.sin_addr.s_addr = htonl(INADDR_ANY); // 0.0.0.0:HOST_PORT (docker's default publish address)
+    if (bind(ls, (struct sockaddr *)&sin, sizeof sin) < 0 || listen(ls, 128) < 0) {
+        close(ls); // host port busy (e.g. another container already published it) -> no forwarding
+        return NULL;
+    }
+    for (;;) {
+        int hc = accept(ls, NULL, NULL);
+        if (hc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        // dial the guest's switch listen socket (same truncation the guest used when it bound it)
+        int gc = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (gc < 0) { close(hc); continue; }
+        struct sockaddr_un un;
+        memset(&un, 0, sizeof un);
+        un.sun_family = AF_UNIX;
+        snprintf(un.sun_path, sizeof un.sun_path, "%s", fl.upath);
+        if (connect(gc, (struct sockaddr *)&un, sizeof un) < 0) { close(gc); close(hc); continue; }
+        struct fwd_relay *fr = malloc(sizeof *fr);
+        if (!fr) { close(gc); close(hc); continue; }
+        fr->a = hc;
+        fr->b = gc;
+        pthread_t t;
+        if (pthread_create(&t, NULL, fwd_relay_thread, fr) != 0) { free(fr); close(gc); close(hc); continue; }
+        pthread_detach(t);
+    }
+    close(ls);
+    return NULL;
+}
+// Host ports we've already spun up a forwarder for (idempotent across re-listen()/SO_REUSEADDR restart).
+static uint16_t g_fwd_started[32];
+static int g_nfwd;
+// Called from listen(): if `fd` is a published switch-backed listening socket, start its host forwarder.
+static void fwd_maybe_start(int fd) {
+    if (fd < 0 || fd >= 1024) return;
+    uint16_t cport = 0;
+    char upath[200];
+    if (g_br_port[fd]) { cport = g_br_port[fd]; br_path(g_br_ip[fd], cport, upath, sizeof upath); }
+    else if (g_lo_port[fd]) { cport = g_lo_port[fd]; lo_path(cport, upath, sizeof upath); }
+    else return; // real host bind (no switch redirect) -> already natively reachable, nothing to do
+    if (!pm_published(cport)) return; // not a published port
+    uint16_t hport = pm_host(cport);
+    for (int i = 0; i < g_nfwd; i++)
+        if (g_fwd_started[i] == hport) return; // already forwarding this host port
+    if (g_nfwd >= 32) return;
+    struct fwd_listen *fl = malloc(sizeof *fl);
+    if (!fl) return;
+    fl->hport = hport;
+    snprintf(fl->upath, sizeof fl->upath, "%s", upath);
+    pthread_t t;
+    if (pthread_create(&t, NULL, fwd_listen_thread, fl) != 0) { free(fl); return; }
+    pthread_detach(t);
+    g_fwd_started[g_nfwd++] = hport;
+}
+
 // ===== Linux <-> macOS sockaddr translation (AF_INET / AF_INET6) — gate: NOSOCKADDR=1 =====
 // The non-isolated socket paths (real host TCP/UDP via bind/connect/accept/getsockname/getpeername/
 // sendto/recvfrom/sendmsg) used to hand the guest's *Linux*-layout sockaddr straight to a macOS

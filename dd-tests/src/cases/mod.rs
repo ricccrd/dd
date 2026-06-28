@@ -149,7 +149,7 @@ fn edge() -> Group {
         // FIXED. Pinned to one engine to bound cost; previously hung to the 25s timeout when treated
         // as relative.
         src("clockabstime", "edge_clockabstime.c").only(&[Engine::LinuxAarch64]).has("abstime_ok=1"),
-        src("sigpipe", "edge_sigpipe.c").has("survived=1 epipe=1").xfail(lin), // MSG_NOSIGNAL: SO_NOSIGPIPE on send* only; write()-to-socket SIGPIPE still kills — PARTIAL
+        src("sigpipe", "edge_sigpipe.c").has("survived=1 epipe=1"), // SO_NOSIGPIPE set on every guest socket at creation (socket/socketpair/accept) -> write/send to a broken socket returns EPIPE, never a fatal SIGPIPE
         src("procfd", "edge_procfd.c").has("resolves=1 enough_fds=1").xfail(lin), // /proc/self/fd
         // times(): tms_utime works on x86_64 but is 0 on aarch64 (clock() works on both) — engine split.
         src("times", "edge_times.c").has("utime_ok=1 clock_ok=1 ret_ok=1").xfail(&[Engine::LinuxAarch64]),

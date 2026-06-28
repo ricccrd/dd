@@ -1940,6 +1940,13 @@ static void service_local(struct cpu *c) {
         // socket (translate Linux domain -> macOS: AF_INET6 10->30, others unchanged)
         int r = socket(af_l2m((int)a0), ty & 0xf, (int)a2);
         if (r >= 0) {
+            // SIGPIPE suppression: Linux delivers EPIPE (not a fatal signal) to a guest that has
+            // SIG_IGN'd SIGPIPE or passes MSG_NOSIGNAL; macOS has no per-call MSG_NOSIGNAL, so make the
+            // suppression sticky on the fd. With SO_NOSIGPIPE set at creation, ANY write to a broken
+            // socket -- write(2), writev(2), send(2) without MSG_NOSIGNAL -- returns -1/EPIPE instead
+            // of raising SIGPIPE. Benign on healthy sockets; only sockets get it, so real pipes/FIFOs
+            // keep Linux's default SIGPIPE-on-write semantics.
+            { int on = 1; setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
             if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
             if (r < 1024) {
@@ -1957,6 +1964,11 @@ static void service_local(struct cpu *c) {
         // socketpair (translate Linux domain -> macOS)
         int r = socketpair(af_l2m((int)a0), (int)a1 & 0xf, (int)a2, sv);
         if (r == 0) {
+            // SO_NOSIGPIPE on both ends so a write/send to a peer-closed pair returns EPIPE, never a
+            // fatal SIGPIPE (matches Linux EPIPE-to-guest behaviour). See case 198 for the rationale.
+            int on = 1;
+            setsockopt(sv[0], SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+            setsockopt(sv[1], SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
             ((int *)a3)[0] = sv[0];
             ((int *)a3)[1] = sv[1];
         }
@@ -2056,7 +2068,14 @@ static void service_local(struct cpu *c) {
         }
         break;
     }
-    case 201: G_RET(c) = listen((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 201: {
+        int lr = listen((int)a0, (int)a1);
+        // Published-port (`-p H:C`) host bridge: if this is a switch-backed listen on a published
+        // container port, spin up a real host AF_INET listener on :H that relays into the guest.
+        if (lr == 0) fwd_maybe_start((int)a0);
+        G_RET(c) = lr < 0 ? (uint64_t)(-errno) : 0;
+        break;
+    }
     case 202:
     case 242: {
         int lfd = (int)a0;
@@ -2073,6 +2092,9 @@ static void service_local(struct cpu *c) {
                             : accept(lfd, want_peer ? (struct sockaddr *)&hss : NULL,
                                      want_peer ? &hsl : (socklen_t *)a2);
         if (r >= 0) {
+            // Accepted connections are sockets too: make SIGPIPE suppression sticky on the new fd so a
+            // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
+            { int on = 1; setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
             if (nr == 242) {
                 if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
                 if ((int)a3 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
