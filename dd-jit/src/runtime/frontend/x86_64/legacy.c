@@ -72,6 +72,11 @@ static int x86_normalize(struct cpu *c) {
     case 57:
     case 58:
         r[7] = 17; r[6] = 0; r[2] = 0; r[10] = 0; r[8] = 0; r[0] = 56; return 0;
+    // getpgrp() -> getpgid(0): x86-only (no aarch64 form, so sysmap leaves it unmapped -> the shared
+    // service saw 0x10000|111 and aborted with "unhandled syscall 65647" during bash job-control setup).
+    // getpgrp takes no args, so rdi is garbage -> zero it, then run as x86 getpgid(121) -> canonical 155.
+    case 111:
+        r[7] = 0; r[0] = 121; return 0;
     default: break;
     }
     return 0;
