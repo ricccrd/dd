@@ -1988,6 +1988,9 @@ static void service(struct cpu *c) {
                     (unsigned long long)g_prof_cross, (unsigned long long)g_prof_sys, (unsigned long long)g_prof_miss,
                     (unsigned long long)(g_prof_cross - g_prof_sys - g_prof_miss), (unsigned long long)g_prof_xlate,
                     (unsigned long long)g_lse_n);
+#ifdef G_PROF_EXTRA
+        G_PROF_EXTRA; // W5B: x86 tier-2 promotion counters
+#endif
         ep_prof_dump(); // w3e: flush epoll kevent-syscall counter (atexit is bypassed by _exit)
         if (g_noexit) { // W3D fork-server prewarm: don't kill the resident parent; unwind run_guest instead
             c->exited = 1;

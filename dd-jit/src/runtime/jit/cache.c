@@ -79,7 +79,12 @@ static int g_prof;
 // recompiles (promotes) the block with the optimized codegen, then resumes (pc already = block start).
 // (The reason code normally lives next to R_BRANCH/R_SYSCALL in include/cpu_aarch64.h; it is defined here
 // because this engine integration is confined to the jit/ + frontend/aarch64/ translate units.)
+// W5B: the x86 engine reuses this substrate but its reason-code space already uses 2 for R_CPUID, so it
+// pre-defines R_TIER2=7 in include/cpu_x86_64.h. Guard the aarch64 default so the x86 value wins in the
+// x86 unity build; aarch64 (whose cpu_aarch64.h does not define it) still gets 2. No aarch64 change.
+#ifndef R_TIER2
 #define R_TIER2 2
+#endif
 //
 // A same-ISA aarch64->aarch64 transliterator already keeps every guest GPR in its host reg and flags
 // native, so tier-1 hot loops are near-native EXCEPT the conditional back-edge: a self-loop `b.cond` is
