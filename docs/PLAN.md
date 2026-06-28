@@ -80,7 +80,10 @@ at a time with the cross-engine matrix as the regression gate.**
    NZCV already survives producer→consumer, so a `cmp;je` is 6 host instrs where 2 suffice (−67%). Design:
    a translate-time pending-flags state machine + cc-mapping, boundary materialize keeps the cross-block
    flag ABI byte-identical (intra-block-only = safe). Warts: `pmovmskb` (48→8 NEON), x87 `fptop`. **First
-   PR:** the `sub/cmp→Jcc` fast path only (~3 sites, revertible). Inherits #1's optimizations + #4 once they land.
+   PR:** the `sub/cmp→Jcc` fast path only (~3 sites, revertible). ✅ **PR1 DONE** (lazy NZCV, drops the
+   save/load round-trip; intra-block so the flag ABI is byte-identical; **matrix 240 green, x86 zero
+   fails**). **Next PR:** extend to add/logical producers + carry-value consumers + `pmovmskb` + x87.
+   Inherits #1's optimizations + #4 once they land.
 
 ## Smaller remaining items
 - **`docker build` BuildKit cache** — layer/step caching (today every build re-runs from the base).
@@ -219,9 +222,10 @@ Remaining — what still needs to be figured out / built (priority):
 |------|-----------------|:---:|
 | `docker inspect` (container) | ~~`NetworkSettings` (ports → fixes `docker port`, + membership), `Name`, `Mounts`, `Config.Image/Env`~~ **done**; still: `State.{Pid,StartedAt,FinishedAt}` (not tracked yet) | P1 |
 | `docker logs` | ~~`--tail`/`--timestamps`, **raw** stream for `-t`~~ **done**; still `-f`/follow, `--since` | P1 |
-| `docker ps` | ~~human `Status` (`Up 3 minutes`)~~ **done**; still `--filter`/`--size`, `Labels`/`ImageID`/network info | P1 |
-| `docker exec` | ~~`-e`/`-w`~~ **done**; still `-u` (needs a `SpawnConfig` uid field), `--privileged`, `exec -d` → 200 | P1 |
-| `docker events` | wire a real lifecycle event bus into the open stream (compose + GUI watch it) | P1 |
+| `docker ps` | ~~human `Status`, `--filter` (status/name/label), `Labels`~~ **done**; still `--size`, `--filter` (other keys) | P1 |
+| `docker exec` | ~~`-e`/`-w`, `exec -d` → 200~~ **done**; still `-u` (needs a `SpawnConfig` uid field), `--privileged` | P1 |
+| `docker events` | ~~real lifecycle event bus (container create/start/stop/die/destroy; type/event/container filters)~~ **done** (verified live); still image/network/volume emits (one-liners, hooks ready) | P1 |
+| `docker inspect` State | ~~`State.{Pid,StartedAt,FinishedAt}`~~ **done** (RFC3339; Pid from live) | P1 |
 | `docker stats` | real CPU/mem accounting from the JIT runtime + streaming *(design: runtime has no cgroup metrics)* | P1 |
 | networks | ~~per-container IP/IPAM + `network inspect` member IPs~~ **PR1 done** (172.18/12, verified `172.18.0.2`); still **container-to-container reachability** (`docker-net.sh` `reach-by-name`/`-ip`): the data path — a per-network AF_UNIX virtual switch + embedded name→IP DNS — see netstack #2 next PR. Cross-network isolation trivially holds. | P2 |
 | `docker build` | ~~`buildargs`/`target`/`nocache`~~ **done**; still `labels`, real content-digest image IDs; (BuildKit cache, above) | P2 |
