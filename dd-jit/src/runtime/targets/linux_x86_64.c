@@ -223,7 +223,11 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     c.r[RDX] = 0;                                              // rtld_fini = 0
     c.rip = jump;
 
+    s1_calibrate(); // S1: anchor CNTVCT vs host REALTIME/MONOTONIC for the inline time fast path
+                    // (also honors JIT86_NOFASTSYS=1 kill-switch -> byte-identical old syscall path)
     run_guest(&c);
+    if (getenv("JIT86_FASTSTAT") || g_fast_count)
+        fprintf(stderr, "[fastsys] enabled=%d inline-served=%llu\n", g_fastsys, (unsigned long long)g_fast_count);
     if (g_prof)
         fprintf(stderr, "[prof] dispatcher round-trips=%llu  IBTC fills=%llu  (IBTC %s)\n",
                 (unsigned long long)g_disp_n, (unsigned long long)g_ibtc_fill, g_noibtc ? "OFF" : "ON");

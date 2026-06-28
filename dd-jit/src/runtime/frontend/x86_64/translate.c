@@ -1310,6 +1310,15 @@ static void *translate_block(uint64_t gpc) {
         } else {
             // ===== two-byte (0F xx) =====
             if (op == 0x05) {
+                if (g_fastsys) { // S1: inline time fast path (no service round-trip for clock_gettime/gettimeofday)
+                    emit_fast_syscall(next);
+                    // The inline-served path falls through here; end the block with a chained branch to
+                    // `next` (regs stay live, no spill) instead of decoding inline -- decoding past the
+                    // syscall would run the decoder off the end of guest .text (SIGBUS). The slow path
+                    // inside emit_fast_syscall already ended the block via emit_exit_const(next,R_SYSCALL).
+                    emit_chain_exit(next);
+                    break;
+                }
                 emit_exit_const(next, R_SYSCALL);
                 break;
             } // syscall

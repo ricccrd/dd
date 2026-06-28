@@ -367,6 +367,139 @@ static void emit_exit_const(uint64_t rip, uint64_t reason) {
     e_movconst(16, (uint64_t)block_return);
     e_br(16); // block_return uses x28 (still cpu)
 }
+// ---------------- S1: inline vDSO-style time fast path (cntvct-based) ----------------
+// Apple Silicon exposes the EL0-readable generic-timer count (CNTVCT_EL0) + its frequency
+// (CNTFRQ_EL0). We calibrate once at startup against the host's REALTIME/MONOTONIC clocks,
+// then emit inline ARM64 at the guest `syscall` site that reads CNTVCT and converts to a Linux
+// timespec/timeval WITHOUT entering service() -- the guest's clock_gettime/gettimeofday never
+// trap. ns = base_ns + ((ticks-base_ticks)*mult)>>FAST_SHIFT (Q30, overflow-safe 128-bit).
+static int g_fastsys = 1;         // master switch (JIT86_NOFASTSYS=1 -> 0 = byte-identical old path)
+static uint64_t g_fast_count;     // # of guest time syscalls satisfied inline (written by emitted code)
+static uint64_t g_cal_base_ticks; // CNTVCT at calibration
+static uint64_t g_cal_mono_ns;    // CLOCK_MONOTONIC ns at calibration
+static uint64_t g_cal_real_ns;    // CLOCK_REALTIME  ns at calibration
+static uint64_t g_cal_mult;       // tick->ns multiplier (Q30): round(1e9 * 2^FAST_SHIFT / cntfrq)
+#define FAST_SHIFT 30
+static void s1_calibrate(void) {
+    const char *off = getenv("JIT86_NOFASTSYS");
+    if (off && off[0] && off[0] != '0') {
+        g_fastsys = 0;
+        return;
+    }
+    uint64_t freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    if (!freq) {
+        g_fastsys = 0; // no readable counter frequency -> safe fallback
+        return;
+    }
+    g_cal_mult = (uint64_t)(((unsigned __int128)1000000000ull << FAST_SHIFT) / freq);
+    struct timespec tm, tr;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(g_cal_base_ticks));
+    clock_gettime(CLOCK_MONOTONIC, &tm);
+    clock_gettime(CLOCK_REALTIME, &tr);
+    g_cal_mono_ns = (uint64_t)tm.tv_sec * 1000000000ull + (uint64_t)tm.tv_nsec;
+    g_cal_real_ns = (uint64_t)tr.tv_sec * 1000000000ull + (uint64_t)tr.tv_nsec;
+}
+// Emitted at the guest `syscall` site. Guest GPRs are live in x0..x15 (rax=x0, rsi=x6, rdi=x7),
+// guest flags live in ARM nzcv, cpu pinned in x28. x16/x17 and the host callee-saved x19..x27
+// (saved by run_block, restored by block_return) are free scratch in-block, NOT guest state.
+// For clock_gettime(228)/gettimeofday(96) with clockid in {REALTIME=0,MONOTONIC=1} we read
+// CNTVCT_EL0, convert with the startup calibration, write the guest result buffer, set rax=0, and
+// branch to L_after. All other syscall numbers (and unhandled clockids) restore flags and take the
+// unchanged full R_SYSCALL exit. Guest nzcv is saved (x17) and restored on EVERY path so the slow
+// exit is semantically identical to the baseline. The CALLER ends the block right after this (a
+// chained branch to `next`); we never continue decoding past the syscall (would run off the end).
+static void emit_fast_syscall(uint64_t next) {
+    emit32(0xD53B4211u); // mrs x17, nzcv   (preserve guest flags across our compares)
+    uint32_t *after[2];
+    int na = 0; // slots: b L_after
+    uint32_t *to_slow[2];
+    int nsl = 0; // slots: b.ne slow_restore
+
+    // ---- clock_gettime: rax == 228 ----
+    e_subi_s(16, 0, 228, 1); // subs x16, x0, #228
+    uint32_t *m1 = (uint32_t *)g_cp;
+    e_bcond(1, 0);           // b.ne -> gettimeofday
+    e_subi_s(16, 7, 1, 1);   // cmp clockid(rdi=x7), #1 (MONOTONIC)
+    uint32_t *cs = (uint32_t *)g_cp;
+    e_bcond(1, 0);                  // b.ne -> check REALTIME
+    e_movconst(19, g_cal_mono_ns);  // base_ns = mono
+    uint32_t *jc = (uint32_t *)g_cp;
+    emit32(0x14000000u);            // b conv
+    // check REALTIME:
+    *cs = (*cs & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - cs) & 0x7FFFF) << 5);
+    e_subi_s(16, 7, 0, 1); // cmp clockid, #0 (REALTIME)
+    to_slow[nsl++] = (uint32_t *)g_cp;
+    e_bcond(1, 0);                 // b.ne -> slow (unhandled clockid)
+    e_movconst(19, g_cal_real_ns); // base_ns = real
+    // conv:
+    *jc = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - jc) & 0x3FFFFFF);
+    emit32(0xD53BE050u);                  // mrs x16, cntvct_el0
+    e_movconst(20, g_cal_base_ticks);
+    e_rrr(A_SUB, 21, 16, 20, 1, 0);       // x21 = delta = ticks - base_ticks
+    e_movconst(20, g_cal_mult);
+    e_mul(22, 21, 20, 1);                 // lo = delta*mult
+    e_umulh(23, 21, 20);                  // hi
+    e_extr(24, 23, 22, FAST_SHIFT, 1);    // x24 = (hi:lo) >> 30 = ns_delta (128-bit safe)
+    e_rrr(A_ADD, 24, 19, 24, 1, 0);       // x24 = base_ns + ns_delta = total_ns
+    e_movconst(25, 1000000000ull);
+    e_udiv(26, 24, 25, 1);                // sec
+    e_msub(27, 26, 25, 24, 1);            // nsec = total - sec*1e9
+    e_str(26, 6, 0);                      // ts->tv_sec   (rsi=x6)
+    e_str(27, 6, 8);                      // ts->tv_nsec
+    e_movconst(20, (uint64_t)&g_fast_count);
+    e_ldr(21, 20, 0);
+    e_addi(21, 21, 1, 1);
+    e_str(21, 20, 0);    // g_fast_count++
+    e_movconst(0, 0);    // rax = 0
+    emit32(0xD51B4211u); // msr nzcv, x17  (restore guest flags)
+    after[na++] = (uint32_t *)g_cp;
+    emit32(0x14000000u); // b L_after
+
+    // ---- gettimeofday: rax == 96 ----
+    *m1 = (*m1 & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - m1) & 0x7FFFF) << 5);
+    e_subi_s(16, 0, 96, 1); // subs x16, x0, #96
+    to_slow[nsl++] = (uint32_t *)g_cp;
+    e_bcond(1, 0);                 // b.ne -> slow
+    e_movconst(19, g_cal_real_ns); // gettimeofday is REALTIME
+    emit32(0xD53BE050u);           // mrs x16, cntvct_el0
+    e_movconst(20, g_cal_base_ticks);
+    e_rrr(A_SUB, 21, 16, 20, 1, 0);
+    e_movconst(20, g_cal_mult);
+    e_mul(22, 21, 20, 1);
+    e_umulh(23, 21, 20);
+    e_extr(24, 23, 22, FAST_SHIFT, 1);
+    e_rrr(A_ADD, 24, 19, 24, 1, 0); // total_ns
+    e_movconst(25, 1000000000ull);
+    e_udiv(26, 24, 25, 1);     // sec
+    e_msub(27, 26, 25, 24, 1); // nsec
+    e_movconst(20, 1000);
+    e_udiv(27, 27, 20, 1); // usec = nsec/1000
+    e_str(26, 7, 0);       // tv->tv_sec   (rdi=x7)
+    e_str(27, 7, 8);       // tv->tv_usec
+    e_movconst(20, (uint64_t)&g_fast_count);
+    e_ldr(21, 20, 0);
+    e_addi(21, 21, 1, 1);
+    e_str(21, 20, 0);
+    e_movconst(0, 0);    // rax = 0
+    emit32(0xD51B4211u); // msr nzcv, x17
+    after[na++] = (uint32_t *)g_cp;
+    emit32(0x14000000u); // b L_after
+
+    // ---- slow path: restore guest flags, take the unchanged full R_SYSCALL exit ----
+    for (int i = 0; i < nsl; i++) {
+        uint32_t *s = to_slow[i];
+        *s = (*s & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - s) & 0x7FFFF) << 5);
+    }
+    emit32(0xD51B4211u);              // msr nzcv, x17
+    emit_exit_const(next, R_SYSCALL); // -> block_return (slow path ends the block)
+
+    // ---- L_after: fall through to the caller's block terminator (chain to `next`) ----
+    for (int i = 0; i < na; i++) {
+        uint32_t *s = after[i];
+        *s = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - s) & 0x3FFFFFF);
+    }
+}
 // Direct-branch chaining: if target already translated, single `b body`; else a full
 // exit whose first insn is remembered and back-patched to `b body` later. (from jit.c)
 static void emit_chain_exit(uint64_t target) {
