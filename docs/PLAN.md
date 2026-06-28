@@ -8,25 +8,22 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
 
 ## Large subsystems (priority order) — each has an executable design + first-PR roadmap in `docs/design/`
 
-1. **jit86 engine dedup** → `docs/design/engine-dedup.md`. Lift the host `jit/` engine so the code cache +
-   dispatcher are cpu-agnostic (the cpu struct + x86 decoder stay per-arch). **PR1 ✅** (x86 on shared
-   `jit/cache.c`) + **PR2 ✅** (dispatch.c frontend-hook seam, aarch64 bit-identical). **Remaining: PR3/PR4**
-   — x86 hook definitions + swap the x86 target onto `jit/dispatch.c`; also hook the 5th divergence (the
-   per-block `g_trace` dump). Gate: matrix green both engines.
-2. **Networking Phase-2b — netstack** → `docs/design/netstack.md`. External egress already works; the gap is
-   L3 identity + reachability. **PR1 ✅** (daemon IPAM `172.18/12`, per-container IP, `--network` join →
-   docker-net 5/7). **PR2 ✅** (br_* AF_UNIX switch + `/etc/hosts` reach-by-name DNS + fd-dup socket-metadata
-   carry → **docker-net 7/7**, reach-by-name/ip + cross-network isolation). **Remaining:** only the optional
-   in-process `smoltcp` stack behind `DD_NETSTACK`.
-3. **Untrusted-guest isolation — sentry process-split** → `docs/design/sentry-split.md`. **No PR yet.** The
-   trust boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on
-   `g_untrusted`, split `service()` by authority (compute/mem local, fs/net/proc → sentry over an SPSC
-   ring), deny-default Seatbelt. First PR: ring + read/write/open family behind the flag.
-4. **x86 translator → native** → `docs/design/x86-perf.md`. **PR1 ✅** (lazy NZCV `sub/cmp→Jcc`), **extended ✅**
-   (Opt3: add/and/or/xor/test producers + dead-flag elim), **`pmovmskb` ✅** (W3-B, 48→8 NEON). The tier-2
-   substrate **landed** — arm adaptive tier-up (W4-E), stolen-register mangle elimination via trace-local
-   allocation (W6-C, the former "tier-2 trace optimizer" subsystem), and the x86 tier-2 optimizer (W5-B).
-   **Remaining:** carry-value consumers (adc/sbb deferral) + x87 `fptop` tracking.
+1. **jit86 engine dedup** → `docs/design/engine-dedup.md`. PR1/PR2 done (x86 on shared `jit/cache.c`;
+   dispatch.c frontend-hook seam, aarch64 bit-identical). **Remaining: PR3/PR4** — x86 hook definitions + swap
+   the x86 target onto `jit/dispatch.c`; hook the 5th divergence (the per-block `g_trace` dump). Gate: matrix
+   green both engines.
+2. **Networking — in-process netstack** → `docs/design/netstack.md`. External egress + L3 identity/reachability
+   done (docker-net 7/7: per-container IP, `--network` join, br_* AF_UNIX switch, reach-by-name/ip, cross-net
+   isolation). **Remaining:** only the optional in-process `smoltcp` stack behind `DD_NETSTACK`.
+3. **Untrusted-guest sentry process-split** → `docs/design/sentry-split.md`. First PR built in research
+   (`dd-jit/docs/optimization-research/w6b-sentry.diff`, not yet integrated): read/write/open(at)/close/lseek
+   forwarded over an SPSC ring to a forked authority process, gate OFF = one-branch passthrough. **Remaining:**
+   per-context rings (a forking `sh` stalls at the first `clone`), the full fs/net/proc set
+   (stat/iovec/sockets/execve/fork), SCM_RIGHTS for file-backed mmap, futex wakeup, allow/deny policy. (Detail
+   in dd-jit/PLAN.md.)
+4. **x86 translator → native** → `docs/design/x86-perf.md`. Lazy NZCV, `pmovmskb`, and the full tier-2 substrate
+   (W4-E arm tier-up / W6-C mangle elimination / W5-B x86 tier-2) landed. **Remaining:** carry-value consumers
+   (`adc`/`sbb` deferral) + x87 `fptop` tracking.
 
 ## Deep bugs (root-caused; fixes scoped)
 
