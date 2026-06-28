@@ -624,6 +624,83 @@ static void emit_rep_string(int movs, int w, int shift) {
     emit_reload();
 }
 
+// ===== x87 translate-time stack-top (fptop) tracking =====================================
+// The baseline x87 path keeps ST(0..7) in cpu->st[] with the live top in cpu->fptop, and every
+// ST(i) touch recomputes the wrapped slot at runtime (e_st_addr: ldr fptop; add #i; and #7; add
+// base; add idx,lsl#3 -- 5 insns) while each push/pop does a ldr/modify/str of cpu->fptop.
+//
+// When the absolute top is statically known at translate time we instead:
+//   * resolve ST(i) to the concrete slot (g_fp_top+i)&7 and address it with ONE `add xa,x28,#off`,
+//   * keep push/pop as pure translate-time bookkeeping (no cpu->fptop traffic), writing the shadow
+//     back to cpu->fptop only when guest state may escape (a faulting guest memory access, a C-helper
+//     exit, or any non-x87 instruction / block boundary) -- exactly as lazy flags spill to cpu->nzcv.
+// Storage stays cpu->st[] at double precision, the ops/condition codes/fpsw paths are untouched, so
+// results are bit-identical to the baseline; only the addressing of ST(i) and the timing of the
+// cpu->fptop store change, and the escape-point materialize keeps cpu->fptop observably current.
+//
+// The top is "known" only after a `finit` anchors it (top=0) within an unbroken run of x87
+// instructions; any non-x87 instruction ends the run (materialize + drop to the runtime model), and
+// any x87 op we cannot statically track falls back to the baseline helpers. NOX87OPT forces the
+// runtime-top path everywhere -> byte-identical to the pre-opt engine.
+static int g_x87opt = -1;  // -1 uninit; 0 = NOX87OPT set (off); 1 = on
+static int g_fp_known = 0; // 1 if the absolute top is statically known right now
+static int g_fp_top = 0;   // the known top (0..7), valid iff g_fp_known
+static int g_fp_dirty = 0; // 1 if the shadow top has not been written to cpu->fptop
+static int x87opt_on(void) {
+    if (g_x87opt < 0) g_x87opt = (getenv("NOX87OPT") == NULL);
+    return g_x87opt;
+}
+// &cpu->st[(g_fp_top+i)&7] -> xdst, single add (OFF_ST + slot*8 fits the add imm12).
+static void fp_slot_addr(int xdst, int i) {
+    unsigned off = (unsigned)OFF_ST + (unsigned)(((g_fp_top + i) & 7) * 8);
+    emit32(0x91000000u | (off << 10) | (28 << 5) | xdst); // add xdst, x28, #off
+}
+// Make cpu->fptop reflect the shadow (idempotent). Keeps g_fp_known.
+static void fp_materialize(void) {
+    if (g_fp_known && g_fp_dirty) {
+        e_movconst(16, (uint64_t)g_fp_top);
+        e_str(16, 28, OFF_FPTOP);
+        g_fp_dirty = 0;
+    }
+}
+// Leave the static-top model (run boundary / untrackable op): spill the shadow, go runtime-top.
+static void fp_drop(void) {
+    fp_materialize();
+    g_fp_known = 0;
+}
+#define FP_STATIC (x87opt_on() && g_fp_known)
+static void fp_ld(int vd, int i) { // vd = ST(i)
+    if (FP_STATIC) {
+        fp_slot_addr(17, i);
+        e_ldr_d(vd, 17);
+    } else
+        e_fp_ld(vd, i);
+}
+static void fp_st(int vs, int i) { // ST(i) = vs
+    if (FP_STATIC) {
+        fp_slot_addr(17, i);
+        e_str_d(vs, 17);
+    } else
+        e_fp_st(vs, i);
+}
+static void fp_push(int vs) { // push vs -> ST(0)  (top -= 1)
+    if (FP_STATIC) {
+        g_fp_top = (g_fp_top - 1) & 7;
+        g_fp_dirty = 1;
+        fp_slot_addr(17, 0);
+        e_str_d(vs, 17);
+    } else
+        e_fp_push(vs);
+}
+static void fp_settop(int delta) { // top += delta  (pop = +1)
+    if (FP_STATIC) {
+        g_fp_top = (g_fp_top + delta) & 7;
+        g_fp_dirty = 1;
+    } else
+        e_fp_settop(delta);
+}
+#undef FP_STATIC
+
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
     uint64_t start = gpc;
@@ -631,6 +708,8 @@ static void *translate_block(uint64_t gpc) {
     emit_prologue();
     void *body = g_cp;
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
+    g_fp_known = 0;         // x87: top unknown at block entry until a finit anchors it
+    g_fp_dirty = 0;
     g_prof_xlate++;         // PROF (measurement-only): translate_block calls
     if (g_stitch < 0) g_stitch = (getenv("NOSTITCH") == NULL);
     // W3-A superblock state: guest block-starts already laid in this region + region budget.
@@ -643,6 +722,7 @@ static void *translate_block(uint64_t gpc) {
     for (;;) {
         if (g_itrace && gpc != start) {
             if (g_fl_pending) flags_materialize(); // materialize before boundary
+            fp_drop();                             // x87: spill the shadow top before the boundary
             emit_chain_exit(gpc);
             break;
         } // 1 insn/block: per-instruction register dump
@@ -676,6 +756,11 @@ static void *translate_block(uint64_t gpc) {
             else
                 flags_materialize();
         }
+
+        // x87 static-top tracking ends at any non-x87 instruction: spill the shadow top to
+        // cpu->fptop and drop to the runtime-top model (the run only spans consecutive x87 ops, so
+        // no top assumption ever crosses a non-x87 op, a branch target, or a block boundary).
+        if (g_fp_known && !(!I.two && op >= 0xD8 && op <= 0xDF)) fp_drop();
 
         if (!I.two) {
             // ---- mov r8, imm8 (B0+r) ----
@@ -1377,19 +1462,22 @@ static void *translate_block(uint64_t gpc) {
         e_nzcv_save();                                                                                                 \
     } while (0)
                 if (I.is_mem) {
+                    // x87 mem forms do a faulting guest load/store and the m80 forms exit to a C
+                    // helper -- both can escape, so make cpu->fptop reflect the (pre-op) shadow first.
+                    fp_materialize();
                     emit_ea(&I, next);
                     e_mov_rr(19, 17, 1); // x19 = EA (helpers clobber x17)
                     if (op == 0xD9) {    // f32 mem
                         if (reg == 0) {
                             e_ldr_s(16, 19);
                             emit32(0x1E22C000u | (16 << 5) | 16);
-                            e_fp_push(16);
+                            fp_push(16);
                         } // fld m32
                         else if (reg == 2 || reg == 3) {
-                            e_fp_ld(16, 0);
+                            fp_ld(16, 0);
                             emit32(0x1E624000u | (16 << 5) | 16);
                             e_str_s(16, 19);
-                            if (reg == 3) e_fp_settop(1);
+                            if (reg == 3) fp_settop(1);
                         }                    // fst/fstp
                         else if (reg == 5) { /* fldcw: ignore */
                         } else if (reg == 7) {
@@ -1403,12 +1491,12 @@ static void *translate_block(uint64_t gpc) {
                     } else if (op == 0xDD) { // f64 mem
                         if (reg == 0) {
                             e_ldr_d(16, 19);
-                            e_fp_push(16);
+                            fp_push(16);
                         } // fld m64
                         else if (reg == 2 || reg == 3) {
-                            e_fp_ld(16, 0);
+                            fp_ld(16, 0);
                             e_str_d(16, 19);
-                            if (reg == 3) e_fp_settop(1);
+                            if (reg == 3) fp_settop(1);
                         } // fst/fstp
                         else if (reg == 7) {
                             e_ldr(16, 28, OFF_FPSW);
@@ -1422,13 +1510,13 @@ static void *translate_block(uint64_t gpc) {
                         if (reg == 0) {
                             emit32(0xB9400000u | (19 << 5) | 16);
                             emit32(0x1E620000u | (16 << 5) | 16);
-                            e_fp_push(16);
+                            fp_push(16);
                         } // fild m32
                         else if (reg == 2 || reg == 3) {
-                            e_fp_ld(16, 0);
+                            fp_ld(16, 0);
                             emit32(0x1E780000u | (16 << 5) | 16);
                             emit32(0xB9000000u | (19 << 5) | 16);
-                            if (reg == 3) e_fp_settop(1);
+                            if (reg == 3) fp_settop(1);
                         } // fist/fistp m32
                         else if (reg == 5) {
                             e_str(19, 28, OFF_X87EA);
@@ -1448,24 +1536,24 @@ static void *translate_block(uint64_t gpc) {
                         if (reg == 0) {
                             emit32(0x79C00000u | (19 << 5) | 16);
                             emit32(0x1E620000u | (16 << 5) | 16);
-                            e_fp_push(16);
+                            fp_push(16);
                         } // fild m16 (ldrsh)
                         else if (reg == 3) {
-                            e_fp_ld(16, 0);
+                            fp_ld(16, 0);
                             emit32(0x1E780000u | (16 << 5) | 16);
                             emit32(0x79000000u | (19 << 5) | 16);
-                            e_fp_settop(1);
+                            fp_settop(1);
                         } // fistp m16
                         else if (reg == 5) {
                             e_ldr(16, 19, 0);
                             emit32(0x9E620000u | (16 << 5) | 16);
-                            e_fp_push(16);
+                            fp_push(16);
                         } // fild m64
                         else if (reg == 7) {
-                            e_fp_ld(16, 0);
+                            fp_ld(16, 0);
                             emit32(0x9E780000u | (16 << 5) | 16);
                             e_str(16, 19, 0);
-                            e_fp_settop(1);
+                            fp_settop(1);
                         } // fistp m64
                         else {
                             report_unimpl(gpc, &I);
@@ -1478,13 +1566,13 @@ static void *translate_block(uint64_t gpc) {
                         } else
                             e_ldr_d(16, 19);
                         if (reg == 2 || reg == 3) {
-                            e_fp_ld(18, 0);
+                            fp_ld(18, 0);
                             e_fcom_setfpsw(18, 16);
-                            if (reg == 3) e_fp_settop(1);
+                            if (reg == 3) fp_settop(1);
                             gpc = next;
                             continue;
                         } // fcom/fcomp
-                        e_fp_ld(18, 0);
+                        fp_ld(18, 0);
                         if (reg == 0)
                             FAd(18, 18, 16);
                         else if (reg == 1)
@@ -1501,7 +1589,7 @@ static void *translate_block(uint64_t gpc) {
                             report_unimpl(gpc, &I);
                             break;
                         }
-                        e_fp_st(18, 0);
+                        fp_st(18, 0);
                     }
                     gpc = next;
                     continue;
@@ -1509,24 +1597,24 @@ static void *translate_block(uint64_t gpc) {
                 // ---- register forms (mod=3) ----
                 if (op == 0xD9) {
                     if (reg == 0) {
-                        e_fp_ld(16, rm);
-                        e_fp_push(16);
+                        fp_ld(16, rm);
+                        fp_push(16);
                     } // fld ST(i)
                     else if (reg == 1) {
-                        e_fp_ld(16, 0);
-                        e_fp_ld(18, rm);
-                        e_fp_st(18, 0);
-                        e_fp_st(16, rm);
+                        fp_ld(16, 0);
+                        fp_ld(18, rm);
+                        fp_st(18, 0);
+                        fp_st(16, rm);
                     } // fxch
                     else if (reg == 4 && rm == 0) {
-                        e_fp_ld(16, 0);
+                        fp_ld(16, 0);
                         emit32(0x1E614000u | (16 << 5) | 16);
-                        e_fp_st(16, 0);
+                        fp_st(16, 0);
                     } // fchs
                     else if (reg == 4 && rm == 1) {
-                        e_fp_ld(16, 0);
+                        fp_ld(16, 0);
                         emit32(0x1E60C000u | (16 << 5) | 16);
-                        e_fp_st(16, 0);
+                        fp_st(16, 0);
                     }                    // fabs
                     else if (reg == 5) { // fld const
                         static const uint64_t k[8] = {0x3FF0000000000000ull /*1*/,
@@ -1539,24 +1627,24 @@ static void *translate_block(uint64_t gpc) {
                                                       0x0ull};
                         e_movconst(16, k[rm]);
                         e_fmov_to_d(16, 16);
-                        e_fp_push(16);
+                        fp_push(16);
                     } else if (reg == 7 && rm == 2) {
-                        e_fp_ld(16, 0);
+                        fp_ld(16, 0);
                         emit32(0x1E61C000u | (16 << 5) | 16);
-                        e_fp_st(16, 0);
+                        fp_st(16, 0);
                     } // fsqrt
                     else {
                         report_unimpl(gpc, &I);
                         break;
                     }
                 } else if (op == 0xD8 || op == 0xDC || op == 0xDE) { // arith ST0/ST(i) [+pop for DE]
-                    e_fp_ld(18, 0);
-                    e_fp_ld(16, rm);                   // v18=ST0, v16=ST(rm)
+                    fp_ld(18, 0);
+                    fp_ld(16, rm);                   // v18=ST0, v16=ST(rm)
                     int dst_i = (op == 0xD8) ? 0 : rm; // D8 -> ST0; DC/DE -> ST(i)
                     if (reg == 2 || reg == 3) {
                         e_fcom_setfpsw(18, 16);
-                        if (op == 0xDE && rm == 1) e_fp_settop(1);
-                        if (reg == 3) e_fp_settop(1);
+                        if (op == 0xDE && rm == 1) fp_settop(1);
+                        if (reg == 3) fp_settop(1);
                         gpc = next;
                         continue;
                     } // fcom[p]/fcompp
@@ -1594,24 +1682,24 @@ static void *translate_block(uint64_t gpc) {
                         report_unimpl(gpc, &I);
                         break;
                     }
-                    e_fp_st(a, dst_i);
-                    if (op == 0xDE) e_fp_settop(1); // pop
+                    fp_st(a, dst_i);
+                    if (op == 0xDE) fp_settop(1); // pop
                 } else if (op == 0xDD) {
                     if (reg == 0) { /* ffree: no tag tracking -> nop */
                     } else if (reg == 2) {
-                        e_fp_ld(16, 0);
-                        e_fp_st(16, rm);
+                        fp_ld(16, 0);
+                        fp_st(16, rm);
                     } // fst ST(i)
                     else if (reg == 3) {
-                        e_fp_ld(16, 0);
-                        e_fp_st(16, rm);
-                        e_fp_settop(1);
+                        fp_ld(16, 0);
+                        fp_st(16, rm);
+                        fp_settop(1);
                     } // fstp ST(i)
                     else if (reg == 4 || reg == 5) {
-                        e_fp_ld(18, 0);
-                        e_fp_ld(16, rm);
+                        fp_ld(18, 0);
+                        fp_ld(16, rm);
                         e_fcom_setfpsw(18, 16);
-                        if (reg == 5) e_fp_settop(1);
+                        if (reg == 5) fp_settop(1);
                     } // fucom[p]
                     else {
                         report_unimpl(gpc, &I);
@@ -1621,11 +1709,16 @@ static void *translate_block(uint64_t gpc) {
                     if (reg == 4 && rm == 3) {
                         e_movconst(16, 0);
                         e_str(16, 28, OFF_FPTOP);
+                        if (x87opt_on()) { // anchor the translate-time shadow: top is now statically 0
+                            g_fp_known = 1;
+                            g_fp_top = 0;
+                            g_fp_dirty = 0; // memory just written, shadow == cpu->fptop
+                        }
                     }                    // finit -> top=0
                     else if (reg == 4) { /* fclex/etc */
                     } else if (reg == 5 || reg == 6) {
-                        e_fp_ld(18, 0);
-                        e_fp_ld(16, rm);
+                        fp_ld(18, 0);
+                        fp_ld(16, rm);
                         FCMPd(18, 16);
                     } // fucomi/fcomi
                     else {
@@ -1638,10 +1731,10 @@ static void *translate_block(uint64_t gpc) {
                         e_bfi(RAX, 16, 0, 16, 1);
                     } // fnstsw ax
                     else if (reg == 5 || reg == 6) {
-                        e_fp_ld(18, 0);
-                        e_fp_ld(16, rm);
+                        fp_ld(18, 0);
+                        fp_ld(16, rm);
                         FCMPd(18, 16);
-                        e_fp_settop(1);
+                        fp_settop(1);
                     } // fucomip/fcomip
                     else {
                         report_unimpl(gpc, &I);
@@ -1652,17 +1745,17 @@ static void *translate_block(uint64_t gpc) {
                         int jcc = (reg == 0) ? 2 : (reg == 1) ? 4 : (reg == 2) ? 6 : 10; // jb/je/jbe/jp
                         int armc = x86cc_to_arm(jcc);
                         e_nzcv_load();
-                        e_fp_ld(18, 0);
-                        e_fp_ld(16, rm); // v18=ST0, v16=ST(i)
+                        fp_ld(18, 0);
+                        fp_ld(16, rm); // v18=ST0, v16=ST(i)
                         emit32(0x1E600C00u | (18 << 16) | ((armc & 0xF) << 12) | (16 << 5) |
                                17); // fcsel d17, STi, ST0, cond
-                        e_fp_st(17, 0);
+                        fp_st(17, 0);
                     } else if (reg == 5 && rm == 1) { // DA E9: fucompp (compare ST0,ST1; pop twice)
-                        e_fp_ld(18, 0);
-                        e_fp_ld(16, 1);
+                        fp_ld(18, 0);
+                        fp_ld(16, 1);
                         e_fcom_setfpsw(18, 16);
-                        e_fp_settop(1);
-                        e_fp_settop(1);
+                        fp_settop(1);
+                        fp_settop(1);
                     } else {
                         report_unimpl(gpc, &I);
                         break;

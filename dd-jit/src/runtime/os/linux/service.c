@@ -48,6 +48,16 @@ int g_rwx_guest;
 static int g_untrusted;                   // gate (defined + env-parsed in os/linux/sentry.c)
 static void syscall_route(struct cpu *c); // sentry router (defined in os/linux/sentry.c)
 static void service_local(struct cpu *c); // fwd: the canonical syscall switch (this file)
+// g2h-style redirect for non-PIE ET_EXEC pointer args. A non-PIE links at a fixed low vaddr but is biased
+// HIGH by load_elf (__PAGEZERO forbids the low 4 GB); an un-relocated pointer baked at the low link vaddr
+// (e.g. a global .rodata string handed to open()/write()) still names the low range, where nothing is
+// mapped. The real bytes live at addr+g_nonpie_bias in the high-mapped image, so any *pointer* syscall arg
+// that lands in [g_nonpie_lo,g_nonpie_hi) must be rebased before the host syscall dereferences it. Inert
+// for PIE/static-PIE (g_nonpie_lo==0, the only state the test matrix ever sees) and for any pointer that is
+// already high (stack/heap/bss-above-bias) -> byte-identical there. Apply ONLY to pointer positions.
+static inline uint64_t nonpie_p(uint64_t a) {
+    return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
+}
 static void service(struct cpu *c) {
     if (__builtin_expect(g_untrusted, 0)) { syscall_route(c); return; } // untrusted: route via sentry
     service_local(c);                                                    // trusted: byte-identical path
@@ -60,6 +70,48 @@ static void service_local(struct cpu *c) {
     if (g_trace)
         fprintf(stderr, "[sys] %llu (%llx,%llx,%llx)\n", (unsigned long long)nr, (unsigned long long)a0,
                 (unsigned long long)a1, (unsigned long long)a2);
+    // --- non-PIE ET_EXEC pointer-arg redirect (g2h) --------------------------------------------------
+    // Rebase ONLY the pointer-typed args of each syscall a non-PIE realistically hands a low-image
+    // (.rodata/.data/.bss) pointer to, so the host syscall reads/writes the SAME bytes a native run would.
+    // Per-syscall + per-position: size/flag/fd/count args are NEVER touched (a blanket a0..a5 rebase would
+    // corrupt a count/fd that happened to fall in the link range). Whole block is inert unless g_nonpie_lo
+    // is set (ET_EXEC only) -> PIE/static-PIE and the entire test matrix are byte-identical. Numbers are
+    // the canonical (aarch64) syscall numbers G_NR() maps the x86 guest's calls onto. Runs BEFORE the
+    // res_bump switch below, which itself dereferences a2 (open_how*) for openat2.
+    if (g_nonpie_lo) {
+        switch (nr) {
+        case 56:                                                  // openat(dfd, PATH, flags, mode)
+        case 33:                                                  // mknodat(dfd, PATH, ...)
+        case 34:                                                  // mkdirat(dfd, PATH, mode)
+        case 35:                                                  // unlinkat(dfd, PATH, flags)
+        case 48:                                                  // faccessat(dfd, PATH, mode)
+        case 439:                                                 // faccessat2(dfd, PATH, mode, flags)
+        case 53:                                                  // fchmodat(dfd, PATH, mode, flags)
+        case 54:                                                  // fchownat(dfd, PATH, uid, gid, flags)
+            a1 = nonpie_p(a1); break;                             //   path is a1 for the whole *at family
+        case 437: a1 = nonpie_p(a1); a2 = nonpie_p(a2); break;    // openat2(dfd, PATH, open_how*, size)
+        case 79:                                                  // newfstatat(dfd, PATH, STATBUF, flags)
+        case 78: a1 = nonpie_p(a1); a2 = nonpie_p(a2); break;     // readlinkat(dfd, PATH, BUF, sz)
+        case 291: a1 = nonpie_p(a1); a4 = nonpie_p(a4); break;    // statx(dfd, PATH, flags, mask, STATXBUF)
+        case 36: a0 = nonpie_p(a0); a2 = nonpie_p(a2); break;     // symlinkat(TARGET, newdfd, LINKPATH)
+        case 37:                                                  // linkat(odfd, OLD, ndfd, NEW, flags)
+        case 38:                                                  // renameat(odfd, OLD, ndfd, NEW)
+        case 276: a1 = nonpie_p(a1); a3 = nonpie_p(a3); break;    // renameat2(odfd, OLD, ndfd, NEW, flags)
+        case 80:                                                  // fstat(fd, STATBUF)
+        case 63:                                                  // read(fd, BUF, count)
+        case 64:                                                  // write(fd, BUF, count)
+        case 67:                                                  // pread64(fd, BUF, count, off)
+        case 68:                                                  // pwrite64(fd, BUF, count, off)
+        case 65:                                                  // readv(fd, IOVEC, n)  -- array base only
+        case 66: a1 = nonpie_p(a1); break;                        // writev(fd, IOVEC, n) -- array base only
+        case 206: a1 = nonpie_p(a1); a4 = nonpie_p(a4); break;    // sendto(fd, BUF, len, fl, SOCKADDR, alen)
+        case 211:                                                 // sendmsg(fd, MSGHDR, flags) -- top only
+        case 212: a1 = nonpie_p(a1); break;                       // recvmsg(fd, MSGHDR, flags) -- top only
+        case 221: a0 = nonpie_p(a0); a1 = nonpie_p(a1); break;    // execve(PATH, ARGV, envp); argv base here,
+                                                                  //   each argv[] element rebased at case 221
+        default: break;
+        }
+    }
     // S2 path-resolution-cache invalidation: bump the epoch BEFORE dispatch on any syscall that mutates
     // the FS namespace, so no cached guest->host string mapping can survive a create/unlink/rename/mkdir/
     // symlink (over-invalidates, never under -- when in doubt, the next lookup MISSES and re-resolves).
@@ -1187,6 +1239,7 @@ static void service_local(struct cpu *c) {
             g_ovldir[cf][0] = 0;
             g_lo_port[cf] = 0;
             g_sock_stream[cf] = 0;
+            g_sock_dgram[cf] = 0;
             g_br_port[cf] = 0;
             g_br_ip[cf] = 0;
             g_eventfd_count[cf] = 0;
@@ -1807,9 +1860,9 @@ static void service_local(struct cpu *c) {
         }
         char *argv[256];
         int ac = 0;
-        uint64_t *gv = (uint64_t *)a1;
+        uint64_t *gv = (uint64_t *)a1; // a1 (argv array base) already nonpie_p()'d at the top redirect
         while (gv && gv[ac] && ac < 255) {
-            argv[ac] = (char *)gv[ac];
+            argv[ac] = (char *)nonpie_p(gv[ac]); // each argv[] element may itself be a low-image pointer
             ac++;
         }
         argv[ac] = NULL;
@@ -1951,6 +2004,7 @@ static void service_local(struct cpu *c) {
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
             if (r < 1024) {
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && (int)a0 == AF_INET);
+                g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM && (int)a0 == AF_INET);
                 g_lo_port[r] = 0;
                 g_br_port[r] = 0;
                 g_br_ip[r] = 0;
@@ -2037,6 +2091,16 @@ static void service_local(struct cpu *c) {
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
+        }
+        // Published UDP (`-p H:C/udp`): swap an AF_INET datagram socket bound to a published port onto
+        // the AF_UNIX switch + start its host->guest datagram forwarder. No-op (returns 0) for
+        // non-published UDP, non-switch nets, or non-datagram sockets -> they fall through unchanged.
+        {
+            int64_t uret;
+            if (udp_bind_maybe((int)a0, sa, (socklen_t)a2, &uret)) {
+                G_RET(c) = (uint64_t)uret;
+                break;
+            }
         }
         if (g_nportmap && sa && a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET) {
             uint16_t cp = ntohs(*(uint16_t *)(sa + 2)), hp = pm_host(cp);
