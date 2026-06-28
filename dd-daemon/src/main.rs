@@ -124,6 +124,7 @@ async fn main() {
         .route("/exec/:id/resize", post(resize))
         .route("/exec/:id/json", get(exec_inspect))
         .route("/containers/:id", delete(containers_delete))
+        .route("/commit", post(commit_container))
         .route("/volumes", get(volumes_list))
         .route("/volumes/create", post(volumes_create))
         .route("/volumes/prune", post(volumes_prune))

@@ -142,7 +142,17 @@ fn filter_values(v: &Value, key: &str) -> Vec<String> {
 /// only when the client disconnects or the bus is torn down (daemon shutdown).
 pub(crate) async fn events(State(a): State<App>, Query(q): Query<EventsQ>) -> Response {
     let rx = a.events.subscribe();
-    let filters = Filters::parse(&q.filters);
+    let mut filters = Filters::parse(&q.filters);
+    // `--filter container=<name|id>` is matched against each event's Actor.ID / name. Some lifecycle
+    // events (die/stop/kill) carry no `name` attribute, so a name-only filter would miss them. Resolve
+    // every container filter value to its FULL id now (by name or id-prefix) and add it to the match
+    // set, so the id-based match catches all of that container's events regardless of the attributes.
+    if !filters.containers.is_empty() {
+        let g = a.inner.lock().await;
+        let resolved: Vec<String> = filters.containers.iter()
+            .filter_map(|c| crate::util::resolve_cid(&g, c)).collect();
+        for id in resolved { if !filters.containers.contains(&id) { filters.containers.push(id); } }
+    }
 
     // `unfold` drives the broadcast receiver into a byte stream. Returning `Some` yields a line;
     // `continue` skips a filtered-out / lagged event; `None` ends the stream (bus closed).

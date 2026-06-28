@@ -59,6 +59,11 @@ pub(crate) struct HostConfig {
     #[serde(rename = "Devices")] devices: Option<Vec<DeviceMapping>>,
     #[serde(rename = "Mounts")] mounts: Option<Vec<Mount>>,
     #[serde(rename = "Privileged")] privileged: Option<bool>,
+    // `--security-opt` (Vec<String> like ["sandbox"], ["seccomp=untrusted"], ["no-new-privileges"]).
+    // Parsed + persisted verbatim; an entry matching sandbox/untrusted opts into the JIT sentry (spawn_cfg).
+    #[serde(rename = "SecurityOpt")] security_opt: Option<Vec<String>>,
+    // `--rm` (HostConfig.AutoRemove): the daemon removes the container automatically once it exits.
+    #[serde(rename = "AutoRemove")] auto_remove: Option<bool>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -73,6 +78,20 @@ pub(crate) fn publish_str(pb: &HashMap<String, Vec<PortBinding>>) -> String {
     v.join(",")
 }
 
+
+/// Parse a `-v`/Binds spec `src:dst[:opts]` into `(host_source, container_dest, read_only)`. Docker
+/// appends comma-separated options after the destination (e.g. `/h:/c:ro`, `vol:/c:rw,z`); `ro` marks
+/// the mount read-only. Returns None for a malformed spec (no destination). Note: the prior code split
+/// only on the FIRST colon, so `src:dst:ro` mounted at the literal path "dst:ro" — this fixes that and
+/// surfaces the RW flag for inspect.
+pub(crate) fn parse_bind(b: &str) -> Option<(&str, &str, bool)> {
+    let mut it = b.splitn(3, ':');
+    let src = it.next()?;
+    let dst = it.next()?;
+    let ro = it.next().map(|o| o.split(',').any(|p| p == "ro")).unwrap_or(false);
+    if dst.is_empty() { return None; }
+    Some((src, dst, ro))
+}
 
 #[derive(Deserialize)]
 pub(crate) struct CreateQ { name: Option<String>, platform: Option<String> }
@@ -105,6 +124,17 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
     env.extend(body.env.unwrap_or_default());
     let working_dir = body.working_dir.filter(|w| !w.is_empty()).unwrap_or_else(|| img.workdir.clone());
     let tty = body.tty.unwrap_or(false);
+    // `docker run --name X` with a name already in use is a 409 Conflict (docker refuses to start a
+    // second container under the same name). Match on the effective name (leading `/` stripped, as we
+    // store it). An empty name (no --name) never conflicts.
+    let want_name = cq.name.as_deref().unwrap_or_default().trim_start_matches('/').to_string();
+    if !want_name.is_empty() {
+        if let Some(existing) = g.containers.values().find(|c| c.name == want_name) {
+            return (StatusCode::CONFLICT, Json(json!({"message": format!(
+                "Conflict. The container name \"/{want_name}\" is already in use by container \"{}\". \
+                 You have to remove (or rename) that container to be able to reuse that name.", existing.id)}))).into_response();
+        }
+    }
     let id = new_id(&image);
     let hc = body.host_config;
     let c = Container {
@@ -115,7 +145,7 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         pids_limit: hc.as_ref().and_then(|h| h.pids_limit).unwrap_or(0),
         publish: hc.as_ref().and_then(|h| h.port_bindings.as_ref()).map(publish_str).unwrap_or_default(),
         created: now_secs(), tty,
-        name: cq.name.unwrap_or_default().trim_start_matches('/').to_string(),
+        name: want_name,
         working_dir, env,
         user: body.user.unwrap_or_default(),
         labels: body.labels.unwrap_or_default(),
@@ -130,6 +160,8 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         devices: hc.as_ref().and_then(|h| h.devices.clone()).unwrap_or_default(),
         mounts: hc.as_ref().and_then(|h| h.mounts.clone()).unwrap_or_default(),
         privileged: hc.as_ref().and_then(|h| h.privileged).unwrap_or(false),
+        security_opt: hc.as_ref().and_then(|h| h.security_opt.clone()).unwrap_or_default(),
+        auto_remove: hc.as_ref().and_then(|h| h.auto_remove).unwrap_or(false),
         status: "created".into(), ..Default::default()
     };
     // Join the network now (fixes the bug where `docker run --network X` never added the container to
@@ -226,7 +258,8 @@ async fn do_stop(a: &App, id: &str, sig: i32, t: i64) -> Response {
     // mark exited (as before); the reaper sets the real exit_code when the signalled process dies.
     let mut g = a.inner.lock().await;
     if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
-    crate::events::emit_event(&a.events, "container", "stop", &full, json!({}));
+    let (cname, cimage) = g.containers.get(&full).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
+    crate::events::emit_event(&a.events, "container", "stop", &full, json!({"name": cname, "image": cimage}));
     save_state(&g, &a.state_path);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -248,7 +281,8 @@ pub(crate) async fn containers_kill(State(a): State<App>, Path(id): Path<String>
         if let Some(pid) = *l.pid.lock().unwrap() { unsafe { libc::kill(pid as i32, sig); } } // mirror of freeze()'s libc::kill
     }
     if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
-    crate::events::emit_event(&a.events, "container", "kill", &full, json!({}));
+    let (cname, cimage) = g.containers.get(&full).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
+    crate::events::emit_event(&a.events, "container", "kill", &full, json!({"name": cname, "image": cimage}));
     save_state(&g, &a.state_path);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -372,6 +406,12 @@ pub(crate) struct ExecCreateBody {
 pub(crate) async fn exec_create(State(a): State<App>, Path(id): Path<String>, Json(body): Json<ExecCreateBody>) -> Response {
     let mut g = a.inner.lock().await;
     let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+    // `docker exec` into a non-running container is a 409 (docker rejects exec unless the container is
+    // up). Match docker's message exactly so the CLI surfaces it verbatim.
+    let running = g.containers.get(&full).map(|c| c.status == "running" || c.status == "paused").unwrap_or(false);
+    if !running {
+        return (StatusCode::CONFLICT, Json(json!({"message": format!("Container {full} is not running")}))).into_response();
+    }
     let cmd = body.cmd.unwrap_or_default();
     if cmd.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"message": "No exec command specified"}))).into_response();
@@ -798,6 +838,11 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
 
     // Replay: collect lines as (stream_id, bytes), stdout first then stderr, apply `--tail` across the
     // combined set, then per-line timestamp + framing.
+    // LIMITATION: the live buffers (`stdout_buf`/`stderr_buf`) store raw bytes with NO per-chunk emit
+    // time, so a chronological stdout/stderr merge of the buffered REPLAY isn't possible — stderr is
+    // appended after stdout. The follow path streams the single ordered `Live.out` broadcast, so newly
+    // produced output IS interleaved correctly in real time; only the historical replay is segregated.
+    // True replay interleave would require timestamping each chunk (a Live-buffer schema change).
     let mut replay = Vec::new();
     if include_buffer {
         let mut entries: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -889,14 +934,14 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
             "RestartCount": c.restart_count,
             // Top-level resolved Mounts: the `-v`/Binds path (Type=bind) plus any `--mount` specs (their
             // declared bind/volume Type), honoring ReadOnly (RW=false) for the mount specs.
-            "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind", "RW": true})))
+            "Mounts": c.binds.iter().filter_map(|b| parse_bind(b).map(|(s, d, ro)| json!({"Source": s, "Destination": d, "Type": "bind", "RW": !ro})))
                 .chain(c.mounts.iter().map(|m| json!({"Type": m.typ, "Source": m.source, "Destination": m.target, "RW": !m.read_only})))
                 .collect::<Vec<_>>(),
             // HostConfig round-trips the fidelity extras verbatim so docker clients diff them cleanly.
             "HostConfig": {"Binds": c.binds, "Memory": c.memory, "PidsLimit": c.pids_limit,
                 "RestartPolicy": {"Name": c.restart_policy.name, "MaximumRetryCount": c.restart_policy.max_retry},
                 "CapAdd": c.cap_add, "CapDrop": c.cap_drop, "Devices": c.devices, "Mounts": c.mounts,
-                "Privileged": c.privileged},
+                "Privileged": c.privileged, "SecurityOpt": c.security_opt},
             // NetworkSettings present so `docker port` (reads .NetworkSettings.Ports) doesn't panic.
             "NetworkSettings": {"Ports": ports_map_json(&c.publish), "IPAddress": primary.0, "Gateway": primary.1,
                 "Networks": Value::Object(networks)}})).into_response()
@@ -1019,7 +1064,7 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
         "Id": c.id, "Image": c.image, "Command": c.cmd.join(" "), "Created": c.created,
         "State": c.status, "Status": human_status(c), "ExitCode": c.exit_code, "Ports": ports_json(&c.publish),
         "Labels": c.labels,
-        "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
+        "Mounts": c.binds.iter().filter_map(|b| parse_bind(b).map(|(s, d, ro)| json!({"Source": s, "Destination": d, "Type": "bind", "RW": !ro}))).collect::<Vec<_>>(),
         "Names": [format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() })]});
         // Only emit the size keys when requested -- docker omits them otherwise.
         if want_size {
@@ -1032,11 +1077,27 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
     Json(json!(v))
 }
 
-pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<String>) -> Response {
+#[derive(Deserialize)]
+pub(crate) struct DeleteQ { force: Option<String>, v: Option<String>, link: Option<String> }
+
+pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<String>, Query(q): Query<DeleteQ>) -> Response {
+    let force = q_truthy(&q.force);
     let mut g = a.inner.lock().await;
     let full = match resolve_cid(&g, &id) { Some(f) => f, None => return no_such(&id) };
-    // Removing a container cancels any pending RestartPolicy restart.
-    if let Some(l) = g.live.get(&full) { l.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst); }
+    // `docker rm` of a running container without `-f` is a 409: docker refuses to remove a live
+    // container and tells the user to stop it (or use `--force`). With `--force` we stop it first.
+    let running = g.containers.get(&full).map(|c| c.status == "running" || c.status == "paused").unwrap_or(false);
+    if running && !force {
+        let short = &full[..12.min(full.len())];
+        return (StatusCode::CONFLICT, Json(json!({"message": format!(
+            "cannot remove a running container {short}: Stop the container before removing or force remove")}))).into_response();
+    }
+    // Removing a container cancels any pending RestartPolicy restart; with `--force` on a running
+    // container we also SIGKILL the live process so the reaper doesn't resurrect/dangle it.
+    if let Some(l) = g.live.get(&full) {
+        l.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        if force && running { if let Some(pid) = *l.pid.lock().unwrap() { unsafe { libc::kill(pid as i32, libc::SIGKILL); } } }
+    }
     if let Some(dc) = g.containers.remove(&full) {
         crate::events::emit_event(&a.events, "container", "destroy", &full, json!({"name": dc.name, "image": dc.image}));
         // Drop the container from any network membership too.

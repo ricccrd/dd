@@ -114,6 +114,24 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
             cfg.env.push(("DD_GID".into(), gid.to_string()));
         }
     }
+    // `--security-opt sandbox`/`untrusted` (or daemon-wide DD_SANDBOX=1) -> run this guest under the JIT's
+    // untrusted-guest sentry: the worker drops to a deny-default OS sandbox (macOS Seatbelt) and the guest's
+    // syscalls are vetted/forwarded over the sentry ring instead of hitting the host directly. We request it
+    // by exporting the JIT's own gates (DDJIT_UNTRUSTED + DDJIT_SANDBOX); default OFF inside the JIT.
+    //
+    // CAVEAT: the JIT sentry is currently a FIRST PR that only forwards read/write/open(at)/close/lseek over
+    // its ring. A real image will hit un-forwarded syscalls under the worker's deny-default sandbox until the
+    // sentry's full fs/net/proc syscall set lands (a parallel JIT-side change is extending it). So this
+    // wiring makes the daemon ABLE to request the sandbox; full untrusted-image support depends on that JIT
+    // completion. Simple images + the end-to-end opt-in path work now.
+    let sandbox = c.security_opt.iter().any(|o| {
+        let o = o.to_ascii_lowercase();
+        o.contains("sandbox") || o.contains("untrusted")
+    }) || std::env::var("DD_SANDBOX").as_deref() == Ok("1");
+    if sandbox {
+        cfg.env.push(("DDJIT_UNTRUSTED".into(), "1".into()));
+        cfg.env.push(("DDJIT_SANDBOX".into(), "1".into()));
+    }
     // Resolve a mount source to a host path: an absolute path is a bind; anything else is a named
     // volume, resolved to its registered mountpoint or a dir under `volumes_dir`. Shared by `-v`/Binds
     // and `--mount` so both go through the SAME (single) volume mechanism.
@@ -126,7 +144,12 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
             PathBuf::from(volumes_dir).join(src).to_string_lossy().into_owned()
         }
     };
-    cfg.volumes = c.binds.iter().filter_map(|b| b.split_once(':').map(|(host, dst)| {
+    // `-v src:dst[:opts]` / Binds: parse off the mount options so the container path is the bare `dst`
+    // (the old `split_once(':')` left `dst:ro` as the literal mount target — a bug). `ro` marks the
+    // mount read-only; ENFORCEMENT GAP: ddjit's `Volume{container,host}` has no read-only flag, so dd
+    // cannot make the bind read-only at the JIT layer — `docker inspect` reports RW:false (see
+    // containers.rs::parse_bind / the inspect Mounts), but writes through the mount are NOT blocked yet.
+    cfg.volumes = c.binds.iter().filter_map(|b| parse_bind(b).map(|(host, dst, _ro)| {
         Volume { container: dst.into(), host: resolve_src(host) }
     })).collect();
     // `--mount` / HostConfig.Mounts: wire bind/volume mounts into the rootfs via the same Volume list.
@@ -328,6 +351,7 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
     *live.pid.lock().unwrap() = child.id(); // remember the pid so pause can SIGSTOP/SIGCONT it
     let app = app.clone();
     let cid = c.id.clone();
+    let auto_remove = c.auto_remove; // `--rm`: drop the container from state once it exits (see below)
     let dbg = std::env::var("DD_DEBUG").is_ok();
     tokio::spawn(async move {
         let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1) as i64;
@@ -343,10 +367,25 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
                 cc.stdout = std::mem::take(&mut *live.stdout_buf.lock().await);
                 cc.stderr = std::mem::take(&mut *live.stderr_buf.lock().await);
             }
-            crate::events::emit_event(&app.events, "container", "die", &cid, serde_json::json!({"exitCode": code.to_string()}));
+            let (cname, cimage) = g.containers.get(&cid).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
+            crate::events::emit_event(&app.events, "container", "die", &cid, serde_json::json!({"exitCode": code.to_string(), "name": cname, "image": cimage}));
             save_state(&g, &app.state_path);
         }
         let _ = live.exit.send(Some(code));
+        // `--rm` (AutoRemove): drop the container from state now that it has exited and its final
+        // status/logs are recorded. AutoRemove and RestartPolicy are mutually exclusive in docker, so a
+        // removed container is never a restart candidate — return before the supervisor runs. Anything
+        // waiting on the exit watch (the `docker run --rm` foreground client) already saw Some(code).
+        if auto_remove {
+            let mut g = app.inner.lock().await;
+            if let Some(dc) = g.containers.remove(&cid) {
+                crate::events::emit_event(&app.events, "container", "destroy", &cid, serde_json::json!({"name": dc.name, "image": dc.image}));
+                for n in g.networks.iter_mut() { leave_network(n, &cid); }
+            }
+            g.live.remove(&cid);
+            save_state(&g, &app.state_path);
+            return;
+        }
         // RestartPolicy supervisor: re-run the container per `--restart` unless it was deliberately
         // stopped (stop/kill/rm set stop_requested). A no-op for the default `no`/empty policy, so the
         // common `docker run` path is untouched.

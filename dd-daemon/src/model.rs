@@ -120,6 +120,12 @@ pub(crate) struct Container {
     pub(crate) mounts: Vec<Mount>, // `--mount` (wired into the rootfs alongside `-v`/Binds)
     #[serde(default)]
     pub(crate) privileged: bool, // `--privileged` — metadata; relaxes daemon-side guards (none currently)
+    #[serde(default)]
+    pub(crate) security_opt: Vec<String>, // `--security-opt` (e.g. "sandbox"/"seccomp=untrusted"); an entry
+    // matching sandbox/untrusted opts the container into the JIT's untrusted-guest sentry (see spawn_cfg).
+    #[serde(default)]
+    pub(crate) auto_remove: bool, // `--rm` (HostConfig.AutoRemove): the daemon removes the container on exit.
+    // Mutually exclusive with restart_policy in docker; the reaper drops the container after finalizing exit.
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]
     pub(crate) arch: Option<Guest>,
