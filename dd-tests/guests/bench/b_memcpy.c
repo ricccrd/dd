@@ -8,7 +8,7 @@ int main(void) {
     unsigned char *a = malloc(N), *b = malloc(N);
     for (int i = 0; i < N; i++) a[i] = (unsigned char)(i * 131 + 7);
     unsigned long sum = 0;
-    for (int rep = 0; rep < 200; rep++) {
+    for (int rep = 0; rep < 2000; rep++) {
         memcpy(b, a, N);
         b[rep % N] ^= (unsigned char)rep;       // defeat dead-store elimination
         memcpy(a, b, N);

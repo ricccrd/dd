@@ -5,7 +5,7 @@ int main(void) {
     const int N = 256;
     double *A = malloc(sizeof(double)*N*N), *B = malloc(sizeof(double)*N*N), *C = malloc(sizeof(double)*N*N);
     for (int i = 0; i < N*N; i++) { A[i] = (i % 7) * 0.5 + 1.0; B[i] = (i % 5) * 0.25 + 1.0; }
-    for (int rep = 0; rep < 20; rep++) {
+    for (int rep = 0; rep < 120; rep++) {
         for (int i = 0; i < N; i++)
             for (int j = 0; j < N; j++) {
                 double s = 0.0;

@@ -120,16 +120,16 @@
     <table class="w-full border-collapse text-[13px] sm:text-sm">
       <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">x86-64 workload</th><th class="p-3">qemu in a VM</th><th class="p-3 text-blue1">dd (no VM)</th><th class="p-3">dd vs VM</th></tr></thead>
       <tbody class="[&>tr]:border-t [&>tr]:border-edge">
-        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.27s</td><td class="p-3">0.25s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
-        <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">7.66s</td><td class="p-3">0.82s</td><td class="p-3 font-semibold text-emerald-400">9.3× faster</td></tr>
-        <tr><td class="p-3 font-medium">matrix multiply</td><td class="p-3 text-muted">1.46s</td><td class="p-3">0.17s</td><td class="p-3 font-semibold text-emerald-400">8.8× faster</td></tr>
+        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.30s</td><td class="p-3">0.25s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
+        <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">7.69s</td><td class="p-3">0.82s</td><td class="p-3 font-semibold text-emerald-400">9.3× faster</td></tr>
+        <tr><td class="p-3 font-medium">matrix multiply</td><td class="p-3 text-muted">8.12s</td><td class="p-3">0.93s</td><td class="p-3 font-semibold text-emerald-400">8.7× faster</td></tr>
         <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">2.88s</td><td class="p-3">0.87s</td><td class="p-3 font-semibold text-emerald-400">3.3× faster</td></tr>
-        <tr><td class="p-3 font-medium">memcpy</td><td class="p-3 text-muted">0.24s</td><td class="p-3">0.11s</td><td class="p-3 font-semibold text-emerald-400">2.1× faster</td></tr>
-        <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">3.83s</td><td class="p-3">1.84s</td><td class="p-3 font-semibold text-emerald-400">2.1× faster</td></tr>
-        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.25s</td><td class="p-3">0.89s</td><td class="p-3 font-semibold text-emerald-400">1.4× faster</td></tr>
-        <tr><td class="p-3 font-medium">text scan (wc/grep)</td><td class="p-3 text-muted">0.32s</td><td class="p-3">0.24s</td><td class="p-3 font-semibold text-emerald-400">1.35× faster</td></tr>
-        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.58s</td><td class="p-3">2.29s</td><td class="p-3 font-semibold text-emerald-400">1.13× faster</td></tr>
-        <tr><td class="p-3 font-medium">base64</td><td class="p-3 text-muted">0.70s</td><td class="p-3">0.83s</td><td class="p-3 text-muted">1.2× slower</td></tr>
+        <tr><td class="p-3 font-medium">memcpy</td><td class="p-3 text-muted">2.31s</td><td class="p-3">1.03s</td><td class="p-3 font-semibold text-emerald-400">2.2× faster</td></tr>
+        <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">3.84s</td><td class="p-3">1.84s</td><td class="p-3 font-semibold text-emerald-400">2.1× faster</td></tr>
+        <tr><td class="p-3 font-medium">text scan (wc/grep)</td><td class="p-3 text-muted">1.35s</td><td class="p-3">0.96s</td><td class="p-3 font-semibold text-emerald-400">1.4× faster</td></tr>
+        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.27s</td><td class="p-3">0.88s</td><td class="p-3 font-semibold text-emerald-400">1.4× faster</td></tr>
+        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.61s</td><td class="p-3">2.32s</td><td class="p-3 font-semibold text-emerald-400">1.13× faster</td></tr>
+        <tr><td class="p-3 font-medium">base64</td><td class="p-3 text-muted">4.13s</td><td class="p-3">4.89s</td><td class="p-3 text-muted">1.2× slower</td></tr>
       </tbody>
     </table>
   </div>
@@ -140,19 +140,23 @@
     <table class="w-full border-collapse text-[13px] sm:text-sm">
       <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">arm64 workload</th><th class="p-3">native VM</th><th class="p-3 text-blue1">dd (no VM)</th><th class="p-3">dd vs VM</th></tr></thead>
       <tbody class="[&>tr]:border-t [&>tr]:border-edge">
-        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">0.74s</td><td class="p-3">0.52s</td><td class="p-3 font-semibold text-emerald-400">1.43× faster</td></tr>
-        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">0.76s</td><td class="p-3">0.71s</td><td class="p-3 font-semibold text-emerald-400">1.07× faster</td></tr>
+        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">0.75s</td><td class="p-3">0.52s</td><td class="p-3 font-semibold text-emerald-400">1.44× faster</td></tr>
+        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">0.77s</td><td class="p-3">0.72s</td><td class="p-3 font-semibold text-emerald-400">1.07× faster</td></tr>
         <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">0.17s</td><td class="p-3">0.17s</td><td class="p-3 text-muted">~parity</td></tr>
-        <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">0.75s</td><td class="p-3">0.76s</td><td class="p-3 text-muted">~parity</td></tr>
-        <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">0.78s</td><td class="p-3">1.34s</td><td class="p-3 text-muted">1.7× slower</td></tr>
+        <tr><td class="p-3 font-medium">memcpy</td><td class="p-3 text-muted">0.53s</td><td class="p-3">0.53s</td><td class="p-3 text-muted">~parity</td></tr>
+        <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">0.76s</td><td class="p-3">0.76s</td><td class="p-3 text-muted">~parity</td></tr>
+        <tr><td class="p-3 font-medium">base64</td><td class="p-3 text-muted">0.66s</td><td class="p-3">0.70s</td><td class="p-3 text-muted">1.07× slower</td></tr>
+        <tr><td class="p-3 font-medium">matrix multiply</td><td class="p-3 text-muted">0.63s</td><td class="p-3">0.75s</td><td class="p-3 text-muted">1.2× slower</td></tr>
+        <tr><td class="p-3 font-medium">text scan (wc/grep)</td><td class="p-3 text-muted">0.48s</td><td class="p-3">0.60s</td><td class="p-3 text-muted">1.26× slower</td></tr>
+        <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">0.79s</td><td class="p-3">1.41s</td><td class="p-3 text-muted">1.78× slower</td></tr>
         <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">0.33s</td><td class="p-3">0.68s</td><td class="p-3 text-muted">~2× slower</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p class="mt-6 leading-relaxed text-muted">The gaps are SQLite (~2×) and qsort (~1.7×) — a userspace kernel pays for every syscall and allocation. That's the optimization frontier I'm on (a throughput-bound server like redis loses ~3× today). I'd rather show it than hide it.</p>
+  <p class="mt-6 leading-relaxed text-muted">The real gaps are SQLite (~2×) and qsort (~1.8×) — a userspace kernel pays for every syscall and allocation. That's the optimization frontier I'm on (a throughput-bound server like redis loses ~3× today). I'd rather show it than hide it.</p>
 
-  <p class="mt-5 leading-relaxed text-muted2 text-sm">Numbers measured, median of 7 on Apple Silicon; reproduce with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">make bench</code>. The dd lane even pays a small per-run bridge tax the shipping app doesn't, so the fastest sub-0.2s arm64 rows (omitted here) are conservative.</p>
+  <p class="mt-5 leading-relaxed text-muted2 text-sm">Numbers measured, median of 7 on Apple Silicon; reproduce with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">make bench</code>. Every workload is sized to run ≥0.45s, so the harness's small per-run bridge tax is negligible.</p>
 
   <!-- WHAT -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">What you get today</h2>

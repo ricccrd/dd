@@ -8,7 +8,7 @@ int main(void) {
     char *out = malloc(((N + 2) / 3) * 4 + 4);
     for (int i = 0; i < N; i++) in[i] = (unsigned char)(i * 73 + 13);
     unsigned long sum = 0;
-    for (int rep = 0; rep < 80; rep++) {
+    for (int rep = 0; rep < 480; rep++) {
         int o = 0;
         for (int i = 0; i < N; i += 3) {
             unsigned v = (in[i] << 16) | ((i+1 < N ? in[i+1] : 0) << 8) | (i+2 < N ? in[i+2] : 0);

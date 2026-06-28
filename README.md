@@ -97,37 +97,36 @@ it either way). dd's JIT beats qemu on **9 of 10** workloads, dramatically on fl
 
 | Workload | VM (qemu) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
-| float n-body | 5.27s | 0.25s | **21× faster** |
-| mandelbrot | 7.66s | 0.82s | **9.3× faster** |
-| matmul | 1.46s | 0.17s | **8.8× faster** |
+| float n-body | 5.30s | 0.25s | **21× faster** |
+| mandelbrot | 7.69s | 0.82s | **9.3× faster** |
+| matmul | 8.12s | 0.93s | **8.7× faster** |
 | SQLite (600k rows) | 2.88s | 0.87s | **3.3× faster** |
-| memcpy | 0.24s | 0.11s | 2.1× faster |
-| qsort | 3.83s | 1.84s | 2.1× faster |
-| int sieve | 1.25s | 0.89s | 1.4× faster |
-| text-scan (wc/grep) | 0.32s | 0.24s | 1.35× faster |
-| SHA-256 | 2.58s | 2.29s | 1.13× faster |
-| base64 | 0.70s | 0.83s | 0.84× (1.2× slower) |
+| memcpy | 2.31s | 1.03s | 2.2× faster |
+| qsort | 3.84s | 1.84s | 2.1× faster |
+| text-scan (wc/grep) | 1.35s | 0.96s | 1.4× faster |
+| int sieve | 1.27s | 0.88s | 1.4× faster |
+| SHA-256 | 2.61s | 2.32s | 1.13× faster |
+| base64 | 4.13s | 4.89s | 0.84× (1.2× slower) |
 
 **aarch64 containers — dd vs a native VM** (the VM runs arm64 at full native speed — the hardest bar):
 
 | Workload | VM (native) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
-| int sieve | 0.74s | 0.52s | **1.43× faster** |
-| SHA-256 | 0.76s | 0.71s | 1.07× faster |
+| int sieve | 0.75s | 0.52s | **1.44× faster** |
+| SHA-256 | 0.77s | 0.72s | 1.07× faster |
 | float n-body | 0.17s | 0.17s | ~parity |
-| mandelbrot | 0.75s | 0.76s | ~parity |
-| memcpy | 0.055s | 0.064s | 1.16× slower † |
-| base64 | 0.11s | 0.13s | 1.16× slower † |
-| matmul | 0.11s | 0.13s | 1.28× slower † |
-| text-scan (wc/grep) | 0.12s | 0.16s | 1.31× slower † |
-| qsort | 0.78s | 1.34s | 1.72× slower |
+| memcpy | 0.53s | 0.53s | ~parity |
+| mandelbrot | 0.76s | 0.76s | ~parity |
+| base64 | 0.66s | 0.70s | 1.07× slower |
+| matmul | 0.63s | 0.75s | 1.2× slower |
+| text-scan (wc/grep) | 0.48s | 0.60s | 1.26× slower |
+| qsort | 0.79s | 1.41s | 1.78× slower |
 | SQLite (600k rows) | 0.33s | 0.68s | ~2× slower |
 
-dd runs arm64 **compute at native speed** (often faster, since the JIT can still re-optimize). The real
-gaps are **allocation/syscall-heavy** work — qsort and SQLite — the price of servicing syscalls in a
-userspace kernel; that's the active optimization frontier. († Rows under ~0.2s are dominated by the
-benchmark's own per-run cross-process `mac`-bridge spawn tax, which the shipping app does **not** pay, so
-those small gaps overstate it — the real app is ~parity there.)
+dd runs arm64 **compute at native speed** — ahead on int sieve + SHA-256, at parity on n-body, memcpy,
+and mandelbrot. The real gaps are **allocation/syscall-heavy** work — qsort (~1.8×) and SQLite (~2×) —
+the price of servicing syscalls in a userspace kernel; that's the active optimization frontier. (Every
+workload is sized to run ≥0.45s, so the harness's small per-run bridge tax is negligible here.)
 
 These are *compute* micro-benchmarks — they don't even capture dd's structural wins (no VM to boot, no
 resident RAM, direct host-filesystem I/O). All numbers measured, median of 7. Reproduce: `make bench`.

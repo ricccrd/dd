@@ -9,7 +9,7 @@ int main(void) {
     for (int i = 0; i < N; i++) { s = s * 1103515245 + 12345; int r = (int)((s >> 16) & 31); buf[i] = r < 26 ? ('a'+r) : (r < 30 ? ' ' : '\n'); }
     buf[N-1] = '\n';
     long words = 0, lines = 0, matches = 0;
-    for (int rep = 0; rep < 4; rep++) {
+    for (int rep = 0; rep < 20; rep++) {
         int inword = 0;
         for (int i = 0; i < N; i++) {
             char c = buf[i];
