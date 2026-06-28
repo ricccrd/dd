@@ -594,6 +594,34 @@ static int shadow_classify(struct cpu *c, uint64_t guest_x30) {
     return SS_FOREIGN;
 }
 
+// ---- opt4: greedy superblock / trace formation ----
+// Follow unconditional `b` edges INLINE, and lay conditional fall-through successors INLINE
+// (inverting the guest condition so the TAKEN side becomes a tiny out-of-line chain-exit).
+// A region is bounded to TRACE_MAX_BYTES / TRACE_MAX_BLK; intermediate guest block-starts are
+// deliberately NOT registered in g_map -- any edge that later enters mid-region self-heals by
+// re-translating a fresh (always-correct) duplicate, wired up through the existing
+// add_pend/patch_links_to back-patch path. NOSTITCH=1 -> g_stitch=0 -> exact single-block
+// baseline (env read once; set-once + idempotent under the JIT lock).
+#define TRACE_MAX_BLK 16
+#define TRACE_MAX_BYTES (16 * 1024)
+static int g_stitch = -1;
+static int seen_has(const uint64_t *seen, int n, uint64_t v) {
+    for (int i = 0; i < n; i++)
+        if (seen[i] == v) return 1;
+    return 0;
+}
+// Lay a conditional's fall-through inline: `inv` is the branch insn with its condition/op
+// already inverted, so when the guest would NOT take it we keep falling through. Emit the
+// inverted branch (skips the taken-side exit), the taken chain-exit, then patch the branch to
+// jump just past it. The patched offset is always tiny (the taken exit is ~1 insn if chained,
+// ~30 if it spills) -> in range even for tbz/tbnz's 14-bit field.
+static void stitch_cond(uint32_t inv, uint64_t taken) {
+    uint32_t *patch = (uint32_t *)g_cp;
+    emit32(0);
+    emit_chain_exit(taken);
+    *patch = recode_cond(inv, ((uint8_t *)g_cp - (uint8_t *)patch) / 4);
+}
+
 static void *translate_block(uint64_t gpc) {
     // gpc is mutated by the decode loop; key the cache by START
     uint64_t start = gpc;
@@ -612,6 +640,15 @@ static void *translate_block(uint64_t gpc) {
         uint32_t in;
     } defer[64];
     int ndefer = 0;
+    // opt4 region state: guest block-starts inlined into this region + a block budget. The
+    // region STOPS (falls to the baseline single-block exit) at any dispatcher-mediated edge
+    // (indirect br/blr, bl/call, ret, svc/syscall), inside an exclusive monitor region, or on
+    // hitting the 16-block / 16 KB bound -- "when unsure, end the region".
+    if (g_stitch < 0) g_stitch = getenv("NOSTITCH") ? 0 : 1;
+    uint64_t seen[TRACE_MAX_BLK];
+    int nseen = 0, trace_blk = 0;
+#define STITCH_OK \
+    (g_stitch && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         uint32_t in = *(uint32_t *)gpc;
 
@@ -638,7 +675,17 @@ static void *translate_block(uint64_t gpc) {
         // b
         if ((in & 0xFC000000u) == 0x14000000u) {
             int64_t off = sext(in & 0x3FFFFFF, 26) << 2;
-            emit_chain_exit(gpc + off);
+            uint64_t tgt = gpc + off;
+            // opt4: follow the unconditional edge INLINE if its target is a fresh block (not the
+            // region head, not already inlined, not already translated) -> the inter-block `b`
+            // disappears. Otherwise chain normally (existing block / loop back-edge).
+            if (STITCH_OK && tgt != start && !seen_has(seen, nseen, tgt) && !map_body(tgt)) {
+                seen[nseen++] = tgt;
+                trace_blk++;
+                gpc = tgt;
+                continue;
+            }
+            emit_chain_exit(tgt);
             break;
         }
         // bl
@@ -686,6 +733,14 @@ static void *translate_block(uint64_t gpc) {
                 gpc += 4;
                 continue;
             }
+            // opt4: lay the fall-through inline; invert the condition so TAKEN is the exit
+            if (STITCH_OK && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall)) {
+                stitch_cond(in ^ 1u, taken);
+                seen[nseen++] = fall;
+                trace_blk++;
+                gpc = fall;
+                continue;
+            }
             uint32_t *patch = (uint32_t *)g_cp;
             // b.cond -> taken (backpatched)
             emit32(0);
@@ -707,6 +762,14 @@ static void *translate_block(uint64_t gpc) {
                 ndefer++;
                 emit32(0);
                 gpc += 4;
+                continue;
+            }
+            // opt4: lay the fall-through inline (non-stolen test reg only); invert op (cbz<->cbnz)
+            if (STITCH_OK && !is_stolen(rt) && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall)) {
+                stitch_cond(in ^ (1u << 24), taken);
+                seen[nseen++] = fall;
+                trace_blk++;
+                gpc = fall;
                 continue;
             }
             // tested reg stolen -> test cpu->x[rt] via a saved scratch
@@ -749,6 +812,14 @@ static void *translate_block(uint64_t gpc) {
                 ndefer++;
                 emit32(0);
                 gpc += 4;
+                continue;
+            }
+            // opt4: lay the fall-through inline (non-stolen test reg only); invert op (tbz<->tbnz)
+            if (STITCH_OK && !is_stolen(rt) && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall)) {
+                stitch_cond(in ^ (1u << 24), taken);
+                seen[nseen++] = fall;
+                trace_blk++;
+                gpc = fall;
                 continue;
             }
             // tested reg stolen -> test cpu->x[rt] via a saved scratch
@@ -894,9 +965,12 @@ static void *translate_block(uint64_t gpc) {
         *defer[i].patch = recode_cond(defer[i].in, d);
         emit_chain_exit(defer[i].target);
     }
+    // Only the REGION HEAD (start) is registered; intermediate inlined block-starts are left
+    // unregistered so a later mid-region entry self-heals via re-translate + back-patch.
     map_put(start, host, body);
     // patch_links_to is MOVED to the dispatcher, AFTER the new block's icache is invalidated:
     // chaining an existing block X -> this new block before its code is icache-coherent on a peer
     // core lets that core fetch stale instructions. Only chain to it once it's visible everywhere.
     return host;
 }
+#undef STITCH_OK
