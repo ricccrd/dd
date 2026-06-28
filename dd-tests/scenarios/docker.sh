@@ -28,10 +28,13 @@ d()   { docker "$@" 2>&1; }
 SCEN_LOG="$ROOT/dd-scenarios.log"
 pkill -x dd-daemon 2>/dev/null
 rm -f "$SOCK"
-export DD_IMAGES="$IMAGES" DDOCKERD_SOCK="$SOCK"
+# Fully isolate this daemon: private socket AND private state/volumes (a fresh per-scenario temp
+# dir), so it starts from empty state and never reads or mutates the developer's real ~/.dd.
+STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dd-scenarios.XXXXXX")"
+export DD_IMAGES="$IMAGES" DDOCKERD_SOCK="$SOCK" DD_STATE="$STATE_DIR/state.json" DD_VOLUMES="$STATE_DIR/volumes"
 "$DAEMON" >"$SCEN_LOG" 2>&1 &
 DPID=$!
-trap 'kill -9 $DPID 2>/dev/null; rm -f "$SOCK" "$SCEN_LOG"' EXIT
+trap 'kill -9 $DPID 2>/dev/null; rm -f "$SOCK" "$SCEN_LOG"; rm -rf "$STATE_DIR"' EXIT
 n=0; until [ -S "$SOCK" ] || [ $n -ge 60 ]; do sleep 0.25; n=$((n+1)); done
 [ -S "$SOCK" ] || { echo "daemon failed to start:"; cat "$SCEN_LOG" 2>/dev/null; exit 1; }
 
