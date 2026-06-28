@@ -221,6 +221,46 @@ static int x86cc_to_arm(int cc) {
     return t[cc & 0xF];
 }
 
+// ---- W3-A: trace / superblock formation (gate NOSTITCH=1; default ON) ----
+// Port of the aarch64 opt4 PoC to the x86 engine. Greedily lay successor blocks inline:
+//  - unconditional `jmp rel` (E9/EB): if the target is a fresh (untranslated, not-yet-inlined)
+//    block, continue translating it inline -- the inter-block `b body` disappears.
+//  - conditional `jcc` fall-through: lay the not-taken (`next`) successor inline, branchless.
+//    The ARM condition is INVERTED so the emitted b.cond jumps over the (tiny, out-of-line)
+//    taken-side exit; the taken successor becomes the out-of-line exit.
+// Intermediate blocks are deliberately NOT registered in g_map, so any mid-region entry simply
+// re-translates a (correct) duplicate and self-heals via the existing add_pend/patch_links_to
+// back-patch path. Region bounded to TRACE_MAX_BLK blocks / TRACE_MAX_BYTES host bytes.
+//
+// x86 lazy-flag interplay (opt3, the critical correctness point): a width-4/8 sub/cmp/add/logic
+// producer DEFERS its NZCV materialization, leaving its result flags live in ARM NZCV with
+// g_fl_pending naming the finalizer that would spill them to cpu->nzcv. A chained/inlined entry
+// reaches a successor's post-prologue body (no NZCV reload), so cpu->nzcv MUST be canonical at
+// every stitched boundary:
+//  - `jmp` stitch is flag-clean for free: the top-of-loop already materializes g_fl_pending
+//    before any non-Jcc instruction (the jmp itself), so g_fl_pending == FL_NONE and the membank
+//    is current when the jmp handler runs -- inline continuation needs nothing extra.
+//  - `jcc` fall-through stitch runs AFTER the existing fast-path flags_materialize() (the
+//    producer's exact spill, which also msr's the value back so live NZCV stays canonical). So
+//    the out-of-line taken exit AND the inline fall-through both see a correct cpu->nzcv, and
+//    g_fl_pending == FL_NONE for the inlined successor.
+static int g_stitch = -1; // -1 uninit; resolved lazily from env (NOSTITCH=1 disables)
+#define TRACE_MAX_BLK 16
+#define TRACE_MAX_BYTES (16u * 1024u)
+static int seen_has(const uint64_t *s, int n, uint64_t v) {
+    for (int i = 0; i < n; i++)
+        if (s[i] == v) return 1;
+    return 0;
+}
+// A successor whose first byte is a trap (hlt / int3 / ud2) is a dynamically-dead guard arm --
+// e.g. musl's alloca size check `cmp size,0xfff; jbe ok; hlt`, where the hlt fall-through is the
+// never-taken oversize trap. Do NOT eagerly inline it: leave it as a normal out-of-line exit so
+// it is only ever translated if actually reached (it isn't), avoiding wasted code + report_unimpl.
+static int trap_head(uint64_t a) {
+    const uint8_t *p = (const uint8_t *)a;
+    return p[0] == 0xF4 || p[0] == 0xCC || (p[0] == 0x0F && p[1] == 0x0B);
+}
+
 // ---------------- opt5: rep movs/stos idiom upgrade ----------------
 // Generalizes the LSE idiom-upgrade lever to the x86 string ops: a `rep movs`/`rep stos`
 // (the idiomatic memcpy/memset of every musl/glibc x86 guest) is lowered to ONE optimized
@@ -352,6 +392,15 @@ static void *translate_block(uint64_t gpc) {
     emit_prologue();
     void *body = g_cp;
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
+    g_prof_xlate++;         // PROF (measurement-only): translate_block calls
+    if (g_stitch < 0) g_stitch = (getenv("NOSTITCH") == NULL);
+    // W3-A superblock state: guest block-starts already laid in this region + region budget.
+    uint64_t seen[TRACE_MAX_BLK];
+    int nseen = 0, trace_blk = 0;
+    seen[nseen++] = start;
+#define STITCH_OK                                                                                                      \
+    (g_stitch && !g_nochain && !g_trace && !g_itrace && trace_blk < TRACE_MAX_BLK - 1 &&                              \
+     (size_t)((uint8_t *)g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         if (g_itrace && gpc != start) {
             if (g_fl_pending) flags_materialize(); // materialize before boundary
@@ -899,7 +948,18 @@ static void *translate_block(uint64_t gpc) {
             } // std (DF=1): backward string ops -> TODO
             // ---- jmp rel (E9/EB) ----
             if (op == 0xE9 || op == 0xEB) {
-                emit_chain_exit(next + (uint64_t)I.imm);
+                uint64_t tgt = next + (uint64_t)I.imm;
+                // STITCH: follow the unconditional edge inline. g_fl_pending is FL_NONE here -- the
+                // top-of-loop materialized any deferred flags before this non-Jcc insn, so the membank
+                // cpu->nzcv is current for the inlined successor. Skip if the target is the region head,
+                // already laid in this region, an already-registered block, or a dead trap arm.
+                if (STITCH_OK && tgt != start && !seen_has(seen, nseen, tgt) && !map_body(tgt) && !trap_head(tgt)) {
+                    seen[nseen++] = tgt;
+                    trace_blk++;
+                    gpc = tgt;
+                    continue;
+                }
+                emit_chain_exit(tgt);
                 break;
             }
             // ---- call rel32 (E8) ----
@@ -939,6 +999,23 @@ static void *translate_block(uint64_t gpc) {
                     flags_materialize();
                 } else {
                     e_nzcv_load();
+                }
+                uint64_t fall = next;
+                // STITCH: lay the fall-through (`next`) inline; the taken side becomes a tiny
+                // out-of-line exit reached by the INVERTED condition. cpu->nzcv was just materialized
+                // above (membank canonical, live NZCV msr'd back), so the inline fall-through and the
+                // out-of-line taken exit agree, and g_fl_pending == FL_NONE for the inlined successor.
+                if (STITCH_OK && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall) && !trap_head(fall)) {
+                    int inv = (cc ^ 1) & 0xF; // not-taken -> branch over the taken exit (x86cc_to_arm is 0..13)
+                    uint32_t *patch = (uint32_t *)g_cp;
+                    emit32(0); // b.inv -> fall (inline)
+                    emit_chain_exit(taken);
+                    int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
+                    *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (uint32_t)inv;
+                    seen[nseen++] = fall;
+                    trace_blk++;
+                    gpc = fall;
+                    continue;
                 }
                 uint32_t *patch = (uint32_t *)g_cp;
                 emit32(0); // b.cond -> taken
@@ -2113,6 +2190,21 @@ static void *translate_block(uint64_t gpc) {
                 } else {
                     e_nzcv_load();
                 }
+                uint64_t fall = next;
+                // STITCH (see jcc rel8): inline the fall-through, invert the cond, taken exit OOL.
+                // cpu->nzcv is materialized above, so both arms see canonical flags.
+                if (STITCH_OK && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall) && !trap_head(fall)) {
+                    int inv = (cc ^ 1) & 0xF;
+                    uint32_t *patch = (uint32_t *)g_cp;
+                    emit32(0); // b.inv -> fall (inline)
+                    emit_chain_exit(taken);
+                    int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
+                    *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (uint32_t)inv;
+                    seen[nseen++] = fall;
+                    trace_blk++;
+                    gpc = fall;
+                    continue;
+                }
                 uint32_t *patch = (uint32_t *)g_cp;
                 emit32(0);
                 emit_chain_exit(next);
@@ -2182,6 +2274,7 @@ static void *translate_block(uint64_t gpc) {
     map_put(start, host, body);
     if (!g_threaded) patch_links_to(start, body); // chaining mutates live blocks -> off when threaded
     return host;
+#undef STITCH_OK
 }
 
 static void report_unimpl(uint64_t pc, struct insn *I) {
