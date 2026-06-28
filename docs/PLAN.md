@@ -29,26 +29,24 @@ via the Makefile: `make test` (cross-engine matrix, **~240 green** / 3 engines),
 
 ## JIT correctness gaps (guest aborts / wrong output)
 
-- **x86 `rep cmps`/`rep scas` → `memcmp`/`memchr`** · gate `NOREPCMP=1` · [`w4c-sse42.md`](design/w4c-sse42.md).
-  Currently **UNIMPL → guest abort** (a correctness fix, not just perf): `rep cmpsb`→memcmp 36.5×, `repne
-  scasb`→strlen 41.4×, memchr 42.2×; exact RCX/RSI/RDI + ZF/SF/CF/OF end-state. (The SSE4.2 `pcmp{i,e}str{i,m}`
-  evaluator is built but kept **dormant** — the CPUID A/B says don't advertise SSE4.2: a 14.8× strcmp regression
-  vs the landed SSE2 `pmovmskb` path.)
-- **`strrchr_sse2` tail bug** — misses the last match in the final ~50 bytes; reproduces on stock baseline +
-  `NOSSEOPT=1` alike (a flag/mask edge in the `pmovmskb`-consuming tail). Forward `strchr` is correct.
+- **x86 SSE2 `strchr`/`strrchr` tail bug** — **both** miss a match in the final partial 16-byte block adjacent
+  to the NUL (return NULL). Deterministic minimal repro (from `make test-diff` differential oracle): a 63-byte
+  buffer with the only `Z` at index 56 → dd-jit `strrchr`/`strchr` = NULL, qemu/native oracle = 56; aarch64 is
+  correct. A flag/mask edge in the `pmovmskb`-consuming tail; reproduces on stock baseline + `NOSSEOPT=1` alike
+  (not the SSE opt). **Broader than previously thought — `strchr` is affected, not just `strrchr`.** Tracked as
+  an `.xfail` regression case in `make test-diff` (`diff_strops`) that flips to xpass when fixed.
 - **non-PIE `ET_EXEC` fork+execve — PARTIAL** · gate `NONPIE_NOFIXUP=1` · [`w6a-deepbugs.md`](design/w6a-deepbugs.md),
   [`fix-nonpie-crash.md`](design/fix-nonpie-crash.md). Landed: a no-relink SIGSEGV fault-fixup (redirect absolute
   code jumps + emulate faulting integer ld/st at `+bias`; 0 PIE regression). **Remaining:** SIMD-Q/`ldr q` +
   LSE-atomic-RMW absolute forms, and syscall pointer-args into low `.rodata`/`.data` (they clean-abort, not
   silently corrupt). The host-`__PAGEZERO`-shrink path is a confirmed dead end. Victims: gcc, postgres `gosu`.
-- **Minor:** 64 KB guard-tail leak per `munmap` (215); ignored `MREMAP_*` flags (correct for musl in practice).
 
 ## Scoped bug-fix designs (root-caused, fix scoped — subplans in `docs/design/`)
 
-- **busybox `sort` SIGSEGV** (x86, large inputs) → [`fix-x86-busybox-sort.md`](design/fix-x86-busybox-sort.md).
-- **AF_UNIX SCM_RIGHTS fd-passing + abstract namespace** (2 `edge` xfail) → [`fix-afunix-bugs.md`](design/fix-afunix-bugs.md).
-- **signal / timer / pipe edge bugs** (3 `edge` correctness) → [`fix-signal-pipe-bugs.md`](design/fix-signal-pipe-bugs.md).
-- **postgres:alpine startup** (post-shebang; also gated on the non-PIE residual) → [`fix-postgres.md`](design/fix-postgres.md).
+- **postgres:alpine startup** → [`fix-postgres.md`](design/fix-postgres.md). The post-shebang clone-stack fix
+  (B3) is landed; full default-path `docker run postgres:alpine` still needs the non-PIE `gosu` residual above
+  (B2) **or** the daemon `--user`→`--uid` / OCI-Entrypoint path (B4, `dd-daemon/src/images.rs`) to skip the
+  `gosu` re-exec.
 
 ## JIT perf — remaining squeeze
 
@@ -84,6 +82,29 @@ via the Makefile: `make test` (cross-engine matrix, **~240 green** / 3 engines),
 | `docker run` opts | wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` (`--user`/`--label` done) | P2 |
 | `docker build` | BuildKit/layer cache (every build re-runs from base) — args/target/nocache/labels/digest-IDs done | P2 |
 | `docker cp` | non-default-driver named volumes (default `<volumes_dir>/<name>` handled) | P3 |
+
+## Docker functional gaps (from `make test-docker-fn` — 72 pass/0 fail; real behavioral assertions)
+`docker exec -it` / `run -it` **confirmed working end-to-end** (pty raw mode, Ctrl-C→SIGINT, resize→SIGWINCH,
+stdin, exit codes). Remaining real gaps:
+
+**Correctness bugs (wrong behavior on valid commands):**
+- **Duplicate `--name` accepted** — a 2nd container starts with an in-use name (should error "already in use"). P1
+- **`docker rm` of a *running* container succeeds without `-f`** (should error). P1
+- **`exec` into a *stopped* container runs the command** (should error "is not running"). P2
+- **`docker events --filter container=<name>` returns nothing** (unfiltered events work — the by-name filter is broken). P2
+- **Logs don't interleave stdout/stderr chronologically** (stderr appended after stdout). P3
+
+**Missing / partial features:**
+- **`-p` published ports not reachable from host** + **container↔container by-name/IP not reachable** — the
+  netstack/TCP-cork area (see [`netstack.md`](design/netstack.md)). **P0 for real usage.**
+- **`-v …:ro` not enforced** (writes to a read-only bind succeed) — correctness/isolation. P1
+- **`--rm` doesn't auto-remove** the container on exit. P2
+- **`docker commit` unimplemented** ("no route for `/commit`" — contradicts the stale "38/38 compliant" claim). P2
+- **`build` with `FROM <previous-stage>` as a base** tries to pull the stage name from the registry (`COPY --from` works). P3
+
+**Harness/infra:** the `scenarios/*.sh` isolate only the *socket*, not state — adopt `DD_STATE`/`DD_VOLUMES`
+isolation (a non-isolated daemon loaded **339 containers** from shared `~/.dd/state.json`). Compose suite
+(`compose.sh`) not delivered — no compose binary on the Linux harness; add where available.
 
 ## Platform limitations (macOS host — can't provide the Linux primitive; off the work-list)
 Non-PIE `ET_EXEC` fixed-vaddr (the `__PAGEZERO` low-4GB reservation — see the JIT correctness gap above for the
