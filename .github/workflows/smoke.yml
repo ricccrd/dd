@@ -1,0 +1,35 @@
+name: Smoke (real images, cross-arch)
+
+# User-perspective regression guard. The unit matrix uses static-PIE guests + curated rootfs
+# fixtures, so it never exercises a FRESH PULL of a real distro whose binaries load libc.so.6
+# through glibc's dynamic linker — the exact path `ddcli run ubuntu` died on ("libc.so.6:
+# failed to map segment"). This job does the user's action for real, on both arches, so that
+# class of bug cannot ship green again. Needs network (registry pull) -> CI, not the offline matrix.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: macos-14   # Apple Silicon (arm64); the amd64 cases exercise the x86_64 -> arm64 JIT.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: smoke
+
+      # Builds ddcli + dd-daemon and (via ddjit's build.rs) compiles + allow-jit-signs the
+      # ddjit-linux_{aarch64,x86_64} engines that ddcli run needs.
+      - name: Build ddcli + daemon + JIT engines
+        run: cargo build --release -p dd-cli -p dd-daemon
+
+      - name: Real-image smoke (fresh pull + run; ubuntu & debian; arm64 & amd64)
+        run: bash dd-tests/scenarios/smoke-realimage.sh

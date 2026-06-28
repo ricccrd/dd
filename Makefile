@@ -1,5 +1,5 @@
 # dd workspace.
-.PHONY: all jit fmt test test-ci test-docker test-docker-full test-compose test-docker-net test-macos test-realsw coverage bench clean app dmg install uninstall mac-image mac-push
+.PHONY: all jit fmt test test-ci test-docker test-docker-full test-compose test-docker-net test-macos test-realsw test-smoke coverage bench clean app dmg install uninstall mac-image mac-push
 # Version is the git tag (v0.2.0 -> 0.2.0); falls back to 0.0.0-dev with no tags. CI passes it too.
 TAG := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
 VERSION ?= $(or $(TAG),0.0.0-dev)
@@ -24,6 +24,9 @@ test-macos: jit ## macOS-container parity: same docker lifecycle on a Linux AND 
 	bash dd-tests/scenarios/macos-container.sh
 test-realsw: jit ## run REAL pulled software (redis/python/postgres/nats) with deterministic workloads
 	bash dd-tests/scenarios/realsw.sh
+test-smoke:     ## user-perspective: FRESH-PULL + run a real glibc distro on BOTH arches (the libc.so.6 guard; needs network, macOS)
+	cargo build --release -p dd-cli -p dd-daemon
+	bash dd-tests/scenarios/smoke-realimage.sh
 coverage: jit  ## report unimplemented syscalls/opcodes (static switch-diff + dynamic corpus run); MODE=static|dynamic|all
 	bash dd-tests/tools/coverage.sh $(or $(MODE),all)
 bench: jit      ## speed: same Linux binary in the VM (native/qemu) vs through dd's JIT (no VM)
