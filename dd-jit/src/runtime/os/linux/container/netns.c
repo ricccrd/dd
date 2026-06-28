@@ -240,6 +240,18 @@ static uint32_t g_myip;          // this endpoint's IP, network byte order (0 = 
 static uint16_t g_br_port[1024]; // fd -> virtual port of a bridge socket (0 = not a bridge socket)
 static uint32_t g_br_ip[1024];   // fd -> virtual IP (network order) reported via getsockname/getpeername
 static int g_br_init;
+// Carry the per-fd socket-emulation metadata (SOCK_STREAM-ness, loopback/bridge port + ip) from `src`
+// to `dst` when an fd is duplicated/moved (dup/dup3/fcntl F_DUPFD). Without this, a guest that creates a
+// TCP socket then relocates it to another fd number (e.g. busybox's xmove_fd -> a fixed low fd) loses the
+// `g_sock_stream` flag that gates the loopback + per-network bridge bind/connect redirection, so its
+// AF_INET traffic silently falls through to host passthrough and never rendezvous with a peer container.
+static void fd_carry_sock(int dst, int src) {
+    if (dst < 0 || dst >= 1024 || src < 0 || src >= 1024) return;
+    g_sock_stream[dst] = g_sock_stream[src];
+    g_lo_port[dst] = g_lo_port[src];
+    g_br_port[dst] = g_br_port[src];
+    g_br_ip[dst] = g_br_ip[src];
+}
 // dotted-quad -> network-order u32 (bytes a.b.c.d), 0 on parse failure
 static uint32_t br_parse_ip(const char *s) {
     unsigned a = 0, b = 0, cc = 0, d = 0;

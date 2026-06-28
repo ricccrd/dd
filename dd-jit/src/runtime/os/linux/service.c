@@ -477,8 +477,8 @@ static void service(struct cpu *c) {
     case 23: {
         // dup
         int r = dup((int)a0);
-        // carry path
-        if (r >= 0 && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024) strcpy(g_fdpath[r], g_fdpath[(int)a0]);
+        // carry path + socket-emulation metadata to the new fd
+        if (r >= 0 && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024) { strcpy(g_fdpath[r], g_fdpath[(int)a0]); fd_carry_sock(r, (int)a0); }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -491,8 +491,10 @@ static void service(struct cpu *c) {
         int r = dup2((int)a0, (int)a1);
         if (r >= 0) {
             if ((int)a2 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC); // O_CLOEXEC
-            if ((int)a1 >= 0 && (int)a1 < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
+            if ((int)a1 >= 0 && (int)a1 < 1024 && (int)a0 >= 0 && (int)a0 < 1024) {
                 strcpy(g_fdpath[(int)a1], g_fdpath[(int)a0]);
+                fd_carry_sock((int)a1, (int)a0);
+            }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -585,9 +587,11 @@ static void service(struct cpu *c) {
         // lease/notify/seals: no-op
         }
         int r = fcntl((int)a0, mcmd, a2);
-        if (r >= 0 && (lcmd == 0 || lcmd == 1030) && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
+        if (r >= 0 && (lcmd == 0 || lcmd == 1030) && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024) {
             // F_DUPFD(_CLOEXEC)
             strcpy(g_fdpath[r], g_fdpath[(int)a0]);
+            fd_carry_sock(r, (int)a0);
+        }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -1704,6 +1708,15 @@ static void service(struct cpu *c) {
         }
         size_t old = (size_t)a1, n = old < (size_t)a2 ? old : (size_t)a2;
         memcpy(r, (void *)a0, n);
+        // W4-B leak fix: mremap MOVES the mapping, so free the OLD region (it was leaked — every
+        // realloc-driven grow leaked the whole previous buffer; busybox `sort` of a 2M-line file does
+        // ~3,874 grows leaking ~31 GB -> ~30 GB RSS -> OOM SIGKILL). Free the tracked extent (incl. the
+        // 64 KB guard tail); allocate-before-free preserved above.
+        uint64_t oldlen = gmap_find_len(a0);
+        munmap((void *)a0, oldlen ? (size_t)oldlen : old);
+        gmap_del(a0);
+        anon_untrack(a0, old);
+        gmap_add((uint64_t)r, (size_t)a2);    // track the new region for execve() teardown
         anon_track((uint64_t)r, (size_t)a2, PROT_READ | PROT_WRITE); // fresh private-anon copy
         G_RET(c) = (uint64_t)r;
         break;

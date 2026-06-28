@@ -478,6 +478,23 @@ static void *translate_block(uint64_t gpc) {
                     gpc = next;
                     continue;
                 }
+                if (w == 1 && k >= 4) { // 8-bit mul/div (0xF6 /4../7) -- were UNIMPL (glibc inet_ntoa aborts)
+                    int rmv = rm_load(&I, next, 1, &mem);
+                    if (k == 4 || k == 5) { // mul/imul r/m8: AX = AL * r/m8 (16-bit result)
+                        if (k == 4) { e_uxt(19, RAX, 1); e_uxt(20, rmv, 1); } // zero-extend AL + src (uxtb)
+                        else        { e_sxt(19, RAX, 1); e_sxt(20, rmv, 1); } // sign-extend (sxtb)
+                        e_mul(21, 19, 20, 0);
+                        e_bfi(RAX, 21, 0, 16, 1); // write AX (low 16), preserve upper RAX (x86 8/16-bit semantics)
+                    } else {                      // div/idiv r/m8: AL = AX / r/m8, AH = AX % r/m8
+                        if (k == 6) { e_uxt(19, RAX, 2); e_uxt(20, rmv, 1); e_udiv(21, 19, 20, 0); } // AX uxth, src uxtb
+                        else        { e_sxt(19, RAX, 2); e_sxt(20, rmv, 1); e_sdiv(21, 19, 20, 0); } // AX sxth, src sxtb
+                        e_msub(22, 21, 20, 19, 0); // rem = dividend - quot*divisor
+                        e_bfi(RAX, 21, 0, 8, 1);   // AL = quotient
+                        e_bfi(RAX, 22, 8, 8, 1);   // AH = remainder
+                    }
+                    gpc = next;
+                    continue;
+                }
                 if (w == 4 || w == 8) {
                     if (k == 4 || k == 5) { // mul / imul (rdx:rax = rax * r/m)
                         int rmv = rm_load(&I, next, w, &mem);

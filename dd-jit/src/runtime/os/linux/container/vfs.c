@@ -75,6 +75,12 @@ static void gmap_del(uint64_t addr) {
     for (int i = 0; i < g_ngmap; i++)
         if (g_gmap[i].addr == addr) { g_gmap[i] = g_gmap[--g_ngmap]; return; }
 }
+// The tracked extent (incl. any guard tail) of a mapping that starts at addr, or 0 if untracked.
+static uint64_t gmap_find_len(uint64_t addr) {
+    for (int i = 0; i < g_ngmap; i++)
+        if (g_gmap[i].addr == addr) return g_gmap[i].len;
+    return 0;
+}
 static void gmap_reset_all(void) { // munmap every tracked guest mapping; the caller reloads fresh
     for (int i = 0; i < g_ngmap; i++) munmap((void *)g_gmap[i].addr, (size_t)g_gmap[i].len);
     g_ngmap = 0;
