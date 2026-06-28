@@ -49,6 +49,8 @@ static void run_guest(struct cpu *c) {
         // A non-PIE image's un-relocated absolute jump lands on its (unmapped) low link vaddr; redirect it
         // into the biased image so we translate real code instead of faulting on the unmapped low address.
         if (g_nonpie_lo && c->pc >= g_nonpie_lo && c->pc < g_nonpie_hi) c->pc += g_nonpie_bias;
+        // Frontend hook: top-of-loop debug instrumentation (x86-only; empty on aarch64).
+        G_DISPATCH_DEBUG(c);
         // With threads, the WHOLE cache lookup is under the lock: an unlocked
         // map_host() races map_put() (torn entry) and lacks the acquire barrier
         // that makes a peer thread's freshly-emitted+icache-flushed code visible.
@@ -68,8 +70,8 @@ static void run_guest(struct cpu *c) {
                 g_npend = 0;
                 // IBTC bodies point into the cache we just dropped
                 memset(g_ibtc, 0, sizeof g_ibtc);
-                // §B: shadow host_rets point into the dropped cache too -> clear
-                c->ssp = 0;
+                // §B: shadow host_rets point into the dropped cache too -> clear (frontend hook)
+                G_SHADOW_CLEAR(c);
                 pthread_jit_write_protect_np(1);
             }
             pthread_jit_write_protect_np(0);
@@ -83,30 +85,9 @@ static void run_guest(struct cpu *c) {
             // back to execute AFTER all cache writes
             pthread_jit_write_protect_np(1);
         }
-        // IBTC: insert the indirect target that just missed
-        if (c->ic_site) {
-            g_prof_miss++;
-            // The shared IBTC read (in emitted code) is unlocked, and the per-site fill toggles
-            // W^X process-wide -- both race other threads. Under threads, skip the fill: indirect
-            // branches fall to the (locked) dispatcher. Correct, slightly slower.
-            void *bd = g_threaded ? NULL : map_body(c->pc);
-            if (bd) {
-                uint32_t h = (uint32_t)((c->pc >> 2) & (IBTC_N - 1));
-                // body_ind; written first
-                g_ibtc[h].body = (void *)((uint64_t)bd - 8);
-                __atomic_store_n(&g_ibtc[h].target, c->pc, __ATOMIC_RELEASE);
-                // per-site monomorphic cache (literals in JIT cache, W^X)
-                if (c->ic_site != 1) {
-                    pthread_jit_write_protect_np(0);
-                    // Lsite_body
-                    ((uint64_t *)c->ic_site)[1] = (uint64_t)bd - 8;
-                    // Lsite_tgt
-                    ((uint64_t *)c->ic_site)[0] = c->pc;
-                    pthread_jit_write_protect_np(1);
-                }
-            }
-            c->ic_site = 0;
-        }
+        // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
+        // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).
+        G_IBTC_FILL(c);
         if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
         if (g_trace) {
             uint32_t *ci = (uint32_t *)c->pc;
@@ -117,17 +98,9 @@ static void run_guest(struct cpu *c) {
         c->reason = 0;
         if (g_prof) g_prof_cross++;
         run_block(c, code);
-        if (c->reason == R_SYSCALL) {
-            if (g_prof) g_prof_sys++;
-            service(c);
-            if (c->exited) break;
-            if (c->redirect)
-                c->redirect = 0;
-            else
-                c->pc += 4;
-        // execve/sigreturn set pc directly
-        }
-        // else R_BRANCH: c->pc already holds the target
+        // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
+        // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
+        G_DISPATCH_REASON(c);
         // async signal -> guest handler
         if (g_pending) maybe_deliver_signal(c);
     }

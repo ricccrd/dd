@@ -27,6 +27,11 @@
 // historical aarch64 hash, so this keeps the aarch64 engine bit-identical.)
 #define G_GPC_HASH_SHIFT 2
 
+// Engine seam (engine-dedup PR2): the shared jit/dispatch.c run_guest() loop calls four hooks at the spots
+// where the dispatcher diverges per guest arch. The aarch64 definitions expand to EXACTLY the code that was
+// inline before, so the aarch64 engine stays bit-identical; the x86 frontend defines its own in a later PR.
+#include "dispatch_hooks.h"
+
 // PC / SP / TLS / §B shadow-stack reset — the remaining per-arch cpu state os/linux touches.
 #define G_PC(c) ((c)->pc)
 #define G_SP(c) ((c)->sp)
