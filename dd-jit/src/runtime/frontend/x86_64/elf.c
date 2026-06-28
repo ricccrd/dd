@@ -450,6 +450,19 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
             } // retry the faulting instruction
         }
     }
+    if (getenv("CRASHDBG")) { // diagnostic: dump the guest instruction that faulted (gated; off by default)
+        struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
+        fprintf(stderr, "[FAULT] sig=%d addr=%p guest_rip=%llx\n", sig, si ? si->si_addr : 0,
+                c ? (unsigned long long)c->rip : 0);
+        if (c && c->rip) {
+            fprintf(stderr, "  bytes@rip:");
+            uint8_t *p = (uint8_t *)c->rip;
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", p[i]);
+            fprintf(stderr, "\n  rax=%llx rsi=%llx rdi=%llx rsp=%llx rbp=%llx\n",
+                    (unsigned long long)c->r[0], (unsigned long long)c->r[6], (unsigned long long)c->r[7],
+                    (unsigned long long)c->r[4], (unsigned long long)c->r[5]);
+        }
+    }
     signal(sig, SIG_DFL);
     raise(sig); // out of budget / mmap failed -> real crash
 }
