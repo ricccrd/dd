@@ -22,38 +22,21 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
    trust boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on
    `g_untrusted`, split `service()` by authority (compute/mem local, fs/net/proc → sentry over an SPSC
    ring), deny-default Seatbelt. First PR: ring + read/write/open family behind the flag.
-4. **Tier-2 trace optimizer** → `docs/design/tier2-optimizer.md`. **No PR yet.** The win is killing the
-   stolen-register mangle (x18/x28/x30) via trace-local allocation; §B-safe (own x9–x17 only in call-free
-   spans; never drop the `gsp` check); PROF needs loop-back heat. First PR: a 2-block identity trace behind
-   `TIER2`, matrix-green when off.
-5. **x86 translator → native** → `docs/design/x86-perf.md`. **PR1 ✅** (lazy NZCV for `sub/cmp→Jcc`).
-   **Remaining:** extend to add/logical producers + carry-value consumers; `pmovmskb` (48→8 NEON); x87
-   `fptop` tracking. Inherits #1 + #4 once they land.
+4. **x86 translator → native** → `docs/design/x86-perf.md`. **PR1 ✅** (lazy NZCV `sub/cmp→Jcc`), **extended ✅**
+   (Opt3: add/and/or/xor/test producers + dead-flag elim), **`pmovmskb` ✅** (W3-B, 48→8 NEON). The tier-2
+   substrate **landed** — arm adaptive tier-up (W4-E), stolen-register mangle elimination via trace-local
+   allocation (W6-C, the former "tier-2 trace optimizer" subsystem), and the x86 tier-2 optimizer (W5-B).
+   **Remaining:** carry-value consumers (adc/sbb deferral) + x87 `fptop` tracking.
 
 ## Deep bugs (root-caused; fixes scoped)
 
-- **fork()+execve() non-PIE crash (victims: gcc toolchain; postgres' `gosu`).** `execve` biases a non-PIE `ET_EXEC` off its fixed
-  vaddr (`__PAGEZERO` forces it); post-`fork` the dense layout makes its un-relocated absolute refs fault.
-  Landed: execve address-space teardown + the dispatcher PC-redirect (advances code-jump fault → data-ref
-  fault). `-pagezero_size 0x1000` + pinning the non-PIE low **fully fixes it** but broke the PIE common case
-  (reverted). **Achievable fix:** small `__PAGEZERO` + force every *other* mapping (PIE image/heap/stack/
-  mmaps) to a high hint so only the non-PIE uses the low region (or an arm64 load/store fault-fixup at
-  `+bias`). **Attempted + REVERTED:** shrinking `__PAGEZERO` crashes the aarch64 JIT *host* binary (its own
-  segments + the PROT_NONE guard land in the freed low band → all aarch64 guests fail). Confirms this is a
-  genuine platform limitation; needs a host-layout-safe approach or stays off-the-list. `docs/design/fix-nonpie-crash.md`.
-- **busybox flaky fork+exec tail** → `docs/design/research-busybox-crash.md` + **`docs/design/dual-map-cache.md`**.
-  Root cause: W^X/`MAP_JIT` execute-permission fault in the fork child (per-thread APRR isn't reliable across
-  fork). First mitigation applied (re-assert execute in the child) — insufficient. **Robust fix (PR-ready):**
-  the **dual-mapped RX/RW code cache** (`mach_vm_remap` a RW alias, route cache stores through `cw()`,
-  execute stays RX in the page tables → survives fork). Also closes the `soak/smc` RWX gap below. **Spine
-  designed; activation deferred** — needs ~20 frontend emit sites routed through `cw()` first (else the live
-  alias APRR-faults every block); the inert spine was reverted from the safe batch.
-- **x86 large-input lazy-fault budget** (unconfirmed): the global monotonic `g_lazymaps<4096` over-read/
-  stack-grow budget never resets — could bite huge workloads. `dd-jit/docs/design/audit-x86-largeinput.md`.
-- **`soak/smc` / RWX guest-JIT pages.** `mmap(PROT_READ|WRITE|EXEC)` returns EPERM (W^X). Any guest that JITs
-  its own code (JVM/V8/LuaJIT/.NET/PyPy) needs executable pages — fixed by the same dual-map cache (intercept
-  RWX/`PROT_EXEC` maps, back with MAP_JIT, re-translate on writes). *(Endurance otherwise holds:
-  `soak/{codecache,indirect,threadchurn,forkchurn,allocchurn}` pass.)*
+- **fork()+execve() non-PIE crash (victims: gcc toolchain; postgres' `gosu`) — PARTIAL fix landed (`NONPIE_NOFIXUP=1`).**
+  `execve` biases a non-PIE `ET_EXEC` off its fixed low vaddr (`__PAGEZERO` forces it); its un-relocated
+  absolute refs then fault. Landed (W6A-1): record the non-PIE `[lo,hi)+bias`, redirect absolute code jumps
+  `+bias`, and a SIGSEGV fault-fixup of faulting integer ld/st at `si_addr+bias` (PIE untouched —
+  `g_nonpie_lo==0`). **Remaining:** SIMD-Q/`ldr q` + LSE-atomic-RMW absolute forms, and syscall pointer-args
+  into low `.rodata`/`.data`, aren't redirected (they take a clean abort, not silent corruption). The
+  host-`__PAGEZERO`-shrink path stays a confirmed dead end (breaks PIE / the aarch64 host). `docs/design/fix-nonpie-crash.md`.
 
 ## Coverage gaps — syscalls
 
