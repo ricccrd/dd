@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dd — Blog</title>
+<meta name="description" content="Notes from the dd project: running Linux and macOS containers on Apple-Silicon macOS with no virtual machine." />
+<meta property="og:title" content="dd — Blog" />
+<meta property="og:description" content="Notes from the dd project: containers without a VM." />
+<meta property="og:type" content="website" />
+<meta property="og:image" content="../assets/logo@2x.png" />
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon.png" />
+<link rel="icon" type="image/png" sizes="64x64" href="../assets/favicon-64.png" />
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: {
+      colors: {
+        ink:'#0c1322', ink2:'#11192b', panel:'#131c30', panel2:'#18233b', edge:'#25324d', code:'#0a101e',
+        blue1:'#97cdff', blue2:'#81b5ff', blue3:'#4f88ff', blue4:'#4a81ff', blue5:'#2f6fe6', blue6:'#215fe7',
+        txt:'#e8eefc', muted:'#9fb0cd', muted2:'#7286a8',
+      },
+      fontFamily: { mono:['ui-monospace','SF Mono','Menlo','monospace'] },
+      maxWidth: { wrap:'64rem' },
+    }}
+  }
+</script>
+</head>
+<body class="bg-ink text-txt font-sans antialiased">
+
+<!-- nav -->
+<header class="sticky top-0 z-20 border-b border-edge bg-ink/70 backdrop-blur-md">
+  <div class="mx-auto flex h-14 max-w-wrap items-center gap-4 px-5">
+    <a href="../index.html" class="flex items-center gap-2 font-bold text-lg"><img src="../assets/logo.png" alt="" class="h-7 w-7 rounded-md" /> dd</a>
+    <nav class="ml-auto flex items-center gap-5 text-sm">
+      <a href="../index.html#features" class="hidden text-muted hover:text-txt md:inline">Features</a>
+      <a href="../index.html#why" class="hidden text-muted hover:text-txt md:inline">Why no VM</a>
+      <a href="../index.html#speed" class="hidden text-muted hover:text-txt md:inline">Speed</a>
+      <a href="./index.html" class="text-blue1 hover:text-txt">Blog</a>
+      <a href="https://github.com/ricccrd/dd" class="rounded-lg border border-edge px-3 py-1.5 font-semibold hover:border-blue3">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<section class="px-5 py-14 md:py-20">
+  <div class="mx-auto max-w-wrap">
+    <p class="text-xs font-bold uppercase tracking-widest text-blue3">Blog</p>
+    <h1 class="mt-2 text-3xl font-bold tracking-tight md:text-5xl">Notes from deleting the VM</h1>
+    <p class="mt-3 max-w-2xl text-base text-muted md:text-lg">How we run Linux and macOS containers on Apple-Silicon macOS without a virtual machine — the ideas, the engineering, and the measured numbers.</p>
+
+    <div class="mt-10 grid gap-5">
+      <!-- post -->
+      <a href="./containers-should-be-processes.html" class="block rounded-2xl border border-edge bg-panel p-6 transition hover:-translate-y-1 hover:border-blue4 md:p-8">
+        <p class="text-xs font-semibold uppercase tracking-wide text-muted2">June 2026 · 6 min read</p>
+        <h2 class="mt-2 text-xl font-bold md:text-2xl">dd — VM-less native JIT containers for Mac</h2>
+        <p class="mt-3 text-muted">Every Docker setup on a Mac keeps a Linux VM running in the background all day. I wanted a container to just be a process, so I built dd: native Apple-Silicon code plus a userspace kernel, no VM. Why I built it, how it works, and honest numbers — including where it loses.</p>
+        <span class="mt-4 inline-block font-semibold text-blue2">Read the post&nbsp;→</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<footer class="border-t border-edge px-5 py-10 text-muted2">
+  <div class="mx-auto flex max-w-wrap flex-wrap items-center gap-4">
+    <span class="flex items-center gap-2 font-bold text-txt"><img src="../assets/logo.png" alt="" class="h-6 w-6 rounded-md" /> dd</span>
+    <span class="text-sm">Linux containers on macOS, no VM. MIT licensed.</span>
+    <nav class="flex flex-wrap gap-5 text-sm sm:ml-auto">
+      <a href="../index.html" class="text-muted hover:text-txt">Home</a>
+      <a href="https://github.com/ricccrd/dd" class="text-muted hover:text-txt">GitHub</a>
+      <a href="mailto:huttarichard@gmail.com" class="text-muted hover:text-txt">Contact</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

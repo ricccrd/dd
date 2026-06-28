@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dd — VM-less native JIT containers for Mac</title>
+<meta name="description" content="Docker Desktop, Colima and OrbStack all keep a Linux VM running in the background on a Mac. I wanted a container to just be a process, so I built dd. Why, how it works, and honest numbers." />
+<meta property="og:title" content="dd — VM-less native JIT containers for Mac" />
+<meta property="og:description" content="Every Docker setup on a Mac runs a Linux VM in the background all day. dd runs a container as a normal macOS process instead — no VM. Here's why I built it, how it works, and the measured numbers (good and bad)." />
+<meta property="og:type" content="article" />
+<meta property="og:image" content="../assets/logo@2x.png" />
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon.png" />
+<link rel="icon" type="image/png" sizes="64x64" href="../assets/favicon-64.png" />
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: {
+      colors: {
+        ink:'#0c1322', ink2:'#11192b', panel:'#131c30', panel2:'#18233b', edge:'#25324d', code:'#0a101e',
+        blue1:'#97cdff', blue2:'#81b5ff', blue3:'#4f88ff', blue4:'#4a81ff', blue5:'#2f6fe6', blue6:'#215fe7',
+        txt:'#e8eefc', muted:'#9fb0cd', muted2:'#7286a8',
+      },
+      fontFamily: { mono:['ui-monospace','SF Mono','Menlo','monospace'] },
+      maxWidth: { wrap:'64rem', read:'48rem' },
+    }}
+  }
+</script>
+</head>
+<body class="bg-ink text-txt font-sans antialiased">
+
+<!-- nav -->
+<header class="sticky top-0 z-20 border-b border-edge bg-ink/70 backdrop-blur-md">
+  <div class="mx-auto flex h-14 max-w-wrap items-center gap-4 px-5">
+    <a href="../index.html" class="flex items-center gap-2 font-bold text-lg"><img src="../assets/logo.png" alt="" class="h-7 w-7 rounded-md" /> dd</a>
+    <nav class="ml-auto flex items-center gap-5 text-sm">
+      <a href="../index.html#features" class="hidden text-muted hover:text-txt md:inline">Features</a>
+      <a href="../index.html#why" class="hidden text-muted hover:text-txt md:inline">Why no VM</a>
+      <a href="../index.html#speed" class="hidden text-muted hover:text-txt md:inline">Speed</a>
+      <a href="./index.html" class="text-blue1 hover:text-txt">Blog</a>
+      <a href="https://github.com/ricccrd/dd" class="rounded-lg border border-edge px-3 py-1.5 font-semibold hover:border-blue3">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<!-- title band -->
+<section class="relative overflow-hidden border-b border-edge" style="background:linear-gradient(to top left,#1c52c8 0%,#2f6fe6 32%,#4f88ff 62%,#81b5ff 88%,#97cdff 100%)">
+  <div class="absolute inset-0" style="background:radial-gradient(1100px 520px at 85% 130%,rgba(12,19,34,.6),transparent 60%)"></div>
+  <div class="relative mx-auto max-w-read px-5 py-14 md:py-20">
+    <a href="./index.html" class="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-widest text-white/80 hover:text-white">&larr;&nbsp;dd blog</a>
+    <h1 class="mt-4 text-3xl font-extrabold leading-tight tracking-tight text-white md:text-5xl">dd — VM-less native JIT containers for Mac</h1>
+    <p class="mt-4 max-w-xl text-base text-blue-50/90 md:text-lg">A container is really just a process with a different view of the system. So I tried running it like one on my Mac — no virtual machine.</p>
+    <p class="mt-5 text-sm font-medium text-white/75">Richard · June 2026 · 6&nbsp;min read</p>
+  </div>
+</section>
+
+<article class="mx-auto max-w-read px-5 py-12 md:py-16">
+
+  <!-- tldr -->
+  <div class="rounded-2xl border border-blue4/40 bg-panel2 p-5 md:p-6">
+    <p class="text-xs font-bold uppercase tracking-widest text-blue3">TL;DR</p>
+    <p class="mt-2 leading-relaxed text-muted"><strong class="text-txt">dd runs Docker containers on an Apple-Silicon Mac with no Linux VM.</strong> A container runs as a normal macOS process — arm64 images as native code, x86-64 images through a JIT — and a userspace kernel answers their syscalls. So: no idle RAM, near-instant start, bind mounts straight to the real filesystem. It's a drop-in <code class="rounded bg-code px-1 py-0.5 font-mono text-[12px] text-blue1">docker context</code>, free and open source (MIT). It's alpha, and honest about it: syscall-heavy workloads are slower today.</p>
+  </div>
+
+  <!-- lede -->
+  <p class="mt-8 text-lg leading-relaxed text-txt">If you run containers on a Mac, you've probably made quiet peace with a background Linux VM. Docker Desktop boots one. So do Colima and OrbStack. It starts when your Mac wakes, holds onto a few gigabytes of RAM whether you're using it or not, and keeps ticking on the train while you're not running anything at all.</p>
+
+  <p class="mt-5 leading-relaxed text-muted">None of those tools is doing it wrong — a VM has been the only practical way to run Linux containers on macOS. But it's a tax you pay all day, not just when you're working. I got tired of paying it, so I spent a while building <strong class="text-txt">dd</strong> to try a different approach:</p>
+
+  <blockquote class="mt-6 border-l-4 border-blue4 bg-panel px-5 py-4 text-lg font-semibold leading-snug text-txt rounded-r-xl">A container is just a process with a different view of the system. So run it as one — not inside a virtual machine.</blockquote>
+
+  <p class="mt-6 leading-relaxed text-muted">This is a short writeup of why I think the VM is worth dropping, how dd drops it without breaking what makes a container a container, and the numbers I measured — including the parts where it loses.</p>
+
+  <!-- WHY -->
+  <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">What the VM costs you every day</h2>
+  <p class="mt-4 leading-relaxed text-muted">Most of the small daily annoyances of containers-on-a-Mac trace back to one thing: the always-on VM in the middle.</p>
+
+  <div class="mt-6 space-y-3">
+    <div class="rounded-xl border border-edge bg-panel p-4"><strong class="text-txt">RAM gone before you start.</strong> <span class="text-muted">A few gigabytes reserved for the VM whether or not a container is running. On a 16&nbsp;GB laptop that's a real chunk, all day.</span></div>
+    <div class="rounded-xl border border-edge bg-panel p-4"><strong class="text-txt">"Docker Desktop is starting…"</strong> <span class="text-muted">A Linux kernel and an in-VM daemon have to boot before you can do anything.</span></div>
+    <div class="rounded-xl border border-edge bg-panel p-4"><strong class="text-txt">Fan and battery while idle.</strong> <span class="text-muted">An idle VM still runs timers, a kernel, a daemon — warming your lap with nothing running.</span></div>
+    <div class="rounded-xl border border-edge bg-panel p-4"><strong class="text-txt">Slow bind mounts.</strong> <span class="text-muted">You edit on the Mac; the container sees it across a <code class="rounded bg-code px-1 py-0.5 font-mono text-[12px] text-blue1">virtiofs</code>/FUSE bridge. Big repos and hot-reload feel laggy — that's the sync boundary, not your code.</span></div>
+    <div class="rounded-xl border border-edge bg-panel p-4"><strong class="text-txt">A disk image that only grows.</strong> <span class="text-muted"><code class="rounded bg-code px-1 py-0.5 font-mono text-[12px] text-blue1">Docker.raw</code> balloons and doesn't shrink when you delete images; reclaiming the space is its own chore.</span></div>
+  </div>
+
+  <p class="mt-6 leading-relaxed text-muted">Remove the VM and that list doesn't get shorter — it goes away. A container becomes a normal macOS process: no RAM held when idle (it's freed on exit), nothing to boot, bind mounts straight to the real filesystem, ports straight to host sockets. And because it's a plain process, it shows up in Activity Monitor like anything else.</p>
+
+  <!-- HOW -->
+  <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">How it works</h2>
+  <p class="mt-4 leading-relaxed text-muted">The trick, in one sentence: <strong class="text-txt">a container doesn't need Linux, it needs the Linux <em>kernel interface</em>.</strong> The code in an image is just normal compute. The only thing that makes it "Linux" is that, now and then, it asks the kernel for something — open a file, bind a socket, fork. Those are syscalls.</p>
+
+  <p class="mt-4 leading-relaxed text-muted">So dd runs the container's compute as <strong class="text-txt">native Apple-Silicon code</strong>, and answers every syscall in userspace with code that <em>is</em> the kernel — namespaces, image layers, the network stack are just data structures in a normal Mac program. (If that sounds familiar, it's the gVisor / PRoot lineage, aimed at the desktop instead of the server.)</p>
+
+  <div class="mt-8 overflow-x-auto rounded-2xl border border-edge bg-panel">
+    <table class="w-full min-w-[34rem] border-collapse text-sm">
+      <thead>
+        <tr class="text-left text-xs uppercase tracking-wide text-muted2">
+          <th class="p-4 font-semibold"></th>
+          <th class="p-4 font-semibold text-blue1">dd — process</th>
+          <th class="p-4 font-semibold">VM-based Docker</th>
+        </tr>
+      </thead>
+      <tbody class="[&>tr]:border-t [&>tr]:border-edge">
+        <tr><td class="p-4 font-semibold">Idle RAM</td><td class="p-4"><span class="font-bold text-emerald-400">None</span>, freed on exit</td><td class="p-4 text-muted">Gigabytes, always on</td></tr>
+        <tr><td class="p-4 font-semibold">Startup</td><td class="p-4"><span class="font-bold text-emerald-400">Process spawn</span></td><td class="p-4 text-muted">Boot a Linux VM + daemon</td></tr>
+        <tr><td class="p-4 font-semibold">Bind mounts</td><td class="p-4"><b class="text-blue1">Direct host FS</b></td><td class="p-4 text-muted">virtiofs/FUSE bridge</td></tr>
+        <tr><td class="p-4 font-semibold">Ports</td><td class="p-4">Host sockets</td><td class="p-4 text-muted">Through VM NAT</td></tr>
+        <tr><td class="p-4 font-semibold">Observability</td><td class="p-4"><b class="text-blue1">A normal process</b></td><td class="p-4 text-muted">An opaque box</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="mt-6 leading-relaxed text-muted">arm64 images run as native code. x86-64 images go through a JIT that rewrites x86 into arm64 the first time a block runs and reuses it after — the same idea as a language VM, applied to machine code. Most of the work is in the details: chaining hot blocks so they never return to the dispatcher, mapping guest returns onto the CPU's real return predictor, and serving the syscalls a container hammers (<code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">stat</code>, path lookups, <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">clock_gettime</code>) inline so they never cross to the host.</p>
+
+  <!-- BENCHMARKS -->
+  <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">Is it actually fast?</h2>
+  <p class="mt-4 leading-relaxed text-muted">For <strong class="text-txt">x86-64 images</strong> the fair comparison is the same binary emulated by qemu inside a VM — what VM-based Docker falls back to for cross-arch images. Here dd's JIT is well ahead:</p>
+
+  <div class="mt-6 overflow-x-auto rounded-xl border border-edge bg-panel">
+    <table class="w-full border-collapse text-[13px] sm:text-sm">
+      <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">x86-64 workload</th><th class="p-3">qemu in a VM</th><th class="p-3 text-blue1">dd (no VM)</th><th class="p-3">dd vs VM</th></tr></thead>
+      <tbody class="[&>tr]:border-t [&>tr]:border-edge">
+        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.42s</td><td class="p-3">0.26s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
+        <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">2.87s</td><td class="p-3">0.87s</td><td class="p-3 font-semibold text-emerald-400">3.3× faster</td></tr>
+        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.32s</td><td class="p-3">0.97s</td><td class="p-3 font-semibold text-emerald-400">1.36× faster</td></tr>
+        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.74s</td><td class="p-3">2.39s</td><td class="p-3 font-semibold text-emerald-400">1.15× faster</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="mt-6 leading-relaxed text-muted">For <strong class="text-txt">arm64 images</strong> there's no emulation to beat — it's native either way, and the bar is a native Linux VM. dd roughly matches it on compute, and there's one honest loss: <strong class="text-txt">syscall-heavy workloads (like SQLite) are slower today</strong>, because a userspace kernel pays for every syscall. That's the part I'm actively working on, and it's the next thing on the bench (a throughput-bound server like redis loses ~3× right now). I'd rather say that than hide it.</p>
+
+  <p class="mt-5 leading-relaxed text-muted2 text-sm">Numbers are measured, median of 7 runs on Apple Silicon; the compute set reproduces with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">make bench</code>.</p>
+
+  <!-- WHAT -->
+  <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">What you get today</h2>
+  <p class="mt-4 leading-relaxed text-muted">dd speaks the Docker Engine API, so it isn't a new tool to learn — it's a <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker context</code>. Your <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker run / ps / build</code> and existing images just work, and startup is a process spawn, not a boot:</p>
+
+  <div class="mt-5 overflow-hidden rounded-xl border border-edge bg-code">
+    <div class="flex items-center gap-1.5 border-b border-edge px-3 py-2.5"><span class="h-2.5 w-2.5 rounded-full bg-[#ff5f57]"></span><span class="h-2.5 w-2.5 rounded-full bg-[#febc2e]"></span><span class="h-2.5 w-2.5 rounded-full bg-[#28c840]"></span></div>
+<pre class="overflow-x-auto p-4 font-mono text-[13px] leading-relaxed text-[#d7e3fa]"><span class="text-slate-500"># warm container start (5 runs, real seconds)</span>
+<span class="text-emerald-400">$</span> for n in 1 2 3 4 5; do /usr/bin/time -p \
+    docker --context dd run --rm debian:stable-slim true; done
+0.02  0.02  0.02  0.02  0.02
+
+<span class="text-slate-500"># a Linux container, then a macOS one — same runtime, no VM</span>
+<span class="text-emerald-400">$</span> docker --context dd run --rm ubuntu uname -a
+Linux jit 6.1.0 #1 jit aarch64 GNU/Linux
+<span class="text-emerald-400">$</span> ddcli mac uname -a
+Darwin m 25.3.0 ... arm64 Darwin</pre>
+  </div>
+
+  <p class="mt-4 leading-relaxed text-muted">Because the kernel is just userspace code, it isn't only a <em>Linux</em> kernel — <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli mac</code> drops you into a real isolated macOS shell too. Language runtimes that generate code at runtime (the JVM, Node/V8, .NET) also run now, which macOS's write-xor-execute rules used to block.</p>
+
+  <!-- HONEST TRADE-OFF -->
+  <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">The honest trade-off</h2>
+  <p class="mt-4 leading-relaxed text-muted">A userspace kernel is only as complete as the syscalls it implements, and dd today runs as a single process. That's a great fit for code you <strong class="text-txt">trust</strong> — your dev environment, your CI, your own tools. For <strong class="text-txt">untrusted</strong> code a VM still gives a harder isolation boundary, and I won't pretend otherwise. A process-split sandbox is on the roadmap; until it lands, use dd for the containers you trust and a VM for the ones you don't. It's also alpha — some images are flaky run-to-run today.</p>
+
+  <!-- CTA -->
+  <div class="mt-12 rounded-2xl border border-edge bg-panel p-8 text-center">
+    <h3 class="text-xl font-bold md:text-2xl">Give it a try</h3>
+    <p class="mx-auto mt-2 max-w-xl text-muted">Apple-Silicon Macs, macOS 12+. One self-contained app — UI, the <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli</code> tool and the runtime. Free and open source (MIT). After that it's just <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker</code>.</p>
+    <div class="mt-6 flex flex-col items-stretch justify-center gap-3 sm:flex-row">
+      <a href="https://github.com/ricccrd/dd/releases/latest" class="rounded-xl bg-gradient-to-br from-blue3 to-blue6 px-6 py-3 font-semibold text-white shadow-lg transition hover:-translate-y-0.5">Download for macOS</a>
+      <a href="https://github.com/ricccrd/dd" class="rounded-xl border border-edge bg-ink2 px-6 py-3 font-semibold text-txt hover:border-blue3">Star it on GitHub</a>
+    </div>
+    <p class="mx-auto mt-4 max-w-xl text-sm text-muted2">If you try one thing: install dd, run a container, and open Activity Monitor. There's no VM in the list — just your container, as a process.</p>
+  </div>
+
+  <!-- signature -->
+  <p class="mt-10 leading-relaxed text-muted">Thanks for reading. If you try it and something breaks (it will), I'd genuinely like to hear about it — <a href="mailto:huttarichard@gmail.com" class="text-blue2 hover:underline">email me</a> or open an issue on <a href="https://github.com/ricccrd/dd" class="text-blue2 hover:underline">GitHub</a>.</p>
+  <p class="mt-4 font-semibold text-txt">— Richard</p>
+
+  <p class="mt-10 text-center text-muted"><a href="./index.html" class="text-blue2 hover:underline">&larr; More from the dd blog</a></p>
+
+</article>
+
+<footer class="border-t border-edge px-5 py-10 text-muted2">
+  <div class="mx-auto flex max-w-wrap flex-wrap items-center gap-4">
+    <span class="flex items-center gap-2 font-bold text-txt"><img src="../assets/logo.png" alt="" class="h-6 w-6 rounded-md" /> dd</span>
+    <span class="text-sm">Linux containers on macOS, no VM. MIT licensed.</span>
+    <nav class="flex flex-wrap gap-5 text-sm sm:ml-auto">
+      <a href="../index.html" class="text-muted hover:text-txt">Home</a>
+      <a href="./index.html" class="text-muted hover:text-txt">Blog</a>
+      <a href="https://github.com/ricccrd/dd" class="text-muted hover:text-txt">GitHub</a>
+      <a href="mailto:huttarichard@gmail.com" class="text-muted hover:text-txt">Contact</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

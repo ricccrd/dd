@@ -1,14 +1,11 @@
 name: Deploy website (GitHub Pages)
 
 # Builds the static site in website/ and publishes it to GitHub Pages.
-# The project docs (docs/*.md + README) are copied in so docs.html can render them.
 on:
   push:
     branches: [master, main]
     paths:
       - "website/**"
-      - "docs/**"
-      - "README.md"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -27,13 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Stage docs into the site
-        run: |
-          mkdir -p website/docs
-          cp docs/*.md website/docs/ 2>/dev/null || true
-          cp README.md website/docs/README.md
-          ls -la website website/docs
 
       - uses: actions/configure-pages@v5
 
