@@ -13,7 +13,30 @@
     let
       system = "aarch64-darwin";
       pkgs = import nixpkgs { inherit system; };
+
+      # --- macOS dev-container userlands (for `ddcli mac`, built by tools/mac-image.sh) ---------
+      # A lean base, and a batteries-included dev set. buildEnv joins them into one profile whose
+      # closure tools/mac-image.sh packs into the image rootfs.
+      base = with pkgs; [
+        bashInteractive coreutils gnugrep gnused gawk findutils diffutils
+        less gnutar gzip which ncurses cacert
+      ];
+      dev = base ++ (with pkgs; [
+        # shells + everyday CLI
+        zsh fish git curl wget openssh htop tree jq ripgrep fd fzf tmux neovim gnupg
+        # build toolchain ("build-essential"-equivalent for macOS)
+        gnumake cmake pkg-config clang
+        # language toolchains
+        python3 nodejs go rustc cargo
+      ]);
+      mkEnv = name: paths: pkgs.buildEnv { inherit name paths; ignoreCollisions = true; };
     in {
+      packages.${system} = {
+        mac-base = mkEnv "ddmac-base" base;
+        mac-dev  = mkEnv "ddmac-dev"  dev;
+        default  = mkEnv "ddmac-dev"  dev;
+      };
+
       devShells.${system}.default = pkgs.mkShell {
         # Build the GUI (pkg-config + gtk4) and assemble/sign the .app + .dmg.
         nativeBuildInputs = [
@@ -24,7 +47,7 @@
           pkgs.macdylibbundler     # provides `dylibbundler` — relocate the dylib graph
           pkgs.create-dmg          # build the .dmg
         ];
-        buildInputs = [ pkgs.gtk4 pkgs.librsvg ];
+        buildInputs = [ pkgs.gtk4 pkgs.librsvg pkgs.vte-gtk4 ];
 
         # Exported so tools/bundle.sh can find the runtime data to stage (no extra nix calls).
         DD_GTK4 = pkgs.gtk4;

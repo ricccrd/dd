@@ -12,7 +12,7 @@ mod update;
 #[cfg(target_os = "macos")]
 mod mac;
 
-use ddclient::{Client, Container, Image, Network};
+use ddclient::{Client, Container, DiskUsage, Image, Network, SystemInfo, Volume};
 use gtk::prelude::GtkWindowExt; // for root.set_default_size on connect/disconnect
 use relm4::prelude::*;
 use std::path::PathBuf;
@@ -25,6 +25,9 @@ pub enum Category {
     Home,
     Containers,
     Images,
+    Networks,
+    Volumes,
+    System,
     Settings,
 }
 
@@ -35,6 +38,8 @@ pub enum Selection {
     None,
     Container(String),
     Image(String),
+    Network(String),
+    Volume(String),
 }
 
 /// A full snapshot of daemon state, fetched off the UI thread.
@@ -44,6 +49,12 @@ struct Snapshot {
     containers: Vec<Container>,
     images: Vec<Image>,
     networks: Vec<Network>,
+    volumes: Vec<Volume>,
+    /// Engine info + disk usage for the System view (None until first fetched).
+    sys: Option<SystemInfo>,
+    df: Option<DiskUsage>,
+    /// Tail of the daemon's own log file (what the daemon is logging).
+    daemon_log: String,
     /// Active `docker` context name, or `None` if the docker CLI isn't installed.
     docker_context: Option<String>,
     /// All selectable `docker` contexts (always includes `dd`).
@@ -64,8 +75,18 @@ enum Msg {
     Select(Selection),
     RunImage(String),
     StartContainer(String),
+    StopContainer(String),
+    RestartContainer(String),
+    PauseContainer(String),
+    UnpauseContainer(String),
     RemoveContainer(String),
     RemoveImage(String),
+    RemoveNetwork(String),
+    NewNetwork,
+    CreateNetwork(String),
+    RemoveVolume(String),
+    NewVolume,
+    CreateVolume(String),
 }
 
 /// Results delivered back to the UI thread from async work.
@@ -73,12 +94,29 @@ enum Msg {
 enum Cmd {
     Snapshot(Box<Snapshot>),
     Logs(String, String),
+    /// Shells detected in a container: (container id, shell basenames).
+    Shells(String, Vec<String>),
+}
+
+/// One time-series sample for the Home sparklines (collected each 2s poll).
+#[derive(Clone, Copy, Default)]
+pub struct Sample {
+    pub running: f64,
+    pub containers: f64,
+    pub images: f64,
+    pub disk_gb: f64,
 }
 
 /// The application model.
 struct AppModel {
     socket: PathBuf,
     snap: Snapshot,
+    /// Rolling history (newest last, capped) backing the Home sparklines.
+    history: std::collections::VecDeque<Sample>,
+    /// Container ids currently being stopped+removed (shown with an orange "removing" status).
+    removing: std::collections::HashSet<String>,
+    /// Shells detected in the selected container: (id, shell basenames) — drives the ＋ menu.
+    shells: Option<(String, Vec<String>)>,
     category: Category,
     selection: Selection,
     /// Logs for the currently selected container: `(container id, text)`.
@@ -109,7 +147,19 @@ impl Component for AppModel {
         let model = AppModel {
             socket: socket.clone(),
             snap: Snapshot::default(),
-            category: Category::Home,
+            history: std::collections::VecDeque::new(),
+            removing: std::collections::HashSet::new(),
+            shells: None,
+            // `DD_SHOT_VIEW` lets the screenshot harness open a specific panel for verification.
+            category: match std::env::var("DD_SHOT_VIEW").as_deref() {
+                Ok("containers") => Category::Containers,
+                Ok("images") => Category::Images,
+                Ok("networks") => Category::Networks,
+                Ok("volumes") => Category::Volumes,
+                Ok("system") => Category::System,
+                Ok("settings") => Category::Settings,
+                _ => Category::Home,
+            },
             selection: Selection::None,
             current_logs: None,
             was_connected: false,
@@ -148,6 +198,21 @@ impl Component for AppModel {
                 })
                 .drop_on_shutdown()
         });
+
+        // Headless verification: `DD_SHOT=/path.png` renders the live window to PNG once the daemon
+        // snapshot has painted, then quits — so the UI can be checked without an interactive session.
+        if let Ok(shot) = std::env::var("DD_SHOT") {
+            root.set_default_size(1040, 680); // skip the compact onboarding size for the capture
+            let win = root.clone();
+            let delay = std::env::var("DD_SHOT_DELAY_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1800);
+            gtk::glib::timeout_add_local_once(Duration::from_millis(delay), move || {
+                match ui::screenshot(&win, &shot) {
+                    Ok(()) => eprintln!("[dd-shot] wrote {shot}"),
+                    Err(e) => eprintln!("[dd-shot] failed: {e}"),
+                }
+                std::process::exit(0);
+            });
+        }
 
         ComponentParts { model, widgets }
     }
@@ -228,7 +293,9 @@ impl Component for AppModel {
                 self.selection = sel.clone();
                 self.current_logs = None;
                 if let Selection::Container(id) = sel {
-                    fetch_logs(&sender, self.socket.clone(), id);
+                    fetch_logs(&sender, self.socket.clone(), id.clone());
+                    self.shells = None; // clear stale list until the probe returns
+                    fetch_shells(&sender, self.socket.clone(), id);
                 }
             }
             Msg::RunImage(image) => {
@@ -245,12 +312,24 @@ impl Component for AppModel {
             Msg::StartContainer(id) => self.act(sender, socket, move |c| async move {
                 let _ = c.start_container(&id).await;
             }),
+            Msg::StopContainer(id) => self.act(sender, socket, move |c| async move {
+                let _ = c.stop_container(&id).await;
+            }),
+            Msg::RestartContainer(id) => self.act(sender, socket, move |c| async move {
+                let _ = c.restart_container(&id).await;
+            }),
+            Msg::PauseContainer(id) => self.act(sender, socket, move |c| async move {
+                let _ = c.pause_container(&id).await;
+            }),
+            Msg::UnpauseContainer(id) => self.act(sender, socket, move |c| async move {
+                let _ = c.unpause_container(&id).await;
+            }),
             Msg::RemoveContainer(id) => {
-                if self.selection == Selection::Container(id.clone()) {
-                    self.selection = Selection::None;
-                }
-                self.current_logs = None;
+                // Mark it "removing" (orange) right away, then stop → remove gracefully. The amber clears
+                // when the next snapshot no longer lists the container.
+                self.removing.insert(id.clone());
                 self.act(sender, socket, move |c| async move {
+                    let _ = c.stop_container(&id).await;
                     let _ = c.remove_container(&id).await;
                 });
             }
@@ -262,6 +341,36 @@ impl Component for AppModel {
                     let _ = c.remove_image(&name).await;
                 });
             }
+            Msg::RemoveNetwork(id) => {
+                if self.selection == Selection::Network(id.clone()) {
+                    self.selection = Selection::None;
+                }
+                self.act(sender, socket, move |c| async move {
+                    let _ = c.remove_network(&id).await;
+                });
+            }
+            Msg::NewNetwork => ui::prompt_name(root, "New network", "network name", &sender, Msg::CreateNetwork),
+            Msg::NewVolume => ui::prompt_name(root, "New volume", "volume name", &sender, Msg::CreateVolume),
+            Msg::CreateNetwork(name) => {
+                self.selection = Selection::None;
+                self.act(sender, socket, move |c| async move {
+                    let _ = c.create_network(&name).await;
+                });
+            }
+            Msg::RemoveVolume(name) => {
+                if self.selection == Selection::Volume(name.clone()) {
+                    self.selection = Selection::None;
+                }
+                self.act(sender, socket, move |c| async move {
+                    let _ = c.remove_volume(&name).await;
+                });
+            }
+            Msg::CreateVolume(name) => {
+                self.selection = Selection::None;
+                self.act(sender, socket, move |c| async move {
+                    let _ = c.create_volume(&name).await;
+                });
+            }
         }
     }
 
@@ -269,6 +378,22 @@ impl Component for AppModel {
         match cmd {
             Cmd::Snapshot(s) => {
                 self.snap = *s;
+                // Drop "removing" markers for containers that are gone (removal finished).
+                self.removing.retain(|id| self.snap.containers.iter().any(|c| &c.id == id));
+                // Append a sparkline sample (keep ~80 = a few minutes at the 2s poll).
+                if self.snap.connected {
+                    let running = self.snap.containers.iter().filter(|c| c.running()).count() as f64;
+                    let disk_gb = self.snap.df.as_ref().map(|d| d.layers_size as f64 / 1.0e9).unwrap_or(0.0);
+                    self.history.push_back(Sample {
+                        running,
+                        containers: self.snap.containers.len() as f64,
+                        images: self.snap.images.len() as f64,
+                        disk_gb,
+                    });
+                    while self.history.len() > 80 {
+                        self.history.pop_front();
+                    }
+                }
                 // Compact onboarding window when the daemon is off; expand when it comes up.
                 if self.snap.connected != self.was_connected {
                     self.was_connected = self.snap.connected;
@@ -302,6 +427,17 @@ impl Component for AppModel {
                                 self.selection = Selection::Image(i.name());
                             }
                         }
+                        Category::Networks => {
+                            if let Some(n) = self.snap.networks.first() {
+                                self.selection = Selection::Network(n.id.clone());
+                            }
+                        }
+                        Category::Volumes => {
+                            if let Some(v) = self.snap.volumes.first() {
+                                self.selection = Selection::Volume(v.name.clone());
+                            }
+                        }
+                        Category::System => {}
                     }
                 } else if let Selection::Container(id) = &self.selection {
                     // Keep the selected container's logs fresh.
@@ -314,6 +450,9 @@ impl Component for AppModel {
                         self.current_logs = Some((id, last_lines(&text, 1000)));
                     }
                 }
+            }
+            Cmd::Shells(id, shells) => {
+                self.shells = Some((id, shells));
             }
         }
     }
@@ -423,6 +562,32 @@ fn fetch_logs(sender: &ComponentSender<AppModel>, socket: PathBuf, id: String) {
     });
 }
 
+/// Probe which shells exist in a container (off-thread) → `Cmd::Shells`. Uses the container's own
+/// `/bin/sh` + `command -v`; returns the basenames it finds, preference-ordered.
+fn fetch_shells(sender: &ComponentSender<AppModel>, socket: PathBuf, id: String) {
+    sender.oneshot_command(async move {
+        let host = format!("unix://{}", socket.display());
+        let docker = ui::components::docker_bin();
+        let out = std::process::Command::new(docker)
+            .args(["--host", &host, "exec", &id, "/bin/sh", "-c", "command -v zsh bash ash dash sh busybox"])
+            .output();
+        let mut shells: Vec<String> = Vec::new();
+        if let Ok(o) = out {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Some(name) = line.trim().rsplit('/').next() {
+                    let name = name.trim();
+                    if !name.is_empty() && !shells.iter().any(|s| s == name) {
+                        shells.push(name.to_string());
+                    }
+                }
+            }
+        }
+        let pref = ["zsh", "bash", "ash", "dash", "sh", "busybox"];
+        shells.sort_by_key(|s| pref.iter().position(|p| p == s).unwrap_or(99));
+        Cmd::Shells(id, shells)
+    });
+}
+
 /// Keep only the last `n` lines of `text`.
 fn last_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -443,8 +608,25 @@ async fn fetch(c: &Client) -> Snapshot {
         containers: c.list_containers().await.unwrap_or_default(),
         images: c.list_images().await.unwrap_or_default(),
         networks: c.list_networks().await.unwrap_or_default(),
+        volumes: c.list_volumes().await.unwrap_or_default(),
+        sys: c.system().await.ok(),
+        df: c.disk_usage().await.ok(),
+        daemon_log: read_daemon_log(),
         docker_context,
         docker_contexts,
+    }
+}
+
+/// The daemon's own log: `$DD_DAEMON_LOG`, else `~/Library/Logs/dd/daemon.err.log`. Returns the last
+/// ~400 lines so the System view shows what the daemon is logging without unbounded growth.
+fn read_daemon_log() -> String {
+    let path = std::env::var("DD_DAEMON_LOG").map(PathBuf::from).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join("Library/Logs/dd/daemon.err.log")
+    });
+    match std::fs::read_to_string(&path) {
+        Ok(s) => last_lines(&s, 400),
+        Err(_) => String::new(),
     }
 }
 
@@ -501,14 +683,26 @@ fn spawn_daemon() -> Option<std::process::Child> {
     let _ = std::fs::create_dir_all(&run);
     let _ = std::fs::create_dir_all(&images);
 
+    // Send the daemon's output to the same log file the LaunchAgent uses, so the System view can tail
+    // what the daemon is logging regardless of how it was started.
+    let logs = PathBuf::from(&home).join("Library/Logs/dd");
+    let _ = std::fs::create_dir_all(&logs);
+    let log = |name: &str| {
+        std::fs::OpenOptions::new().create(true).append(true).open(logs.join(name)).ok()
+    };
+    let (out, err): (Stdio, Stdio) = match (log("daemon.out.log"), log("daemon.err.log")) {
+        (Some(o), Some(e)) => (o.into(), e.into()),
+        _ => (Stdio::null(), Stdio::null()),
+    };
+
     let (bin, jit_dir) = resolve_daemon()?;
     Command::new(&bin)
         .env("DDOCKERD_SOCK", run.join("docker.sock"))
         .env("DD_IMAGES", &images)
         .env("DDJIT_DIR", &jit_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .ok()
 }

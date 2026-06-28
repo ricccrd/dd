@@ -43,11 +43,18 @@ pub fn parse(raw: Vec<String>) -> Result<RunArgs, String> {
     Ok(RunArgs { platform, isolated, keep, image, command: rest.collect() })
 }
 
-/// `ddcli mac [command…]` — drop into a macOS (arm64) container: a native nix userland jailed via
+/// `ddcli mac [command…]` — drop into a macOS (arm64) dev container: a native userland jailed via
 /// darwinjail, the current dir mounted, host networking. Uniform with `ddcli ubuntu`.
+///
+/// The image is downloaded on first use (the daemon pulls it like any other), so a fresh machine
+/// needs no local build. Override with `DD_MAC_IMAGE` (e.g. a locally-built `macos`, or a pinned tag).
 pub fn mac(raw: Vec<String>) -> i32 {
-    run(RunArgs { platform: None, isolated: false, keep: false, image: "macos".into(), command: raw })
+    let image = std::env::var("DD_MAC_IMAGE").unwrap_or_else(|_| DEFAULT_MAC_IMAGE.into());
+    run(RunArgs { platform: None, isolated: false, keep: false, image, command: raw })
 }
+
+/// The published macOS dev image `ddcli mac` pulls by default.
+pub const DEFAULT_MAC_IMAGE: &str = "huttarichard/ddmac:latest";
 
 /// Run a container with the easy-access defaults, by invoking `docker` against dd's socket.
 pub fn run(args: RunArgs) -> i32 {

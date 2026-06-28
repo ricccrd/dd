@@ -106,6 +106,41 @@ command -v gtk4-update-icon-cache >/dev/null && gtk4-update-icon-cache -q -f -t 
 mkdir -p "$RES/fontconfig"
 cp "$ROOT/packaging/fonts.conf" "$RES/fontconfig/fonts.conf"
 
+# 7b. Resolve the libiconv name-collision. nixpkgs ships TWO different libiconv.2.dylib: Apple's (exports
+# _iconv, used by glib/gtk) and GNU's (exports _libiconv, used by libidn2/libunistring). dylibbundler
+# collapses them into one file, so whichever consumer needs the other's symbols crashes at dyld time.
+# Fix: keep Apple's as libiconv.2.dylib, and give the GNU consumers their own libiconv-gnu.2.dylib.
+needgnu=0
+for d in "$FW"/*.dylib "$FW"/*.so; do [ -f "$d" ] && nm -u "$d" 2>/dev/null | grep -qw _libiconv && { needgnu=1; break; }; done
+if [ "$needgnu" = 1 ] && ! nm -gU "$FW/libiconv.2.dylib" 2>/dev/null | grep -qw _libiconv; then
+  log "splitting Apple/GNU libiconv (dylibbundler name-collision)"
+  # Ensure libiconv.2.dylib is the Apple one (has _iconv) for glib & co.
+  if ! nm -gU "$FW/libiconv.2.dylib" 2>/dev/null | grep -qw _iconv; then
+    for p in /nix/store/*libiconv*/lib/libiconv.2.dylib; do
+      nm -gU "$p" 2>/dev/null | grep -qw _iconv && { cp -f "$p" "$FW/libiconv.2.dylib"; install_name_tool -id @executable_path/../Frameworks/libiconv.2.dylib "$FW/libiconv.2.dylib"; break; }
+    done
+  fi
+  # Bundle a GNU libiconv (has _libiconv) under a distinct name + its libcharset.
+  gnu=""; for p in /nix/store/*libiconv*/lib/libiconv.2.dylib; do nm -gU "$p" 2>/dev/null | grep -qw _libiconv && { gnu="$p"; break; }; done
+  if [ -n "$gnu" ]; then
+    cp -f "$gnu" "$FW/libiconv-gnu.2.dylib"; install_name_tool -id @executable_path/../Frameworks/libiconv-gnu.2.dylib "$FW/libiconv-gnu.2.dylib"
+    gc=$(otool -L "$gnu" | awk '/libcharset/{print $1}' | grep '^/nix' | head -1 || true)
+    if [ -n "$gc" ]; then
+      cp -f "$(dirname "$gnu")/libcharset.1.dylib" "$FW/libcharset-gnu.1.dylib"
+      install_name_tool -id @executable_path/../Frameworks/libcharset-gnu.1.dylib "$FW/libcharset-gnu.1.dylib"
+      install_name_tool -change "$gc" @executable_path/../Frameworks/libcharset-gnu.1.dylib "$FW/libiconv-gnu.2.dylib"
+    fi
+    # Repoint every _libiconv consumer to the GNU copy.
+    for d in "$FW"/*.dylib "$FW"/*.so; do
+      [ -f "$d" ] || continue; [ "$(basename "$d")" = libiconv-gnu.2.dylib ] && continue
+      if nm -u "$d" 2>/dev/null | grep -qw _libiconv; then
+        ref=$(otool -L "$d" | awk '/Frameworks\/libiconv\.2\.dylib/{print $1}' | head -1)
+        [ -n "$ref" ] && install_name_tool -change "$ref" @executable_path/../Frameworks/libiconv-gnu.2.dylib "$d"
+      fi
+    done
+  fi
+fi
+
 # 8. Strip + codesign, deepest first (any later edit invalidates a signature).
 log "stripping + signing (ad-hoc)"
 chmod -R u+w "$APP"   # data copied from the nix store is read-only; codesign needs write access

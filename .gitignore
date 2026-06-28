@@ -4,3 +4,6 @@
 /website/docs/
 dd.sock
 **/.bench-cache/
+/target-mac/
+/target-bench/
+/test.db
