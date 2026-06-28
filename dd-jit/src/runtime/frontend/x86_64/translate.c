@@ -747,6 +747,15 @@ static void *translate_block(uint64_t gpc) {
             }
             // ---- nop (90) / xchg rAX, rN (91-97) ----
             if (op == 0x90 && !I.rep) {
+                // `90` is XCHG eAX,rN — only a NOP when N==rAX. With REX.B it targets r8 (`49 90` =
+                // xchg rax,r8), a REAL swap; dropping it (stale r8) is the busybox `sort` SIGSEGV (the
+                // `call malloc; xchg %rax,%r8` allocator idiom). Mirror the 0x91-0x97 sibling.
+                if (I.rexB) {
+                    int r = I.rexB << 3; // r8
+                    e_mov_rr(19, RAX, sf);
+                    e_mov_rr(RAX, r, sf);
+                    e_mov_rr(r, 19, sf);
+                }
                 gpc = next;
                 continue;
             } // (F3 90 = pause -> also nop)
