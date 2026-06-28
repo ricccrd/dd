@@ -67,6 +67,69 @@ static int msgflags_l2m(int lf) {
     if (lf & 0x100) mf |= 0x40;
     return mf;
 }
+// macOS MSG_* -> Linux MSG_* (inverse of msgflags_l2m; used for recvmsg msg_flags writeback). The
+// returned-flags set differs: notably MSG_CTRUNC is macOS 0x20 / Linux 0x8, MSG_TRUNC macOS 0x10 /
+// Linux 0x20, MSG_EOR macOS 0x8 / Linux 0x80. OOB/DONTROUTE map straight through.
+static int msgflags_m2l(int mf) {
+    // MSG_OOB(0x1)/MSG_DONTROUTE(0x4) identical; MSG_PEEK isn't a returned flag but is harmless
+    int lf = mf & (0x1 | 0x2 | 0x4);
+    // MSG_TRUNC: macOS 0x10 -> Linux 0x20
+    if (mf & 0x10) lf |= 0x20;
+    // MSG_CTRUNC: macOS 0x20 -> Linux 0x8
+    if (mf & 0x20) lf |= 0x8;
+    // MSG_EOR: macOS 0x8 -> Linux 0x80
+    if (mf & 0x8) lf |= 0x80;
+    return lf;
+}
+// ---- SCM ancillary data: Linux<->macOS cmsg framing translation (SOL_SOCKET/SCM_RIGHTS fd passing).
+// dd uses host fds directly as guest fds, so the fd integers in an SCM_RIGHTS payload need no remap --
+// only the cmsg framing differs: Linux hdr=16B (8B len @0, int level @8, int type @12), 8-byte align,
+// SOL_SOCKET=1; macOS hdr=12B (4B len @0, int level @4, int type @8), 4-byte align, SOL_SOCKET=0xffff.
+#define LX_CMSG_ALIGN(n) (((n) + 7u) & ~(size_t)7u) // Linux: 8-byte align
+#define LX_CMSGHDR 16u                               // Linux cmsg header: 8(len)+4(level)+4(type)
+#define LX_SOL_SOCKET 1
+static int cmsg_level_l2m(int lv) { return lv == LX_SOL_SOCKET ? SOL_SOCKET : lv; }
+static int cmsg_level_m2l(int lv) { return lv == SOL_SOCKET ? LX_SOL_SOCKET : lv; }
+// guest(Linux) control buf -> host(macOS) control buf. Returns host bytes written (<=cap), or 0/none.
+static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap) {
+    size_t go = 0, ho = 0;
+    while (go + LX_CMSGHDR <= glen) {
+        uint64_t clen = *(const uint64_t *)(g + go); // Linux cmsg_len (8B)
+        int lvl = *(const int *)(g + go + 8);
+        int typ = *(const int *)(g + go + 12);
+        if (clen < LX_CMSGHDR || go + clen > glen) break; // malformed guest input
+        size_t dlen = (size_t)clen - LX_CMSGHDR;          // payload bytes (e.g. N*4 fds)
+        size_t need = CMSG_SPACE(dlen);
+        if (ho + need > cap) break; // host scratch full
+        struct cmsghdr ch;
+        memset(&ch, 0, sizeof ch);
+        ch.cmsg_len = CMSG_LEN(dlen); // macOS 12+dlen
+        ch.cmsg_level = cmsg_level_l2m(lvl);
+        ch.cmsg_type = typ; // SCM_RIGHTS==1 on both
+        memcpy(h + ho, &ch, sizeof ch);
+        memcpy(CMSG_DATA((struct cmsghdr *)(h + ho)), g + go + LX_CMSGHDR, dlen);
+        ho += need;
+        go += LX_CMSG_ALIGN(clen);
+    }
+    return (ssize_t)ho;
+}
+// host(macOS) control buf -> guest(Linux) control buf. Returns Linux bytes written (<=cap; stops at
+// the guest-buffer boundary, leaving the kernel's MSG_CTRUNC in mh->msg_flags to be translated).
+static ssize_t cmsg_m2l(const struct msghdr *mh, uint8_t *g, size_t cap) {
+    size_t go = 0;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR((struct msghdr *)mh); c;
+         c = CMSG_NXTHDR((struct msghdr *)mh, c)) {
+        size_t dlen = (size_t)c->cmsg_len - CMSG_LEN(0); // payload bytes (macOS hdr=12)
+        size_t need = LX_CMSG_ALIGN(LX_CMSGHDR + dlen);
+        if (go + LX_CMSGHDR + dlen > cap) break; // guest buf full -> truncate (kernel set MSG_CTRUNC)
+        *(uint64_t *)(g + go) = (uint64_t)(LX_CMSGHDR + dlen); // Linux cmsg_len
+        *(int *)(g + go + 8) = cmsg_level_m2l(c->cmsg_level);
+        *(int *)(g + go + 12) = c->cmsg_type;
+        memcpy(g + go + LX_CMSGHDR, CMSG_DATA(c), dlen);
+        go += need;
+    }
+    return (ssize_t)go;
+}
 // SOL_SOCKET option name: Linux -> macOS (they differ). -1 = ignore (unsupported here).
 static int so_opt_l2m(int o) {
     switch (o) {
@@ -241,6 +304,50 @@ static void fill_inet_br(uint8_t *sa, socklen_t *l, uint32_t ip_be, uint16_t por
     *(uint32_t *)(sa + 4) = ip_be;
     memset(sa + 8, 0, 8);
     if (l) *l = 16;
+}
+
+// ---- abstract-namespace AF_UNIX (sun_path[0]=='\0'): macOS has no abstract namespace, so map the
+// abstract name to a real filesystem socket under a per-namespace dir keyed by DD_NETNS (same key as
+// ipc_ns_key), so two guests in one container rendezvous and different containers stay isolated. The
+// guest socket is already a real host AF_UNIX socket (case 198), so only the ADDRESS is rewritten.
+static char g_absdir[200];
+static int g_abs_init;
+static void abs_init(void) {
+    if (g_abs_init) return;
+    g_abs_init = 1;
+    const char *ns = getenv("DD_NETNS"); // same key used by ipc_ns_key (service.c)
+    snprintf(g_absdir, sizeof g_absdir, "/tmp/.ddabs-%.40s", (ns && ns[0]) ? ns : "default");
+    mkdir(g_absdir, 0700); // EEXIST fine; peers share it (0700, guest is path-jailed)
+}
+// Is this guest sockaddr an abstract AF_UNIX addr? family u16==AF_UNIX, sun_path[0]==NUL, name>=1B.
+static int abs_is(const uint8_t *sa, socklen_t l) {
+    return sa && l > 3 && *(const uint16_t *)sa == AF_UNIX && sa[2] == 0; // sun_path[0] @ offset 2
+}
+// Map abstract name (bytes sa+3 .. for namelen=l-3) to a filesystem path. Hex when it fits macOS
+// sun_path[104], else FNV-1a hash (long D-Bus/X11/systemd names overflow); the name may hold NULs,
+// '/', non-printables, so hex/hash makes a safe single path component (no traversal).
+static void abs_path(const uint8_t *sa, socklen_t l, char *out, size_t n) {
+    abs_init();
+    const uint8_t *nm = sa + 3;
+    size_t nl = (size_t)l - 3;
+    size_t dl = strlen(g_absdir);
+    if (dl + 1 + nl * 2 + 1 <= n && dl + 1 + nl * 2 < 104) { // full hex (unambiguous, fits sun_path)
+        char hx[210];
+        static const char *H = "0123456789abcdef";
+        for (size_t i = 0; i < nl; i++) {
+            hx[2 * i] = H[nm[i] >> 4];
+            hx[2 * i + 1] = H[nm[i] & 15];
+        }
+        hx[2 * nl] = 0;
+        snprintf(out, n, "%s/%s", g_absdir, hx);
+    } else { // hash fallback (FNV-1a) keeps the path bounded
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < nl; i++) {
+            h ^= nm[i];
+            h *= 1099511628211ull;
+        }
+        snprintf(out, n, "%s/h%016llx", g_absdir, (unsigned long long)h);
+    }
 }
 
 struct loaded {

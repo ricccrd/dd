@@ -1830,6 +1830,11 @@ static void service(struct cpu *c) {
         // fork/vfork: COW copy; child continues
         pid_t pid = fork();
         if (pid == 0) {
+            // clone(CLONE_VM, child_stack): glibc posix_spawn/popen/vfork pass a separate child stack in a1
+            // and seed the clone trampoline (fn ptr + args) at its top. We fork() (COW) instead of sharing
+            // the VM, but the child MUST run on a1 or glibc reads the trampoline off the parent's SP ->
+            // garbage branch (SIGILL — broke initdb). a1==0 for a plain fork (bash), keeping the inherited SP.
+            if ((a0 & 0x100) && a1) G_SP(c) = a1;
             // Re-assert MAP_JIT execute mode: the per-thread W^X/APRR state isn't reliable across fork(),
             // so the child's first run_block can instruction-abort fetching from the (non-executable) code
             // cache -> the intermittent fork+exec SIGBUS. pthread_jit_write_protect_np(1) = RX (executable).
@@ -2164,11 +2169,18 @@ static void service(struct cpu *c) {
                 default: mc = CLOCK_MONOTONIC; break; // 1/4/6/7 -> monotonic
             }
             struct timespec now, d;
-            clock_gettime(mc, &now);
-            d.tv_sec = req->tv_sec - now.tv_sec;
-            d.tv_nsec = req->tv_nsec - now.tv_nsec;
-            if (d.tv_nsec < 0) { d.tv_sec--; d.tv_nsec += 1000000000L; }
-            if (d.tv_sec > 0 || (d.tv_sec == 0 && d.tv_nsec > 0)) nanosleep(&d, NULL);
+            // Loop on EINTR re-reading `now` each pass so a signal can't make the guest under-sleep:
+            // recompute the remaining (deadline - now) against the ABSOLUTE deadline, not nanosleep's
+            // own relative remainder, so accumulated scheduling slop never shortens the sleep.
+            for (;;) {
+                clock_gettime(mc, &now);
+                d.tv_sec = req->tv_sec - now.tv_sec;
+                d.tv_nsec = req->tv_nsec - now.tv_nsec;
+                if (d.tv_nsec < 0) { d.tv_sec--; d.tv_nsec += 1000000000L; }
+                if (d.tv_sec < 0 || (d.tv_sec == 0 && d.tv_nsec <= 0)) break; // deadline passed
+                if (nanosleep(&d, NULL) == 0) break;
+                if (errno != EINTR) break; // recompute against the absolute deadline and retry
+            }
             G_RET(c) = 0; // absolute sleep has no remainder to report
             break;
         }
@@ -2273,6 +2285,20 @@ static void service(struct cpu *c) {
                 g_br_port[(int)a0] = p ? p : 1;
                 g_br_ip[(int)a0] = g_myip;
             }
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
+        // abstract AF_UNIX (sun_path[0]==0): macOS has no abstract ns -> bind a real fs socket keyed by
+        // DD_NETNS. Must run BEFORE any general AF_UNIX passthrough below.
+        if (abs_is(sa, (socklen_t)a2)) {
+            char up[200];
+            abs_path(sa, (socklen_t)a2, up, sizeof up);
+            unlink(up); // replace stale (cf. lo_/br_ above)
+            struct sockaddr_un un;
+            memset(&un, 0, sizeof un);
+            un.sun_family = AF_UNIX;
+            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
@@ -2383,6 +2409,19 @@ static void service(struct cpu *c) {
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+        // abstract AF_UNIX (sun_path[0]==0): dial the same DD_NETNS-keyed fs socket bind used. Must run
+        // BEFORE the general AF_UNIX passthrough below.
+        if (abs_is(sa, (socklen_t)a2)) {
+            char up[200];
+            abs_path(sa, (socklen_t)a2, up, sizeof up);
+            struct sockaddr_un un;
+            memset(&un, 0, sizeof un);
+            un.sun_family = AF_UNIX;
+            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
+            G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
+            break;
+        }
         G_RET(c) = connect((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -2487,18 +2526,31 @@ static void service(struct cpu *c) {
         mh.msg_namelen = *(uint32_t *)(g + 8);
         mh.msg_iov = (void *)*(uint64_t *)(g + 16);
         mh.msg_iovlen = (int)*(uint64_t *)(g + 24);
-        mh.msg_control = (void *)*(uint64_t *)(g + 32);
-        mh.msg_controllen = (socklen_t) * (uint64_t *)(g + 40);
         mh.msg_flags = *(uint32_t *)(g + 48);
+        // Ancillary data: the guest control buf is Linux-cmsg layout; macOS reads a different cmsghdr,
+        // so route it through a host-layout scratch buffer (NULL-control left untouched, so edge/msgflags
+        // with no control buffer stays on the old path).
+        uint8_t *gc = (void *)*(uint64_t *)(g + 32);
+        size_t gcl = *(uint64_t *)(g + 40);
+        uint8_t hctl[4096]; // host-layout scratch (macOS hdr is smaller, so this is ample)
+        if (nr == 211) {    // sendmsg: translate guest -> host before the call
+            ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, sizeof hctl) : 0;
+            mh.msg_control = hn > 0 ? hctl : NULL;
+            mh.msg_controllen = hn > 0 ? (socklen_t)hn : 0;
+        } else { // recvmsg: receive into host scratch
+            mh.msg_control = (gc && gcl) ? hctl : NULL;
+            mh.msg_controllen = (gc && gcl) ? (socklen_t)sizeof hctl : 0;
+        }
         // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE (macOS has no per-call flag); EPIPE instead of SIGPIPE.
         if (nr == 211 && ((int)a2 & 0x4000)) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
         ssize_t r =
             (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         if (nr == 212 && r >= 0) {
-            // recvmsg writes back name/control len + flags
+            // recvmsg writes back name len + (host->guest) control + translated flags
             *(uint32_t *)(g + 8) = mh.msg_namelen;
-            *(uint64_t *)(g + 40) = mh.msg_controllen;
-            *(uint32_t *)(g + 48) = (uint32_t)mh.msg_flags;
+            size_t ln = (gc && gcl) ? (size_t)cmsg_m2l(&mh, gc, gcl) : 0;
+            *(uint64_t *)(g + 40) = ln;
+            *(uint32_t *)(g + 48) = (uint32_t)msgflags_m2l((int)mh.msg_flags);
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -2510,6 +2562,8 @@ static void service(struct cpu *c) {
         unsigned vlen = (unsigned)a2;
         // mmsghdr = msghdr(56) + msg_len(4) + pad
         int done = 0, err = 0;
+        // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE once before the fan-out (macOS has no per-call flag).
+        if (nr == 269 && ((int)a3 & 0x4000)) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
         for (unsigned i = 0; i < vlen; i++) {
             uint8_t *g = vec + (size_t)i * 64;
             struct msghdr mh;
@@ -2518,9 +2572,19 @@ static void service(struct cpu *c) {
             mh.msg_namelen = *(uint32_t *)(g + 8);
             mh.msg_iov = (void *)*(uint64_t *)(g + 16);
             mh.msg_iovlen = (int)*(uint64_t *)(g + 24);
-            mh.msg_control = (void *)*(uint64_t *)(g + 32);
-            mh.msg_controllen = (socklen_t) * (uint64_t *)(g + 40);
             mh.msg_flags = *(uint32_t *)(g + 48);
+            // Ancillary data: route the per-submessage control buf through a host-layout scratch buffer.
+            uint8_t *gc = (void *)*(uint64_t *)(g + 32);
+            size_t gcl = *(uint64_t *)(g + 40);
+            uint8_t hctl[4096];
+            if (nr == 269) { // sendmmsg: translate guest -> host
+                ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, sizeof hctl) : 0;
+                mh.msg_control = hn > 0 ? hctl : NULL;
+                mh.msg_controllen = hn > 0 ? (socklen_t)hn : 0;
+            } else { // recvmmsg: receive into host scratch
+                mh.msg_control = (gc && gcl) ? hctl : NULL;
+                mh.msg_controllen = (gc && gcl) ? (socklen_t)sizeof hctl : 0;
+            }
             int rf = (int)a3;
             // after the first, don't block (MSG_WAITFORONE-ish)
             if (nr == 243 && i > 0) rf |= 0x40;
@@ -2533,8 +2597,9 @@ static void service(struct cpu *c) {
             *(uint32_t *)(g + 56) = (uint32_t)r;
             if (nr == 243) {
                 *(uint32_t *)(g + 8) = mh.msg_namelen;
-                *(uint64_t *)(g + 40) = mh.msg_controllen;
-                *(uint32_t *)(g + 48) = (uint32_t)mh.msg_flags;
+                size_t ln = (gc && gcl) ? (size_t)cmsg_m2l(&mh, gc, gcl) : 0;
+                *(uint64_t *)(g + 40) = ln;
+                *(uint32_t *)(g + 48) = (uint32_t)msgflags_m2l((int)mh.msg_flags);
             }
             done++;
         }

@@ -128,7 +128,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     }
     // the container's env arrives as DD_GUEST_ENV="K=V\nK=V\n…" (set by the daemon) -- forward EXACTLY
     // these to the guest FIRST so they override the defaults, NOT the daemon/host environment. Then the
-    // built-in defaults fill whatever the container didn't set (getenv returns the first match).
+    // built-in defaults fill ONLY the keys the container didn't set.
     char *ge = getenv("DD_GUEST_ENV");
     if (ge) {
         char *copy = strdup(ge), *save = NULL;
@@ -140,7 +140,17 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         }
         free(copy);
     }
+    int guest_envc = envc; // [0..guest_envc) came from the container; the rest are defaults
     for (int i = 0; g_guest_env[i] && envc < 255; i++) {
+        // Skip a default whose KEY the container already set: a duplicate "PATH=" would otherwise appear
+        // in envp, and shells (bash) honor the LAST occurrence -> the default would shadow the image PATH
+        // (this is what made `gosu` unresolvable in the postgres entrypoint). Match on the "KEY=" prefix.
+        const char *eq = strchr(g_guest_env[i], '=');
+        size_t klen = eq ? (size_t)(eq - g_guest_env[i]) + 1 : 0;
+        int dup = 0;
+        for (int j = 0; j < guest_envc && klen; j++)
+            if (strncmp((char *)envp_[j], g_guest_env[i], klen) == 0) { dup = 1; break; }
+        if (dup) continue;
         size_t l = strlen(g_guest_env[i]) + 1;
         top -= l;
         memcpy(top, g_guest_env[i], l);
