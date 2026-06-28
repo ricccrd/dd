@@ -262,29 +262,132 @@ static void lazy_diag(void) {
 }
 // W6A item 1: emulate a faulting host load/store against the biased non-PIE image. A non-PIE guest's
 // absolute ref resolves to the original low link vaddr (in [g_nonpie_lo,g_nonpie_hi)); the real data
-// lives at that vaddr + g_nonpie_bias. We decode the faulting emitted arm64 load/store, perform the
-// access at +bias, and skip the instruction. Covers the integer ld/st-register family (scaled +
-// unscaled, signed/unsigned, b/h/w/x) the x86 memory paths emit -- the absolute DATA ref that __PAGEZERO
-// otherwise makes fatal. Returns 1 if handled. (SIMD-Q `ldr q` and LSE atomic-RMW forms are left to the
-// normal path -> a clean abort rather than silent wrong data; documented residual.) Gated on g_nonpie_lo
-// (set only for ET_EXEC) -> PIE/static-PIE never enter here.
+// lives at that vaddr + g_nonpie_bias. We decode the faulting emitted arm64 access, perform it at +bias,
+// and skip the instruction. Every guest memory access is emitted with the effective address pre-folded
+// into x17 (off=0) -> si_addr is the access base. Three families are served:
+//   * INTEGER ld/st-register (scaled uimm + unscaled ldur/stur, signed/unsigned, b/h/w/x),
+//   * SIMD&FP ld/st-register Q/D/S/H/B (the SSE constant/spill paths emit `ldr q`/`str q` etc. against
+//     low .rodata/.data) -- moved through the ucontext NEON state (__ns.__v[t]); FP loads zero the upper
+//     lanes, matching arm64,
+//   * LSE atomic RMW (ldadd/ldclr/ldeor/ldset/swp) + compare-and-swap (cas) -- the x86 LOCK path emits
+//     these against the absolute EA; performed ATOMICALLY at +bias, old value written back to the reg.
+// Returns 1 if handled. Anything it can't decode safely (e.g. an LSE signed/unsigned min/max subform the
+// x86 backend never emits) returns 0 -> the normal handler re-raises = a clean abort, never silent wrong
+// data. Gated on g_nonpie_lo (set only for ET_EXEC) -> PIE/static-PIE never enter here. OUT OF SCOPE
+// (documented residual, a separate broad g2h change): syscall POINTER args that point into the low
+// non-PIE image are read 1:1 in service.c and are NOT redirected here.
+
+// Atomic RMW helpers (truly atomic, width-typed) used by the LSE/CAS fixup paths below.
+static int nonpie_lse_rmw(void *p, int size, int opc, uint64_t v, uint64_t *old) {
+    // opc: 0=ADD 1=CLR(&~) 2=EOR 3=SET(|). Returns 1 if handled, 0 for an unsupported subform.
+    switch (size) {
+#define NP_RMW(TY)                                                                                             \
+    {                                                                                                          \
+        TY *a = (TY *)p, ov = (TY)v, o;                                                                        \
+        switch (opc) {                                                                                         \
+        case 0: o = __atomic_fetch_add(a, ov, __ATOMIC_SEQ_CST); break;                                       \
+        case 1: o = __atomic_fetch_and(a, (TY)~ov, __ATOMIC_SEQ_CST); break;                                  \
+        case 2: o = __atomic_fetch_xor(a, ov, __ATOMIC_SEQ_CST); break;                                       \
+        case 3: o = __atomic_fetch_or(a, ov, __ATOMIC_SEQ_CST); break;                                        \
+        default: return 0;                                                                                    \
+        }                                                                                                     \
+        *old = (uint64_t)o;                                                                                   \
+        return 1;                                                                                             \
+    }
+    case 0: NP_RMW(uint8_t)
+    case 1: NP_RMW(uint16_t)
+    case 2: NP_RMW(uint32_t)
+    default: NP_RMW(uint64_t)
+#undef NP_RMW
+    }
+}
+static uint64_t nonpie_lse_swp(void *p, int size, uint64_t v) {
+    switch (size) {
+    case 0: return __atomic_exchange_n((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    case 1: return __atomic_exchange_n((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    case 2: return __atomic_exchange_n((uint32_t *)p, (uint32_t)v, __ATOMIC_SEQ_CST);
+    default: return __atomic_exchange_n((uint64_t *)p, v, __ATOMIC_SEQ_CST);
+    }
+}
+static uint64_t nonpie_cas(void *p, int size, uint64_t expected, uint64_t newv) {
+    // Compare-and-swap; returns the pre-CAS memory value. __atomic_compare_exchange_n leaves the loaded
+    // value in `e` on failure, and `e` unchanged (== old, since it matched) on success -> `e` is the old
+    // value in both cases, which is what cas writes back into Rs.
+    switch (size) {
+    case 0: { uint8_t e = (uint8_t)expected; __atomic_compare_exchange_n((uint8_t *)p, &e, (uint8_t)newv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+    case 1: { uint16_t e = (uint16_t)expected; __atomic_compare_exchange_n((uint16_t *)p, &e, (uint16_t)newv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+    case 2: { uint32_t e = (uint32_t)expected; __atomic_compare_exchange_n((uint32_t *)p, &e, (uint32_t)newv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+    default: { uint64_t e = expected; __atomic_compare_exchange_n((uint64_t *)p, &e, newv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+    }
+}
+// zero-extend a `size`-byte value to register width (matches W-register upper-32 clearing for size<8).
+static uint64_t nonpie_zext(uint64_t v, int size) { return size >= 3 ? v : (v & ((1ull << (8 << size)) - 1)); }
+
 static int nonpie_fixup(siginfo_t *si, void *ucv) {
     if (!g_nonpie_lo || !ucv || !si) return 0;
     uint64_t va = (uint64_t)si->si_addr;
     if (va < g_nonpie_lo || va >= g_nonpie_hi) return 0;
     ucontext_t *uc = (ucontext_t *)ucv;
     uint32_t insn = *(uint32_t *)(uc->uc_mcontext->__ss.__pc);
-    uint64_t real = va + g_nonpie_bias; // the actual mapped location of the datum
-    uint32_t top = insn >> 24;          // size(2) | family bits
-    int size = insn >> 30;              // 0=B 1=H 2=W 3=X
-    int v = (insn >> 26) & 1;           // SIMD?
-    int opc = (insn >> 22) & 3;         // 01=load(zext) 00=store 10=load-sext(64) 11=ldrsw
-    int rt = insn & 0x1F;
-    // family: bits[29:27]==111 and bit[25:24] select scaled(01)/unscaled-or-reg(00). We accept the scaled
-    // unsigned-immediate (xx111001...) and unscaled ldur/stur (xx111000...0) integer forms.
-    int is_ls = ((insn >> 27) & 7) == 7 && !v; // 0b111 in [29:27], integer
-    if (!is_ls) return 0;
+    uint64_t real = va + g_nonpie_bias;      // the actual mapped location of the datum
     uint64_t *X = uc->uc_mcontext->__ss.__x; // __x[0..28]; 29=fp 30=lr 31=zr/sp
+    int v = (insn >> 26) & 1;                // SIMD&FP?
+    int rt = insn & 0x1F;
+    // Load/store-register IMMEDIATE family: bits[29:27]==111, and either the scaled unsigned-imm form
+    // (bit24==1) or the unscaled ldur/stur form (bit24==0 && bit21==0 && bits[11:10]==00). This EXCLUDES
+    // the register-offset form (bit21==1) and the LSE atomics (bit21==1, decoded separately below) -- both
+    // also have bits[29:27]==111, but the backend never emits a register-offset access for a guest EA.
+    int fam = ((insn >> 27) & 7) == 7;
+    int scaled = (insn >> 24) & 1;
+    int ls_imm = fam && (scaled || (!((insn >> 21) & 1) && !((insn >> 10) & 3)));
+
+    // ---- SIMD&FP Q/D/S/H/B load/store (V==1). width = 1<<((opc[1]<<2)|size): B1 H2 S4 D8 Q16. ----
+    if (v && ls_imm) {
+        int size = insn >> 30, opc = (insn >> 22) & 3;
+        int bytes = 1 << (((opc >> 1) << 2) | size);
+        if (opc & 1) { // load -> write Vt, zeroing the upper lanes (arm64 FP-load semantics)
+            __uint128_t z = 0;
+            memcpy(&z, (void *)real, (size_t)bytes);
+            uc->uc_mcontext->__ns.__v[rt] = z;
+        } else { // store -> low `bytes` of Vt to memory
+            __uint128_t s = uc->uc_mcontext->__ns.__v[rt];
+            memcpy((void *)real, &s, (size_t)bytes);
+        }
+        uc->uc_mcontext->__ss.__pc += 4;
+        return 1;
+    }
+
+    // ---- LSE atomic RMW: size[31:30] 111 0 00 A R 1 Rs[20:16] o3[15] opc[14:12] 00 Rn[9:5] Rt[4:0] ----
+    if ((insn & 0x3F200C00u) == 0x38200000u) {
+        int size = insn >> 30, o3 = (insn >> 15) & 1, opc = (insn >> 12) & 7;
+        int rs = (insn >> 16) & 0x1F;
+        uint64_t operand = (rs == 31) ? 0 : X[rs], old;
+        if (o3 && opc == 0) { // swp: x = [m]; [m] = operand
+            old = nonpie_lse_swp((void *)real, size, operand);
+        } else if (!o3 && opc < 4) { // ldadd / ldclr / ldeor / ldset
+            if (!nonpie_lse_rmw((void *)real, size, opc, operand, &old)) return 0;
+        } else {
+            return 0; // signed/unsigned min/max (never emitted by the x86 backend) -> clean abort
+        }
+        if (rt != 31) X[rt] = nonpie_zext(old, size); // Rt receives the old value
+        uc->uc_mcontext->__ss.__pc += 4;
+        return 1;
+    }
+
+    // ---- CAS/CASAL: size[31:30] 001000 1 1 1 Rs[20:16] o0 11111 Rn[9:5] Rt[4:0]. Rs=cmp in/old out. ----
+    if ((insn & 0x3FE0FC00u) == 0x08E0FC00u) {
+        int size = insn >> 30, rs = (insn >> 16) & 0x1F;
+        uint64_t expected = (rs == 31) ? 0 : X[rs], newv = (rt == 31) ? 0 : X[rt];
+        uint64_t old = nonpie_cas((void *)real, size, expected, newv);
+        if (rs != 31) X[rs] = nonpie_zext(old, size); // Rs receives the old value
+        uc->uc_mcontext->__ss.__pc += 4;
+        return 1;
+    }
+
+    // ---- INTEGER load/store-register (scaled + unscaled, signed/unsigned, b/h/w/x) ----
+    if (!(ls_imm && !v)) return 0; // not a form we decode -> clean abort (the handler re-raises)
+    int size = insn >> 30;         // 0=B 1=H 2=W 3=X
+    int opc = (insn >> 22) & 3;    // 01=load(zext) 00=store 10=load-sext(64) 11=ldrsw
     uint64_t val;
     if (opc == 0) { // store: write rt's low `size` bytes
         val = (rt == 31) ? 0 : X[rt];
@@ -304,7 +407,6 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         if (rt != 31) X[rt] = val;
     }
     uc->uc_mcontext->__ss.__pc += 4; // skip the faulting load/store
-    (void)top;
     return 1;
 }
 void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
