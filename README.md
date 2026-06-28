@@ -91,10 +91,10 @@ cross-process bridge tax the real app doesn't — so these are *conservative*.
 
 | Workload | VM (native) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
-| int sieve | 0.78s | 0.55s | **1.43× faster** |
-| float n-body | 0.17s | 0.17s | ~parity |
-| SHA-256 | 0.81s | 0.76s | 1.07× faster |
-| SQLite (600k rows) | 0.35s | 0.71s | 0.49× (≈2× slower) |
+| int sieve | 0.74s | 0.52s | **1.43× faster** |
+| float n-body | 0.16s | 0.16s | ~parity |
+| SHA-256 | 0.77s | 0.72s | 1.07× faster |
+| SQLite (600k rows) | 0.34s | 0.68s | 0.49× (≈2× slower) |
 
 dd runs arm64 **compute at native speed — often faster** (same-ISA translation plus the JIT's own
 optimizations). Syscall/allocation-heavy SQLite is ~2× slower — the price of servicing syscalls in
@@ -105,10 +105,10 @@ it either way):
 
 | Workload | VM (qemu) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
-| int sieve | 1.32s | 0.97s | 1.36× faster |
-| float n-body | 5.42s | 0.26s | **21× faster** |
-| SHA-256 | 2.74s | 2.39s | 1.15× faster |
-| SQLite (600k rows) | 2.97s | 0.94s | **3.16× faster** |
+| int sieve | 1.24s | 0.87s | 1.42× faster |
+| float n-body | 5.22s | 0.25s | **21× faster** |
+| SHA-256 | 2.60s | 2.32s | 1.12× faster |
+| SQLite (600k rows) | 2.88s | 0.88s | **3.28× faster** |
 
 dd's JIT beats qemu-user emulation on **every** workload, dramatically on floating-point. (A
 Rosetta-backed VM would narrow the gap.)

@@ -50,7 +50,7 @@
     <a href="./index.html" class="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-widest text-white/80 hover:text-white">&larr;&nbsp;dd blog</a>
     <h1 class="mt-4 text-3xl font-extrabold leading-tight tracking-tight text-white md:text-5xl">dd — VM-less native JIT containers for Mac</h1>
     <p class="mt-4 max-w-xl text-base text-blue-50/90 md:text-lg">A container is really just a process with a different view of the system. So I tried running it like one on my Mac — no virtual machine.</p>
-    <p class="mt-5 text-sm font-medium text-white/75">Richard · June 2026 · 6&nbsp;min read</p>
+    <p class="mt-5 text-sm font-medium text-white/75">Richard Hutta · June 2026 · 6&nbsp;min read</p>
   </div>
 </section>
 
@@ -59,7 +59,7 @@
   <!-- tldr -->
   <div class="rounded-2xl border border-blue4/40 bg-panel2 p-5 md:p-6">
     <p class="text-xs font-bold uppercase tracking-widest text-blue3">TL;DR</p>
-    <p class="mt-2 leading-relaxed text-muted"><strong class="text-txt">dd runs Docker containers on an Apple-Silicon Mac with no Linux VM.</strong> A container runs as a normal macOS process — arm64 images as native code, x86-64 images through a JIT — and a userspace kernel answers their syscalls. So: no idle RAM, near-instant start, bind mounts straight to the real filesystem. It's a drop-in <code class="rounded bg-code px-1 py-0.5 font-mono text-[12px] text-blue1">docker context</code>, free and open source (MIT). It's alpha, and honest about it: syscall-heavy workloads are slower today.</p>
+    <p class="mt-2 leading-relaxed text-muted"><strong class="text-txt">dd runs Docker containers on an Apple-Silicon Mac with no Linux VM.</strong> A container runs as a normal macOS process and a userspace kernel answers its syscalls. One engine, three runtimes: <strong class="text-txt">Linux arm64</strong> (native), <strong class="text-txt">Linux x86-64</strong> (through a JIT), and <strong class="text-txt">macOS arm64</strong>. So: no idle RAM, near-instant start, bind mounts straight to the real filesystem. It's a drop-in <code class="rounded bg-code px-1 py-0.5 font-mono text-[12px] text-blue1">docker context</code>, free and open source (MIT). It's alpha, and honest about it: syscall-heavy workloads are slower today.</p>
   </div>
 
   <!-- lede -->
@@ -120,10 +120,10 @@
     <table class="w-full border-collapse text-[13px] sm:text-sm">
       <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">x86-64 workload</th><th class="p-3">qemu in a VM</th><th class="p-3 text-blue1">dd (no VM)</th><th class="p-3">dd vs VM</th></tr></thead>
       <tbody class="[&>tr]:border-t [&>tr]:border-edge">
-        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.42s</td><td class="p-3">0.26s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
-        <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">2.87s</td><td class="p-3">0.87s</td><td class="p-3 font-semibold text-emerald-400">3.3× faster</td></tr>
-        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.32s</td><td class="p-3">0.97s</td><td class="p-3 font-semibold text-emerald-400">1.36× faster</td></tr>
-        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.74s</td><td class="p-3">2.39s</td><td class="p-3 font-semibold text-emerald-400">1.15× faster</td></tr>
+        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.22s</td><td class="p-3">0.25s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
+        <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">2.88s</td><td class="p-3">0.88s</td><td class="p-3 font-semibold text-emerald-400">3.3× faster</td></tr>
+        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.24s</td><td class="p-3">0.87s</td><td class="p-3 font-semibold text-emerald-400">1.4× faster</td></tr>
+        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.60s</td><td class="p-3">2.32s</td><td class="p-3 font-semibold text-emerald-400">1.1× faster</td></tr>
       </tbody>
     </table>
   </div>
@@ -143,14 +143,16 @@
     docker --context dd run --rm debian:stable-slim true; done
 0.02  0.02  0.02  0.02  0.02
 
-<span class="text-slate-500"># a Linux container, then a macOS one — same runtime, no VM</span>
-<span class="text-emerald-400">$</span> docker --context dd run --rm ubuntu uname -a
-Linux jit 6.1.0 #1 jit aarch64 GNU/Linux
-<span class="text-emerald-400">$</span> ddcli mac uname -a
+<span class="text-slate-500"># one runtime, three worlds — Linux arm64, Linux x86-64, macOS — no VM in any of them</span>
+<span class="text-emerald-400">$</span> docker --context dd run --rm ubuntu uname -m                      <span class="text-slate-500"># linux/arm64 — native</span>
+aarch64
+<span class="text-emerald-400">$</span> docker --context dd run --rm --platform linux/amd64 alpine uname -m   <span class="text-slate-500"># linux/amd64 — JIT</span>
+x86_64
+<span class="text-emerald-400">$</span> ddcli mac uname -a                                          <span class="text-slate-500"># macOS arm64</span>
 Darwin m 25.3.0 ... arm64 Darwin</pre>
   </div>
 
-  <p class="mt-4 leading-relaxed text-muted">Because the kernel is just userspace code, it isn't only a <em>Linux</em> kernel — <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli mac</code> drops you into a real isolated macOS shell too. Language runtimes that generate code at runtime (the JVM, Node/V8, .NET) also run now, which macOS's write-xor-execute rules used to block.</p>
+  <p class="mt-4 leading-relaxed text-muted">That's the part I'm most happy with: <strong class="text-txt">dd runs three guest runtimes</strong> — Linux arm64 as native code, Linux x86-64 through the JIT, and macOS arm64 — all from the one engine, with no VM in any of them. Because the kernel is just userspace code, it isn't only a <em>Linux</em> kernel, so <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli mac</code> drops you into a real isolated macOS shell. Language runtimes that generate code at runtime (the JVM, Node/V8, .NET) run too — something macOS's write-xor-execute rules used to block.</p>
 
   <!-- HONEST TRADE-OFF -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">The honest trade-off</h2>
@@ -169,7 +171,7 @@ Darwin m 25.3.0 ... arm64 Darwin</pre>
 
   <!-- signature -->
   <p class="mt-10 leading-relaxed text-muted">Thanks for reading. If you try it and something breaks (it will), I'd genuinely like to hear about it — <a href="mailto:huttarichard@gmail.com" class="text-blue2 hover:underline">email me</a> or open an issue on <a href="https://github.com/ricccrd/dd" class="text-blue2 hover:underline">GitHub</a>.</p>
-  <p class="mt-4 font-semibold text-txt">— Richard</p>
+  <p class="mt-4 font-semibold text-txt">— Richard Hutta</p>
 
   <p class="mt-10 text-center text-muted"><a href="./index.html" class="text-blue2 hover:underline">&larr; More from the dd blog</a></p>
 
