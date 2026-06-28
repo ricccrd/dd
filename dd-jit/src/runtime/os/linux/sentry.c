@@ -443,6 +443,29 @@ static void sentry_track_cmsg_fds(const uint8_t *ctl, size_t len) {
         o += (size_t)((clen + 7u) & ~(uint64_t)7u);  // CMSG_ALIGN to 8
     }
 }
+// SEND-path mirror of sentry_track_cmsg_fds (P2 finding G): the same Linux-layout cmsg walk, but it
+// VALIDATES instead of tracks. Before the sentry forwards a guest sendmsg carrying an SCM_RIGHTS cmsg, every
+// fd that cmsg would emit on the wire must be one the sentry handed THIS guest (g_guest_fds). A malicious
+// worker that smuggles a sentry-internal fd -- a g_ctl[] control socket, the ring shm, a daemon fd -- into
+// the cmsg would otherwise leak it to the socket peer. Returns 0 if all SCM_RIGHTS fds are guest-owned (a
+// correct guest only ever passes its OWN fds, so this is always 0 for it), -1 if any fd is not (reject).
+// Strictly bounded by `len` -- never derefs past it.
+static int sentry_cmsg_fds_owned(const uint8_t *ctl, size_t len) {
+    size_t o = 0;
+    while (o + 16u <= len) {                          // Linux struct cmsghdr: {u64 cmsg_len; int level; int type}
+        uint64_t clen = *(const uint64_t *)(ctl + o);
+        int level = *(const int *)(ctl + o + 8);
+        int type = *(const int *)(ctl + o + 12);
+        if (clen < 16u || o + clen > len) break;
+        if (level == SOL_SOCKET && type == SCM_RIGHTS) {
+            size_t nfd = (size_t)(clen - 16u) / sizeof(int);
+            for (size_t i = 0; i < nfd; i++)
+                if (!sentry_fd_owned(*(const int *)(ctl + o + 16u + i * sizeof(int)))) return -1; // not ours -> reject
+        }
+        o += (size_t)((clen + 7u) & ~(uint64_t)7u);  // CMSG_ALIGN to 8
+    }
+    return 0;
+}
 
 // ------------------------------------------------------------------ sentry process body
 // Holds host authority. Services ONE marshaled request on ring R: rebuilds a cpu from the marshaled
@@ -513,6 +536,7 @@ static void sentry_service_one(struct sentry_ring *R) {
     socklen_t pslen = 0; // PRIVATE in/out socklen: the kernel never sources the length from shared memory
     int slen_back = 0;   // after the call, mirror pslen back into the SLEN window for the worker copy-back
     uint8_t ph[64];      // PRIVATE Linux-layout 56-byte msghdr copy (sendmsg/recvmsg graph)
+    uint8_t pctl[SENTRY_MSGCTLCAP]; // PRIVATE sendmsg cmsg copy (validated SCM_RIGHTS fds, race-free; finding G)
     int msg_built = 0;
     uint64_t coff = 0;   // recvmsg control-window offset (for the SCM_RIGHTS fd-track after the call)
 
@@ -648,8 +672,23 @@ static void sentry_service_one(struct sentry_ring *R) {
             *(uint64_t *)(ph + 24) = n;
             if (coff) {
                 if (clen > (uint64_t)(SENTRY_BUFSZ - coff)) clen = SENTRY_BUFSZ - coff;
-                *(uint64_t *)(ph + 32) = (uint64_t)(R->buf + coff); // msg_control -> ring ptr
-                *(uint64_t *)(ph + 40) = clen;                      // msg_controllen, clamped to window
+                if (snr == 211) {
+                    // ---- P2 finding G: OUTBOUND SCM_RIGHTS fd validation. A guest sendmsg may only emit fds
+                    //      the sentry handed it. Copy the cmsg into PRIVATE memory FIRST (so the validation is
+                    //      race-free vs a concurrent worker thread rewriting the ring -- finding E), then verify
+                    //      every SCM_RIGHTS fd is guest-owned. If any is not (a smuggled g_ctl[]/ring/daemon fd),
+                    //      fail the WHOLE call -EPERM -- simplest and clearly correct; a correct guest only ever
+                    //      passes its own fds so all pass and this never fires for it. service_local then sends
+                    //      from the validated PRIVATE copy, not attacker-writable shared memory. ----
+                    uint64_t ccap = clen > SENTRY_MSGCTLCAP ? SENTRY_MSGCTLCAP : clen; // legit cmsg already <= cap
+                    memcpy(pctl, R->buf + coff, (size_t)ccap);
+                    if (sentry_cmsg_fds_owned(pctl, (size_t)ccap) != 0) { R->ret = -EPERM; R->nserved++; return; }
+                    *(uint64_t *)(ph + 32) = (uint64_t)pctl; // msg_control -> validated PRIVATE copy
+                    *(uint64_t *)(ph + 40) = ccap;           // msg_controllen, clamped to the control window
+                } else {
+                    *(uint64_t *)(ph + 32) = (uint64_t)(R->buf + coff); // recvmsg: ring ptr (sentry writes fds here)
+                    *(uint64_t *)(ph + 40) = clen;                      // msg_controllen, clamped to window
+                }
             }
             *(uint32_t *)(ph + 48) = mflags;
             G_A1(&tmp) = (uint64_t)ph; // service_local reads/writes the PRIVATE msghdr
