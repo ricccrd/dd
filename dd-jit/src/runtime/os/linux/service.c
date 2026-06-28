@@ -1574,6 +1574,10 @@ static void service(struct cpu *c) {
                     (unsigned long long)g_lse_n, (unsigned long long)g_wx_toggles, g_dualmap, g_xlate_ns / 1e6,
                     g_mtibtc, (unsigned long long)g_mtfill, g_futexq, (unsigned long long)g_futex_wake_fast,
                     (unsigned long long)g_futex_wake_slow, (unsigned long long)g_futex_wait_n);
+#ifdef R_REPSTR // W4-C: x86-only rep cmps/scas idiom firing counts
+        if (getenv("PROF")) fprintf(stderr, "[prof] repstr=%llu repstr_elems=%llu\n",
+                                    (unsigned long long)g_repstr_n, (unsigned long long)g_repstr_elems);
+#endif
 #ifdef G_PROF_EXTRA
         G_PROF_EXTRA; // W5B: x86 tier-2 promotion counters
 #endif

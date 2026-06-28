@@ -1115,6 +1115,21 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
+            // ---- cmps (A6/A7) / scas (AE/AF): memcmp/memchr/strlen building blocks. DF=0 (fwd). ----
+            // The whole (possibly REP/REPE/REPNE) compare+scan is done in ONE C round-trip (like cpuid/div):
+            // bit-exact RCX/RSI/RDI + ZF/SF/CF/OF end-state, fast host memcmp/memchr inside (gate NOREPCMP
+            // for the naive per-element oracle loop). Descriptor (width | isscas | isrepne | isrep) -> cpu->divop.
+            if (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF) {
+                int w = (op & 1) ? I.opsize : 1;
+                int isscas = (op == 0xAE || op == 0xAF);
+                int isrep = (I.rep || I.repne);
+                uint64_t desc = (uint64_t)w | ((uint64_t)isscas << 8) | ((uint64_t)(I.repne ? 1 : 0) << 9) |
+                                ((uint64_t)isrep << 10);
+                e_movconst(16, desc);
+                e_str(16, 28, OFF_DIVOP);
+                emit_exit_const(next, R_REPSTR); // spills regs+flags; do_repstr() resumes at `next`
+                break;                           // block ends here (helper runs, dispatcher continues)
+            }
             if (op == 0xFC) {
                 gpc = next;
                 continue;

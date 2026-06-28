@@ -1,6 +1,100 @@
 // frontend/x86_64/x86_ops.c -- x86-only block-exit helpers the dispatcher invokes: cpuid emulation
 // and the 80-bit x87 load/store (which need a C round-trip, not inline codegen).
 
+// ---- W4-C: rep cmps/scas idiom (R_REPSTR) -------------------------------------------------
+// One C round-trip does the entire (possibly REP/REPE/REPNE) compare/scan, then writes the exact
+// x86 end-state (RCX/RSI/RDI and ZF/SF/CF/OF) back to the cpu struct. DF assumed 0 (forward) --
+// matches the rest of the string-op path (std is still report_unimpl'd at translate time).
+static uint64_t repstr_rd(uint64_t p, int w) {
+    switch (w) {
+    case 1: return *(uint8_t *)p;
+    case 2: return *(uint16_t *)p;
+    case 4: return *(uint32_t *)p;
+    default: return *(uint64_t *)p;
+    }
+}
+// width-w (a-b) flags -> ARM NZCV, in the engine's borrow convention (stored C = NOT x86 CF),
+// byte-identical to what do_alu()/SUBS produces for a normal cmp of the same width.
+static uint64_t repstr_nzcv(uint64_t a, uint64_t b, int w) {
+    int bits = 8 * w;
+    uint64_t mask = (w == 8) ? ~0ull : ((1ull << bits) - 1);
+    uint64_t ua = a & mask, ub = b & mask, r = (ua - ub) & mask;
+    uint64_t N = r >> (bits - 1);
+    uint64_t Z = (r == 0);
+    uint64_t C = (ua >= ub); // ARM carry = NO borrow
+    // signed overflow of (a-b): sign(a)!=sign(b) AND sign(r)!=sign(a). Bitwise -> works at all widths
+    // incl. 64-bit (a naive INT64 negation form was the one bug the qemu oracle caught -- see W4-C md §5).
+    uint64_t V = (((ua ^ ub) & (ua ^ r)) >> (bits - 1)) & 1;
+    return (N << 31) | (Z << 30) | (C << 29) | (V << 28);
+}
+static void do_repstr(struct cpu *c) {
+    uint64_t d = c->divop;
+    int w = (int)(d & 0xff);
+    int isscas = (d >> 8) & 1, isrepne = (d >> 9) & 1, isrep = (d >> 10) & 1;
+    uint64_t n = isrep ? c->r[RCX] : 1; // REP uses RCX; a bare cmps/scas does exactly one step
+    if (n == 0) return;                 // REP with RCX==0: no element executed, flags+pointers UNCHANGED
+    uint64_t rsi = c->r[RSI], rdi = c->r[RDI];
+    uint64_t wmask = (w == 8) ? ~0ull : ((1ull << (8 * w)) - 1);
+    uint64_t acc = c->r[RAX] & wmask;     // scas accumulator (AL/AX/EAX/RAX)
+    int stop_on_equal = isrepne;          // REPNE stops at first equal; REPE stops at first not-equal
+    uint64_t k = 0, av = 0, bv = 0;
+    if (!norepcmp() && isrep && w == 1) {  // ---- fast host scan (the lever) ----
+        if (!isscas) {                     // rep cmps byte  -> memcmp-style first-difference scan
+            const uint8_t *pa = (const uint8_t *)rsi, *pb = (const uint8_t *)rdi;
+            if (!stop_on_equal) {          // REPE: stop at first diff -> memcmp tests equality fast,
+                if (memcmp(pa, pb, n) == 0) k = n; // then a bounded scan locates the mismatch byte.
+                else { size_t i = 0; while (pa[i] == pb[i]) i++; k = i + 1; }
+            } else {                       // REPNE: stop at first equal (rare)
+                size_t i = 0; while (i < n && pa[i] != pb[i]) i++;
+                k = (i < n) ? i + 1 : n;
+            }
+            av = pa[k - 1]; bv = pb[k - 1];
+        } else {                           // scas byte: REPNE -> memchr (strlen/memchr), REPE -> run-scan
+            const uint8_t *pb = (const uint8_t *)rdi;
+            uint8_t cc = (uint8_t)acc;
+            if (stop_on_equal) {
+                const uint8_t *hit = memchr(pb, cc, n);
+                k = hit ? (uint64_t)(hit - pb) + 1 : n;
+            } else {
+                size_t i = 0;
+                while (i < n && pb[i] == cc) i++;
+                k = (i < n) ? i + 1 : n;
+            }
+            av = acc; bv = pb[k - 1];
+        }
+    } else if (!norepcmp() && isrep && !isscas) { // rep cmps word/dword/qword
+        if (!stop_on_equal) {              // REPE: memcmp tests equality fast, then locate the element
+            if (memcmp((void *)rsi, (void *)rdi, n * (size_t)w) == 0) k = n;
+            else { size_t i = 0; while (repstr_rd(rsi + i * w, w) == repstr_rd(rdi + i * w, w)) i++; k = i + 1; }
+        } else {
+            size_t i = 0; while (i < n && repstr_rd(rsi + i * w, w) != repstr_rd(rdi + i * w, w)) i++;
+            k = (i < n) ? i + 1 : n;
+        }
+        av = repstr_rd(rsi + (k - 1) * w, w); bv = repstr_rd(rdi + (k - 1) * w, w);
+    } else if (!norepcmp() && isrep) {            // rep scas word/dword/qword: typed loop
+        size_t i = 0;
+        if (stop_on_equal) while (i < n && (repstr_rd(rdi + i * w, w) & wmask) != acc) i++;
+        else               while (i < n && (repstr_rd(rdi + i * w, w) & wmask) == acc) i++;
+        k = (i < n) ? i + 1 : n;
+        av = acc; bv = repstr_rd(rdi + (k - 1) * w, w);
+    } else {                                       // naive per-element loop: NOREPCMP oracle + bare cmps/scas
+        for (;;) {
+            if (isscas) { av = acc; bv = repstr_rd(rdi + k * w, w); }
+            else        { av = repstr_rd(rsi + k * w, w); bv = repstr_rd(rdi + k * w, w); }
+            k++;
+            int eq = ((av & wmask) == (bv & wmask));
+            if (k >= n) break;
+            if (stop_on_equal ? eq : !eq) break;
+        }
+    }
+    if (isrep) c->r[RCX] = n - k;
+    if (!isscas) c->r[RSI] = rsi + k * (uint64_t)w;
+    c->r[RDI] = rdi + k * (uint64_t)w;
+    c->nzcv = repstr_nzcv(av, bv, w);
+    g_repstr_n++;
+    g_repstr_elems += k;
+}
+
 static void do_cpuid(struct cpu *c) {
     uint32_t leaf = (uint32_t)c->r[RAX], a = 0, b = 0, cc = 0, d = 0;
     switch (leaf) {

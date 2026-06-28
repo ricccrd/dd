@@ -171,6 +171,10 @@ static void run_guest(struct cpu *c) {
             do_cpuid(c);
             continue;
         } // rip already = next
+        if (c->reason == R_REPSTR) {
+            do_repstr(c);
+            continue;
+        } // W4-C rep cmps/scas idiom (rip already = next)
         if (c->reason == R_X87FLD) {
             x87_fld_m80(c);
             continue;

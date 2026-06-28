@@ -16,6 +16,14 @@
 
 static int g_trace, g_noibtc, g_itrace; // g_itrace: 1 instruction per block (per-insn register dump)
 static uint64_t g_disp_n, g_ibtc_fill;  // PROF: dispatcher round-trips, IBTC fills
+// ---- W4-C: rep cmps/scas idiom (R_REPSTR) globals + the NOREPCMP A/B kill-switch ----
+static uint64_t g_repstr_n;     // PROF: rep cmps/scas idiom firings
+static uint64_t g_repstr_elems; // PROF: elements consumed by the rep cmps/scas idiom
+static int g_norepcmp = -1;     // gate: NOREPCMP=1 -> rep cmps/scas use the naive per-element loop
+static int norepcmp(void) {     // (the A/B kill-switch; also the bit-exact per-element oracle path)
+    if (g_norepcmp < 0) g_norepcmp = getenv("NOREPCMP") ? 1 : 0;
+    return g_norepcmp;
+}
 
 // ---- opt2: x86-only 2-way set-associative IBTC (gate IBTC1WAY=1) ----
 // The x86 engine gets its OWN indirect-branch-target cache here, leaving the SHARED jit/cache.c g_ibtc

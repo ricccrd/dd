@@ -65,5 +65,9 @@ struct cpu {
 // recompiles (promotes) the block (folded back-edge + dead-flag-save elision), swaps it in live, resumes
 // (rip already == loop start). See frontend/x86_64/translate.c tier2_promote().
 #define R_TIER2 7
+// W4-C: rep cmps/scas (A6/A7/AE/AF) idiom -> C helper does the whole (possibly REP/REPE/REPNE)
+// compare/scan in one round-trip (descriptor in cpu->divop), writing the exact x86 RCX/RSI/RDI +
+// ZF/SF/CF/OF end-state. Gate NOREPCMP=1 -> naive per-element oracle loop. See do_repstr().
+#define R_REPSTR 8
 // x86 register encodings (== host reg numbers)
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };
