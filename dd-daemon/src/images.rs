@@ -228,18 +228,33 @@ pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: C
         .or_else(|| manifest_arch(&pulled.config))
         .unwrap_or(Guest::LinuxAarch64);
     let darwin = arch.os() == "darwin";
+    // Pull the OCI config's full run metadata. Entrypoint and Cmd are kept *separate* (NOT flattened like
+    // `config_cmd` does) so docker's override semantics survive the round-trip — `containers_create` rebuilds
+    // argv = entrypoint ++ cmd, and `--entrypoint`/CMD overrides act on the right half (see containers.rs).
+    let entrypoint = config_strs(&pulled.config, "Entrypoint");
+    let env = config_strs(&pulled.config, "Env");
+    let workdir = pulled.config["config"]["WorkingDir"].as_str().unwrap_or("").to_string();
+    let labels = config_labels(&pulled.config);
     // A pulled macOS image's `dd-image.json` sidecar doesn't survive the registry round-trip and its
     // userland shell lives on the in-jail PATH (`/profile/bin/bash`), not `/bin/sh` — so default a
-    // darwin image to a bare `bash` (resolved via PATH by the darwinjail) rather than `/bin/sh`.
-    let cmd = config_cmd(&pulled.config)
-        .unwrap_or_else(|| if darwin { vec!["bash".into()] } else { default_shell(&rootfs) });
+    // darwin image to a bare `bash` (resolved via PATH by the darwinjail) rather than `/bin/sh`. Only fall
+    // back when the config supplies neither Entrypoint nor Cmd (an entrypoint-only image keeps empty cmd).
+    let mut cmd = config_strs(&pulled.config, "Cmd");
+    if cmd.is_empty() && entrypoint.is_empty() {
+        cmd = if darwin { vec!["bash".into()] } else { default_shell(&rootfs) };
+    }
     let name = iref.short();
-    // Record name + cmd (+ os for darwin) so the image keeps its identity across a daemon restart (the
-    // dir name alone doesn't round-trip -- e.g. "docker.io_library_alpine_latest").
-    let mut meta = json!({ "name": name.clone(), "cmd": cmd.clone() });
+    // Record name + the full OCI run config (cmd/env/entrypoint/workdir, +os for darwin) so the image keeps
+    // its identity AND its entrypoint/env/workdir across a daemon restart (the dir name alone doesn't
+    // round-trip -- e.g. "docker.io_library_alpine_latest"). Mirrors the `docker load` path (`image_load`).
+    let mut meta = json!({ "name": name.clone(), "cmd": cmd.clone(), "env": env.clone(),
+                           "entrypoint": entrypoint.clone(), "workdir": workdir.clone() });
     if darwin { meta["os"] = json!("darwin"); }
     let _ = std::fs::write(format!("{images_dir}/{}/dd-image.json", safe_name(&iref)), meta.to_string());
-    Ok(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, created: now_secs(), ..Default::default() })
+    Ok(Image {
+        name, rootfs: rootfs.to_string_lossy().into_owned(), arch,
+        cmd, env, entrypoint, workdir, labels, created: now_secs(),
+    })
 }
 
 
@@ -269,13 +284,20 @@ pub(crate) fn repo_tag(name: &str) -> String {
 pub(crate) fn safe_name(r: &ImageRef) -> String { r.canonical().replace(['/', ':'], "_") }
 
 
-/// The image's default command from its OCI config blob (Entrypoint ++ Cmd), if present.
-pub(crate) fn config_cmd(config: &Value) -> Option<Vec<String>> {
-    let strs = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
-    let entry = strs(&config["config"]["Entrypoint"]).unwrap_or_default();
-    let cmd = strs(&config["config"]["Cmd"]).unwrap_or_default();
-    let argv: Vec<String> = entry.into_iter().chain(cmd).collect();
-    (!argv.is_empty()).then_some(argv)
+/// A string array at `config.config.<key>` of an OCI image config blob (e.g. `Entrypoint`, `Cmd`, `Env`),
+/// flattened to `Vec<String>` (non-string/absent -> empty). Kept granular so pull can persist Entrypoint
+/// and Cmd separately (docker's override semantics depend on the split).
+pub(crate) fn config_strs(config: &Value, key: &str) -> Vec<String> {
+    config["config"][key].as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// The `config.config.Labels` object of an OCI image config blob as a `HashMap` (absent/non-string -> empty).
+pub(crate) fn config_labels(config: &Value) -> std::collections::HashMap<String, String> {
+    config["config"]["Labels"].as_object()
+        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+        .unwrap_or_default()
 }
 
 /// Fallback default command for an image whose config has no Cmd: prefer /bin/sh, else /bin/bash.
