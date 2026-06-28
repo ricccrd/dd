@@ -6,7 +6,7 @@
 # or run `xattr -dr com.apple.quarantine /Applications/dd.app` (also printed by `dd doctor`).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # script lives in dd-gui/package/, repo root is ../..
 VERSION="${1:-0.1.0}"
 APP="$ROOT/target/dd.app"
 ARCH="$(uname -m)"
@@ -41,18 +41,25 @@ fi
 # create-dmg can leave a read-write scratch image behind; tidy it up.
 rm -f "$DIST"/rw.*.dmg
 
-# Sign + notarize + staple when a notarytool keychain profile is configured (DD_NOTARY_PROFILE, e.g. "dd-notary").
-# The app inside must already be Developer ID-signed with hardened runtime (tools/bundle.sh + DD_SIGN_ID).
-if [ -n "${DD_NOTARY_PROFILE:-}" ]; then
+# Sign + notarize + staple when notarization creds are configured — either a notarytool keychain profile
+# (DD_NOTARY_PROFILE, e.g. "dd-notary", local) OR inline App Store Connect creds (DD_NOTARY_APPLE_ID +
+# DD_NOTARY_TEAM_ID + DD_NOTARY_PW, used by CI from secrets). The app inside must already be Developer
+# ID-signed with hardened runtime (tools/bundle.sh + DD_SIGN_ID).
+if [ -n "${DD_NOTARY_PROFILE:-}" ] || [ -n "${DD_NOTARY_APPLE_ID:-}" ]; then
   if [ -n "${DD_SIGN_ID:-}" ] && [ "${DD_SIGN_ID}" != "-" ]; then
     KCFLAG=""
     [ -n "${DD_SIGN_KEYCHAIN:-}" ] && { security unlock-keychain ${DD_SIGN_KEYCHAIN_PW:+-p "$DD_SIGN_KEYCHAIN_PW"} "$DD_SIGN_KEYCHAIN" 2>/dev/null || true; KCFLAG="--keychain $DD_SIGN_KEYCHAIN"; }
     codesign -s "$DD_SIGN_ID" --timestamp $KCFLAG -f "$OUT"
   fi
-  echo "[make-dmg] notarizing $OUT (profile $DD_NOTARY_PROFILE) — Apple round-trip, ~1-5 min..."
+  if [ -n "${DD_NOTARY_APPLE_ID:-}" ]; then
+    NAUTH=(--apple-id "$DD_NOTARY_APPLE_ID" --team-id "$DD_NOTARY_TEAM_ID" --password "$DD_NOTARY_PW")
+  else
+    NAUTH=(--keychain-profile "$DD_NOTARY_PROFILE")
+  fi
+  echo "[make-dmg] notarizing $OUT — Apple round-trip, ~1-5 min..."
   # Apple's /usr/bin/xcrun, NOT the nix-shell xcrun (which can't resolve notarytool/stapler).
   # Note: notarytool uploads to Apple S3 and rejects >15-min clock skew (RequestTimeTooSkewed) — keep the host clock synced.
-  /usr/bin/xcrun notarytool submit "$OUT" --keychain-profile "$DD_NOTARY_PROFILE" --wait
+  /usr/bin/xcrun notarytool submit "$OUT" "${NAUTH[@]}" --wait
   /usr/bin/xcrun stapler staple "$OUT"
   /usr/bin/xcrun stapler validate "$OUT"
   echo "[make-dmg] notarized + stapled"

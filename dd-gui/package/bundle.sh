@@ -14,7 +14,7 @@
 #   Contents/Resources/icons/                 Adwaita + hicolor icon themes
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # script lives in dd-gui/package/, repo root is ../..
 VERSION="${1:-0.1.0}"
 APP="$ROOT/target/dd.app"   # under target/ (gitignored) — kept out of the repo root
 C="$APP/Contents"; MACOS="$C/MacOS"; RES="$C/Resources"; FW="$C/Frameworks"
@@ -45,8 +45,8 @@ for cli in dd ddcli; do # the CLI (whatever it's named) — installed to PATH fr
   [ -f "$ROOT/target/release/$cli" ] && cp "$ROOT/target/release/$cli" "$RES/$cli"
 done
 printf 'APPL????' > "$C/PkgInfo"
-sed "s/@VERSION@/$VERSION/g" "$ROOT/packaging/Info.plist.in" > "$C/Info.plist"
-[ -f "$ROOT/packaging/dd-app.icns" ] && cp "$ROOT/packaging/dd-app.icns" "$RES/dd-app.icns" || true
+sed "s/@VERSION@/$VERSION/g" "$ROOT/dd-gui/package/Info.plist.in" > "$C/Info.plist"
+[ -f "$ROOT/dd-gui/package/dd-app.icns" ] && cp "$ROOT/dd-gui/package/dd-app.icns" "$RES/dd-app.icns" || true
 [ -f "$ROOT/assets/logo.png" ] && cp "$ROOT/assets/logo.png" "$RES/logo.png" || true # onboarding logo
 [ -d "$ROOT/assets/images" ] && cp -R "$ROOT/assets/images" "$RES/images" || true # bundled starter images (hello-dd)
 
@@ -104,7 +104,7 @@ command -v gtk4-update-icon-cache >/dev/null && gtk4-update-icon-cache -q -f -t 
 
 # 7. Fontconfig.
 mkdir -p "$RES/fontconfig"
-cp "$ROOT/packaging/fonts.conf" "$RES/fontconfig/fonts.conf"
+cp "$ROOT/dd-gui/package/fonts.conf" "$RES/fontconfig/fonts.conf"
 
 # 7b. Resolve the libiconv name-collision. nixpkgs ships TWO different libiconv.2.dylib: Apple's (exports
 # _iconv, used by glib/gtk) and GNU's (exports _libiconv, used by libidn2/libunistring). dylibbundler

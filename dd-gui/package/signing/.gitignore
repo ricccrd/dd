@@ -1,0 +1,5 @@
+# Signing material is private — commit ONLY this .gitignore and README.md.
+# Private keys, certs, the .p12, API keys, and the GitHub Actions secret values stay local.
+*
+!.gitignore
+!README.md
