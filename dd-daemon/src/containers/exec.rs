@@ -108,7 +108,7 @@ pub(crate) async fn exec_create(State(a): State<App>, Path(id): Path<String>, Js
         user: body.user.unwrap_or_default(),
         // `--privileged`: metadata only (no Linux-cap enforcement in the JIT). Accept + record it so
         // exec inspect reflects it; the spawn path is unchanged (mirrors -e/-w/-u being plain fields).
-        privileged: body.privileged.unwrap_or(false) });
+        privileged: body.privileged.unwrap_or(false), exit_code: 0 });
     (StatusCode::CREATED, Json(json!({"Id": exec_id}))).into_response()
 }
 
@@ -169,9 +169,11 @@ pub(crate) async fn exec_inspect(State(a): State<App>, Path(id): Path<String>) -
     let Some(exec) = g.execs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("no such exec: {id}")}))).into_response();
     };
+    // While the exec is live, read Running/ExitCode from its Live's exit watch. Once it exits the reaper
+    // drops the Live (freeing its buffers) but records the code on the Exec, so fall back to that here.
     let (running, code) = match g.live.get(&id) {
         Some(l) => match *l.exit_rx.borrow() { Some(c) => (false, c), None => (true, 0) },
-        None => (false, 0),
+        None => (false, exec.exit_code),
     };
     Json(json!({"ID": id, "Running": running, "ExitCode": code, "ContainerID": exec.container_id,
         "ProcessConfig": {"tty": exec.tty, "privileged": exec.privileged,

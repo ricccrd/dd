@@ -29,12 +29,36 @@ use hyper_util::rt::TokioIo;
 use ddjit::{Guest, PortMap, SpawnConfig, Volume};
 
 
+/// Cap on the retained `docker logs` replay buffer (per container/exec). A chatty or long-lived guest
+/// would otherwise grow `live.log_chunks` without bound and OOM the daemon. When a new chunk pushes the
+/// buffer over this, the oldest chunks are dropped from the front — standard log-rotation behavior, so
+/// `docker logs` shows the most-recent ≤ 8 MiB of output.
+const LOG_CHUNKS_CAP_BYTES: usize = 8 * 1024 * 1024;
+
+/// Append one output chunk to a Live's ordered `docker logs` buffer, enforcing [`LOG_CHUNKS_CAP_BYTES`]
+/// by draining the oldest chunks from the front. The single place the cap lives, shared by the pipe
+/// `pump` and the PTY reader. Locks ONLY `live.log_chunks` (never `inner`), so it preserves the reaper's
+/// `inner` → `log_chunks` lock ordering and introduces no deadlock.
+async fn push_log(live: &Live, ts: i64, stream: u8, bytes: Vec<u8>) {
+    let mut log = live.log_chunks.lock().await;
+    log.push((ts, stream, bytes));
+    let mut total: usize = log.iter().map(|(_, _, b)| b.len()).sum();
+    // Drop oldest chunks until under the cap, but always keep at least the just-pushed chunk.
+    let mut drop_to = 0;
+    while total > LOG_CHUNKS_CAP_BYTES && drop_to < log.len() - 1 {
+        total -= log[drop_to].2.len();
+        drop_to += 1;
+    }
+    if drop_to > 0 { log.drain(..drop_to); }
+}
+
+
 /// Resolve a docker `--user`/`Config.User` spec to a numeric `(uid, gid)` against the container's
 /// rootfs. Accepts every docker form: `uid`, `name`, `uid:gid`, `name:group`, `uid:group`, `name:gid`.
 /// A numeric component is taken verbatim (no file access needed — keeps the numeric path independent of
 /// the rootfs contents); a NAME is looked up in `<rootfs>/etc/passwd` (user) or `<rootfs>/etc/group`
-/// (group). When no group is given the user's primary gid from /etc/passwd is used (falling back to the
-/// uid when the user isn't in passwd). Returns `None` if a name component can't be resolved, so the
+/// (group). When no group is given a NAME uses its primary gid from /etc/passwd, while a numeric uid
+/// defaults to gid 0 (docker semantics). Returns `None` if a name component can't be resolved, so the
 /// caller leaves the guest's default identity (matching the prior "skip unknown user" behavior).
 fn resolve_user(rootfs: &str, spec: &str) -> Option<(u32, u32)> {
     let (us, gs) = spec.split_once(':').map_or((spec, None), |(u, g)| (u, Some(g)));
@@ -58,8 +82,11 @@ fn resolve_user(rootfs: &str, spec: &str) -> Option<(u32, u32)> {
         Ok(n) => (n, None),
         Err(_) => { let (u, g) = lookup_passwd(us)?; (u, Some(g)) }
     };
-    let gid = match gs {
-        None => primary_gid.unwrap_or(uid), // no `:group`: the passwd primary gid, else mirror the uid
+    // A trailing-colon empty group (`"name:"` / `"1000:"`) means "no group" — not a parse failure.
+    let gid = match gs.filter(|g| !g.is_empty()) {
+        // No `:group`: a NAME uses its passwd primary gid; a numeric uid defaults to gid 0 (docker
+        // semantics — `--user 1000` => 1000:0), since `primary_gid` is None on the numeric path.
+        None => primary_gid.unwrap_or(0),
         Some(g) => g.parse().ok().or_else(|| lookup_group(g))?,
     };
     Some((uid, gid))
@@ -247,8 +274,9 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
                 Ok(n) => {
                     let chunk = buf[..n].to_vec();
                     let _ = live.out.send((kind, chunk.clone()));
-                    // Append to the single ordered log (arrival order) so the buffered replay interleaves.
-                    live.log_chunks.lock().await.push((now_secs(), kind, chunk));
+                    // Append to the single ordered log (arrival order) so the buffered replay interleaves;
+                    // push_log enforces the LOG_CHUNKS_CAP_BYTES rotation so this can't grow unbounded.
+                    push_log(&live, now_secs(), kind, chunk).await;
                 }
             }
         }
@@ -311,8 +339,9 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
                     Ok(Ok(n)) => {
                         let chunk = buf[..n].to_vec();
                         let _ = lr.out.send((1, chunk.clone()));
-                        // TTY: one merged raw stream, all stdout (kind 1), recorded in arrival order.
-                        lr.log_chunks.lock().await.push((now_secs(), 1, chunk));
+                        // TTY: one merged raw stream, all stdout (kind 1), recorded in arrival order;
+                        // push_log enforces the LOG_CHUNKS_CAP_BYTES rotation (most-recent ≤ 8 MiB).
+                        push_log(&lr, now_secs(), 1, chunk).await;
                     }
                     Err(_would_block) => continue,
                 }
@@ -380,6 +409,21 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
             save_state(&g, &app.state_path);
         }
         let _ = live.exit.send(Some(code));
+        // Exec cleanup: a `docker exec` runs through spawn_live with the EXEC id as `cid` (never a
+        // `containers` entry). Record the exit code on the Exec, then drop ONLY its Live now that it has
+        // exited — the Live's 8 MiB log buffer + channels are the real leak; without this every exec
+        // leaks one. We KEEP the (tiny) Exec record so a post-exit `docker exec inspect` still returns
+        // the real code (it reads `exec.exit_code` once the Live is gone). Independent of `--rm`, which
+        // governs the parent CONTAINER, not the exec. Return: AutoRemove/RestartPolicy below are
+        // container-only (and would no-op on an exec id anyway).
+        {
+            let mut g = app.inner.lock().await;
+            if let Some(e) = g.execs.get_mut(&cid) {
+                e.exit_code = code;
+                g.live.remove(&cid);
+                return;
+            }
+        }
         // `--rm` (AutoRemove): drop the container from state now that it has exited and its final
         // status/logs are recorded. AutoRemove and RestartPolicy are mutually exclusive in docker, so a
         // removed container is never a restart candidate — return before the supervisor runs. Anything
@@ -435,6 +479,13 @@ fn maybe_restart<'a>(app: &'a App, cid: &'a str, code: i64)
             // Re-check: a stop/rm may have raced in during the backoff.
             Some(cc) if cc.status == "exited" => {}
             _ => return,
+        }
+        // A deliberate `docker stop`/`kill`/`rm` during the backoff sets `stop_requested` on the OLD,
+        // spent Live (still the `g.live[cid]` entry until we replace it below) but leaves status
+        // "exited" — so the status check above can't see it. Re-read that flag and abort the restart,
+        // otherwise the container the user just stopped would respawn.
+        if g.live.get(cid).map_or(false, |l| l.stop_requested.load(std::sync::atomic::Ordering::SeqCst)) {
+            return;
         }
         g.live.insert(cid.to_string(), live.clone());
         if let Some(cc) = g.containers.get_mut(cid) {

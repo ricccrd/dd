@@ -306,6 +306,8 @@ pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<Strin
         crate::events::emit_event(&a.events, "container", "destroy", &full, json!({"name": dc.name, "image": dc.image}));
         // Drop the container from any network membership too.
         for n in g.networks.iter_mut() { leave_network(n, &full); }
+        // Drop its live IO plumbing (log buffers + channels); otherwise `docker rm` leaks the Live.
+        g.live.remove(&full);
         save_state(&g, &a.state_path);
         StatusCode::NO_CONTENT.into_response()
     } else { no_such(&id) }

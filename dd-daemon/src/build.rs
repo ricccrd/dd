@@ -669,14 +669,20 @@ pub(crate) async fn commit_container(State(a): State<App>, Query(q): Query<Commi
     }
     // Resolve the source container; carry its run config into the new image. The container only stores
     // the resolved cmd/env it ran with, so inherit the source image's ENTRYPOINT (and arch as a fallback).
-    let (rootfs, cmd, entrypoint, env, workdir, labels, arch) = {
+    // `docker commit` pauses the container by default while snapshotting (so the image isn't captured
+    // mid-write); `--pause=false` opts out. `pause_pid` is the live pid to SIGSTOP/SIGCONT around the
+    // `cp -a` — Some only when we will pause AND the guest is actually running.
+    let pause = !matches!(q.pause.as_deref(), Some("0") | Some("false") | Some("False"));
+    let (rootfs, cmd, entrypoint, env, workdir, labels, arch, pause_pid) = {
         let g = a.inner.lock().await;
         let Some(full) = resolve_cid(&g, &cid) else { return no_such(&cid) };
         let Some(c) = g.containers.get(&full) else { return no_such(&cid) };
         let img = g.images.iter().find(|i| ref_name(&i.name) == ref_name(&c.image)).cloned();
         let entrypoint = img.as_ref().map(|i| i.entrypoint.clone()).unwrap_or_default();
         let arch = c.arch.or(img.as_ref().map(|i| i.arch)).unwrap_or(Guest::LinuxAarch64);
-        (c.rootfs.clone(), c.cmd.clone(), entrypoint, c.env.clone(), c.working_dir.clone(), c.labels.clone(), arch)
+        let pause_pid = (pause && c.status == "running")
+            .then(|| g.live.get(&full).and_then(|l| *l.pid.lock().unwrap())).flatten();
+        (c.rootfs.clone(), c.cmd.clone(), entrypoint, c.env.clone(), c.working_dir.clone(), c.labels.clone(), arch, pause_pid)
     };
     // The host-fs `macos` image (rootfs "/") can't be snapshotted — copying it would be catastrophic.
     if rootfs.is_empty() || rootfs == "/" {
@@ -695,7 +701,12 @@ pub(crate) async fn commit_container(State(a): State<App>, Query(q): Query<Commi
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": format!("commit: {e}")}))).into_response();
     }
     // `cp -a SRC DST` (DST absent) copies the SRC tree to DST, preserving perms/links/timestamps.
+    // Default-pause: freeze the guest (SIGSTOP) around the snapshot so the rootfs isn't copied while the
+    // container is mid-write, then SIGCONT — unconditionally, even if the copy failed, so we never leave
+    // it stopped.
+    if let Some(pid) = pause_pid { unsafe { libc::kill(pid as i32, libc::SIGSTOP); } }
     let cp = std::process::Command::new("cp").arg("-a").arg(&rootfs).arg(&new_rootfs).status();
+    if let Some(pid) = pause_pid { unsafe { libc::kill(pid as i32, libc::SIGCONT); } }
     if !matches!(cp, Ok(s) if s.success()) {
         let _ = std::fs::remove_dir_all(&target);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": "commit: failed to snapshot rootfs"}))).into_response();
@@ -712,7 +723,6 @@ pub(crate) async fn commit_container(State(a): State<App>, Query(q): Query<Commi
     if let Some(c) = &q.comment { dd["comment"] = json!(c); }
     if let Some(a) = &q.author { dd["author"] = json!(a); }
     let _ = std::fs::write(target.join("dd-image.json"), dd.to_string());
-    let _ = &q.pause; // accepted for CLI compatibility; dd's snapshot doesn't need to freeze the guest.
     {
         let mut g = a.inner.lock().await;
         // Replace any existing image sharing this repo:tag (mirrors the build/load re-tag dedupe).

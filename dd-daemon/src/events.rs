@@ -113,8 +113,13 @@ impl Filters {
         if !self.actions.is_empty() && !self.actions.iter().any(|a| a == action) {
             return false;
         }
+        // Exact match on the resolved id or the name only. `events()` pre-resolves every `container=`
+        // filter value to its FULL id and appends it to this set, so a name/id-prefix filter still
+        // catches name-less events (die/stop/kill) via that full id. We deliberately do NOT also match
+        // `id.starts_with(filter)` — that broad prefix made `--filter container=a` match every container
+        // whose id merely begins with "a".
         if !self.containers.is_empty()
-            && !self.containers.iter().any(|c| c == id || c == name || id.starts_with(c.as_str()))
+            && !self.containers.iter().any(|c| c == id || c == name)
         {
             return false;
         }

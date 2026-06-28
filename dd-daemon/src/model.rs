@@ -233,6 +233,10 @@ pub(crate) struct Exec {
     /// `docker exec --privileged` — metadata only (the JIT doesn't enforce Linux caps); accepted
     /// without error and surfaced in exec inspect, mirroring the container-level `privileged`.
     pub(crate) privileged: bool,
+    /// The exec process's exit code, recorded by the reaper when it exits. The reaper then drops the
+    /// exec's `Live` (its log buffers/channels) to avoid a leak, but keeps THIS record so a post-exit
+    /// `docker exec inspect` still reports the real code (the Live is gone, so inspect reads it here).
+    pub(crate) exit_code: i64,
 }
 
 
