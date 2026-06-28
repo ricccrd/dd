@@ -50,9 +50,11 @@ if [ -n "${DD_NOTARY_PROFILE:-}" ]; then
     codesign -s "$DD_SIGN_ID" --timestamp $KCFLAG -f "$OUT"
   fi
   echo "[make-dmg] notarizing $OUT (profile $DD_NOTARY_PROFILE) — Apple round-trip, ~1-5 min..."
-  xcrun notarytool submit "$OUT" --keychain-profile "$DD_NOTARY_PROFILE" --wait
-  xcrun stapler staple "$OUT"
-  xcrun stapler validate "$OUT"
+  # Apple's /usr/bin/xcrun, NOT the nix-shell xcrun (which can't resolve notarytool/stapler).
+  # Note: notarytool uploads to Apple S3 and rejects >15-min clock skew (RequestTimeTooSkewed) — keep the host clock synced.
+  /usr/bin/xcrun notarytool submit "$OUT" --keychain-profile "$DD_NOTARY_PROFILE" --wait
+  /usr/bin/xcrun stapler staple "$OUT"
+  /usr/bin/xcrun stapler validate "$OUT"
   echo "[make-dmg] notarized + stapled"
 fi
 
