@@ -199,8 +199,14 @@ to a **high hint** so the PIE world is unchanged and only the non-PIE uses the l
 an arm64 load/store fault-fixup handler that re-does a link-range data access at `+bias` — heavier.) Either
 way the diagnostic plumbing (`CRASHDBG` forwarding + `[CRASH]`) is now in place to iterate.
 
-**Separately, the flaky busybox tail is a DISTINCT, still-open bug** (busybox is PIE, immune to all the
-above) — a different fork+exec SIGSEGV under load, not yet root-caused.
+**Separately, the flaky busybox tail is ROOT-CAUSED** (research, live ESR probe): a **W^X/`MAP_JIT`
+execute-permission fault in the `fork()` child** — the child's first `run_block` instruction-fetches from
+the code cache while the per-thread JIT execute (APRR) state isn't reliable across fork (`pc`=ld-musl
+`_Fork`, `esr=0x8200000f` = instruction-abort permission fault inside the cache; intermittent under load,
+PIE/non-PIE irrelevant). First mitigation applied (re-assert `pthread_jit_write_protect_np(1)` in the fork
+child) but a single run still flaked — the **robust fix is a dual-mapped RX/RW code cache** (execute lives
+in the page tables, survives fork; also closes the `soak/smc` RWX gap) in `jit/cache.c`. See
+`docs/design/research-busybox-crash.md`.
 
 **Docker API compliance** — goal is a faithful Engine API **v1.43** for the **everyday developer
 workflow** so the stock `docker` CLI + bollard work unmodified. **Swarm / services / nodes / tasks /
@@ -247,14 +253,14 @@ Real, syscall/fork/thread/mmap-heavy production binaries run with deterministic 
 - **GCC-14 toolchain** (`compile` group, gcc-bundle image) ❌ — `gcc`/`g++`/`cc1` **segfault**: this IS
   the fork()+execve()/non-PIE crash diagnosed above (driver is always fork+exec'd by the shell).
   xfail-tracked (`compile/{hello,c-primes,cpp-stl}`); XPASS fires when the execve address-space-reset lands.
-- **redis:alpine** ❌ — DISTINCT bug (redis-server is **PIE**, so *not* the non-PIE crash): the server
-  **crashes during startup** — prints its config banner (+ jemalloc `MADV_DONTNEED` unsupported / overcommit
-  warnings) then exits *before* binding (nothing on the port; `redis-cli` → refused). Dies in bootstrap
-  (post-config, pre-listener) — suspect the `madvise`/jemalloc or an eventloop/thread-init path; needs a
-  faulting-address capture.
-- **postgres:alpine** ❌ — DISTINCT bug (postgres is **PIE**): never reaches "ready to accept connections".
-  Its `setuid`/`setgid` drop *works* (146/144/145/147 are handled) — the gap is the daemonize, i.e. the
-  still-missing **`setsid`(157)**, plus possibly the fork+exec path during initdb.
+- **redis:alpine** ✅ **FIXED** — root-caused (research): `mprotect`(226) is a no-op so a guest
+  `PROT_READ`→`R|W` upgrade was dropped → SIGBUS on the next store (`checkLinuxMadvFreeForkBug`). Fix: anon
+  `mmap` now maps writable up front. (`MADV_DONTNEED` was a red herring — jemalloc falls back to memset.)
+- **postgres:alpine** — root-caused (research): the crash is in the JIT's **initial `load_elf`** (0 guest
+  syscalls) — the entry `docker-entrypoint.sh` is a `#!` script but only `execve` handles shebangs; the
+  initial loader parses it as a bogus ELF. **Fix in progress** (reuse execve's shebang logic in `jit_run`).
+  setuid/setgid drop already works; daemonize/initdb is the *next* gap, downstream of this. (Also: the local
+  `postgres` image's `dd-image.json` lacks `entrypoint`/`env` — a daemon-side metadata gap.)
 - **nats:latest** ❌ — won't even **pull**: `dd-daemon` reports "could not detect the image architecture"
   on a distroless/scratch image (the arch sniffer in `containers_create`/`detect_arch` scans for an ELF
   where there is none — needs a manifest-`platform` fallback). A `dd-daemon` image-arch-detection gap.
