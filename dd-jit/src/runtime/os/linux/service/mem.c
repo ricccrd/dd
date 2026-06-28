@@ -35,11 +35,23 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         break;
     }
     case 215: {
-        // munmap
-        int r = munmap((void *)a0, (size_t)a1);
+        // munmap. A non-fixed anon mapping carries a 64 KB guard tail that mmap (case 222) reserved
+        // past the guest's logical length (so glibc's vectorized over-reads land in mapped memory).
+        // The guest only knows its logical length a1, so a plain munmap(a0, a1) leaves that tail mapped
+        // -> ~64 KB of address space (plus its gmap/anon_track bookkeeping) leaks per map/unmap cycle.
+        // When a0 starts a tracked mapping whose FULL extent is exactly a1 + the 64 KB guard, extend the
+        // unmap to cover the tail too. The gmap registry stores the full extent (incl. guard); requiring
+        // an exact `full == a1 + 0x10000` match means a0 is the mapping start AND a1 is its original
+        // logical length -- i.e. a complete unmap -- so this can never reach past the mapping into a
+        // neighbour (a partial unmap, full == a1, leaves the tail alone). Guard-less mappings (file/fixed,
+        // full == a1) and untracked mappings (full == 0) keep the plain a1 unmap unchanged.
+        size_t len = (size_t)a1;
+        uint64_t full = gmap_find_len(a0);
+        if (full == (uint64_t)a1 + 0x10000) len = (size_t)full; // complete unmap of a guarded mapping
+        int r = munmap((void *)a0, len);
         if (r == 0) {
             gmap_del(a0); // drop from the execve() teardown registry
-            anon_untrack(a0, (size_t)a1); // and from the DONTNEED anon-range registry
+            anon_untrack(a0, len); // and from the DONTNEED anon-range registry (covers the freed tail)
         }
         if (r == 0 && g_mem_max) {
             // uncharge (clamp >=0)
