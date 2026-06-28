@@ -141,14 +141,15 @@ fn edge() -> Group {
         src("pipepacket", "edge_pipepacket.c").oracle().xfail(lin), // pipe2(O_DIRECT) packet boundaries
         src("msgflags", "edge_msgpeek.c").oracle(),                 // recv MSG_PEEK + MSG_DONTWAIT — WORKS
         src("abstract", "edge_abstract.c").oracle(),               // abstract-namespace AF_UNIX — FIXED (DD_NETNS fs-socket map)
-        src("pipesz", "edge_pipesz.c").oracle().xfail(lin),         // F_SET/GETPIPE_SZ + dup3 self-dup
+        src("pipesz", "edge_pipesz.c").oracle(),                    // F_SET/GETPIPE_SZ (shadow-table emulation) + dup3 self-dup — FIXED
         // mprotect: portable — darwin (native) FAULTS correctly, the JIT no-ops it; xfail only Linux so
         // the darwin pass / Linux fail contrast is explicit.
         port("mprotect", "edge_mprotect.c").out("mprotect faulted=1 readable_after=1\n").xfail(lin),
-        // clock_nanosleep TIMER_ABSTIME is treated as relative -> hangs; pin to one engine to bound the
-        // 25s timeout cost while still tracking the gap.
-        src("clockabstime", "edge_clockabstime.c").only(&[Engine::LinuxAarch64]).has("abstime_ok=1").xfail(&[Engine::LinuxAarch64]),
-        src("sigpipe", "edge_sigpipe.c").has("survived=1 epipe=1").xfail(lin), // MSG_NOSIGNAL -> EPIPE
+        // clock_nanosleep TIMER_ABSTIME: emulated as (deadline - now) with an EINTR-recompute loop —
+        // FIXED. Pinned to one engine to bound cost; previously hung to the 25s timeout when treated
+        // as relative.
+        src("clockabstime", "edge_clockabstime.c").only(&[Engine::LinuxAarch64]).has("abstime_ok=1"),
+        src("sigpipe", "edge_sigpipe.c").has("survived=1 epipe=1").xfail(lin), // MSG_NOSIGNAL: SO_NOSIGPIPE on send* only; write()-to-socket SIGPIPE still kills — PARTIAL
         src("procfd", "edge_procfd.c").has("resolves=1 enough_fds=1").xfail(lin), // /proc/self/fd
         // times(): tms_utime works on x86_64 but is 0 on aarch64 (clock() works on both) — engine split.
         src("times", "edge_times.c").has("utime_ok=1 clock_ok=1 ret_ok=1").xfail(&[Engine::LinuxAarch64]),
