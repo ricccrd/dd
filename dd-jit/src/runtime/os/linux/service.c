@@ -35,7 +35,24 @@ int g_rwx_guest;
 #include "service/mem.c"
 #include "service/signal.c"
 #include "service/time.c"
+// --- untrusted-guest isolation seam (subsystem #3: the sentry process-split) --------------------
+// The dispatcher's syscall boundary (run_guest -> service(c)) is the entire guest->host authority
+// crossing. We interpose a one-branch router so an UNTRUSTED guest's fs/net/proc syscalls can be
+// executed in a separate, deny-default-sandboxed SENTRY process instead of in this (JIT-hosting)
+// worker. The gate `g_untrusted` and the router `syscall_route()` live in os/linux/sentry.c, which
+// the target TU #includes immediately AFTER this file (next to it). When the gate is OFF -- the
+// default, and the ENTIRE test matrix -- service() tail-calls service_local(c) (the canonical switch
+// below, renamed) through a single statically-predicted-not-taken branch: byte-identical to the
+// pre-split engine, no behavior change, no measurable cost. The fork/ring/Seatbelt machinery only
+// exists under the gate. This is the ONLY edit to this file.
+static int g_untrusted;                   // gate (defined + env-parsed in os/linux/sentry.c)
+static void syscall_route(struct cpu *c); // sentry router (defined in os/linux/sentry.c)
+static void service_local(struct cpu *c); // fwd: the canonical syscall switch (this file)
 static void service(struct cpu *c) {
+    if (__builtin_expect(g_untrusted, 0)) { syscall_route(c); return; } // untrusted: route via sentry
+    service_local(c);                                                    // trusted: byte-identical path
+}
+static void service_local(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
     if (G_NORMALIZE(c)) return;

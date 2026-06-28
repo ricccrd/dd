@@ -60,6 +60,8 @@
 #include "../os/linux/fscache.c"
 // the syscall layer (service())
 #include "../os/linux/service.c"
+// untrusted-guest isolation: SPSC ring + sentry split (g_untrusted; OFF by default)
+#include "../os/linux/sentry.c"
 // host trampoline + run_guest
 #include "../jit/dispatch.c"
 // ELF loader + initial stack
@@ -320,6 +322,9 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     g_prof = getenv("PROF") != NULL;
     if (getenv("NOMTIBTC")) g_mtibtc = 0; // W5C: disable race-free threaded IBTC fill (A/B kill-switch)
     if (getenv("NOFUTEXQ")) g_futexq = 0; // W5C: disable per-address futex wait queues (A/B kill-switch)
+    // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.
+    g_untrusted = getenv("DDJIT_UNTRUSTED") != NULL;
+    g_sentry_sandbox = getenv("DDJIT_SANDBOX") != NULL;
     char gb[1024];
     prog = find_in_path(prog, gb, sizeof gb); // bare "sh" (docker) -> "/bin/sh" via the container PATH
     g_exe_path = prog;
@@ -378,7 +383,9 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     c.sp = build_stack(argc, (char **)argv, &lm, at_base);
     c.pc = jump;
 
+    if (g_untrusted) sentry_init(); // fork the host-authority sentry + (optionally) confine the worker
     run_guest(&c);
+    if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
     return c.exit_code;
 }
 
