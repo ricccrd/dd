@@ -5,40 +5,41 @@ surface. **This is the only plan — a work list of what is NOT yet implemented.
 [`docs/design/`](design/). Validate: `make test` (**249-green** / 3 engines), `make test-docker[-full|-net|-fn]`,
 `make test-macos`, `make test-realsw`, `make coverage`.
 
-> **Landed (see git history):** the wave-1–6 opt sweep, wave-5 server bugs, the W6A deep-bug cluster,
-> **engine-dedup PR3/4**, strchr/strrchr, **non-PIE** SIMD/LSE fixup **+ syscall pointer-arg g2h** (only nested
-> iovec/msghdr left), adc/sbb, POSIX timers, **x87 fptop**, sigpipe, the **`-p` TCP + UDP host-port bridges**,
-> the **sentry** (first PR + fs set + **socket family** + **N-ring pool** + daemon `--security-opt` wiring),
-> postgres B3/B4, the munmap guard-tail leak, the **vfs.c / translate.c / daemon containers.rs splits**, and the
-> full **Docker-API** HostConfig / build-cache / `commit` / `--name`·rm·exec·`--rm`·events·`:ro` fidelity.
+> **The clearable JIT + daemon work is DONE (see git history):** the wave-1–6 opt sweep, wave-5 server bugs, the
+> W6A deep-bug cluster, engine-dedup PR3/4, strchr/strrchr, non-PIE (SIMD/LSE fixup **+ syscall pointer-arg
+> g2h**), adc/sbb, **x87 fptop**, POSIX timers, sigpipe, the **`-p` TCP + UDP host-port bridges**, the **sentry**
+> (fs + socket family + N-ring pool + fork/exec/wait + sendmsg/SCM_RIGHTS + poll/epoll + daemon `--security-opt`
+> wiring), the **sqlite RAM temp-file backing**, **`-v :ro` enforcement**, postgres B3/B4, the munmap guard-tail
+> leak, the **vfs.c / translate.c / daemon containers.rs refactor splits**, and the full **Docker-API** fidelity
+> (HostConfig / build-cache / `commit` / `--name`·rm·exec·`--rm`·events·logs-interleave·`:ro`).
 
-## In flight (agents running)
+## Residual — NOT clearable by a mechanical agent pass
 
-- **Sentry next PR** — execve/clone/wait4 (forked-guest lanes), sendmsg/recvmsg + SCM_RIGHTS fd-passing,
-  poll/epoll over sentry-owned fds, futex wakeup. Closes the gap to a sound sandbox for real images.
-- **sqlite in-memory temp-file backing** — back O_TMPFILE/unlinked-scratch with a host memfd (the 97%-pread/pwrite
-  spill → memcpy perf win).
-- **docker logs chronological interleave** — the last `make test-docker-fn` behavioral bug.
+**Perf (needs iterative profiling, not a one-shot change):**
+- redis command-dispatch hot path (~18× off native, 98.5% CPU-bound) — a measure-and-tune loop.
+- sub-ms startup — the fork-server residual is `fork()` of the large-VM reservation + the guest `ld.so`.
+- tier-2 multi-block: investigated — **already realized** by the `opt4` superblock former + the self-loop fold;
+  no gap on the same-ISA aarch64 engine.
 
-## Remaining (queued / harder)
+**Refactoring (blocked on a root-cause, not a mechanical split):**
+- `service.c` (3.5k) io/proc/misc dispatcher split — a prior verbatim attempt regressed threading and the cause
+  was never found, so it was reverted. sysv/mem/signal/time are split. Retrying mechanically risks the same
+  subtle regression; this needs the root cause found first (a debugging task — per "don't break anything").
 
-- **Perf squeeze** (lower priority): redis command-dispatch hot-path tuning (~18× off native), tier-2 multi-block
-  traces over call-free spans, sub-ms startup (fork of the large-VM reservation + ld.so). [`x86-perf.md`](design/x86-perf.md)
-- **Refactoring:** `service.c` (3.5k) io/proc/misc dispatcher split — needs a careful retry (a prior attempt
-  broke threading; root cause never found, so reverted). The sysv/mem/signal/time splits already landed.
-- **`-v :ro` JIT-layer write enforcement** — the daemon parses + reports it; the JIT `Volume{}` has no RO flag,
-  so writes to a read-only bind aren't blocked at the mount.
+**Sentry completeness (the sandbox is functional for real images; these are edge/perf):**
+- futex/`__ulock` wakeup (replace the servicer spin), per-process fd tables, eventfd/timerfd/signalfd
+  forwarding, sendmmsg/recvmmsg, execve-under-Seatbelt image read.
 
-## Blocked on inputs / environment
+## Blocked on inputs / environment (cannot do in this sandbox)
 
 - **netstack smoltcp** (`DD_NETSTACK`) — the crate dep can't be fetched in the offline build.
-- **real redis / postgres / nats end-to-end** — needs **x86_64 images** (only arm64 local).
+- **real x86_64 redis/postgres/nats end-to-end** — only arm64 images are local.
 
-## Platform limitations (macOS host — can't provide the Linux primitive)
+## Platform limitations (macOS host — the Linux primitive doesn't exist)
 
-Non-PIE `ET_EXEC` `__PAGEZERO` (the JIT pointer-fixup is the achievable workaround), cpu/io throttling (no
-cgroup; mem+pids via rlimit), `pidfd`, `io_uring`, mqueue `mq_*`, `edge` corners (`mprotect` PROT_NONE,
-`pipe2(O_DIRECT)`). Free on a linux→linux build.
+Non-PIE `ET_EXEC` `__PAGEZERO` (the JIT pointer-fixup is the workaround), cpu/io throttling (no cgroup; mem+pids
+via rlimit), `pidfd`, `io_uring`, mqueue `mq_*`, `edge` corners (`mprotect` PROT_NONE, `pipe2(O_DIRECT)`). Free
+on a linux→linux build.
 
 ## Portability matrix (only darwin-host / both-guests built)
 
