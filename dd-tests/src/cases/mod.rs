@@ -344,6 +344,17 @@ fn sandbox() -> Group {
         // host-only absolute paths are not present inside the jail -> ENOENT, never the host dir.
         sh("jail-no-users", "cat /Users 2>&1; echo DONE").has("DONE").has("o such file"),
         sh("jail-no-private", "cat /private/etc/hosts 2>&1; echo DONE").has("DONE").has("o such file"),
+        // --- untrusted-guest SENTRY split (DDJIT_UNTRUSTED) ---------------------------------------------
+        // Each guest is registered TWICE against the SAME golden line: once on the trusted path (baseline)
+        // and once with `.untrusted()` (DDJIT_UNTRUSTED=1) so every fs/net syscall is marshaled to the
+        // forked sentry over the SPSC ring and the copied-back bytes must reproduce the baseline exactly.
+        // This is the matrix's ONLY DDJIT_UNTRUSTED coverage. DDJIT_SANDBOX stays off (ring, not Seatbelt).
+        // fs round-trip: openat/write/lseek/read/pread64/fstat/getdents64/close all cross the ring.
+        src("sentry-fs", "sentry_fs.c").out("sentry_fs sum=32640 size=256 found=1\n"),
+        src("sentry-fs-untrusted", "sentry_fs.c").out("sentry_fs sum=32640 size=256 found=1\n").untrusted(),
+        // socket family: socket/bind/getsockname/sendto/recvfrom on a sentry-owned UDP loopback socket.
+        src("sentry-net", "sentry_net.c").out("sentry_net echo=datagram-echo-42 len=16\n"),
+        src("sentry-net-untrusted", "sentry_net.c").out("sentry_net echo=datagram-echo-42 len=16\n").untrusted(),
     ])
 }
 

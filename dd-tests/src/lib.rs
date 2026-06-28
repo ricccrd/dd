@@ -83,6 +83,11 @@ pub struct Case {
     /// Engines where this case is a KNOWN failure (jit86 translator/service bugs under debugging) — a
     /// fail there is reported `xfail`, not a regression.
     pub xfail: Vec<Engine>,
+    /// Run the guest with the untrusted-guest SENTRY split enabled (sets `DDJIT_UNTRUSTED=1` in the
+    /// engine's env so fs/net/proc syscalls route through the forked sentry over the SPSC ring). OFF by
+    /// default → the existing matrix is byte-identical. `DDJIT_SANDBOX` is intentionally NOT set: this
+    /// validates the ring marshaling/forwarding, not the (macOS) Seatbelt confinement.
+    pub untrusted: bool,
     pub checks: Vec<Check>,
 }
 
@@ -101,7 +106,7 @@ fn base(name: &'static str, bin: Bin) -> Case {
         Bin::Fixture(fx) => fx.iter().map(|(e, _)| *e).collect(),
         Bin::InRootfs => vec![Engine::LinuxAarch64], // container rootfs fixtures are aarch64 today
     };
-    Case { name, bin, args: vec![], rootfs: None, lowers: vec![], mem_max: 0, engines, xfail: vec![], checks: vec![] }
+    Case { name, bin, args: vec![], rootfs: None, lowers: vec![], mem_max: 0, engines, xfail: vec![], untrusted: false, checks: vec![] }
 }
 /// A case whose guest is compiled from a Linux/aarch64 C source under `guests/`.
 pub fn src(name: &'static str, source: &'static str) -> Case { base(name, Bin::Source(source)) }
@@ -137,6 +142,11 @@ impl Case {
     /// Mark this case a KNOWN failure on the given engines (jit86 bugs under debugging): a fail there
     /// is reported `xfail` (not a regression); an unexpected pass is reported `XPASS`.
     pub fn xfail(mut self, e: &[Engine]) -> Self { self.xfail = e.to_vec(); self }
+    /// Enable the untrusted-guest SENTRY split for this case (`DDJIT_UNTRUSTED=1` in the engine's env):
+    /// fs/net/proc syscalls are marshaled to the forked sentry over the ring instead of run in the JIT
+    /// worker. Used to re-run a guest under the split and assert the SAME golden output as the trusted
+    /// baseline. Linux-engine only in effect (the sentry is Linux-only); the env is inert on darwin.
+    pub fn untrusted(mut self) -> Self { self.untrusted = true; self }
 }
 
 /// Result of running one case on one engine.
@@ -282,6 +292,10 @@ pub fn run(ctx: &Ctx, c: &Case, e: Engine) -> Status {
     let mut cfg = ddjit::SpawnConfig::new(String::new(), rootfs.unwrap_or_default());
     cfg.lowers = c.lowers.clone();
     cfg.mem_max = c.mem_max;
+    // Untrusted-guest SENTRY split: bake DDJIT_UNTRUSTED=1 into the engine's launch env (via SpawnConfig's
+    // `env`, which serializes into the `exec env …` prefix of the launch script — so it survives the `mac`
+    // bridge that drops ambient env). DDJIT_SANDBOX is left unset on purpose (ring/forwarding, not Seatbelt).
+    if c.untrusted { cfg.env.push(("DDJIT_UNTRUSTED".into(), "1".into())); }
     cfg.argv = match &c.bin {
         Bin::InRootfs => c.args.clone(),
         _ => std::iter::once(guest.clone()).chain(c.args.iter().cloned()).collect(),
