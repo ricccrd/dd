@@ -138,6 +138,42 @@ static int insn_is_flagkill(const struct insn *I) {
     return 0;
 }
 
+// opt3 carry-value consumer (adc/sbb): 1 iff I reaches do_alu kind 2/3 with width>=4 -- the forms that
+// can pull their x86 CF carry-in straight from an immediately-preceding deferred producer's LIVE NZCV
+// (so the main loop must NOT eagerly materialize the pending flags before it; do_alu consumes them).
+// Byte/word adc/sbb (report_unimpl) and every non-adc/sbb op return 0 -> normal materialize path.
+static int insn_is_carry_consumer(const struct insn *I) {
+    if (I->two) return 0;
+    uint8_t op = I->op;
+    // primary reg/rm forms 10/11/12/13 (adc) 18/19/1A/1B (sbb): width>=4 needs (op&1) && opsize>=4
+    if (op < 0x40 && (op & 7) <= 3 && alu_kind_primary(op) >= 0) {
+        int k = alu_kind_primary(op);
+        return (k == 2 || k == 3) && (op & 1) && I->opsize >= 4;
+    }
+    // imm-to-acc 15 (adc eax,imm) 1D (sbb eax,imm): (op&7)==5 is the word/dword form
+    if (op < 0x40 && (op & 7) == 5 && alu_kind_primary(op) >= 0) {
+        int k = alu_kind_primary(op);
+        return (k == 2 || k == 3) && I->opsize >= 4;
+    }
+    // group1 81/83 (/2 adc, /3 sbb); 80 is byte-only -> not a carry consumer here
+    if (op == 0x81 || op == 0x83) {
+        int k = I->reg & 7;
+        return (k == 2 || k == 3) && I->opsize >= 4;
+    }
+    return 0;
+}
+
+// opt3 carry-flow: adjust ONLY the C bit of the LIVE ARM NZCV in place (no cpu->nzcv round-trip), so an
+// adc/sbb can read its x86 CF carry-in directly from a deferred producer's live flags. `alu_base` selects
+// the bit op on bit 29 (C): A_EOR flips it, A_BIC clears it, A_ORR sets it. Scratch x20/x22 match the
+// e_nzcv_* convention (callee-saved, never an x86 guest reg x0..x15 nor a do_alu operand reg).
+static void e_nzcv_C_op(uint32_t alu_base) {
+    emit32(0xD53B4200u | 20);          // mrs x20, nzcv
+    e_movconst(22, 1u << 29);          // C is bit 29 of nzcv
+    e_rrr(alu_base, 20, 20, 22, 1, 0); // x20 = x20 <op> (1<<29)   (EOR=flip / BIC=clear / ORR=set)
+    emit32(0xD51B4200u | 20);          // msr nzcv, x20
+}
+
 // Width-correct ALU: dst = a <kind> b, set cpu->nzcv.  dst<0 => cmp/test (no write).
 // 4/8-byte: direct ARM op. 1/2-byte: operate in the HIGH bits (<<sh) so ARM NZCV matches
 // x86 byte/word flags exactly, then merge the low w bytes back (preserving upper bits).
@@ -145,16 +181,42 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
     int sf = w == 8, out = dst < 0 ? 31 : dst;
     int ak = kind == 7 ? 5 : kind; // cmp == sub(discard); test == and(discard)
     if (kind == 7) ak = 5;
-    if (kind == 2) {                          // ADC: carry-in = x86 CF = NOT stored; result CF stored inverted
-        e_nzcv_load_ci();                     // live ARM C = x86 CF
-        e_rrr(0x3A000000u, out, a, b, sf, 0); // adcs
-        e_nzcv_save_ci();
-        return;
-    }
-    if (kind == 3) { // SBB: borrow convention matches stored C directly
-        e_nzcv_load();
-        e_rrr(0x7A000000u, out, a, b, sf, 0); // sbcs
-        e_nzcv_save();
+    if (kind == 2 || kind == 3) { // ADC / SBB -- carry-VALUE consumers (opt3 lazy carry-flow)
+        // ARM ADCS computes a+b+C, SBCS computes a-b-(NOT C). x86 ADC/SBB use x86 CF directly.
+        // Borrow convention: cpu->nzcv stores ARM C = NOT x86 CF. Hence the required LIVE ARM C is:
+        //   ADC -> C = x86 CF        SBB -> C = NOT x86 CF (so SBCS' -(NOT C) = -CF).
+        // The op's OWN result is itself deferrable: after ADCS, live C = x86 carry-out, so the canonical
+        // spill is the FL_ADD finalizer (e_nzcv_save_ci, flip-C); after SBCS, live C is already the borrow
+        // convention, so it is the FL_SUB finalizer (e_nzcv_save). FL_ADC/FL_SBB therefore FOLD into
+        // FL_ADD/FL_SUB with bit-identical finalizer bytes, and every downstream Jcc/boundary/SETcc
+        // consumer handles them unchanged.
+        int adc = (kind == 2);
+        uint32_t opc = adc ? 0x3A000000u : 0x7A000000u; // adcs / sbcs
+        if (lazyflags_on() && g_fl_pending != FL_NONE) {
+            // Carry-in is derivable from the deferred producer's LIVE NZCV with a single C-bit fixup --
+            // no cpu->nzcv load/store. Producer live ARM C: FL_SUB -> NOT CF, FL_ADD -> CF, FL_LOGIC ->
+            // (x86 CF forced to 0, since AND/OR/XOR/TEST clear CF). An adc;adc;… / sbb;sbb;… bignum chain
+            // thus stays in registers with the host carry flowing, never touching cpu->nzcv per step.
+            switch (g_fl_pending) {
+            case FL_SUB: if (adc) e_nzcv_C_op(A_EOR); /* NOT CF -> CF; SBB needs NOT CF already */ break;
+            case FL_ADD: if (!adc) e_nzcv_C_op(A_EOR); /* CF ok for ADC; SBB needs NOT CF */ break;
+            case FL_LOGIC: e_nzcv_C_op(adc ? A_BIC : A_ORR); /* x86 CF=0: ADC C=0, SBB C=1 */ break;
+            default: break;
+            }
+            e_rrr(opc, out, a, b, sf, 0);          // adcs / sbcs off the live carry
+            g_fl_pending = adc ? FL_ADD : FL_SUB;  // defer own flags (FL_ADC==FL_ADD, FL_SBB==FL_SUB)
+            return;
+        }
+        // No live producer (FL_NONE) under lazy, OR NOLAZY: carry-in from cpu->nzcv (membank).
+        if (adc) e_nzcv_load_ci(); // live ARM C = x86 CF
+        else     e_nzcv_load();    // live ARM C = stored borrow (= NOT x86 CF)
+        e_rrr(opc, out, a, b, sf, 0);
+        if (lazyflags_on())
+            g_fl_pending = adc ? FL_ADD : FL_SUB; // keep the chain alive: defer (same finalizer bytes)
+        else if (adc)
+            e_nzcv_save_ci();                     // NOLAZY: exact pre-opt3 inline path (spill to membank)
+        else
+            e_nzcv_save();
         return;
     }
     int logical = (kind == 1 || kind == 4 || kind == 6); // or/and/xor (and test): x86 clears CF
@@ -605,7 +667,11 @@ static void *translate_block(uint64_t gpc) {
         // dead-flag elimination, so the pending sub/cmp always materializes (PR1 behavior).
         int is_jcc = (!I.two && op >= 0x70 && op <= 0x7F) || (I.two && (op & 0xF0) == 0x80);
         if (g_fl_pending && !is_jcc) {
-            if (lazyflags_on() && insn_is_flagkill(&I))
+            int lazy = lazyflags_on();
+            if (lazy && insn_is_carry_consumer(&I)) {
+                // opt3 carry-flow: leave the producer's flags LIVE; do_alu's adc/sbb pulls its x86 CF
+                // carry-in straight from them (FL_SUB/FL_ADD/FL_LOGIC) -- no eager materialize.
+            } else if (lazy && insn_is_flagkill(&I))
                 g_fl_pending = FL_NONE; // dead: next op fully overwrites the flags before any read
             else
                 flags_materialize();
@@ -1893,10 +1959,10 @@ static void *translate_block(uint64_t gpc) {
                         emit_ea(&I, next);
                         e_ldr_q(16, 17, 0);
                     }
-                    uint32_t b = op == 0xDE   ? 0x6E20A400u
-                                 : op == 0xDA ? 0x6E20AC00u
-                                 : op == 0xEE ? 0x4E60A400u
-                                              : 0x4E60AC00u;
+                    uint32_t b = op == 0xDE   ? 0x6E206400u  // pmaxub -> UMAX  .16B (lane-wise, NOT UMAXP)
+                                 : op == 0xDA ? 0x6E206C00u  // pminub -> UMIN  .16B (lane-wise, NOT UMINP)
+                                 : op == 0xEE ? 0x4E606400u  // pmaxsw -> SMAX  .8H  (lane-wise, NOT SMAXP)
+                                              : 0x4E606C00u; // pminsw -> SMIN  .8H  (lane-wise, NOT SMINP)
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4) { // paddb/w/d/q
                     int s = I.is_mem ? 16 : vm;
