@@ -24,6 +24,12 @@ fn works() -> Vec<Work> {
         Work { name: "int-sieve",  srcs: &["b_int.c"],   libs: &[],     defs: &[], sqlite: false },
         Work { name: "float-nbody",srcs: &["b_float.c"], libs: &["-lm"],defs: &[], sqlite: false },
         Work { name: "sha256",     srcs: &["b_hash.c"],  libs: &[],     defs: &[], sqlite: false },
+        Work { name: "memcpy",     srcs: &["b_memcpy.c"],libs: &[],     defs: &[], sqlite: false },
+        Work { name: "matmul",     srcs: &["b_matmul.c"],libs: &[],     defs: &[], sqlite: false },
+        Work { name: "mandelbrot", srcs: &["b_mandel.c"],libs: &[],     defs: &[], sqlite: false },
+        Work { name: "qsort",      srcs: &["b_sort.c"],  libs: &[],     defs: &[], sqlite: false },
+        Work { name: "base64",     srcs: &["b_base64.c"],libs: &[],     defs: &[], sqlite: false },
+        Work { name: "text-scan",  srcs: &["b_strings.c"],libs: &[],    defs: &[], sqlite: false },
         Work { name: "sqlite",     srcs: &["b_sqlite.c"],libs: &["-lm"],
                defs: &["-DSQLITE_THREADSAFE=0","-DSQLITE_OMIT_LOAD_EXTENSION","-DSQLITE_DEFAULT_MEMSTATUS=0"], sqlite: true },
     ]

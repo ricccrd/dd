@@ -114,23 +114,29 @@
 
   <!-- BENCHMARKS -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">Is it actually fast?</h2>
-  <p class="mt-4 leading-relaxed text-muted">For <strong class="text-txt">x86-64 images</strong> the fair comparison is the same binary emulated by qemu inside a VM — what VM-based Docker falls back to for cross-arch images. Here dd's JIT is well ahead:</p>
+  <p class="mt-4 leading-relaxed text-muted">Ten workloads, the same static binary timed two ways, median of 7. For <strong class="text-txt">x86-64 images</strong> the fair comparison is the same binary emulated by qemu inside a VM — what VM-based Docker falls back to for cross-arch images. dd's JIT wins <strong class="text-txt">9 of 10</strong>, hugely on floating-point:</p>
 
   <div class="mt-6 overflow-x-auto rounded-xl border border-edge bg-panel">
     <table class="w-full border-collapse text-[13px] sm:text-sm">
       <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">x86-64 workload</th><th class="p-3">qemu in a VM</th><th class="p-3 text-blue1">dd (no VM)</th><th class="p-3">dd vs VM</th></tr></thead>
       <tbody class="[&>tr]:border-t [&>tr]:border-edge">
-        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.22s</td><td class="p-3">0.25s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
-        <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">2.88s</td><td class="p-3">0.88s</td><td class="p-3 font-semibold text-emerald-400">3.3× faster</td></tr>
-        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.24s</td><td class="p-3">0.87s</td><td class="p-3 font-semibold text-emerald-400">1.4× faster</td></tr>
-        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.60s</td><td class="p-3">2.32s</td><td class="p-3 font-semibold text-emerald-400">1.1× faster</td></tr>
+        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.27s</td><td class="p-3">0.25s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
+        <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">7.66s</td><td class="p-3">0.82s</td><td class="p-3 font-semibold text-emerald-400">9.3× faster</td></tr>
+        <tr><td class="p-3 font-medium">matrix multiply</td><td class="p-3 text-muted">1.46s</td><td class="p-3">0.17s</td><td class="p-3 font-semibold text-emerald-400">8.8× faster</td></tr>
+        <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">2.88s</td><td class="p-3">0.87s</td><td class="p-3 font-semibold text-emerald-400">3.3× faster</td></tr>
+        <tr><td class="p-3 font-medium">memcpy</td><td class="p-3 text-muted">0.24s</td><td class="p-3">0.11s</td><td class="p-3 font-semibold text-emerald-400">2.1× faster</td></tr>
+        <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">3.83s</td><td class="p-3">1.84s</td><td class="p-3 font-semibold text-emerald-400">2.1× faster</td></tr>
+        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.25s</td><td class="p-3">0.89s</td><td class="p-3 font-semibold text-emerald-400">1.4× faster</td></tr>
+        <tr><td class="p-3 font-medium">text scan (wc/grep)</td><td class="p-3 text-muted">0.32s</td><td class="p-3">0.24s</td><td class="p-3 font-semibold text-emerald-400">1.35× faster</td></tr>
+        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.58s</td><td class="p-3">2.29s</td><td class="p-3 font-semibold text-emerald-400">1.13× faster</td></tr>
+        <tr><td class="p-3 font-medium">base64</td><td class="p-3 text-muted">0.70s</td><td class="p-3">0.83s</td><td class="p-3 text-muted">1.2× slower</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p class="mt-6 leading-relaxed text-muted">For <strong class="text-txt">arm64 images</strong> there's no emulation to beat — it's native either way, and the bar is a native Linux VM. dd roughly matches it on compute, and there's one honest loss: <strong class="text-txt">syscall-heavy workloads (like SQLite) are slower today</strong>, because a userspace kernel pays for every syscall. That's the part I'm actively working on, and it's the next thing on the bench (a throughput-bound server like redis loses ~3× right now). I'd rather say that than hide it.</p>
+  <p class="mt-6 leading-relaxed text-muted">For <strong class="text-txt">arm64 images</strong> there's no emulation to beat — it's native either way, and the bar is a native Linux VM (the hardest one). dd matches it on compute (int sieve, SHA-256, n-body, mandelbrot all at or above parity) and the honest losses are <strong class="text-txt">allocation/syscall-heavy</strong> work — qsort (~1.7×) and SQLite (~2×) — because a userspace kernel pays for every syscall. That's the optimization frontier I'm on (a throughput-bound server like redis loses ~3× today). I'd rather show it than hide it.</p>
 
-  <p class="mt-5 leading-relaxed text-muted2 text-sm">Numbers are measured, median of 7 runs on Apple Silicon; the compute set reproduces with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">make bench</code>.</p>
+  <p class="mt-5 leading-relaxed text-muted2 text-sm">Numbers measured, median of 7 on Apple Silicon; reproduce with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">make bench</code>. The dd lane even pays a small per-run bridge tax the shipping app doesn't, so sub-0.2s rows are conservative.</p>
 
   <!-- WHAT -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">What you get today</h2>

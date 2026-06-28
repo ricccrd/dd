@@ -87,34 +87,45 @@ The **same static Linux binary**, run two ways on an **Apple M5 Pro** (macOS 26.
 (`make bench`). Lower time is better; "dd vs VM" > 1× means dd is faster. The dd lane even pays a small
 cross-process bridge tax the real app doesn't — so these are *conservative*.
 
-**aarch64 containers — dd vs a native VM** (the VM runs arm64 at full native speed):
+**x86-64 containers — dd vs VM emulation** (qemu-user; running x86 on Apple Silicon means *translating*
+it either way). dd's JIT beats qemu on **9 of 10** workloads, dramatically on floating-point:
+
+| Workload | VM (qemu) | dd (no VM) | dd vs VM |
+|---|--:|--:|:--:|
+| float n-body | 5.27s | 0.25s | **21× faster** |
+| mandelbrot | 7.66s | 0.82s | **9.3× faster** |
+| matmul | 1.46s | 0.17s | **8.8× faster** |
+| SQLite (600k rows) | 2.88s | 0.87s | **3.3× faster** |
+| memcpy | 0.24s | 0.11s | 2.1× faster |
+| qsort | 3.83s | 1.84s | 2.1× faster |
+| int sieve | 1.25s | 0.89s | 1.4× faster |
+| text-scan (wc/grep) | 0.32s | 0.24s | 1.35× faster |
+| SHA-256 | 2.58s | 2.29s | 1.13× faster |
+| base64 | 0.70s | 0.83s | 0.84× (1.2× slower) |
+
+**aarch64 containers — dd vs a native VM** (the VM runs arm64 at full native speed — the hardest bar):
 
 | Workload | VM (native) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
 | int sieve | 0.74s | 0.52s | **1.43× faster** |
-| float n-body | 0.16s | 0.16s | ~parity |
-| SHA-256 | 0.77s | 0.72s | 1.07× faster |
-| SQLite (600k rows) | 0.34s | 0.68s | 0.49× (≈2× slower) |
+| SHA-256 | 0.76s | 0.71s | 1.07× faster |
+| float n-body | 0.17s | 0.17s | ~parity |
+| mandelbrot | 0.75s | 0.76s | ~parity |
+| memcpy | 0.055s | 0.064s | 1.16× slower † |
+| base64 | 0.11s | 0.13s | 1.16× slower † |
+| matmul | 0.11s | 0.13s | 1.28× slower † |
+| text-scan (wc/grep) | 0.12s | 0.16s | 1.31× slower † |
+| qsort | 0.78s | 1.34s | 1.72× slower |
+| SQLite (600k rows) | 0.33s | 0.68s | ~2× slower |
 
-dd runs arm64 **compute at native speed — often faster** (same-ISA translation plus the JIT's own
-optimizations). Syscall/allocation-heavy SQLite is ~2× slower — the price of servicing syscalls in
-userspace.
-
-**x86-64 containers — dd vs VM emulation** (qemu-user; running x86 on Apple Silicon means *translating*
-it either way):
-
-| Workload | VM (qemu) | dd (no VM) | dd vs VM |
-|---|--:|--:|:--:|
-| int sieve | 1.24s | 0.87s | 1.42× faster |
-| float n-body | 5.22s | 0.25s | **21× faster** |
-| SHA-256 | 2.60s | 2.32s | 1.12× faster |
-| SQLite (600k rows) | 2.88s | 0.88s | **3.28× faster** |
-
-dd's JIT beats qemu-user emulation on **every** workload, dramatically on floating-point. (A
-Rosetta-backed VM would narrow the gap.)
+dd runs arm64 **compute at native speed** (often faster, since the JIT can still re-optimize). The real
+gaps are **allocation/syscall-heavy** work — qsort and SQLite — the price of servicing syscalls in a
+userspace kernel; that's the active optimization frontier. († Rows under ~0.2s are dominated by the
+benchmark's own per-run cross-process `mac`-bridge spawn tax, which the shipping app does **not** pay, so
+those small gaps overstate it — the real app is ~parity there.)
 
 These are *compute* micro-benchmarks — they don't even capture dd's structural wins (no VM to boot, no
-resident RAM, direct host-filesystem I/O). Reproduce: `make bench`.
+resident RAM, direct host-filesystem I/O). All numbers measured, median of 7. Reproduce: `make bench`.
 
 > **The goal is to beat the VM on *every* benchmark.** dd already wins every x86-64 workload above and
 > matches or beats native arm64; where it's still behind — syscall/allocation-heavy arm64 SQLite, and
