@@ -188,6 +188,8 @@ static char g_netns[200];
 static uint16_t g_lo_port[1024];
 // fd -> 1 if created SOCK_STREAM (only those get loopback isolation)
 static uint8_t g_sock_stream[1024];
+// fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
+static uint8_t g_sock_dgram[1024];
 static int lo_on(void) { return g_netns[0] != 0; }
 static int lo_is(const uint8_t *sa, socklen_t l) {
     return sa && l >= 8 && *(uint16_t *)sa == AF_INET && sa[4] == 127;
@@ -263,6 +265,7 @@ static int g_br_init;
 static void fd_carry_sock(int dst, int src) {
     if (dst < 0 || dst >= 1024 || src < 0 || src >= 1024) return;
     g_sock_stream[dst] = g_sock_stream[src];
+    g_sock_dgram[dst] = g_sock_dgram[src];
     g_lo_port[dst] = g_lo_port[src];
     g_br_port[dst] = g_br_port[src];
     g_br_ip[dst] = g_br_ip[src];
@@ -456,6 +459,216 @@ static void fwd_maybe_start(int fd) {
     if (pthread_create(&t, NULL, fwd_listen_thread, fl) != 0) { free(fl); return; }
     pthread_detach(t);
     g_fwd_started[g_nfwd++] = hport;
+}
+
+// ---- Published-port host UDP forwarder (`docker run -p HOST:CONTAINER/udp`) ----------------------
+// UDP has no listen()/accept(): a guest UDP server bind()s a datagram socket on the virtual switch
+// (AF_UNIX SOCK_DGRAM at br_path/lo_path, set up in the bind hook below) and recvfrom()s it. As with
+// TCP nothing on the host owns an AF_INET socket for HOST_PORT, so a host process sending to
+// localhost:HOST_PORT never reaches the guest. This bridges that gap with a real host
+// AF_INET/SOCK_DGRAM socket on 0.0.0.0:HOST_PORT that relays datagrams to/from the guest's switch
+// socket. Because UDP is connectionless, replies must route back to the right host client: we give
+// EACH distinct host client its own guest-facing AF_UNIX/SOCK_DGRAM socket bound to a unique synthetic
+// path, and send the client's datagrams to the guest FROM that socket. The guest's recvfrom() then sees
+// that synthetic path as the source address, and a standard server that sendto()s its reply back to the
+// recvfrom source lands on exactly that per-client socket -- which the forwarder maps back to the host
+// client. So per-peer reply routing falls out of the normal UDP request/reply pattern, with no change
+// to the guest's sendto/recvfrom path (AF_UNIX addresses pass through service.c's sa_l2m/sa_m2l raw).
+// Scoped to PUBLISHED ports only (pm_published): non-published UDP is left entirely untouched (real
+// host bind / egress / DNS unchanged), and it is a no-op on --network host/none (br_on()/lo_on() off),
+// mirroring the TCP forwarder's guards. TCP publishing, container<->container and egress are unaffected.
+
+// Swap the AF_INET socket at `fd` for a fresh AF_UNIX SOCK_DGRAM one (keeping the fd number + flags).
+// Mirrors lo_swap() but for datagram sockets (the switch-backed UDP server socket).
+static int udp_swap(int fd) {
+    int fl = fcntl(fd, F_GETFL), df = fcntl(fd, F_GETFD);
+    int u = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (u < 0) return -1;
+    if (u != fd) {
+        if (dup2(u, fd) < 0) { close(u); return -1; }
+        close(u);
+    }
+    if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
+    if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return 0;
+}
+
+#define UDP_FWD_MAXPEERS 64
+struct udp_peer {
+    struct sockaddr_storage caddr; // host client addr (macOS layout, as recvfrom delivered it)
+    socklen_t calen;
+    int gs;                        // guest-facing AF_UNIX/SOCK_DGRAM socket (bound to its own path,
+                                   // connected to the guest switch socket) -- this client's identity
+    int used;
+};
+struct udp_fwd {
+    uint16_t hport;
+    char upath[200];               // guest switch datagram socket path (br_/lo_path, as the guest bound)
+    char pdir[80];                 // dir holding this forwarder's synthetic per-client socket paths
+    int hs;                        // host AF_INET/SOCK_DGRAM socket on 0.0.0.0:hport
+    struct udp_peer peers[UDP_FWD_MAXPEERS];
+    int npeers;
+    unsigned pseq;                 // monotonic id for unique synthetic peer paths (+ ring eviction)
+};
+// Find the peer slot for host client (sa,sl), or create one (its own AF_UNIX dgram socket bound to a
+// fresh synthetic path and connected to the guest switch socket). Returns the guest-facing fd or -1.
+static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t sl) {
+    for (int i = 0; i < f->npeers; i++)
+        if (f->peers[i].used && f->peers[i].calen == sl && memcmp(&f->peers[i].caddr, sa, sl) == 0)
+            return f->peers[i].gs;
+    int slot, appended = 0;
+    if (f->npeers < UDP_FWD_MAXPEERS) {
+        slot = f->npeers;
+        appended = 1;
+    } else { // table full: evict a slot round-robin (oldest-ish) so new clients still work
+        slot = (int)(f->pseq % UDP_FWD_MAXPEERS);
+        if (f->peers[slot].used) close(f->peers[slot].gs);
+        f->peers[slot].used = 0;
+    }
+    int gs = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (gs < 0) return -1;
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    snprintf(un.sun_path, sizeof un.sun_path, "%s/%u", f->pdir, f->pseq++);
+    unlink(un.sun_path);
+    if (bind(gs, (struct sockaddr *)&un, sizeof un) < 0) { close(gs); return -1; }
+    struct sockaddr_un gu;
+    memset(&gu, 0, sizeof gu);
+    gu.sun_family = AF_UNIX;
+    snprintf(gu.sun_path, sizeof gu.sun_path, "%s", f->upath);
+    if (connect(gs, (struct sockaddr *)&gu, sizeof gu) < 0) { close(gs); unlink(un.sun_path); return -1; }
+    if (appended) f->npeers++;
+    f->peers[slot].used = 1;
+    f->peers[slot].gs = gs;
+    f->peers[slot].calen = sl;
+    memcpy(&f->peers[slot].caddr, sa, sl < sizeof f->peers[slot].caddr ? sl : sizeof f->peers[slot].caddr);
+    return gs;
+}
+static void *udp_fwd_thread(void *p) {
+    struct udp_fwd *f = (struct udp_fwd *)p; // heap-owned by this thread for its lifetime
+    int hs = socket(AF_INET, SOCK_DGRAM, 0);
+    if (hs < 0) { free(f); return NULL; }
+    int on = 1;
+    setsockopt(hs, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(f->hport);
+    sin.sin_addr.s_addr = htonl(INADDR_ANY); // 0.0.0.0:HOST_PORT (docker's default publish address)
+    if (bind(hs, (struct sockaddr *)&sin, sizeof sin) < 0) { // host port busy -> no forwarding
+        close(hs);
+        free(f);
+        return NULL;
+    }
+    f->hs = hs;
+    snprintf(f->pdir, sizeof f->pdir, "/tmp/.ddudp.%d.%u", (int)getpid(), (unsigned)f->hport);
+    mkdir(f->pdir, 0700);
+    char buf[65536];
+    for (;;) {
+        struct pollfd pf[1 + UDP_FWD_MAXPEERS];
+        pf[0].fd = hs;
+        pf[0].events = POLLIN;
+        pf[0].revents = 0;
+        int n = 1;
+        for (int i = 0; i < f->npeers; i++) {
+            if (!f->peers[i].used) continue;
+            pf[n].fd = f->peers[i].gs;
+            pf[n].events = POLLIN;
+            pf[n].revents = 0;
+            n++;
+        }
+        if (poll(pf, n, -1) < 0) { if (errno == EINTR) continue; break; }
+        // host client -> guest: per-client guest-facing socket preserves the reply path
+        if (pf[0].revents & (POLLIN | POLLERR)) {
+            struct sockaddr_storage ca;
+            socklen_t cl = sizeof ca;
+            ssize_t r = recvfrom(hs, buf, sizeof buf, 0, (struct sockaddr *)&ca, &cl);
+            if (r >= 0) {
+                int gs = udp_peer_get(f, (struct sockaddr *)&ca, cl);
+                if (gs >= 0) send(gs, buf, (size_t)r, 0); // connected to the guest switch socket
+            }
+        }
+        // guest replies -> back out to the originating host client (the socket that received it)
+        for (int i = 0; i < f->npeers; i++) {
+            if (!f->peers[i].used) continue;
+            int hit = 0;
+            for (int j = 1; j < n; j++)
+                if (pf[j].fd == f->peers[i].gs && (pf[j].revents & (POLLIN | POLLERR))) { hit = 1; break; }
+            if (!hit) continue;
+            ssize_t r = recv(f->peers[i].gs, buf, sizeof buf, 0);
+            if (r >= 0)
+                sendto(hs, buf, (size_t)r, 0, (struct sockaddr *)&f->peers[i].caddr, f->peers[i].calen);
+        }
+    }
+    for (int i = 0; i < f->npeers; i++)
+        if (f->peers[i].used) close(f->peers[i].gs);
+    close(hs);
+    free(f);
+    return NULL;
+}
+// Host ports we've already spun up a UDP forwarder for (idempotent across re-bind / SO_REUSEADDR).
+static uint16_t g_udp_fwd_started[32];
+static int g_nudpfwd;
+// Called from the UDP bind hook once a published switch-backed datagram socket is bound: start its host
+// forwarder. Mirrors fwd_maybe_start() but triggers at bind (UDP has no listen) and keys off g_*_port,
+// which the bind hook just set on this fd.
+static void udp_fwd_maybe_start(int fd) {
+    if (fd < 0 || fd >= 1024) return;
+    uint16_t cport = 0;
+    char upath[200];
+    if (g_br_port[fd]) { cport = g_br_port[fd]; br_path(g_br_ip[fd], cport, upath, sizeof upath); }
+    else if (g_lo_port[fd]) { cport = g_lo_port[fd]; lo_path(cport, upath, sizeof upath); }
+    else return;
+    if (!pm_published(cport)) return;
+    uint16_t hport = pm_host(cport);
+    for (int i = 0; i < g_nudpfwd; i++)
+        if (g_udp_fwd_started[i] == hport) return; // already forwarding this host port
+    if (g_nudpfwd >= 32) return;
+    struct udp_fwd *f = (struct udp_fwd *)calloc(1, sizeof *f);
+    if (!f) return;
+    f->hport = hport;
+    snprintf(f->upath, sizeof f->upath, "%s", upath);
+    pthread_t t;
+    if (pthread_create(&t, NULL, udp_fwd_thread, f) != 0) { free(f); return; }
+    pthread_detach(t);
+    g_udp_fwd_started[g_nudpfwd++] = hport;
+}
+// UDP bind hook: if `fd` is an AF_INET datagram socket binding a PUBLISHED container port on the bridge
+// (0.0.0.0/own-ip/in-subnet) or private loopback, swap it onto an AF_UNIX/SOCK_DGRAM switch socket and
+// start the host->guest forwarder. Returns 1 if handled (result in *out), 0 to let the caller bind
+// normally (non-published UDP, non-switch nets, or anything not AF_INET datagram -> untouched).
+static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) {
+    if (fd < 0 || fd >= 1024 || !g_sock_dgram[fd]) return 0;
+    uint16_t cport;
+    char up[200];
+    uint32_t myip = 0;
+    if (br_on() && br_bind_is(sa, l)) {
+        cport = ntohs(*(const uint16_t *)(sa + 2));
+        if (cport == 0 || !pm_published(cport)) return 0; // only explicit, published ports get switched
+        myip = g_myip;
+        br_path(myip, cport, up, sizeof up); // we always listen on OUR endpoint IP
+    } else if (lo_on() && lo_is(sa, l)) {
+        cport = ntohs(*(const uint16_t *)(sa + 2));
+        if (cport == 0 || !pm_published(cport)) return 0;
+        lo_path(cport, up, sizeof up);
+    } else {
+        return 0;
+    }
+    if (udp_swap(fd) < 0) { *out = -errno; return 1; }
+    unlink(up);
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+    int r = bind(fd, (struct sockaddr *)&un, sizeof un);
+    if (r == 0) {
+        if (myip) { g_br_port[fd] = cport; g_br_ip[fd] = myip; }
+        else { g_lo_port[fd] = cport; }
+        udp_fwd_maybe_start(fd);
+    }
+    *out = r < 0 ? -errno : 0;
+    return 1;
 }
 
 // ===== Linux <-> macOS sockaddr translation (AF_INET / AF_INET6) — gate: NOSOCKADDR=1 =====
