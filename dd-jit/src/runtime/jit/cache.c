@@ -8,6 +8,54 @@ static uint8_t *g_cache, *g_cp;
 // start of current translation (for icache flush)
 static uint8_t *g_emit_start;
 
+// ---- dual-mapped (W^X-toggle-free) code cache ----
+// g_cache/g_cp are the RW (writer) alias; the engine EXECUTES through an RX alias of the
+// SAME physical pages at g_cache + g_rw2rx (created by vm_remap'ing to a second address,
+// the Apple-Silicon dual-map JIT technique). All PC-relative emission/back-patching is a
+// difference of two cache addresses, so it is alias-invariant and needs no conversion;
+// only the few ABSOLUTE handoffs (run_block target, IBTC/IC body literals, icache flush)
+// convert RW<->RX. g_rw2rx == 0 selects the single-MAP_JIT fallback that toggles the whole
+// region's W^X per translation/IC-fill (NODUALMAP=1).
+static ptrdiff_t g_rw2rx;     // RX_addr - RW_addr (0 in fallback)
+static int g_dualmap;         // 1 when the RW/RX dual mapping is active
+static uint64_t g_wx_toggles; // # of pthread_jit_write_protect_np() calls actually made (PROF)
+#define J_RX(p) ((void *)((uint8_t *)(p) + g_rw2rx)) // RW alias addr -> RX alias addr
+#define J_RW(p) ((void *)((uint8_t *)(p) - g_rw2rx)) // RX alias addr -> RW alias addr
+// The single W^X gate. Under dual mapping it is a no-op: writes land on the RW alias and
+// execution reads the RX alias, so no per-region permission flip (and no peer-thread race).
+static inline void jit_wprot(int enable_exec) {
+    if (g_dualmap) return;
+    g_wx_toggles++;
+    pthread_jit_write_protect_np(enable_exec);
+}
+// Allocate one dual-mapped code cache: a plain anon RW region + an RX alias of the SAME physical
+// pages at a second VA (vm_remap). Returns 0 and fills *rw / *delta(=RX-RW) on success.
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+static int dualmap_alloc(uint8_t **rw_out, ptrdiff_t *delta_out) {
+    uint8_t *rw = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (rw == MAP_FAILED) return -1;
+    mach_vm_address_t rx = 0;
+    vm_prot_t cur = 0, max = 0;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &rx, CACHE_SZ, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+                                     (mach_vm_address_t)rw, FALSE, &cur, &max, VM_INHERIT_DEFAULT);
+    if (kr == KERN_SUCCESS) kr = mach_vm_protect(mach_task_self(), rx, CACHE_SZ, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        munmap(rw, CACHE_SZ);
+        return -1;
+    }
+    *rw_out = rw;
+    *delta_out = (uint8_t *)rx - rw;
+    return 0;
+}
+// PROF-only: accumulated wall time spent in the translate region (the part the W^X toggles bracket).
+static uint64_t g_xlate_ns;
+static inline uint64_t now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+
 // Threads: each guest thread runs run_guest on its OWN struct cpu, stored in a
 // pthread TSD slot so emitted block-exit code can recover it from host TLS.
 static pthread_key_t g_cpu_key;
@@ -66,10 +114,40 @@ static void map_put(uint64_t gpc, void *host, void *body) {
 // inline by indirect branches. Handles polymorphic dispatch (interpreters) that a
 // per-site 1-entry cache can't. Plain data (no W^X); zeroed at start and on flush.
 #define IBTC_N 8192
-static struct {
+// 16-byte aligned so each {target,body} entry sits in a single 16-byte granule -> a
+// naturally-aligned 128-bit ldp/stp is single-copy atomic under FEAT_LSE2 (all Apple
+// Silicon). That atomicity is what lets a lock-free reader observe {target,body} as an
+// indivisible pair: it can never see new-target/old-body or old-target/new-body (the
+// torn-dispatch hazard). See G_IBTC_FILL (writer) + emit_ibranch (reader).
+typedef struct {
     uint64_t target;
     void *body;
-} g_ibtc[IBTC_N];
+} ibtc_ent;
+_Alignas(16) static ibtc_ent g_ibtc[IBTC_N];
+
+// ---- W5C: race-free threaded IBTC fill ----
+// g_mtibtc: enable threaded shared-hash IBTC fill (NOMTIBTC=1 disables -> revert to the
+// locked-dispatcher path where threaded indirect branches always miss to the C dispatcher).
+// g_mtfill: PROF count of threaded shared-hash publishes. g_futexq: per-address futex
+// wait queues (NOFUTEXQ=1 -> the legacy single global mutex + broadcast in thread.c).
+static int g_mtibtc = 1;
+static int g_futexq = 1;
+static uint64_t g_mtfill;
+// Atomic 128-bit RELEASE publish of a {target, body} pair into a 16-byte-aligned IBTC slot.
+// Single writer (the dispatcher holds g_jit_lock across every fill); many lock-free readers.
+// `dmb ish` orders all prior stores (incl. the body block's translation + its IC IVAU, both
+// already DSB-complete before this point) before the pair becomes observable; the `stp` of two
+// X regs to a 16-byte-aligned address is single-copy atomic under FEAT_LSE2 (all Apple Silicon),
+// so it is mutually atomic with the reader's plain `ldp`. We use explicit asm rather than a
+// 16-byte __atomic (which could lower to a lock-based libatomic call that would NOT be atomic
+// against the lock-free ldp reader). Layout: target at +0, body at +8 (matches struct ibtc_ent).
+static inline void ibtc_publish(ibtc_ent *e, uint64_t target, void *body) {
+    __asm__ volatile("dmb ish\n\t"
+                     "stp %1, %2, [%0]\n\t"
+                     :
+                     : "r"(e), "r"(target), "r"(body)
+                     : "memory");
+}
 static uint64_t g_prof_cross, g_prof_miss, g_prof_xlate, g_prof_sys, g_lse_n;
 // PROF=1: dispatcher crossings / IBTC misses / translations
 static int g_prof;
@@ -162,4 +240,25 @@ static void patch_links_to(uint64_t gpc, void *body) {
         } else
             i++;
     }
+}
+
+// fork() COWs the RW and RX aliases independently, so after a guest fork the child's two views of the
+// SAME cache silently diverge (writes through RW never reach the COW'd RX -> the child executes stale/
+// zero pages). In the child we build a FRESH dual map (private, correctly re-aliased) and drop the
+// inherited translations; the child re-translates on demand. No-op without dual mapping -- the MAP_JIT
+// RWX fallback's execute permission lives in the page tables and is inherited across fork() correctly.
+// Must run in the child after fork(), before its next run_block.
+static void jit_after_fork(void) {
+    if (!g_dualmap) return;
+    uint8_t *old_rw = g_cache, *old_rx = (uint8_t *)J_RX(g_cache);
+    uint8_t *rw;
+    ptrdiff_t d;
+    if (dualmap_alloc(&rw, &d) != 0) return; // alloc failure (extremely rare): leave map as-is
+    g_cache = g_cp = rw;
+    g_rw2rx = d;
+    memset(g_map, 0, sizeof g_map);
+    memset(g_ibtc, 0, sizeof g_ibtc);
+    g_npend = 0;
+    munmap(old_rw, CACHE_SZ);
+    munmap(old_rx, CACHE_SZ);
 }

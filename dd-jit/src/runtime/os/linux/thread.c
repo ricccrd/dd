@@ -5,53 +5,138 @@
 // fwd: thread trampoline runs the dispatcher
 static void run_guest(struct cpu *c);
 
-// One global wait queue. Coarse but correct: a waker takes the lock, so it can't
-// slip between a waiter's value-check and its wait. Waiters re-check their own
-// address, so a broadcast is sound (just not maximally efficient).
+// ---------------- futex: per-address hashed wait queues ----------------
+// Legacy (NOFUTEXQ=1): ONE global mutex + condvar. Correct but a WAKE on ANY address takes
+// the global lock and broadcasts EVERY waiter on EVERY address (thundering herd) -> the real
+// multi-thread DB bottleneck. The S3 uncontended fast path helped only the no-sleeper case.
+//
+// W5C (default): a fixed table of per-address buckets {mutex, condvar, waiter-count}, keyed by
+// hash(uaddr). A WAKE touches only the bucket for that address; uncontended/no-sleeper WAKE is a
+// single SEQ_CST counter load with NO lock. Addresses that collide in a bucket share its lock
+// (occasional extra spurious wakeups, never a missed wakeup). Correctness:
+//   * Lost-wakeup closed by a Dekker/SEQ_CST handshake on the no-sleeper fast path: the WAITER
+//     increments bucket.waiters (SEQ_CST) BEFORE loading *uaddr (SEQ_CST); the WAKER stores *uaddr
+//     (the guest did this before the syscall; we add a SEQ_CST fence) BEFORE loading bucket.waiters
+//     (SEQ_CST). By the single total order of SEQ_CST ops, if the waker reads waiters==0 (and so
+//     skips the wake), the waiter is guaranteed to read the new *uaddr and bail with EAGAIN rather
+//     than sleep. If the waker reads waiters>=1 it takes the lock+broadcast and the waiter (still
+//     under the bucket mutex) is reliably signalled.
+//   * A real blocked waiter is always woken because waker and waiter use the SAME bucket mutex for
+//     that uaddr, so the waker cannot slip between the waiter's value-check and its cond_wait.
+//   * FUTEX_WAIT may return 0 spuriously (per spec); the guest re-checks the word and re-waits.
+#define FUTEX_NBUCKET 256
+struct futex_bucket {
+    pthread_mutex_t m;
+    pthread_cond_t c;
+    _Atomic int waiters;
+};
+static struct futex_bucket g_fbk[FUTEX_NBUCKET] = {
+    [0 ...(FUTEX_NBUCKET - 1)] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0}};
+static inline struct futex_bucket *fbk_of(const void *uaddr) {
+    uint32_t h = (uint32_t)(((uintptr_t)uaddr >> 2) * 2654435761u) & (FUTEX_NBUCKET - 1);
+    return &g_fbk[h];
+}
+// legacy global queue (NOFUTEXQ=1)
 static pthread_mutex_t g_futex_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_futex_c = PTHREAD_COND_INITIALIZER;
+// PROF: fast (no-lock) wakes, slow (locked) wakes, eagain pre-checks
+static uint64_t g_futex_wake_fast, g_futex_wake_slow, g_futex_wait_n;
+
+static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {
+    clock_gettime(CLOCK_REALTIME, abs);
+    abs->tv_sec += ts->tv_sec;
+    abs->tv_nsec += ts->tv_nsec;
+    if (abs->tv_nsec >= 1000000000) {
+        abs->tv_sec++;
+        abs->tv_nsec -= 1000000000;
+    }
+}
 static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
+    if (!g_futexq) {
+        // ---- legacy single global queue ----
+        if (op == 0 || op == 9) {
+            pthread_mutex_lock(&g_futex_m);
+            if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
+                pthread_mutex_unlock(&g_futex_m);
+                return -EAGAIN;
+            }
+            if (ts) {
+                struct timespec abs;
+                abs_from_rel(&abs, ts);
+                pthread_cond_timedwait(&g_futex_c, &g_futex_m, &abs);
+            } else
+                pthread_cond_wait(&g_futex_c, &g_futex_m);
+            pthread_mutex_unlock(&g_futex_m);
+            return 0;
+        }
+        if (op == 1 || op == 10) {
+            pthread_mutex_lock(&g_futex_m);
+            pthread_cond_broadcast(&g_futex_c);
+            pthread_mutex_unlock(&g_futex_m);
+            return val;
+        }
+        return 0;
+    }
+    // ---- W5C per-address buckets ----
+    struct futex_bucket *b = fbk_of(uaddr);
     // FUTEX_WAIT / WAIT_BITSET: sleep while *uaddr == val
     if (op == 0 || op == 9) {
-        pthread_mutex_lock(&g_futex_m);
+        if (g_prof) g_futex_wait_n++;
+        pthread_mutex_lock(&b->m);
+        // Publish "a waiter is arriving on this bucket" BEFORE checking the word, both SEQ_CST,
+        // so a concurrent lock-free WAKE either sees waiters>=1 (and locks+wakes us) or we see
+        // the waker's new *uaddr here and bail -> no lost wakeup. (Counter held up across the
+        // value-check so the no-sleeper waker can't observe a gap.)
+        atomic_fetch_add_explicit(&b->waiters, 1, memory_order_seq_cst);
         if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
-            pthread_mutex_unlock(&g_futex_m);
+            atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_seq_cst);
+            pthread_mutex_unlock(&b->m);
             return -EAGAIN;
-        // EAGAIN
         }
         if (ts) {
             struct timespec abs;
-            clock_gettime(CLOCK_REALTIME, &abs);
-            abs.tv_sec += ts->tv_sec;
-            abs.tv_nsec += ts->tv_nsec;
-            if (abs.tv_nsec >= 1000000000) {
-                abs.tv_sec++;
-                abs.tv_nsec -= 1000000000;
-            }
-            pthread_cond_timedwait(&g_futex_c, &g_futex_m, &abs);
+            abs_from_rel(&abs, ts);
+            pthread_cond_timedwait(&b->c, &b->m, &abs);
         } else
-            pthread_cond_wait(&g_futex_c, &g_futex_m);
-        pthread_mutex_unlock(&g_futex_m);
+            pthread_cond_wait(&b->c, &b->m);
+        atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_seq_cst);
+        pthread_mutex_unlock(&b->m);
         return 0;
     }
-    // FUTEX_WAKE / WAKE_BITSET: wake up to `val` waiters
+    // FUTEX_WAKE / WAKE_BITSET: wake up to `val` waiters on THIS address's bucket only
     if (op == 1 || op == 10) {
-        pthread_mutex_lock(&g_futex_m);
-        // they re-check their own addr
-        pthread_cond_broadcast(&g_futex_c);
-        pthread_mutex_unlock(&g_futex_m);
+        // The guest changed *uaddr before this syscall; fence so that store is ordered before the
+        // waiters load (SEQ_CST), completing the Dekker handshake with an arriving waiter.
+        atomic_thread_fence(memory_order_seq_cst);
+        if (atomic_load_explicit(&b->waiters, memory_order_seq_cst) == 0) {
+            if (g_prof) g_futex_wake_fast++;
+            return val; // no sleeper in this bucket -> no lock, no broadcast
+        }
+        if (g_prof) g_futex_wake_slow++;
+        pthread_mutex_lock(&b->m);
+        pthread_cond_broadcast(&b->c); // waiters re-check their own word; spurious wakes are legal
+        pthread_mutex_unlock(&b->m);
         return val;
     }
-    // other ops: pretend success
+    // other ops (REQUEUE/CMP_REQUEUE/WAKE_OP/...): unchanged -- pretend success (baseline behavior)
     return 0;
 }
 static void futex_wake_addr(uint64_t uaddr) {
     if (!uaddr) return;
-    // CLONE_CHILD_CLEARTID: zero then wake joiners
+    // CLONE_CHILD_CLEARTID: zero then wake joiners (pthread_join FUTEX_WAITs on this word)
     *(int *)uaddr = 0;
-    pthread_mutex_lock(&g_futex_m);
-    pthread_cond_broadcast(&g_futex_c);
-    pthread_mutex_unlock(&g_futex_m);
+    if (!g_futexq) {
+        pthread_mutex_lock(&g_futex_m);
+        pthread_cond_broadcast(&g_futex_c);
+        pthread_mutex_unlock(&g_futex_m);
+        return;
+    }
+    struct futex_bucket *b = fbk_of((const void *)(uintptr_t)uaddr);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&b->waiters, memory_order_seq_cst) == 0) return;
+    pthread_mutex_lock(&b->m);
+    pthread_cond_broadcast(&b->c);
+    pthread_mutex_unlock(&b->m);
 }
 
 static volatile int g_next_tid = 1000;

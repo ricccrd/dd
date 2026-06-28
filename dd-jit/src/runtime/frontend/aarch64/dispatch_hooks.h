@@ -24,20 +24,43 @@
 // (1) IBTC miss fill. aarch64 keys off c->ic_site (0=none, 1=shared-only, else=per-site IC literal addr),
 // stores body-8 (the indirect-entry stub that restores guest x16/x17), and patches the per-site
 // monomorphic IC literals in the W^X cache. Byte-for-byte the prior inline block.
+/* W5C: race-free threaded IBTC fill. The fill runs under g_jit_lock (single writer);    \
+ * readers are lock-free emitted code. Two hazards historically forced the threaded skip: \
+ *   (1) the per-site monomorphic IC writes a NON-atomic 16-byte literal pair into the    \
+ *       W^X code cache, requiring a process-wide W^X flip + tearable by a peer reader;    \
+ *   (2) the shared hash {target,body} pair was written as two plain stores -> a peer     \
+ *       reader could observe a torn entry (new target / stale body, or vice-versa).      \
+ * Fix: under threads, fill ONLY the shared hash, and publish it with a single 128-bit    \
+ * RELEASE store (ibtc_publish, atomic under LSE2). The reader consumes it with a single  \
+ * atomic-acquire ldp, so the pair is always observed whole -> no torn dispatch. The      \
+ * per-site IC (which would need the tearable literal-pair write) is skipped under threads;\
+ * its inline compare just always misses (literals stay 0) and falls into the shared hash.\
+ * Single-threaded behavior is byte-identical: shared hash via plain stores in dependency \
+ * order + the per-site IC exactly as before. NOMTIBTC=1 restores the locked-dispatcher    \
+ * path (threaded indirect branches miss to C every time). */
 #define G_IBTC_FILL(c)                                                                                          \
     if ((c)->ic_site) {                                                                                         \
         g_prof_miss++;                                                                                          \
-        /* shared IBTC read + per-site fill toggle W^X process-wide -> both race peers; skip when threaded */  \
-        void *bd = g_threaded ? NULL : map_body((c)->pc);                                                      \
+        int _mt = g_threaded;                                                                                   \
+        void *bd = (_mt && !g_mtibtc) ? NULL : map_body((c)->pc);                                               \
         if (bd) {                                                                                               \
             uint32_t h = (uint32_t)(((c)->pc >> 2) & (IBTC_N - 1));                                             \
-            g_ibtc[h].body = (void *)((uint64_t)bd - 8); /* body_ind; written first */                         \
-            __atomic_store_n(&g_ibtc[h].target, (c)->pc, __ATOMIC_RELEASE);                                    \
-            if ((c)->ic_site != 1) { /* per-site monomorphic cache (literals in JIT cache, W^X) */             \
-                pthread_jit_write_protect_np(0);                                                                \
-                ((uint64_t *)(c)->ic_site)[1] = (uint64_t)bd - 8; /* Lsite_body */                             \
-                ((uint64_t *)(c)->ic_site)[0] = (c)->pc;          /* Lsite_tgt  */                             \
-                pthread_jit_write_protect_np(1);                                                                \
+            void *bind = (void *)((uint64_t)J_RX(bd) - 8); /* RX body_ind (entry that restores x16/x17) */     \
+            if (_mt) {                                                                                          \
+                /* threaded: single 128-bit atomic release publish; consumed by an atomic ldp reader */        \
+                ibtc_publish(&g_ibtc[h], (c)->pc, bind);                                                        \
+                g_mtfill++;                                                                                     \
+            } else {                                                                                            \
+                g_ibtc[h].body = bind; /* body_ind; written first */                                           \
+                __atomic_store_n(&g_ibtc[h].target, (c)->pc, __ATOMIC_RELEASE);                                \
+                if ((c)->ic_site != 1) { /* per-site monomorphic cache (literals in the code cache) */         \
+                    /* ic_site is the RX address of the literal pair (from a runtime adr); write via RW. */     \
+                    uint64_t *site = (uint64_t *)J_RW((c)->ic_site);                                           \
+                    jit_wprot(0);                                                                               \
+                    site[1] = (uint64_t)bind; /* Lsite_body (RX) */                                            \
+                    site[0] = (c)->pc;        /* Lsite_tgt       */                                            \
+                    jit_wprot(1);                                                                               \
+                }                                                                                               \
             }                                                                                                   \
         }                                                                                                       \
         (c)->ic_site = 0;                                                                                       \

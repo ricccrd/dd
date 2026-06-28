@@ -1984,10 +1984,14 @@ static void service(struct cpu *c) {
     case 94:
         if (getenv("PROF"))
             fprintf(stderr,
-                    "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu\n",
+                    "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu "
+                    "wx_toggles=%llu dualmap=%d xlate_ms=%.3f mtibtc=%d mtfill=%llu futexq=%d "
+                    "fwake_fast=%llu fwake_slow=%llu fwait=%llu\n",
                     (unsigned long long)g_prof_cross, (unsigned long long)g_prof_sys, (unsigned long long)g_prof_miss,
                     (unsigned long long)(g_prof_cross - g_prof_sys - g_prof_miss), (unsigned long long)g_prof_xlate,
-                    (unsigned long long)g_lse_n);
+                    (unsigned long long)g_lse_n, (unsigned long long)g_wx_toggles, g_dualmap, g_xlate_ns / 1e6,
+                    g_mtibtc, (unsigned long long)g_mtfill, g_futexq, (unsigned long long)g_futex_wake_fast,
+                    (unsigned long long)g_futex_wake_slow, (unsigned long long)g_futex_wait_n);
 #ifdef G_PROF_EXTRA
         G_PROF_EXTRA; // W5B: x86 tier-2 promotion counters
 #endif
@@ -1997,6 +2001,9 @@ static void service(struct cpu *c) {
             c->exit_code = (int)a0;
             break;
         }
+#ifdef PCACHE_SAVE_HOOK
+        PCACHE_SAVE_HOOK; // opt8: persist the translated arena before the one-shot _exit (DDJIT_PCACHE only)
+#endif
         _exit((int)a0);
     case 96:
         G_RET(c) = (uint64_t)getpid();
@@ -2165,6 +2172,7 @@ static void service(struct cpu *c) {
             // so the child's first run_block can instruction-abort fetching from the (non-executable) code
             // cache -> the intermittent fork+exec SIGBUS. pthread_jit_write_protect_np(1) = RX (executable).
             pthread_jit_write_protect_np(1);
+            jit_after_fork(); // dual map: COW split the RW/RX aliases -> rebuild a fresh aliased cache
             G_SHADOW_RESET(c); // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
             rc_reset();        // S2: drop the inherited (COW) path-resolution cache so the child can never
                                // serve a guest->host mapping that the parent populated before the FS diverged
@@ -2315,6 +2323,7 @@ static void service(struct cpu *c) {
         pid_t pid = fork();
         // §B: same -- child drops the inherited shadow; S2: and the inherited path-resolution cache
         if (pid == 0) {
+            jit_after_fork(); // dual map: rebuild the child's aliased cache (COW split RW/RX)
             G_SHADOW_RESET(c);
             rc_reset();
         }

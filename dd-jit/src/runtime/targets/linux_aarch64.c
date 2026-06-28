@@ -26,6 +26,7 @@
 #include <dirent.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h> // mach_vm_remap/protect for the dual-mapped RW/RX code cache
 #define DD_HAS_MACH_EXC 1 // service.c gates its CRASHDBG fork-child Mach re-arm on this
 #include <dlfcn.h>
 #include <sys/event.h>
@@ -290,15 +291,35 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         return 1;
     }
 
-    g_cache = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-    if (g_cache == MAP_FAILED) {
-        perror("mmap jit");
-        return 1;
+    // Code cache. Default: dual-mapped RW/RX so the engine never toggles W^X. Allocate a
+    // plain anon RW region (the writer alias = g_cache) and vm_remap the SAME physical pages
+    // to a second address that we mark RX (the executor alias). Writes through g_cache become
+    // visible to execution at g_cache+g_rw2rx after an icache flush, with NO per-region
+    // pthread_jit_write_protect_np() flip. NODUALMAP=1 reverts to a single MAP_JIT mapping.
+    if (!getenv("NODUALMAP")) {
+        uint8_t *rw;
+        ptrdiff_t d;
+        if (dualmap_alloc(&rw, &d) == 0) {
+            g_cache = rw;
+            g_rw2rx = d;
+            g_dualmap = 1;
+        } else {
+            fprintf(stderr, "[jit] dual-map unavailable -> W^X-toggle fallback\n");
+        }
+    }
+    if (!g_dualmap) {
+        g_cache = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (g_cache == MAP_FAILED) {
+            perror("mmap jit");
+            return 1;
+        }
     }
     g_cp = g_cache;
 
     g_trace = getenv("JT") != NULL;
     g_prof = getenv("PROF") != NULL;
+    if (getenv("NOMTIBTC")) g_mtibtc = 0; // W5C: disable race-free threaded IBTC fill (A/B kill-switch)
+    if (getenv("NOFUTEXQ")) g_futexq = 0; // W5C: disable per-address futex wait queues (A/B kill-switch)
     char gb[1024];
     prog = find_in_path(prog, gb, sizeof gb); // bare "sh" (docker) -> "/bin/sh" via the container PATH
     g_exe_path = prog;

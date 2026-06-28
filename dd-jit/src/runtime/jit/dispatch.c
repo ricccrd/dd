@@ -58,13 +58,14 @@ static void run_guest(struct cpu *c) {
         if (g_threaded) pthread_mutex_lock(&g_jit_lock);
         void *code = map_host(c->pc);
         if (!code) {
+            uint64_t _t0 = g_prof ? now_ns() : 0;
             // near full -> wholesale flush
             if (g_cp + (1u << 16) > g_cache + CACHE_SZ) {
                 if (g_threaded) {
                     fprintf(stderr, "[jit] code cache full with threads (unsupported)\n");
                     _exit(70);
                 }
-                pthread_jit_write_protect_np(0);
+                jit_wprot(0);
                 g_cp = g_cache;
                 memset(g_map, 0, sizeof g_map);
                 g_npend = 0;
@@ -72,18 +73,19 @@ static void run_guest(struct cpu *c) {
                 memset(g_ibtc, 0, sizeof g_ibtc);
                 // §B: shadow host_rets point into the dropped cache too -> clear (frontend hook)
                 G_SHADOW_CLEAR(c);
-                pthread_jit_write_protect_np(1);
+                jit_wprot(1);
             }
-            pthread_jit_write_protect_np(0);
+            jit_wprot(0);
             g_emit_start = g_cp;
             code = translate_block(c->pc);
             g_prof_xlate++;
-            // new block coherent on all cores FIRST
-            sys_icache_invalidate(g_emit_start, (size_t)(g_cp - g_emit_start));
+            // new block coherent on all cores FIRST (icache is on the RX alias under dual map)
+            sys_icache_invalidate(J_RX(g_emit_start), (size_t)(g_cp - g_emit_start));
             // THEN chain existing blocks to it (still write mode)
             patch_links_to(c->pc, map_body(c->pc));
             // back to execute AFTER all cache writes
-            pthread_jit_write_protect_np(1);
+            jit_wprot(1);
+            if (g_prof) g_xlate_ns += now_ns() - _t0;
         }
         // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
         // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).
@@ -97,7 +99,8 @@ static void run_guest(struct cpu *c) {
         }
         c->reason = 0;
         if (g_prof) g_prof_cross++;
-        run_block(c, code);
+        // map_host()/translate_block() return RW-alias addresses; execute via the RX alias.
+        run_block(c, J_RX(code));
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
         // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
         G_DISPATCH_REASON(c);

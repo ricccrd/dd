@@ -51,7 +51,10 @@ static void e_subi(int d, int n, unsigned imm) {
 // ret (host x30)
 static void e_hret(void) { emit32(0xD65F03C0u); }
 static void e_adrp_add(int rd, uint64_t target) {
-    int64_t off = (int64_t)((target & ~0xFFFull) - ((uint64_t)g_cp & ~0xFFFull)) >> 12;
+    // adrp's page immediate is PC-relative; this instruction EXECUTES from the RX alias, so it
+    // must be computed against the RX-alias address of the emit cursor (g_cp is the RW alias).
+    // `target` is always an absolute external address (e.g. &g_ibtc), so no J_RX on it.
+    int64_t off = (int64_t)((target & ~0xFFFull) - ((uint64_t)J_RX(g_cp) & ~0xFFFull)) >> 12;
     emit32(0x90000000u | (((uint32_t)off & 3) << 29) | (((uint32_t)(off >> 2) & 0x7FFFF) << 5) | rd);
     emit32(0x91000000u | (((uint32_t)(target & 0xFFF)) << 10) | (rd << 5) | rd);
 }
@@ -233,20 +236,23 @@ static void emit_ibranch(int rn) {
         // and x17, x17, #0x1FFF
         emit32(0x92403000u | (17 << 5) | 17);
         e_adrp_add(16, (uint64_t)g_ibtc);
-        emit32(0x8B000000u | (17 << 16) | (4 << 10) | (16 << 5) | 16);
-        // x17 = slot.target
-        e_ldr(17, 16, 0);
+        emit32(0x8B000000u | (17 << 16) | (4 << 10) | (16 << 5) | 16); // x16 = slot ptr
+        // W5C: atomic 128-bit load of the {target,body} pair (single-copy atomic under LSE2 since the
+        // slot is 16-byte aligned) -> a peer's 128-bit release publish is never observed torn. Non-
+        // writeback ldp with Rt2==Rn is well-defined (only Rt1==Rt2 is constrained). x17=slot.target,
+        // x16=slot.body. Target is a scratch reg here, so reload the guest target from the red zone to
+        // compare; stash body across that reload (x16/x17 are the only free GPRs on this path).
+        e_ldp(17, 16, 16, 0);
+        // stash body at [sp,-40], reload guest target stashed at [sp,-32]
+        e_stur(16, 31, -40);
         e_ldur(16, 31, -32);
-        // sub x17, x17, x16
+        // sub x17, x17, x16  (slot.target - guest target)
         emit32(0xCB000000u | (16 << 16) | (17 << 5) | 17);
         uint32_t *p_cbnz = (uint32_t *)g_cp;
         // cbnz x17, miss
         emit32(0);
-        emit32(0xD342FC00u | (16 << 5) | 17);
-        emit32(0x92403000u | (17 << 5) | 17);
-        e_adrp_add(16, (uint64_t)g_ibtc);
-        emit32(0x8B000000u | (17 << 16) | (4 << 10) | (16 << 5) | 16);
-        e_ldr(16, 16, 8);
+        // x16 = body ; HIT -> jump (body_ind restores x16/x17)
+        e_ldur(16, 31, -40);
         e_br(16);
         uint32_t *miss = (uint32_t *)g_cp;
         e_ldur(16, 31, -16);
@@ -299,18 +305,18 @@ static void emit_ibranch(int rn) {
     emit32(0xD3423800u | (rn << 5) | 16);
     // x17 = &g_ibtc  (2 instr)
     e_adrp_add(17, (uint64_t)g_ibtc);
-    // add x16, x17, x16, lsl #4  (slot)
+    // add x16, x17, x16, lsl #4  (slot ptr)
     emit32(0x8B000000u | (16 << 16) | (4 << 10) | (17 << 5) | 16);
-    // x17 = slot.target
-    e_ldr(17, 16, 0);
+    // W5C: atomic 128-bit load of {target,body} (single-copy atomic, LSE2) -> never torn.
+    // x16=slot ptr -> x17=slot.target, x16=slot.body. The guest target stays live in xRn
+    // (a normal guest reg; rn is never 16/17/18/28 here), so no red-zone reload is needed.
+    e_ldp(17, 16, 16, 0);
     // sub x17, x17, xRn
     emit32(0xCB000000u | (rn << 16) | (17 << 5) | 17);
     uint32_t *p_cbnz = (uint32_t *)g_cp;
     // cbnz x17, Lmiss
     emit32(0);
-    // x16 = slot.body (body_ind)
-    e_ldr(16, 16, 8);
-    // HIT -> jump
+    // x16 = slot.body (body_ind) -> HIT -> jump
     e_br(16);
     uint32_t *miss = (uint32_t *)g_cp;
     e_ldur(16, 31, -16);
