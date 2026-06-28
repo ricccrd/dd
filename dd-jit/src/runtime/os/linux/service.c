@@ -1712,11 +1712,14 @@ static void service(struct cpu *c) {
         // realloc-driven grow leaked the whole previous buffer; busybox `sort` of a 2M-line file does
         // ~3,874 grows leaking ~31 GB -> ~30 GB RSS -> OOM SIGKILL). Free the tracked extent (incl. the
         // 64 KB guard tail); allocate-before-free preserved above.
-        uint64_t oldlen = gmap_find_len(a0);
-        munmap((void *)a0, oldlen ? (size_t)oldlen : old);
-        gmap_del(a0);
-        anon_untrack(a0, old);
-        gmap_add((uint64_t)r, (size_t)a2);    // track the new region for execve() teardown
+        uint64_t old_full = gmap_find_len(a0); // tracked extent (incl. guard tail); fall back to old length
+        if (old_full < old) old_full = old;
+        if (a0) {
+            munmap((void *)a0, (size_t)old_full);
+            gmap_del(a0);
+            anon_untrack(a0, (size_t)old_full); // untrack the FULL extent (was untracking only `old`)
+        }
+        gmap_add((uint64_t)r, (uint64_t)a2);    // track the new region for execve() teardown
         anon_track((uint64_t)r, (size_t)a2, PROT_READ | PROT_WRITE); // fresh private-anon copy
         G_RET(c) = (uint64_t)r;
         break;
