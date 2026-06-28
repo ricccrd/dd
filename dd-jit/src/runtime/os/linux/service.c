@@ -1328,6 +1328,31 @@ static void service(struct cpu *c) {
         }
         // TOCTOU-free per-component resolve in the jail
         if (g_rootfs) {
+            // W4D: openat resolution cache. Memoizes the guest-abs-path -> canonical host path that the
+            // jail walk below produces, so a REPEATED open of the same path collapses the ~6-syscall
+            // per-component walk to a single open(host, O_NOFOLLOW). The real open ALWAYS still runs (no
+            // fabricated existence/contents); a stale entry can only ever be the wrong PATH, which the
+            // shared g_res_epoch (bumped above on every FS mutation, incl. this case's O_CREAT) prevents.
+            // EXCLUDE O_CREAT/O_EXCL/O_TRUNC (mutating/creating) and O_DIRECTORY (deep-host-path reopen
+            // regressed; see optimization-research/w4d-openat.md). Kill switch: W4_NOOPENCACHE=1.
+            int cacheable = !(lf & (0x40 | 0x80 | 0x200 | G_O_DIRECTORY));
+            char gkey[4200], hostc[4200];
+            if (cacheable) abs_guest((int)a0, (const char *)a1, gkey, sizeof gkey);
+            if (cacheable && oc_lookup(gkey, hostc, sizeof hostc)) {
+                // ONE atomic open replaces the per-component walk; hostc is already canonical+symlink-free.
+                int r = open(hostc, mf | O_NOFOLLOW, (mode_t)a3);
+                int e = errno;
+                if (r >= 0) {
+                    fd_setpath(r, hostc);
+                    if (lf & 3) { // write-open: keep the metadata caches coherent (same as the walk path)
+                        mc_evict(hostc);
+                        rl_evict(hostc);
+                        ac_evict(hostc);
+                    }
+                }
+                G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
+                break;
+            }
             char fin[512];
             // resolve following the final symlink unless the guest asked O_NOFOLLOW (per-arch bit)
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (lf & G_O_NOFOLLOW) != 0);
@@ -1349,6 +1374,9 @@ static void service(struct cpu *c) {
                         rl_evict(gp);
                         ac_evict(gp);
                     }
+                    // W4D: memoize this walk's result (gp = F_GETPATH = canonical in-jail host path) so the
+                    // next open of the same guest path is a single open(). oc_store re-checks in-jail+epoch.
+                    if (cacheable) oc_store(gkey, gp);
                 }
             }
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;

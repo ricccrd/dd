@@ -15,6 +15,13 @@ static int rc_lookup(const char *g, char *out, size_t n);
 static void rc_store(const char *g, const char *host);
 static void res_bump(void);
 static void rc_reset(void);
+// ---- W4D openat resolution cache (forward decls; impl after the S2 rc_* cache it extends) ----
+// Extends item-9's rc_* (which memoizes only the read-only atpath() resolver) to the open-heavy half:
+// guest-abs-path -> canonical symlink-free host path, so a repeated open collapses the TOCTOU-safe
+// per-component jail walk to a single open(host, O_NOFOLLOW). Shares g_res_epoch. Kill: W4_NOOPENCACHE=1.
+static int oc_lookup(const char *g, char *out, size_t n);
+static void oc_store(const char *g, const char *host);
+static void oc_reset(void);
 // Rewrite ABSOLUTE guest paths into the rootfs; relative paths pass through (resolved
 // against the dir-fd by the *at syscall, e.g. ls stat-ing entries relative to a dir).
 static const char *atpath(int dirfd, const char *raw, char *buf, size_t n) {
@@ -259,6 +266,7 @@ static void rc_reset(void) {
     memset(g_rc, 0, sizeof g_rc);
     g_res_epoch = 1;
     g_rc_hits = g_rc_miss = 0;
+    oc_reset(); // W4D: drop the inherited open-resolution cache too (same COW hazard, under the same lock)
     CUL;
 }
 static int rc_lookup(const char *g, char *out, size_t n) {
@@ -289,6 +297,77 @@ static void rc_store(const char *g, const char *host) {
     strcpy(e->host, host);
     g_rc_miss++;
     CUL;
+}
+
+// ---- W4D openat resolution cache (impl) ----
+// item-9's rc_* cache above memoizes the atpath() resolver used by the read-only metadata syscalls
+// (stat/access/readlink/exec). openat takes a DIFFERENT, TOCTOU-safe resolver -- jail_at()/resolve_at()
+// walks the path one component at a time on pinned dir-fds (~6 host syscalls) so a guest can't swap a
+// component for an out-of-jail symlink between check and use -- and item-9 left THAT uncached. This fills
+// the gap for the open-heavy half: it memoizes the WALK as a guest-abs-path -> canonical, symlink-free
+// host path obtained via F_GETPATH on a SUCCESSFUL real open. On a HIT the ~6-syscall walk collapses to a
+// single open(host, O_NOFOLLOW); the REAL open ALWAYS still runs, so a stale entry can never fabricate
+// existence/contents -- the only failure mode is a wrong host *path*, which the SHARED g_res_epoch guard
+// prevents: every FS-namespace mutation (service.c res_bump on mknod/mkdir/unlink/rmdir/symlink/link/
+// rename/(u)mount + openat O_CREAT) bumps the epoch, so the whole cache misses -- conservative
+// over-invalidation, identical threat model to item 9 (the host outside the jail is not in scope; when in
+// doubt we MISS and re-walk). oc_store additionally refuses to cache any host path that escaped the rootfs
+// (defensive strncmp). The caller EXCLUDES O_CREAT/O_EXCL/O_TRUNC (mutating/creating) and O_DIRECTORY
+// (deep-host-path reopen regressed -21%; see optimization-research/w4d-openat.md). Hard reset on fork via
+// oc_reset() (from rc_reset). Kill switch (read once): W4_NOOPENCACHE=1 -> the original uncached walk.
+#define OCACHE_N 8192
+static struct ocent {
+    uint64_t hash;
+    uint32_t epoch;
+    char guest[200];
+    char host[256];
+} g_oc[OCACHE_N];
+// PROF
+static uint64_t g_oc_hits, g_oc_miss;
+static int oc_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("W4_NOOPENCACHE");
+        on = (e && e[0] == '1') ? 0 : 1;
+    }
+    return on;
+}
+static int oc_lookup(const char *g, char *out, size_t n) {
+    if (!oc_enabled() || !g || g[0] != '/' || strlen(g) >= sizeof(((struct ocent *)0)->guest)) return 0;
+    CLK;
+    int hit = 0;
+    uint64_t h = mc_hash(g);
+    struct ocent *e = &g_oc[h & (OCACHE_N - 1)];
+    if (e->hash == h && e->epoch == g_res_epoch && !strcmp(e->guest, g)) {
+        snprintf(out, n, "%s", e->host);
+        g_oc_hits++;
+        hit = 1;
+    }
+    CUL;
+    return hit;
+}
+static void oc_store(const char *g, const char *host) {
+    if (!oc_enabled() || !g || g[0] != '/' || !host) return;
+    // over-length paths simply bypass the cache (fixed-size slot) -> re-walked every time, safely.
+    if (strlen(g) >= sizeof(((struct ocent *)0)->guest) || strlen(host) >= sizeof(((struct ocent *)0)->host))
+        return;
+    // defensive: never cache a host path that resolved OUTSIDE the rootfs jail (item-9-style confinement).
+    if (g_rootfs_canon_len && strncmp(host, g_rootfs_canon, g_rootfs_canon_len)) return;
+    CLK;
+    uint64_t h = mc_hash(g);
+    struct ocent *e = &g_oc[h & (OCACHE_N - 1)];
+    e->hash = h;
+    e->epoch = g_res_epoch; // stamp the CURRENT epoch; a later mutation invalidates it
+    strcpy(e->guest, g);
+    strcpy(e->host, host);
+    g_oc_miss++;
+    CUL;
+}
+// fork child: drop every inherited (COW) entry so it cannot outlive a parent-side mutation. Called from
+// rc_reset() which already holds the cache lock, so this does NOT re-take it (non-recursive mutex).
+static void oc_reset(void) {
+    memset(g_oc, 0, sizeof g_oc);
+    g_oc_hits = g_oc_miss = 0;
 }
 
 static void fd_setpath(int fd, const char *p) {
