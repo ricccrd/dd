@@ -376,8 +376,12 @@ static const char *k_worker_sbpl =
     "(allow process-info* (target self))\n"
     "(allow signal (target self))\n"
     "(allow sysctl-read)\n"
-    "(allow mach-lookup)\n"
-    "(allow mach-priv-task-port)\n"
+    // mach-lookup reaches the bootstrap server / WindowServer -- the classic macOS sandbox-escape primitive.
+    // Default-deny it explicitly (belt-and-suspenders over (deny default)); the JIT worker is pure compute/
+    // memory after the post-fork confinement point and needs no bootstrap services. mach-priv-task-port is
+    // scoped to (target self) so a popped worker cannot grab another task's port.
+    "(deny mach-lookup (global-name-regex #\".*\"))\n"
+    "(allow mach-priv-task-port (target self))\n"
     "(deny file-write*)\n"    // no host writes  -- only via the sentry
     "(deny file-read-data)\n" // no host reads   -- only via the sentry
     "(deny network*)\n";      // no host sockets -- only via the sentry
@@ -393,12 +397,51 @@ static void worker_sandbox(void) {
     if (sandbox_init(k_worker_sbpl, 0 /* literal profile, not SANDBOX_NAMED */, &err) != 0) {
         fprintf(stderr, "[sentry] worker Seatbelt sandbox_init failed: %s\n", err ? err : "(null)");
         if (err) sandbox_free_error(err);
-        // Production would fail CLOSED (_exit) here; in this first PR we warn and continue so the
-        // ring path can be A/B'd even where the profile needs tuning for the host OS revision.
-    } else {
-        fprintf(stderr, "[sentry] worker confined under deny-default Seatbelt profile\n");
+        // FAIL CLOSED: an untrusted worker that could not be confined must NOT run unconfined -- abort it
+        // rather than expose the host fs/net directly. (DDJIT_SANDBOX is opt-in; the operator asked for it.)
+        _exit(72);
     }
+    fprintf(stderr, "[sentry] worker confined under deny-default Seatbelt profile\n");
 #endif
+}
+
+// ------------------------------------------------------------------ guest fd-ownership set (P1: FDPASS / SCM)
+// SCM_RIGHTS fd-lend (SENTRY_OP_FDPASS) must only ever surface an fd the sentry opened ON BEHALF OF THE
+// GUEST -- never one of the sentry's own control sockets (g_ctl[]), the daemon stdio, or any other non-guest
+// host fd. We record every fd service_local() hands back for this guest (openat/socket/accept*/dup*/pipe2/
+// socketpair/fcntl-F_DUPFD/recvmsg-SCM_RIGHTS) in a sentry-PRIVATE bitset and clear it on close. This array
+// lives in the sentry process's own memory (NOT the shared ring) so a malicious worker cannot tamper with
+// it; it IS shared across the per-ring servicer threads (one sentry process), so mutate with atomic word
+// ops. An fd >= the cap is untrackable and therefore never lendable -> rejected -EBADF.
+#define SENTRY_FDSET_MAX 65536u
+static _Atomic uint64_t g_guest_fds[SENTRY_FDSET_MAX / 64];
+static void sentry_fd_track(int fd) {
+    if (fd < 0 || (unsigned)fd >= SENTRY_FDSET_MAX) return;
+    atomic_fetch_or_explicit(&g_guest_fds[(unsigned)fd >> 6], 1ull << ((unsigned)fd & 63), memory_order_relaxed);
+}
+static void sentry_fd_untrack(int fd) {
+    if (fd < 0 || (unsigned)fd >= SENTRY_FDSET_MAX) return;
+    atomic_fetch_and_explicit(&g_guest_fds[(unsigned)fd >> 6], ~(1ull << ((unsigned)fd & 63)), memory_order_relaxed);
+}
+static int sentry_fd_owned(int fd) {
+    if (fd < 0 || (unsigned)fd >= SENTRY_FDSET_MAX) return 0;
+    return (int)((atomic_load_explicit(&g_guest_fds[(unsigned)fd >> 6], memory_order_relaxed) >> ((unsigned)fd & 63)) & 1u);
+}
+// Walk a (sentry-produced, Linux-layout) cmsg buffer and track every SCM_RIGHTS fd a recvmsg received, so a
+// later FDPASS of that fd is recognized as guest-owned. Strictly bounded by `len` -- never derefs past it.
+static void sentry_track_cmsg_fds(const uint8_t *ctl, size_t len) {
+    size_t o = 0;
+    while (o + 16u <= len) {                          // Linux struct cmsghdr: {u64 cmsg_len; int level; int type}
+        uint64_t clen = *(const uint64_t *)(ctl + o);
+        int level = *(const int *)(ctl + o + 8);
+        int type = *(const int *)(ctl + o + 12);
+        if (clen < 16u || o + clen > len) break;
+        if (level == SOL_SOCKET && type == SCM_RIGHTS) {
+            size_t nfd = (size_t)(clen - 16u) / sizeof(int);
+            for (size_t i = 0; i < nfd; i++) sentry_fd_track(*(const int *)(ctl + o + 16u + i * sizeof(int)));
+        }
+        o += (size_t)((clen + 7u) & ~(uint64_t)7u);  // CMSG_ALIGN to 8
+    }
 }
 
 // ------------------------------------------------------------------ sentry process body
@@ -409,13 +452,23 @@ static void worker_sandbox(void) {
 // bytes. NOTE: it MUST call service_local() (the canonical switch), not service() -- service() would
 // re-enter syscall_route() in this (g_untrusted) process and recurse onto the ring.
 static void sentry_service_one(struct sentry_ring *R) {
-    // fd-lend (item 3): not a syscall -- send a sentry-owned fd to the worker over THIS ring's control
-    // socketpair (SCM_RIGHTS). Worker mmaps it locally then drops it. Detected before any cpu reconstruction.
+    // fd-lend (item 3): not a syscall -- lend a sentry-owned fd to the worker over THIS ring's control
+    // socketpair (SCM_RIGHTS) for a file-backed mmap; the worker maps it locally then drops it. OWNERSHIP
+    // (P1, finding F): the lendable fd MUST be one the sentry opened ON BEHALF OF THE GUEST (tracked at
+    // openat/socket/accept/dup/pipe2/socketpair/...). An arbitrary worker-named integer -- the sentry's own
+    // g_ctl[] control socket, the daemon stdio, any non-guest host fd -- is rejected -EBADF. Detected before
+    // any cpu reconstruction. We ALWAYS send a control datagram (with the fd, or empty on reject) so the
+    // worker's matching recv stays in lockstep with the round-trip and never desyncs the next lend.
     if (R->rawnr == SENTRY_OP_FDPASS) {
         int idx = (int)(R - g_shm->ring);
         int fd = (int)(int64_t)R->a[0];
-        sentry_send_fd(g_ctl[idx][1], fd);
-        R->ret = (fd >= 0) ? 0 : -EBADF;
+        if (sentry_fd_owned(fd)) {
+            sentry_send_fd(g_ctl[idx][1], fd);
+            R->ret = 0;
+        } else {
+            sentry_send_fd(g_ctl[idx][1], -1); // empty datagram: keep the worker recv in lockstep
+            R->ret = -EBADF;
+        }
         R->nserved++;
         return;
     }
@@ -428,63 +481,219 @@ static void sentry_service_one(struct sentry_ring *R) {
     G_A3(&tmp) = R->a[3];
     G_A4(&tmp) = R->a[4];
     G_A5(&tmp) = R->a[5];
+    // Snapshot the pointer-redirect metadata into sentry-PRIVATE locals: from here on every validation reads
+    // these copies, NEVER the attacker-writable shared ring, so a racing worker thread cannot rewrite a
+    // field between our check and the kernel's use of it (the validate-in-place TOCTOU, finding E). Scalars
+    // are already snapshotted into `tmp`; this extends the same discipline to the redir table + iovn.
+    int32_t redir[6];
+    for (int i = 0; i < 6; i++) redir[i] = R->redir[i];
+    uint32_t iovn = R->iovn;
+
     // Redirect each flagged pointer arg into the ring buffer (THE crossing point: from here on
-    // service_local() touches only ring memory). Bounds-check every worker-supplied offset first --
+    // service_local() touches only ring/private memory). Bounds-check every worker-supplied offset first --
     // an out-of-range offset is a hijacked/buggy worker and faults the call rather than the sentry.
     int bad = 0;
+    uint32_t off[6] = {0, 0, 0, 0, 0, 0};
+    int have[6] = {0, 0, 0, 0, 0, 0};
     uint64_t *ta[6] = {&G_A0(&tmp), &G_A1(&tmp), &G_A2(&tmp), &G_A3(&tmp), &G_A4(&tmp), &G_A5(&tmp)};
     for (int i = 0; i < 6; i++) {
-        if (R->redir[i] < 0) continue;
-        uint32_t off = (uint32_t)R->redir[i];
-        if (off >= SENTRY_BUFSZ) { bad = 1; break; }
-        *ta[i] = (uint64_t)(R->buf + off);
+        if (redir[i] < 0) continue;
+        uint32_t o = (uint32_t)redir[i];
+        if (o >= SENTRY_BUFSZ) { bad = 1; break; }
+        off[i] = o;
+        have[i] = 1;
+        *ta[i] = (uint64_t)(R->buf + o);
     }
-    if (!bad && R->iovn) { // rebase + bounds-check the flattened iovec at a1 (offsets -> ring ptrs)
-        struct iovec *iv = (struct iovec *)(R->buf + (uint32_t)R->redir[1]);
-        for (uint32_t k = 0; k < R->iovn; k++) {
-            uint64_t boff = (uint64_t)(uintptr_t)iv[k].iov_base, len = iv[k].iov_len;
-            if (boff > SENTRY_BUFSZ || len > SENTRY_BUFSZ || boff + len > SENTRY_BUFSZ) {
-                iv[k].iov_base = R->buf; // clamp a bad segment to empty rather than escape the ring
-                iv[k].iov_len = 0;
-            } else
-                iv[k].iov_base = R->buf + boff;
+
+    uint64_t snr = bad ? 0 : G_NR(&tmp);
+
+    // Per-servicer-thread PRIVATE iovec[] -- the kernel scatters/gathers through THIS, not the shared ring,
+    // so a racing worker thread cannot move a segment after we validated it (finding E). 16B/seg * IOVMAX.
+    static __thread struct iovec piov[SENTRY_IOVMAX];
+    socklen_t pslen = 0; // PRIVATE in/out socklen: the kernel never sources the length from shared memory
+    int slen_back = 0;   // after the call, mirror pslen back into the SLEN window for the worker copy-back
+    uint8_t ph[64];      // PRIVATE Linux-layout 56-byte msghdr copy (sendmsg/recvmsg graph)
+    int msg_built = 0;
+    uint64_t coff = 0;   // recvmsg control-window offset (for the SCM_RIGHTS fd-track after the call)
+
+    // ---- P0 finding A/D: clamp EVERY length the kernel will use to read/write buf[] down to the bytes
+    //      actually remaining in that ring window (BUFSZ - offset). Correct traffic is already inside its
+    //      window, so the min() is a no-op for it; only a hostile over-large length is cut. The worker-side
+    //      caps are NOT a security control -- this is the sentry re-deriving the bound from the redir window.
+    //      In/out socklen/optlen values are routed through PRIVATE storage (pslen) so the kernel reads the
+    //      clamped capacity from sentry memory, race-free, and the output is mirrored back afterwards. ----
+    if (!bad) {
+        switch (snr) {
+        case 61: case 63: case 67: // getdents64 / read / pread64: a2 = byte count through buf+off[1]
+        case 64: case 68:          // write / pwrite64
+        case 200: case 203:        // bind / connect: a2 = addrlen through buf+off[1]
+            if (have[1] && G_A2(&tmp) > (uint64_t)(SENTRY_BUFSZ - off[1])) G_A2(&tmp) = SENTRY_BUFSZ - off[1];
+            break;
+        case 206:                  // sendto: a2 = data len (off[1]); a5 = destaddr len (off[4])
+            if (have[1] && G_A2(&tmp) > (uint64_t)(SENTRY_BUFSZ - off[1])) G_A2(&tmp) = SENTRY_BUFSZ - off[1];
+            if (have[4] && G_A5(&tmp) > (uint64_t)(SENTRY_BUFSZ - off[4])) G_A5(&tmp) = SENTRY_BUFSZ - off[4];
+            break;
+        case 207:                  // recvfrom: a2 = data len; a5 = in/out socklen -> PRIVATE (clamped to window)
+            if (have[1] && G_A2(&tmp) > (uint64_t)(SENTRY_BUFSZ - off[1])) G_A2(&tmp) = SENTRY_BUFSZ - off[1];
+            if (have[5]) {
+                pslen = *(socklen_t *)(R->buf + SENTRY_SLEN_OFF);
+                if (pslen > SENTRY_SADDRCAP) pslen = SENTRY_SADDRCAP;
+                G_A5(&tmp) = (uint64_t)&pslen;
+                slen_back = 1;
+            }
+            break;
+        case 202: case 242:        // accept / accept4
+        case 204: case 205:        // getsockname / getpeername: a2 = in/out socklen -> PRIVATE (clamped)
+            if (have[2]) {
+                pslen = *(socklen_t *)(R->buf + SENTRY_SLEN_OFF);
+                if (pslen > SENTRY_SADDRCAP) pslen = SENTRY_SADDRCAP;
+                G_A2(&tmp) = (uint64_t)&pslen;
+                slen_back = 1;
+            }
+            break;
+        case 208:                  // setsockopt: a4 = optlen through buf+off[3]
+            if (have[3] && G_A4(&tmp) > (uint64_t)(SENTRY_BUFSZ - off[3])) G_A4(&tmp) = SENTRY_BUFSZ - off[3];
+            break;
+        case 209:                  // getsockopt: a4 = in/out optlen -> PRIVATE (clamped to the optval window)
+            if (have[4]) {
+                pslen = *(socklen_t *)(R->buf + SENTRY_SLEN_OFF);
+                if (pslen > SENTRY_OPTCAP) pslen = SENTRY_OPTCAP;
+                G_A4(&tmp) = (uint64_t)&pslen;
+                slen_back = 1;
+            }
+            break;
+        case 73:                   // ppoll: a1 = nfds (8B/entry) into the pollfd window [0,DATACAP)
+            if (G_A1(&tmp) > (uint64_t)(SENTRY_DATACAP / 8u)) G_A1(&tmp) = SENTRY_DATACAP / 8u;
+            break;
+        case 72:                   // pselect6: a0 = nfds -> (nfds+7)/8 <= 128B fits each fd_set window
+            if (G_A0(&tmp) > 1024u) G_A0(&tmp) = 1024u;
+            break;
+        case 22:                   // epoll_pwait: a2 = maxevents (12B/entry) into the out window [0,BUFSZ)
+            if (have[1] && G_A2(&tmp) > (uint64_t)(SENTRY_BUFSZ / SENTRY_EPEV_SZ)) G_A2(&tmp) = SENTRY_BUFSZ / SENTRY_EPEV_SZ;
+            break;
+        case 56: case 79: case 291: // openat / newfstatat / statx: force the in-path NUL-terminated within
+            R->buf[SENTRY_PATHCAP - 1] = 0; // its window so service_local()'s C-string walk can't run off buf
+            break;
+        default: break;
         }
     }
-    // sendmsg/recvmsg (item 2): a1 was redirected to the marshaled 56-byte msghdr COPY at buf[0]; its
-    // msg_name/msg_iov/msg_control are buf-relative OFFSETS (0 == NULL, since a real field never sits at
-    // offset 0) that we rebase to ring pointers here -- and each msg_iov[].iov_base offset too. After this
-    // service_local() reads a fully ring-internal msghdr graph. (R->iovn stays 0 for these so the plain
-    // iovec block above is skipped.)
-    if (!bad) {
-        uint64_t snr = G_NR(&tmp);
-        if (snr == 211 || snr == 212) {
-            uint8_t *h = R->buf;
-            uint64_t noff = *(uint64_t *)(h + 0), ioff = *(uint64_t *)(h + 16), in = *(uint64_t *)(h + 24),
-                     coff = *(uint64_t *)(h + 32);
-            if (noff >= SENTRY_BUFSZ || ioff >= SENTRY_BUFSZ || coff >= SENTRY_BUFSZ) bad = 1;
-            if (!bad) {
-                if (noff) *(uint64_t *)(h + 0) = (uint64_t)(R->buf + noff);   // msg_name -> ring ptr
-                if (coff) *(uint64_t *)(h + 32) = (uint64_t)(R->buf + coff);  // msg_control -> ring ptr
-                if (ioff) {
-                    struct iovec *iv = (struct iovec *)(R->buf + ioff);
-                    for (uint64_t k = 0; k < in; k++) {
-                        uint64_t boff = (uint64_t)(uintptr_t)iv[k].iov_base, len = iv[k].iov_len;
-                        if (boff > SENTRY_BUFSZ || len > SENTRY_BUFSZ || boff + len > SENTRY_BUFSZ) {
-                            iv[k].iov_base = R->buf;
-                            iv[k].iov_len = 0;
-                        } else
-                            iv[k].iov_base = R->buf + boff;
-                    }
-                    *(uint64_t *)(h + 16) = (uint64_t)(R->buf + ioff); // msg_iov -> ring ptr
+
+    // ---- P0 finding B/E: readv/writev -- bound the segment count, reject a wild base, then COPY the iovec[]
+    //      descriptor array OUT of the shared ring into private memory, validate the copy, and point the
+    //      kernel at it. (We also mirror the validated descriptors back into buf[] for the worker's own
+    //      scatter copy-back; that read is worker-side / intra-principal, not a sentry crossing.) ----
+    if (!bad && iovn) {
+        if (!have[1]) {
+            bad = 1; // iovn>0 with no valid a1 redir window would be a wild deref off buf[] -- reject (finding B.2)
+        } else {
+            uint32_t maxn = (uint32_t)((SENTRY_BUFSZ - off[1]) / sizeof(struct iovec));
+            if (iovn > SENTRY_IOVMAX) iovn = SENTRY_IOVMAX;
+            if (iovn > maxn) iovn = maxn;
+            struct iovec *iv = (struct iovec *)(R->buf + off[1]); // shared (attacker-writable)
+            for (uint32_t k = 0; k < iovn; k++) {
+                uint64_t boff = (uint64_t)(uintptr_t)iv[k].iov_base, len = iv[k].iov_len; // read ONCE
+                if (boff > SENTRY_BUFSZ || len > SENTRY_BUFSZ || boff + len > SENTRY_BUFSZ) {
+                    piov[k].iov_base = R->buf;        piov[k].iov_len = 0; // bad seg -> empty (don't escape the ring)
+                    iv[k].iov_base = R->buf;          iv[k].iov_len = 0;
+                } else {
+                    piov[k].iov_base = R->buf + boff; piov[k].iov_len = (size_t)len;
+                    iv[k].iov_base = R->buf + boff;   iv[k].iov_len = (size_t)len;
                 }
             }
+            G_A1(&tmp) = (uint64_t)piov; // kernel reads the PRIVATE iovec[]
+            G_A2(&tmp) = iovn;
         }
     }
+
+    // ---- P0 finding C/E: sendmsg/recvmsg -- build the WHOLE msghdr graph in private memory: a Linux-layout
+    //      56-byte header pointing at the private iovec[], with msg_namelen/msg_controllen clamped to their
+    //      windows. service_local() reads/writes this private header; nothing it touches is re-read by the
+    //      kernel from attacker-writable shared memory. (R->iovn stays 0 for these so the block above is skipped.)
+    if (!bad && (snr == 211 || snr == 212)) {
+        uint8_t *h = R->buf;
+        uint64_t noff = *(uint64_t *)(h + 0);
+        uint32_t nlen = *(uint32_t *)(h + 8);
+        uint64_t ioff = *(uint64_t *)(h + 16);
+        uint64_t in = *(uint64_t *)(h + 24);
+        uint64_t clen = *(uint64_t *)(h + 40);
+        uint32_t mflags = *(uint32_t *)(h + 48);
+        coff = *(uint64_t *)(h + 32);
+        if (noff >= SENTRY_BUFSZ || ioff >= SENTRY_BUFSZ || coff >= SENTRY_BUFSZ) {
+            bad = 1;
+        } else {
+            memset(ph, 0, sizeof ph);
+            if (noff) {
+                if (nlen > (uint32_t)(SENTRY_BUFSZ - noff)) nlen = (uint32_t)(SENTRY_BUFSZ - noff);
+                *(uint64_t *)(ph + 0) = (uint64_t)(R->buf + noff); // msg_name -> ring ptr
+                *(uint32_t *)(ph + 8) = nlen;                      // msg_namelen, clamped to window
+            }
+            uint32_t n = 0;
+            if (ioff) {
+                uint32_t maxn = (uint32_t)((SENTRY_BUFSZ - ioff) / sizeof(struct iovec));
+                n = (in > SENTRY_IOVMAX) ? SENTRY_IOVMAX : (uint32_t)in; // bound msg_iovlen (finding C)
+                if (n > maxn) n = maxn;
+                struct iovec *iv = (struct iovec *)(R->buf + ioff);
+                for (uint32_t k = 0; k < n; k++) {
+                    uint64_t boff = (uint64_t)(uintptr_t)iv[k].iov_base, len = iv[k].iov_len;
+                    if (boff > SENTRY_BUFSZ || len > SENTRY_BUFSZ || boff + len > SENTRY_BUFSZ) {
+                        piov[k].iov_base = R->buf;        piov[k].iov_len = 0;
+                        iv[k].iov_base = R->buf;          iv[k].iov_len = 0;
+                    } else {
+                        piov[k].iov_base = R->buf + boff; piov[k].iov_len = (size_t)len;
+                        iv[k].iov_base = R->buf + boff;   iv[k].iov_len = (size_t)len;
+                    }
+                }
+                *(uint64_t *)(ph + 16) = (uint64_t)piov; // msg_iov -> PRIVATE iovec[]
+            }
+            *(uint64_t *)(ph + 24) = n;
+            if (coff) {
+                if (clen > (uint64_t)(SENTRY_BUFSZ - coff)) clen = SENTRY_BUFSZ - coff;
+                *(uint64_t *)(ph + 32) = (uint64_t)(R->buf + coff); // msg_control -> ring ptr
+                *(uint64_t *)(ph + 40) = clen;                      // msg_controllen, clamped to window
+            }
+            *(uint32_t *)(ph + 48) = mflags;
+            G_A1(&tmp) = (uint64_t)ph; // service_local reads/writes the PRIVATE msghdr
+            msg_built = 1;
+        }
+    }
+
     if (bad) {
         R->ret = -EFAULT;
-    } else {
-        service_local(&tmp); // real host authority + container policy
-        R->ret = (int64_t)G_RET(&tmp);
+        R->nserved++;
+        return;
+    }
+
+    service_local(&tmp); // real host authority + container policy (touches only ring + private memory now)
+    int64_t ret = (int64_t)G_RET(&tmp);
+    R->ret = ret;
+
+    // Mirror PRIVATE out-values back into the ring so the worker's copy-back into guest memory sees them.
+    if (slen_back) *(socklen_t *)(R->buf + SENTRY_SLEN_OFF) = pslen;
+    if (msg_built && snr == 212) {
+        *(uint32_t *)(R->buf + 8) = *(uint32_t *)(ph + 8);   // updated msg_namelen
+        *(uint64_t *)(R->buf + 40) = *(uint64_t *)(ph + 40); // updated msg_controllen
+        *(uint32_t *)(R->buf + 48) = *(uint32_t *)(ph + 48); // updated msg_flags
+    }
+
+    // ---- P1 finding F: record every fd the sentry just handed THIS guest, so only such fds are
+    //      FDPASS-lendable; drop it on close. (g_ctl[]/stdio/non-guest host fds are never tracked.) ----
+    switch (snr) {
+    case 56: case 198: case 202: case 242: case 23: case 24: case 20: // openat/socket/accept*/dup*/epoll_create1
+        if (ret >= 0) sentry_fd_track((int)ret);
+        break;
+    case 25: // fcntl F_DUPFD(0) / F_DUPFD_CLOEXEC(1030) return a new fd
+        if ((G_A1(&tmp) == 0 || G_A1(&tmp) == 1030) && ret >= 0) sentry_fd_track((int)ret);
+        break;
+    case 59: case 199: // pipe2 / socketpair: the two new fds landed at buf[0..8)
+        if (ret == 0) { sentry_fd_track(*(int *)(R->buf)); sentry_fd_track(*(int *)(R->buf + 4)); }
+        break;
+    case 57: // close
+        if (ret == 0) sentry_fd_untrack((int)R->a[0]);
+        break;
+    case 212: // recvmsg: track any SCM_RIGHTS fds received in the (sentry-written) control window
+        if (ret >= 0 && coff) sentry_track_cmsg_fds(R->buf + coff, (size_t)*(uint64_t *)(R->buf + 40));
+        break;
+    default: break;
     }
     R->nserved++;
 }
