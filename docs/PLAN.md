@@ -67,12 +67,10 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
 
 | Area | What's left | Pri |
 |------|-------------|:---:|
-| `docker ps` | remaining `--filter` keys (status/name/label/`--size` done) | P1 |
-| `docker exec` | `-u` (needs a `SpawnConfig` uid field), `--privileged` (`-e`/`-w`/`-d` done) | P1 |
-| `docker run` opts | `--user` (uid not applied), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` (`--label` done) | P2 |
+| `docker exec` | `--privileged` (rare; `-e`/`-w`/`-d`/`-u` done) | P3 |
+| `docker run` opts | wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` (`--user`/`--label` done) | P2 |
 | `docker build` | BuildKit/layer cache (every build re-runs from base) — args/target/nocache/labels/digest-IDs done | P2 |
 | `docker cp` | non-default-driver named volumes (default `<volumes_dir>/<name>` handled) | P3 |
-| IPC | `*ctl(IPC_STAT/IPC_SET)` introspection (macOS `*_ds` layout differs; ENOSYS today) | P3 |
 
 ## Platform limitations (macOS host — can't provide the Linux primitive; off the work-list)
 Non-PIE `ET_EXEC` fixed-vaddr (the `__PAGEZERO` low-4GB reservation — see the deep bug above for the
