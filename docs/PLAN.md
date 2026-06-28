@@ -5,55 +5,39 @@ surface. **This is the only plan — a work list of what is NOT yet implemented.
 [`docs/design/`](design/). Validate: `make test` (**249-green** / 3 engines), `make test-docker[-full|-net|-fn]`,
 `make test-macos`, `make test-realsw`, `make coverage`.
 
-> **Landed (see git history):** the wave-1–6 opt sweep (20 opts), wave-5 server bugs, the W6A deep-bug cluster,
-> **engine-dedup PR3/4**, **strchr/strrchr** fix, **non-PIE SIMD-Q/LSE-RMW** fixup, **adc/sbb** deferral, **POSIX
-> timers**, **sigpipe** (SO_NOSIGPIPE), the **`-p` TCP host-port bridge**, the **sentry** first PR + fs syscall
-> set + daemon `--security-opt` wiring, **postgres B3/B4**, the munmap guard-tail leak, the **vfs.c split**, and
-> the full **Docker-API HostConfig / build-layer-cache / exec / cp** fidelity.
+> **Landed (see git history):** the wave-1–6 opt sweep, wave-5 server bugs, the W6A deep-bug cluster,
+> **engine-dedup PR3/4**, strchr/strrchr, **non-PIE** SIMD/LSE fixup **+ syscall pointer-arg g2h** (only nested
+> iovec/msghdr left), adc/sbb, POSIX timers, **x87 fptop**, sigpipe, the **`-p` TCP + UDP host-port bridges**,
+> the **sentry** (first PR + fs set + **socket family** + **N-ring pool** + daemon `--security-opt` wiring),
+> postgres B3/B4, the munmap guard-tail leak, the **vfs.c / translate.c / daemon containers.rs splits**, and the
+> full **Docker-API** HostConfig / build-cache / `commit` / `--name`·rm·exec·`--rm`·events·`:ro` fidelity.
 
-## Docker functional gaps (real behavioral bugs — `make test-docker-fn`)
+## In flight (agents running)
 
-- **[P1/P2/P3]** *(agent in flight)*: duplicate `--name`, `rm` of a running container w/o `-f`, `exec` into a
-  stopped container, `events --filter container=`, `--rm` auto-remove, `-v :ro` enforcement, logs interleave,
-  **`docker commit`**, `build FROM <prev-stage>`.
-- **[P0] `-p` ports:** TCP host-bridge **landed**; **published UDP** *(in flight)* + a same-host-port-conflict
-  pre-check at create.
-- **Harness:** `scenarios/*.sh` isolate only the socket (adopt `DD_STATE`/`DD_VOLUMES`); no compose binary.
+- **Sentry next PR** — execve/clone/wait4 (forked-guest lanes), sendmsg/recvmsg + SCM_RIGHTS fd-passing,
+  poll/epoll over sentry-owned fds, futex wakeup. Closes the gap to a sound sandbox for real images.
+- **sqlite in-memory temp-file backing** — back O_TMPFILE/unlinked-scratch with a host memfd (the 97%-pread/pwrite
+  spill → memcpy perf win).
+- **docker logs chronological interleave** — the last `make test-docker-fn` behavioral bug.
 
-## Subsystems (remaining)
+## Remaining (queued / harder)
 
-- **Sentry** → [`sentry-split.md`](design/sentry-split.md). First PR + fs syscall set + daemon wiring landed;
-  **sockets + per-context rings** *(in flight)*. **Remaining:** execve/clone, SCM_RIGHTS for file-backed mmap,
-  futex/`__ulock` wakeup (replace the spin), allow/deny policy.
-- **x86 translator → native** → [`x86-perf.md`](design/x86-perf.md). All but x87 landed; **x87 `fptop`** *(in
-  flight)*. Then the perf squeeze below.
-- **In-process netstack smoltcp** → [`netstack.md`](design/netstack.md). Optional, **blocked** (offline crate dep).
+- **Perf squeeze** (lower priority): redis command-dispatch hot-path tuning (~18× off native), tier-2 multi-block
+  traces over call-free spans, sub-ms startup (fork of the large-VM reservation + ld.so). [`x86-perf.md`](design/x86-perf.md)
+- **Refactoring:** `service.c` (3.5k) io/proc/misc dispatcher split — needs a careful retry (a prior attempt
+  broke threading; root cause never found, so reverted). The sysv/mem/signal/time splits already landed.
+- **`-v :ro` JIT-layer write enforcement** — the daemon parses + reports it; the JIT `Volume{}` has no RO flag,
+  so writes to a read-only bind aren't blocked at the mount.
 
-## JIT correctness (remaining)
+## Blocked on inputs / environment
 
-- **non-PIE syscall pointer-args (g2h redirect)** *(in flight)* — the last non-PIE residual (low-image `.rodata`/
-  `.data` pointers passed to syscalls). [`w6a-deepbugs.md`](design/w6a-deepbugs.md).
-
-## JIT perf — remaining squeeze (lower priority)
-
-- redis hot-path tuning; tier-2 multi-block traces (x30 call-prologue mangle); sqlite tmpfs temp fd; sub-ms
-  startup (fork-server residual = large-VM fork + ld.so).
-
-## Refactoring — split oversized files *(in progress)*
-
-`vfs.c` done (→ vfs/{gmap,overlay,resolve}). Remaining: `translate.c` (2.5k), `service.c` (3.5k — sysv/mem/
-signal/time extracted; io/proc/misc needs a careful retry), daemon `containers.rs` (1k). Pattern: verbatim
-`#include` of category sub-files, matrix-gated byte-identical.
-
-## Validation blocked on inputs
-
-- **real redis / postgres / nats end-to-end** — needs **x86_64 images** (only arm64 local) + the non-PIE
-  pointer-arg residual above.
+- **netstack smoltcp** (`DD_NETSTACK`) — the crate dep can't be fetched in the offline build.
+- **real redis / postgres / nats end-to-end** — needs **x86_64 images** (only arm64 local).
 
 ## Platform limitations (macOS host — can't provide the Linux primitive)
 
-Non-PIE `ET_EXEC` `__PAGEZERO` (see the JIT correctness gap for the workaround), cpu/io throttling (no cgroup;
-mem+pids via rlimit), `pidfd`, `io_uring`, mqueue `mq_*`, `edge` corners (`mprotect` PROT_NONE,
+Non-PIE `ET_EXEC` `__PAGEZERO` (the JIT pointer-fixup is the achievable workaround), cpu/io throttling (no
+cgroup; mem+pids via rlimit), `pidfd`, `io_uring`, mqueue `mq_*`, `edge` corners (`mprotect` PROT_NONE,
 `pipe2(O_DIRECT)`). Free on a linux→linux build.
 
 ## Portability matrix (only darwin-host / both-guests built)
