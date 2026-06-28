@@ -1445,7 +1445,11 @@ static void service(struct cpu *c) {
         // that hits an unmapped page -> SIGBUS. Map a 64KB guard tail on non-fixed anon maps so the
         // over-read lands in mapped zero memory (x86 glibc relies on this; harmless for aarch64).
         size_t guard = (!(a3 & 0x10) && (a3 & 0x20)) ? 0x10000 : 0;
-        void *r = mmap((void *)a0, (size_t)a1 + guard, (int)a2, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4,
+        // mprotect (case 226) is a no-op (the JIT never executes guest pages), so a later PROT_READ ->
+        // PROT_READ|WRITE upgrade would be silently dropped. Map ANON memory writable up front so the
+        // upgrade is already in effect (redis' checkLinuxMadvFreeForkBug mmaps R then mprotects RW then stores).
+        int prot = (a3 & 0x20) ? ((int)a2 | PROT_READ | PROT_WRITE) : (int)a2;
+        void *r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4,
                        (off_t)a5);
         // refund
         if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
