@@ -125,6 +125,38 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         void *r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4,
                        (off_t)a5);
+        // 16 KB-vs-4 KB MAP_FIXED reconciliation. macOS arm64 mmap REQUIRES a 16 KB-aligned address for
+        // MAP_FIXED, but x86_64 .so PT_LOAD segments are only p_align=0x1000 (4 KB), so ld.so's MAP_FIXED
+        // mapping of e.g. libc's text segment at a 4 KB- (not 16 KB-) aligned guest address returns EINVAL
+        // -> "failed to map segment from shared object" (file-backed) / "cannot map zero-fill pages" (the
+        // anon BSS tail). (aarch64 .so segments use p_align 0x10000, a multiple of 16 KB, so they never hit
+        // this.) ld.so has ALREADY reserved this whole .so address range with an earlier (kernel-placed,
+        // 16 KB-aligned) mmap, so the range is ours -- emulate the failing fixed map with a private ANON
+        // map at the 16 KB-rounded base, then pread the file bytes (file-backed) or leave it zero (anon
+        // BSS): a private, writable copy, exactly what MAP_PRIVATE promises. Gated on the DIRECT mmap having
+        // FAILED for a MAP_FIXED request, so every working case (non-fixed maps, and 16 KB-aligned aarch64
+        // file/anon maps) takes the unchanged direct path above and is byte-identical.
+        if (r == MAP_FAILED && (a3 & 0x10)) {
+            uint64_t lo = a0 & ~(uint64_t)0x3fff; // round the start DOWN to a 16 KB host page
+            size_t head = (size_t)(a0 - lo);      // bytes in the low page that belong to the PREVIOUS segment
+            // The low page may also hold the tail of the previous PT_LOAD (a0 sits mid-16 KB-page). The ANON
+            // MAP_FIXED below zeros that whole page, so snapshot the neighbour's bytes FIRST and restore them
+            // after -- they were already written (prev segment / ld.so's reservation) and must survive. (The
+            // HIGH edge needs no save: bytes past a0+a1 belong to the NEXT segment, which refills them via
+            // its own map, or are this segment's BSS, which must read as zero anyway.)
+            void *hsave = head ? malloc(head) : NULL;
+            if (hsave) memcpy(hsave, (void *)lo, head);
+            // RW only: the JIT never executes guest pages, and an ANON PROT_EXEC map hits macOS W^X EPERM.
+            void *ar = mmap((void *)lo, (size_t)a1 + head, PROT_READ | PROT_WRITE,
+                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (ar != MAP_FAILED) {
+                if (hsave) memcpy((void *)lo, hsave, head);                // restore the previous seg's tail
+                if (!(a3 & 0x20) && (int)a4 >= 0)                          // file-backed: load the file bytes;
+                    pread((int)a4, (void *)a0, (size_t)a1, (off_t)a5);     //   short read => trailing BSS zeros
+                r = (void *)a0; // success: the mapping now lives at the requested fixed guest address
+            }
+            free(hsave);
+        }
         // refund
         if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
         if (r != MAP_FAILED) {
