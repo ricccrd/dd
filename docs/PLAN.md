@@ -43,10 +43,12 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
   fork). First mitigation applied (re-assert execute in the child) — insufficient. **Robust fix (PR-ready):**
   the **dual-mapped RX/RW code cache** (`mach_vm_remap` a RW alias, route cache stores through `cw()`,
   execute stays RX in the page tables → survives fork). Also closes the `soak/smc` RWX gap below.
-- **x86 busybox `sort` SIGSEGV on large input** (jit86 frontend; baseline bug, 3 independent confirmations,
-  tracked separately from the fork+exec crashes). Small input works, large faults → a mistranslated
-  instruction on the bulk path (suspect: `rep movs/cmps`, SSE memcpy/`pmovmskb` strlen, or address sign-ext).
-  Under differential-trace + static-audit research → `docs/design/{fix-x86-busybox-sort,audit-x86-largeinput}.md`.
+- **x86 busybox `sort` SIGSEGV** — ROOT-CAUSED + **fix applied** (pending matrix gate): the `0x90` NOP
+  handler ignored `REX.B`, so `49 90` (`xchg rax,r8`, the `call malloc; xchg %rax,%r8` allocator idiom) was
+  dropped → stale `r8` → wild memset → SIGSEGV. Differential-proven (qemu 66 vs jit 153); data-INDEPENDENT
+  (the "large input" framing was an empty-piped-stdin artifact). See `docs/design/fix-x86-busybox-sort.md`.
+  *Secondary (tracked, unconfirmed):* the global monotonic `g_lazymaps<4096` over-read/stack-grow budget
+  never resets — could bite huge workloads; see `dd-jit/docs/design/audit-x86-largeinput.md`.
 - **`soak/smc` / RWX guest-JIT pages.** `mmap(PROT_READ|WRITE|EXEC)` returns EPERM (W^X). Any guest that JITs
   its own code (JVM/V8/LuaJIT/.NET/PyPy) needs executable pages — fixed by the same dual-map cache (intercept
   RWX/`PROT_EXEC` maps, back with MAP_JIT, re-translate on writes). *(Endurance otherwise holds:
