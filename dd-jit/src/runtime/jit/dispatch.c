@@ -4,6 +4,14 @@
 // run_block(cpu, code): save host callee-saved into cpu, set env=x28, jump to code.
 // The block tail-calls block_return, which restores host state and returns here's
 // caller (the dispatcher).
+//
+// Per-arch trampolines: aarch64 enters block_return with cpu in x0 (all 31 GPRs are guest regs) and
+// saves at offsets #288..#376 (q8..q15 @#896, host_sp@#280). x86 has only 16 guest GPRs, pins cpu in
+// x28 for the whole block, and saves at different offsets -- so the x86 frontend supplies its OWN
+// run_block/block_return (frontend/x86_64/translate.c, included before this file) and defines
+// G_OWN_TRAMPOLINES to suppress these aarch64 ones. (engine-dedup §B.1/§B.3: the register model is the
+// one irreducible divergence; the shared loop only CALLS run_block, never bakes its offsets.)
+#ifndef G_OWN_TRAMPOLINES
 __attribute__((naked)) static void run_block(struct cpu *cpu, void *code) {
     // x0=cpu, x1=code
     __asm__ volatile(
@@ -35,20 +43,53 @@ __attribute__((naked)) static void block_return(void) {
         "ldr x9, [x0, #280]\n mov sp, x9\n"
         "ret\n");
 }
+#endif // G_OWN_TRAMPOLINES
+
+// ---------------- dispatch seam defaults ----------------
+// Hooks the aarch64 frontend does NOT define in frontend/aarch64/dispatch_hooks.h (the seams added for
+// engine-dedup PR3/PR4 + opts committed after the design). Their #ifndef defaults below reproduce the
+// EXACT aarch64-inline behavior, so the aarch64 engine stays bit-identical; the x86 frontend overrides
+// each in frontend/x86_64/dispatch_hooks.h. (The four PR2 seams -- G_DISPATCH_DEBUG / G_SHADOW_CLEAR /
+// G_IBTC_FILL / G_DISPATCH_REASON -- are defined by BOTH frontends, so they need no default here.)
+
+// One-time per-thread setup before the loop. aarch64 has none.
+#ifndef G_DISPATCH_ENTER
+#define G_DISPATCH_ENTER(c) ((void)0)
+#endif
+// Post-translate chaining. aarch64 chains in the dispatcher (here); x86 chains inside translate_block.
+#ifndef G_DISPATCH_CHAIN
+#define G_DISPATCH_CHAIN(c) patch_links_to(G_PC(c), map_body(G_PC(c)))
+#endif
+// Post-translate per-arch step. aarch64 has none; x86 does W6A SMC source-page write-protect.
+#ifndef G_AFTER_TRANSLATE
+#define G_AFTER_TRANSLATE(c) ((void)0)
+#endif
+// Per-block JT trace dump (the 5th divergence). aarch64 dumps pc + x19/x20/sp + the first 6 block words.
+#ifndef G_TRACE_DUMP
+#define G_TRACE_DUMP(c)                                                                                                  \
+    if (g_trace) {                                                                                                       \
+        uint32_t *ci = (uint32_t *)G_PC(c);                                                                              \
+        fprintf(stderr, "[blk] pc=%llx x19=%llx x20=%llx sp=%llx | %08x %08x %08x %08x %08x %08x\n",                     \
+                (unsigned long long)G_PC(c), (unsigned long long)(c)->x[19], (unsigned long long)(c)->x[20],            \
+                (unsigned long long)(c)->sp, ci[0], ci[1], ci[2], ci[3], ci[4], ci[5]);                                 \
+    }
+#endif
 
 // ---------------- dispatcher ----------------
 static void run_guest(struct cpu *c) {
     // this thread's cpu, for emitted block exits
     pthread_setspecific(g_cpu_key, c);
+    // Frontend hook: one-time per-thread entry setup (x86 publishes the 2-way IBTC base; empty on aarch64).
+    G_DISPATCH_ENTER(c);
     while (!c->exited) {
-        if (c->pc == SIGRETURN_PC) {
+        if (G_PC(c) == SIGRETURN_PC) {
             do_sigreturn(c);
             continue;
         // handler returned -> restore context
         }
         // A non-PIE image's un-relocated absolute jump lands on its (unmapped) low link vaddr; redirect it
         // into the biased image so we translate real code instead of faulting on the unmapped low address.
-        if (g_nonpie_lo && c->pc >= g_nonpie_lo && c->pc < g_nonpie_hi) c->pc += g_nonpie_bias;
+        if (g_nonpie_lo && G_PC(c) >= g_nonpie_lo && G_PC(c) < g_nonpie_hi) G_PC(c) += g_nonpie_bias;
         // Frontend hook: top-of-loop debug instrumentation (x86-only; empty on aarch64).
         G_DISPATCH_DEBUG(c);
         // With threads, the WHOLE cache lookup is under the lock: an unlocked
@@ -56,7 +97,7 @@ static void run_guest(struct cpu *c) {
         // that makes a peer thread's freshly-emitted+icache-flushed code visible.
         // Single-threaded skips the lock entirely (g_threaded == 0).
         if (g_threaded) pthread_mutex_lock(&g_jit_lock);
-        void *code = map_host(c->pc);
+        void *code = map_host(G_PC(c));
         if (!code) {
             uint64_t _t0 = g_prof ? now_ns() : 0;
             // near full -> wholesale flush
@@ -77,26 +118,25 @@ static void run_guest(struct cpu *c) {
             }
             jit_wprot(0);
             g_emit_start = g_cp;
-            code = translate_block(c->pc);
+            code = translate_block(G_PC(c));
             g_prof_xlate++;
             // new block coherent on all cores FIRST (icache is on the RX alias under dual map)
             sys_icache_invalidate(J_RX(g_emit_start), (size_t)(g_cp - g_emit_start));
-            // THEN chain existing blocks to it (still write mode)
-            patch_links_to(c->pc, map_body(c->pc));
+            // THEN chain existing blocks to it (still write mode). Frontend hook: aarch64 chains here;
+            // x86's translate_block already chained internally, so its hook is a no-op.
+            G_DISPATCH_CHAIN(c);
             // back to execute AFTER all cache writes
             jit_wprot(1);
+            // Frontend hook: post-translate per-arch step (x86 W6A SMC source-page write-protect; empty aarch64).
+            G_AFTER_TRANSLATE(c);
             if (g_prof) g_xlate_ns += now_ns() - _t0;
         }
         // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
         // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).
         G_IBTC_FILL(c);
         if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
-        if (g_trace) {
-            uint32_t *ci = (uint32_t *)c->pc;
-            fprintf(stderr, "[blk] pc=%llx x19=%llx x20=%llx sp=%llx | %08x %08x %08x %08x %08x %08x\n",
-                    (unsigned long long)c->pc, (unsigned long long)c->x[19], (unsigned long long)c->x[20],
-                    (unsigned long long)c->sp, ci[0], ci[1], ci[2], ci[3], ci[4], ci[5]);
-        }
+        // Frontend hook: per-block JT trace dump (per-arch register/flag layout). See §A.3 (5th divergence).
+        G_TRACE_DUMP(c);
         c->reason = 0;
         if (g_prof) g_prof_cross++;
         // map_host()/translate_block() return RW-alias addresses; execute via the RX alias.
@@ -106,10 +146,11 @@ static void run_guest(struct cpu *c) {
         G_DISPATCH_REASON(c);
         // W4E tier-2: a hot self-loop's back-edge counter fired -> recompile+swap it in. pc is already =
         // loop start, so the next iteration of this dispatcher loop runs the folded block. R_TIER2 is
-        // disjoint from R_SYSCALL (handled in the hook above) so this never double-fires. tier2_promote is a
-        // no-op under threads / NOTIER2. (This TU is the aarch64 dispatcher only -- the x86 engine includes
-        // frontend/x86_64/dispatch.c instead -- so R_TIER2/tier2_promote are aarch64-scoped here.)
-        if (c->reason == R_TIER2) tier2_promote(c->pc);
+        // disjoint from R_SYSCALL (handled in the reason hook above) so this never double-fires.
+        // tier2_promote is a no-op under threads / NOTIER2. NOTE: the x86 frontend's G_DISPATCH_REASON
+        // handles R_TIER2 itself (with `continue`), so for the x86 engine this line is never reached;
+        // it remains the aarch64 path. Both arches define tier2_promote (per-arch).
+        if (c->reason == R_TIER2) tier2_promote(G_PC(c));
         // async signal -> guest handler
         if (g_pending) maybe_deliver_signal(c);
     }

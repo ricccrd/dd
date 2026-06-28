@@ -58,6 +58,7 @@
 
 #include "../include/cpu_x86_64.h"
 #include "../frontend/x86_64/abi.h"          // cpu-interface seam (G_* contract + sysmap + normalize)
+#include "../frontend/x86_64/dispatch_hooks.h" // x86 dispatch seam for the SHARED jit/dispatch.c (engine-dedup)
 #include "../frontend/x86_64/fill_stat.c"    // per-arch struct-stat layout os/linux fills
 
 #include "../os/linux/container/state.c"     // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
@@ -75,8 +76,10 @@
 #include "../os/linux/container/netns.c"     // SHARED: sockets, loopback netns, termios
 #include "../os/linux/fscache.c"             // SHARED: fd/path cache
 #include "../os/linux/service.c"             // SHARED: the canonical syscall layer
+#include "../os/linux/sentry.c"              // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../frontend/x86_64/x86_ops.c"        // x86 cpuid + x87 m80 block-exit helpers
-#include "../frontend/x86_64/dispatch.c"     // x86 run_guest dispatcher
+#include "../jit/dispatch.c"                  // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
+                                              // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../frontend/x86_64/elf.c"      // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
 
 // ---- entry + main ----
@@ -209,6 +212,9 @@ static int engine_global_init(void) {
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGBUS, &sa, NULL);
     }
+    // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.
+    g_untrusted = getenv("DDJIT_UNTRUSTED") != NULL;
+    g_sentry_sandbox = getenv("DDJIT_SANDBOX") != NULL;
     g_engine_inited = 1;
     return 0;
 }
@@ -267,7 +273,9 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
 
     s1_calibrate(); // S1: anchor CNTVCT vs host REALTIME/MONOTONIC for the inline time fast path
                     // (also honors JIT86_NOFASTSYS=1 kill-switch -> byte-identical old syscall path)
+    if (g_untrusted) sentry_init(); // fork the host-authority sentry + (optionally) confine the worker
     run_guest(&c);
+    if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
     if (getenv("JIT86_FASTSTAT") || g_fast_count)
         fprintf(stderr, "[fastsys] enabled=%d inline-served=%llu\n", g_fastsys, (unsigned long long)g_fast_count);
     if (g_prof)
