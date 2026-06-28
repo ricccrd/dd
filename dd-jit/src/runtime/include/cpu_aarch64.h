@@ -66,7 +66,12 @@ struct cpu {
 #define OFF_GSP offsetof(struct cpu, gsp)
 // §B: real x28 reserved = cpu pointer
 #define CPUREG 28
-// x18 volatile, x28=cpu, x30=host link (§B)
-static int is_stolen(int r) { return r == 18 || r == 28 || r == 30; }
+// A1: x16/x17 engine-private (IBTC scratch); guest x16/x17 mangled like x18 so they never live in
+// the host reg -> the per-indirect-branch red-zone stash/restore of x16/x17 disappears.
+// x18 volatile, x28=cpu, x30=host link (§B). NOSTEAL1617=1 reverts to the 3-reg stolen set at startup.
+static int g_steal1617 = 1;
+static int is_stolen(int r) {
+    return r == 18 || r == 28 || r == 30 || (g_steal1617 && (r == 16 || r == 17));
+}
 #define R_BRANCH 0
 #define R_SYSCALL 1

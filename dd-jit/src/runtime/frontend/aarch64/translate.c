@@ -123,6 +123,20 @@ static void x18_epilog(void) {
     e_ldur(1, 31, -24);
     e_ldur(0, 31, -16);
 }
+// A3 §B instrumentation (PROF=1 only): bump a 64-bit global counter from emitted code. Self-contained:
+// spills x9/x10 to the [sp,#-16/-24] red zone (same convention as emit_t2_counter / the IBTC), so it is
+// independent of whatever scratch the surrounding shadow push/ret is juggling. Gated on g_prof, so the
+// non-PROF codegen is byte-identical to baseline (zero steady-state cost).
+static void emit_prof_bump(void *ctr) {
+    e_stur(9, 31, -16);
+    e_stur(10, 31, -24);
+    e_adrp_add(9, (uint64_t)ctr); // x9 = &counter (plain RW data; adrp+add reaches it)
+    e_ldr(10, 9, 0);
+    e_addi(10, 10, 1);
+    e_str(10, 9, 0);
+    e_ldur(9, 31, -16);
+    e_ldur(10, 31, -24);
+}
 // §B: store a constant to cpu->x[30] (the stolen guest link reg). x28=cpu; x0 scratched via mscratch.
 static void emit_set_x30(uint64_t val) {
     e_str(0, CPUREG, (int)OFF_MSCRATCH);
@@ -134,6 +148,7 @@ static void emit_set_x30(uint64_t val) {
 // cpu->mscratch (all guest regs are live across the call). Returns the `adr x1,Lcont` to backpatch.
 static uint32_t *emit_shadow_push(uint64_t gpc) {
     int M = (int)OFF_MSCRATCH;
+    if (g_prof) emit_prof_bump(&g_prof_shpush); // A3: count §B shadow pushes executed (PROF only)
     e_stp(0, 1, CPUREG, M);
     // spill x0..x3 -> mscratch (paired: 2 stp not 4 str)
     e_stp(2, 3, CPUREG, M + 16);
@@ -174,8 +189,36 @@ static uint32_t *emit_shadow_push(uint64_t gpc) {
 // -- so paying the per-bl shadow push is pure overhead (floatk: sqrt/sin/pow). Only non-leaf targets
 // (depth -> the hardware RAS predicts nested returns: stringk/recursion) get §B. Static, no profiling
 // overhead; the ret auto-adapts (no frame pushed -> classify falls to the IC return).
+// A3 §B depth-gate tuning. The baseline gate (scan_calls + target_is_leaf) is depth-2 static and
+// MISCLASSIFIES two important cases as "leaf" (-> withholds §B -> the return falls to the IBTC):
+//   (1) a function LARGER than the 64-insn scan window whose calls live past it (fib at -O2, most of
+//       sqlite's VDBE helpers) -- the scan exhausts having seen no bl and reports "leaf";
+//   (2) a "shallow" helper that calls only leaves but is itself called from MANY sites -- its single
+//       return site is polymorphic, so the per-site IC thrashes (exactly what the RAS fixes).
+// §B is self-validating (emit_shadow_ret checks guest_ret AND guest_sp; a wrong guess -> IBTC, never a
+// misland), so the gate only ever trades cycles, never correctness. MEASUREMENT (see arm-a3.md) shows
+// §B is NET-NEGATIVE on every return-heavy workload tested -- sqlite, qsort, AND the ideal polymorphic
+// deep-recursion cases (longfib 2x, deepcall 1.4x) -- because the shadow push (~19 insn + sstk stores)
+// plus the shadow-ret validate (~22 insn: guest_ret AND guest_sp compares) cost FAR more than the IBTC
+// return path they replace (a monomorphic per-site IC hit, or even a thrashing shared-hash probe). The
+// host RAS's 1-cycle `ret` is buried under ~40 insn of software bookkeeping. So the right tune is the
+// OPPOSITE of "widen": DISABLE §B and return every ret through the proven IBTC. Levels (env, once):
+//   -1 (DEFAULT)      -> §B OFF: no shadow push; every ret -> bare IBTC (IC + shared hash). The win.
+//   -2 SHADOWGATE=-2  -> §B OFF on the push side, but ret keeps the shadow-ret stub (empty -> IBTC).
+//    0 NOSHADOWTUNE=1 -> EXACT original §B-on gate (byte-identical baseline codegen). A/B kill switch.
+//    1 SHADOWGATE=1   -> widen-fix: window-exhaustion = large/complex fn -> DEEP not leaf (measured: worse).
+//    2 SHADOWGATE=2   -> widen more: ANY direct call -> §B (measured: worse / no better).
+static int g_shadowgate = -2;
+static int shadowgate(void) {
+    if (g_shadowgate == -2) {
+        if (getenv("NOSHADOWTUNE")) g_shadowgate = 0;
+        else { const char *e = getenv("SHADOWGATE"); g_shadowgate = e ? atoi(e) : -1; }
+    }
+    return g_shadowgate;
+}
 // Scan target's straight-line extent (bounded by forward-branch reach). Returns -1 if a blr (unknown
-// callee), else the count of direct-call (bl) targets, writing up to `max` of them to calls[].
+// callee) -- or, when tuned, if the scan window is exhausted with no clean terminal (large/complex fn,
+// treat as deep) -- else the count of direct-call (bl) targets, writing up to `max` of them to calls[].
 static int scan_calls(uint64_t target, uint64_t calls[], int max) {
     int64_t reach = 0;
     int n = 0;
@@ -215,7 +258,9 @@ static int scan_calls(uint64_t target, uint64_t calls[], int max) {
             // terminal past all branches
             if (i >= reach) return n;
     }
-    return n;
+    // window exhausted with no clean terminal: a function larger than the scan window. Baseline reported
+    // whatever bl count it happened to see (usually 0 -> "leaf"); tuned treats it as deep/unknown.
+    return shadowgate() ? -1 : n;
 }
 static int is_leaf0(uint64_t t) {
     uint64_t c[1];
@@ -228,22 +273,30 @@ static int is_leaf0(uint64_t t) {
 static int target_is_leaf(uint64_t target) {
     uint64_t calls[16];
     int n = scan_calls(target, calls, 16);
-    // indirect callee -> assume deep -> §B
+    // SHADOWGATE=-1: never §B (every bl -> leaf path, every ret -> IBTC). Floor experiment.
+    if (shadowgate() < 0) return 1;
+    // indirect callee / large-complex fn (tuned) -> assume deep -> §B
     if (n < 0) return 0;
+    // true leaf (no calls at all: sqrt/sin/pow) -> Stage-B, regardless of level
+    if (n == 0) return 1;
+    // L2/L3: ANY direct call -> §B (covers multiply-called shallow helpers whose ret site is polymorphic)
+    if (shadowgate() >= 2) return 0;
     for (int i = 0; i < n && i < 16; i++)
         // calls a non-leaf -> deep -> §B
         if (!is_leaf0(calls[i])) return 0;
-    // leaf / all-leaf-calls (shallow) -> Stage-B
+    // all-leaf-calls (shallow) -> Stage-B
     return 1;
 }
 // §B guest bl: push shadow, host `bl body(target)` (RAS pushes &Lcont), Lcont continues at gpc+4.
 static void emit_bl_ras(uint64_t gpc, uint64_t target) {
     if (target_is_leaf(target)) {
+        if (g_prof) g_prof_bl_leaf++; // A3: depth-gate steered this bl to the cheap leaf Stage-B path
         emit_set_x30(gpc + 4);
         emit_chain_exit(target);
         return;
     // leaf -> cheap Stage-B (IC return)
     }
+    if (g_prof) g_prof_bl_shadow++; // A3: depth-gate steered this bl to §B (shadow push + RAS ret)
     uint32_t *p_adr = emit_shadow_push(gpc);
     void *body = map_body(target);
     uint32_t *slot = (uint32_t *)g_cp;
@@ -268,6 +321,10 @@ static void emit_bl_ras(uint64_t gpc, uint64_t target) {
 // §B guest ret: if cpu->x[30] == shadow-top guest_ret, pop + real x30=host_ret + host `ret`
 // (hardware-RAS predicted). Else fall back to the dispatcher reading cpu->x[30]. Never lands wrong.
 static void emit_shadow_ret(void) {
+    if (g_ibprof) { // ARM-B1 IBPROF: log the return as an indirect transfer (target = cpu->x[30])
+        emit_iblog(30);
+        return;
+    }
     int M = (int)OFF_MSCRATCH;
     e_stp(0, 1, CPUREG, M);
     // spill x0..x3 (paired)
@@ -308,6 +365,7 @@ static void emit_shadow_ret(void) {
     e_ldp(0, 1, CPUREG, M);
     // restore x0..x3 (paired)
     e_ldp(2, 3, CPUREG, M + 16);
+    if (g_prof) emit_prof_bump(&g_prof_shret_hit); // A3: §B predicted-return FAST hit (PROF only)
     // host ret -> &Lcont (hardware-RAS predicted)
     e_hret();
     uint8_t *Lfb = g_cp;
@@ -319,6 +377,7 @@ static void emit_shadow_ret(void) {
     e_ldp(0, 1, CPUREG, M);
     // restore x0..x3 (paired)
     e_ldp(2, 3, CPUREG, M + 16);
+    if (g_prof) emit_prof_bump(&g_prof_shret_fb); // A3: §B return fell to the IBTC fallback (PROF only)
     // UNWIND/FOREIGN -> IBTC (per-site IC + hash), NOT the dispatcher
     emit_ibranch(30);
 }
@@ -737,6 +796,7 @@ static void *translate_block(uint64_t gpc) {
     (g_stitch && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         uint32_t in = *(uint32_t *)gpc;
+        g_emit_gpc = gpc; // ARM-B1 IBPROF: tag indirect-branch sites with their guest PC
 
         if (!in_excl && !getenv("NOLSE")) {
             int n = try_lse_atomic(gpc);
@@ -771,6 +831,20 @@ static void *translate_block(uint64_t gpc) {
                 gpc = tgt;
                 continue;
             }
+            // ARM-B1 VDBETRACE: path-specialize the VDBE dispatch. The shared loop-top (jump-table)
+            // block is already translated, so opt4's `!map_body` guard would chain to the ONE shared
+            // dispatch (-> polymorphic `br`, SDC hit rate = order-0 ~6%). Force-inline a PRIVATE copy of
+            // the dispatch into THIS predecessor so its `br` sees only this handler's successor
+            // (order-1+, ~75-98% stable). Re-translation of a mid-region entry self-heals as usual.
+            if (g_vdbetrace && g_stitch && !in_excl && (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES &&
+                tgt != start && !seen_has(seen, nseen, tgt) && nseen < TRACE_MAX_BLK - 1 &&
+                is_jt_dispatch_block(tgt)) {
+                g_vt_force_inl++;
+                seen[nseen++] = tgt;
+                trace_blk++;
+                gpc = tgt;
+                continue;
+            }
             emit_chain_exit(tgt);
             break;
         }
@@ -785,8 +859,9 @@ static void *translate_block(uint64_t gpc) {
         if ((in & 0xFFFFFC1Fu) == 0xD65F0000u) {
             int rrn = (in >> 5) & 31;
             if (rrn == 30)
-                // §B: FAST shadow ret (guest_ret+guest_sp match -> host ret) / IBTC fallback
-                emit_shadow_ret();
+                // A3: §B OFF (default) -> bare IBTC return (no shadow-ret preamble); §B ON -> shadow ret
+                // (FAST host-ret on guest_ret+guest_sp match, else IBTC fallback).
+                shadowgate() == -1 ? emit_ibranch(30) : emit_shadow_ret();
             else
                 // ret xN via another reg -> ordinary indirect branch
                 emit_ibranch(rrn);
@@ -794,7 +869,14 @@ static void *translate_block(uint64_t gpc) {
         }
         // br
         if ((in & 0xFFFFFC1Fu) == 0xD61F0000u) {
-            emit_ibranch((in >> 5) & 31);
+            int brn = (in >> 5) & 31;
+            // ARM-B1 VDBETRACE: a clang jump-table dispatch `br` -> speculative direct-chain (SDC)
+            // instead of the polymorphic IBTC probe. (brn is a normal reg here -- never 16/17/18/28/30
+            // for a compiler switch dispatch.) Bit-exact: SDC guard falls back to the shared-hash IBTC.
+            if (g_vdbetrace && brn < 16 && is_jt_dispatch_br(gpc))
+                emit_vdbe_sdc(brn);
+            else
+                emit_ibranch(brn);
             break;
         }
         // blr

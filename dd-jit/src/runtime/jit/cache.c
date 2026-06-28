@@ -151,6 +151,208 @@ static inline void ibtc_publish(ibtc_ent *e, uint64_t target, void *body) {
 static uint64_t g_prof_cross, g_prof_miss, g_prof_xlate, g_prof_sys, g_lse_n;
 // PROF=1: dispatcher crossings / IBTC misses / translations
 static int g_prof;
+// A3 §B instrumentation (PROF=1). Runtime: shadow pushes executed, predicted-return FAST hits (host
+// ret, RAS), and returns that fell through emit_shadow_ret to the IBTC fallback. Translate-time:
+// how many guest `bl` sites the depth-gate steered to §B (shadow push) vs the cheap leaf Stage-B path.
+static uint64_t g_prof_shpush, g_prof_shret_hit, g_prof_shret_fb;
+static uint64_t g_prof_bl_shadow, g_prof_bl_leaf;
+
+// ============================================================================
+// ARM-B1 FEASIBILITY INSTRUMENTATION (IBPROF) -- gated, measurement-only.
+// Forces EVERY guest indirect transfer (br/blr/ret) through the C dispatcher
+// (reason R_IBLOG) so we can record per-(site) traffic + the executed target
+// stream. The normal inline IBTC is bypassed (no fills) while IBPROF is on, so
+// the cost numbers it reports are SHAPE-only (counts), never timing.
+//   - per-site histogram: which guest indirect branch dominates traffic
+//   - last-value (monomorphic) hit rate per site  (= per-site IC effectiveness)
+//   - 1st-order Markov hit rate per (site, prev-target)  (= the B1 thread guard
+//     hit rate: given we just ran handler A, is the next handler always B?)
+// ============================================================================
+#ifndef R_IBLOG
+#define R_IBLOG 3
+#endif
+static int g_ibprof;    // IBPROF=1
+static int g_vdbetrace; // VDBETRACE=1 (ARM-B1 prototype gate; defined here, used in translate.c)
+#define IBSITE_N 8192
+static struct ibsite {
+    uint64_t site, count, last_tgt, mono; // mono = #times target==previous target at this site
+    uint64_t h1, h2, h3;                  // most-recent 3 targets (h1=newest) for the order-k predictors
+} g_ibsite[IBSITE_N];
+// One open-addressed predictor table per Markov order. Each entry is a (key)->last-observed-next
+// "last value" predictor; hit = #times the actual next equalled the prediction. The order-k key
+// folds the site with the last k targets, so order-k models "given the last k opcode handlers, is
+// the next handler fixed?" -- exactly the guard a depth-k thread of the VDBE loop would carry.
+#define IBTRANS_N (1u << 19)
+static struct ibtrans {
+    uint64_t site, pred, count, hit;
+} g_ibtrans1[IBTRANS_N], g_ibtrans2[IBTRANS_N], g_ibtrans3[IBTRANS_N];
+static uint64_t g_ib_total;
+static inline uint64_t ibmix(uint64_t a, uint64_t b) {
+    uint64_t h = a * 0x9E3779B97F4A7C15ull ^ (b + 0x7F4A7C15ull);
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 32;
+    return h;
+}
+static struct ibsite *ib_find_site(uint64_t site) {
+    uint32_t h = (uint32_t)(ibmix(site, 0) & (IBSITE_N - 1));
+    for (int i = 0; i < IBSITE_N; i++) {
+        uint32_t j = (h + i) & (IBSITE_N - 1);
+        if (g_ibsite[j].count == 0 && g_ibsite[j].site == 0) {
+            g_ibsite[j].site = site;
+            return &g_ibsite[j];
+        }
+        if (g_ibsite[j].site == site) return &g_ibsite[j];
+    }
+    return &g_ibsite[0]; // table full: degrade, don't crash
+}
+// Keyed predictor slot: the fold key lives in a side array `keys`; `tab[j].site` carries the real
+// site (for per-site aggregation in the dump). NULL on probe overflow (rare).
+static uint64_t g_k1[IBTRANS_N], g_k2[IBTRANS_N], g_k3[IBTRANS_N];
+static struct ibtrans *ib_slot(struct ibtrans *tab, uint64_t *keys, uint64_t key, uint64_t site) {
+    if (key == 0) key = 1;
+    uint32_t h = (uint32_t)(key & (IBTRANS_N - 1));
+    for (int i = 0; i < 64; i++) {
+        uint32_t j = (h + i) & (IBTRANS_N - 1);
+        if (keys[j] == 0) {
+            keys[j] = key;
+            tab[j].site = site;
+            return &tab[j];
+        }
+        if (keys[j] == key) return &tab[j];
+    }
+    return NULL;
+}
+static inline void ib_pred(struct ibtrans *t, uint64_t target) {
+    if (!t) return;
+    if (t->count == 0)
+        t->pred = target; // seed (uncounted)
+    else if (t->pred == target)
+        t->hit++;
+    else
+        t->pred = target; // last-value, adapt
+    t->count++;
+}
+static void ib_log(uint64_t site, uint64_t target) {
+    g_ib_total++;
+    struct ibsite *s = ib_find_site(site);
+    int n = (s->count != 0) + (s->h2 != 0 || s->count > 1) + (s->h3 != 0 || s->count > 2);
+    (void)n;
+    if (s->count >= 1) { // have h1
+        if (target == s->h1) s->mono++;
+        ib_pred(ib_slot(g_ibtrans1, g_k1, ibmix(site, s->h1), site), target);
+    }
+    if (s->count >= 2) // have h1,h2
+        ib_pred(ib_slot(g_ibtrans2, g_k2, ibmix(ibmix(site, s->h1), s->h2), site), target);
+    if (s->count >= 3) // have h1,h2,h3
+        ib_pred(ib_slot(g_ibtrans3, g_k3, ibmix(ibmix(ibmix(site, s->h1), s->h2), s->h3), site), target);
+    s->h3 = s->h2;
+    s->h2 = s->h1;
+    s->h1 = target;
+    s->last_tgt = target;
+    s->count++;
+}
+// ARM-B1 VDBETRACE prototype counters/state.
+static uint64_t g_vt_inline;    // # of speculative-direct-chain (SDC) JT-dispatch sites emitted
+static uint64_t g_vt_fills;     // # of SDC (re)specializations performed by the dispatcher
+static uint64_t g_vt_force_inl; // # of dispatch blocks force-inlined into a predecessor (path-specialize)
+static int g_vt_hitcount;       // VTHITCOUNT=1: emit an inline SDC guard-hit counter (perturbs timing)
+static uint64_t g_vt_hit;       // # of SDC guard hits (threaded direct chains taken)
+// ARM-B1 SDC fill: the speculative direct-chain at a JT dispatch missed to the dispatcher (genuinely-new
+// target). (Re)specialize the site to this target: write the guard literal and back-patch the in-cache
+// `b` slot to a DIRECT branch into the target's body (regs-live entry). `rec_rx` is the RX address of the
+// 2-quad record { [0]=guard target literal, [1]=RW addr of the `b` slot } (low tag bit already stripped).
+static void sdc_fill(uint64_t rec_rx, uint64_t target) {
+    uint64_t *rec = (uint64_t *)J_RW((void *)rec_rx);
+    void *body = map_body(target); // RW body (post-prologue, regs-live entry)
+    if (!body) return;             // not translated (shouldn't happen: dispatcher just translated pc)
+    uint32_t *bslot = (uint32_t *)rec[1]; // RW addr of the direct-branch slot
+    jit_wprot(0);
+    int64_t d = ((uint8_t *)body - (uint8_t *)bslot) / 4; // RW-RW delta == RX-RX delta (alias-invariant)
+    *bslot = 0x14000000u | ((uint32_t)d & 0x3FFFFFFu);     // b body
+    rec[0] = target;                                       // arm the guard
+    jit_wprot(1);
+    sys_icache_invalidate(J_RX(bslot), 4); // the patched `b` executes from the RX alias
+    g_vt_fills++;
+}
+static void vt_dump(void) {
+    if (!g_vdbetrace) return;
+    fprintf(stderr, "[vdbetrace] sdc_sites=%llu sdc_fills=%llu force_inlined_dispatch=%llu\n",
+            (unsigned long long)g_vt_inline, (unsigned long long)g_vt_fills, (unsigned long long)g_vt_force_inl);
+    if (g_vt_hitcount)
+        fprintf(stderr, "[vdbetrace] guard_hits=%llu (threaded direct chains taken; VTHITCOUNT perturbs timing)\n",
+                (unsigned long long)g_vt_hit);
+}
+// ARM-B1: recognize a clang jump-table switch dispatch at a guest `br xN`. The compiler emits
+//   ldrh wM,[xB,wI,uxtw #1] ; adr xA,. ; add xN,xA,wM,sxth #2 ; br xN
+// (an indexed 16-bit offset table). Bit-exact opcode match on the 3 predecessors + Rd==br.Rn.
+static int is_jt_dispatch_br(uint64_t gpc) {
+    uint32_t a = *(uint32_t *)(gpc - 12), b = *(uint32_t *)(gpc - 8), c = *(uint32_t *)(gpc - 4),
+             br = *(uint32_t *)gpc;
+    int brn = (int)((br >> 5) & 31);
+    return (a & 0xFFE0FC00u) == 0x78605800u   // ldrh wM,[xB,wI,uxtw #1]
+           && (b & 0x9F000000u) == 0x10000000u // adr xA, .
+           && (c & 0xFFE0FC00u) == 0x8B20A800u // add xd,xa,wm,sxth #2
+           && (int)(c & 31) == brn;            // add Rd feeds the br
+}
+// True if the block at `tgt` is a JT-dispatch block (reaches a JT-dispatch `br` with no intervening
+// call/return/svc/unconditional-b that would end the block first). Used to force-inline the shared
+// dispatch into each predecessor so the resulting `br` is PATH-SPECIFIC (the B1 specialization).
+static int is_jt_dispatch_block(uint64_t tgt) {
+    for (int i = 3; i < 28; i++) {
+        uint64_t p = tgt + 4u * (unsigned)i;
+        uint32_t in = *(uint32_t *)p;
+        if ((in & 0xFFFFFC1Fu) == 0xD61F0000u) return is_jt_dispatch_br(p); // br
+        if ((in & 0xFC000000u) == 0x94000000u) return 0;                    // bl
+        if ((in & 0xFFFFFC1Fu) == 0xD63F0000u) return 0;                    // blr
+        if ((in & 0xFFFFFC1Fu) == 0xD65F0000u) return 0;                    // ret
+        if (in == 0xD4000001u) return 0;                                    // svc
+        if ((in & 0xFC000000u) == 0x14000000u) return 0; // unconditional b: block ends before any br
+    }
+    return 0;
+}
+static int ibsite_cmp(const void *a, const void *b) {
+    uint64_t ca = ((const struct ibsite *)a)->count, cb = ((const struct ibsite *)b)->count;
+    return ca < cb ? 1 : ca > cb ? -1 : 0;
+}
+static void ib_dump(void) {
+    if (!g_ibprof) return;
+    // copy + sort sites by traffic
+    static struct ibsite snap[IBSITE_N];
+    int n = 0;
+    for (int i = 0; i < IBSITE_N; i++)
+        if (g_ibsite[i].count) snap[n++] = g_ibsite[i];
+    qsort(snap, (size_t)n, sizeof snap[0], ibsite_cmp);
+    fprintf(stderr, "[ibprof] total_indirect=%llu distinct_sites=%d\n", (unsigned long long)g_ib_total, n);
+    fprintf(stderr, "[ibprof]  rank        site      count    %%traffic  mono%%   o1%%    o2%%    o3%%   dt\n");
+    for (int r = 0; r < n && r < 24; r++) {
+        // aggregate order-k hit rates for this site (hits / counted-transitions, excluding seeds)
+        uint64_t h1 = 0, c1 = 0, h2 = 0, c2 = 0, h3 = 0, c3 = 0;
+        int dt = 0;
+        for (uint32_t k = 0; k < IBTRANS_N; k++) {
+            if (g_ibtrans1[k].count && g_ibtrans1[k].site == snap[r].site) {
+                h1 += g_ibtrans1[k].hit;
+                c1 += g_ibtrans1[k].count - 1;
+                dt++;
+            }
+            if (g_ibtrans2[k].count && g_ibtrans2[k].site == snap[r].site) {
+                h2 += g_ibtrans2[k].hit;
+                c2 += g_ibtrans2[k].count - 1;
+            }
+            if (g_ibtrans3[k].count && g_ibtrans3[k].site == snap[r].site) {
+                h3 += g_ibtrans3[k].hit;
+                c3 += g_ibtrans3[k].count - 1;
+            }
+        }
+        double pct = 100.0 * (double)snap[r].count / (double)(g_ib_total ? g_ib_total : 1);
+        double monop = 100.0 * (double)snap[r].mono / (double)(snap[r].count ? snap[r].count : 1);
+        double o1 = c1 ? 100.0 * (double)h1 / (double)c1 : 0.0;
+        double o2 = c2 ? 100.0 * (double)h2 / (double)c2 : 0.0;
+        double o3 = c3 ? 100.0 * (double)h3 / (double)c3 : 0.0;
+        fprintf(stderr, "[ibprof]  %3d  %12llx  %11llu  %7.2f  %5.1f  %5.2f  %5.2f  %5.2f  %4d\n", r,
+                (unsigned long long)snap[r].site, (unsigned long long)snap[r].count, pct, monop, o1, o2, o3, dt);
+    }
+}
 
 // ---------------- W4E adaptive tier-2 ----------------
 // W4E tier-2: a hot self-loop's in-cache back-edge counter reached threshold -> the dispatcher

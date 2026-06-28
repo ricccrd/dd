@@ -21,6 +21,33 @@
 // so reset the shadow stack pointer. (Was the inline `c->ssp = 0;`.)
 #define G_SHADOW_CLEAR(c) ((c)->ssp = 0)
 
+// A3: align each freshly translated block ENTRY to 16B when §B is OFF (shadowgate()<0). The §B-off
+// codegen emits smaller per-bl stubs, which can shift hot NEON loops into a worse cache/predictor
+// alignment (sha256 wobbled ~7% with no hot returns at all). Padding precedes the entry, so it never
+// executes. §B-on (incl. NOSHADOWTUNE=1) -> 0 -> byte-identical to baseline.
+#define G_BLOCK_ALIGN (shadowgate() < 0)
+
+// ARM-B1 (aarch64-only): dispatcher seams for the VDBETRACE meta-trace. The shared jit/dispatch.c calls
+// these; aarch64 keys on c->ic_site (bit0 tag) / c->pc. Both gated at runtime (g_vdbetrace / g_ibprof,
+// default OFF), so default codegen/behaviour is unchanged. x86 defines them empty (different IBTC keying,
+// no ic_site seam) so the shared dispatcher still compiles for the x86_64 engine.
+//   - SDC_FILL: a speculative-direct-chain JT-dispatch site missed -> (re)specialize it to the new target.
+//   - IBPROF_LOG: measurement-only -- record (site -> guest target) for the indirect-traffic study.
+#define G_VDBE_SDC_FILL(c)                                                                                  \
+    do {                                                                                                    \
+        if (g_vdbetrace && ((c)->ic_site & 1)) {                                                            \
+            sdc_fill((c)->ic_site & ~1ull, (c)->pc);                                                        \
+            (c)->ic_site = 1;                                                                               \
+        }                                                                                                   \
+    } while (0)
+#define G_IBPROF_LOG(c)                                                                                     \
+    do {                                                                                                    \
+        if (g_ibprof && (c)->reason == R_IBLOG) {                                                           \
+            ib_log((c)->ic_site, (c)->pc);                                                                  \
+            (c)->ic_site = 0;                                                                               \
+        }                                                                                                   \
+    } while (0)
+
 // (1) IBTC miss fill. aarch64 keys off c->ic_site (0=none, 1=shared-only, else=per-site IC literal addr),
 // stores body-8 (the indirect-entry stub that restores guest x16/x17), and patches the per-site
 // monomorphic IC literals in the W^X cache. Byte-for-byte the prior inline block.
@@ -45,7 +72,8 @@
         void *bd = (_mt && !g_mtibtc) ? NULL : map_body((c)->pc);                                               \
         if (bd) {                                                                                               \
             uint32_t h = (uint32_t)(((c)->pc >> 2) & (IBTC_N - 1));                                             \
-            void *bind = (void *)((uint64_t)J_RX(bd) - 8); /* RX body_ind (entry that restores x16/x17) */     \
+            /* A1: x16/x17 stolen -> probe needs no restore -> land on body; legacy lands on body-8.   */    \
+            void *bind = (void *)((uint64_t)J_RX(bd) - (g_steal1617 ? 0 : 8));                                  \
             if (_mt) {                                                                                          \
                 /* threaded: single 128-bit atomic release publish; consumed by an atomic ldp reader */        \
                 ibtc_publish(&g_ibtc[h], (c)->pc, bind);                                                        \

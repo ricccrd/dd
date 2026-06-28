@@ -1334,6 +1334,16 @@ static void service_local(struct cpu *c) {
                     (unsigned long long)g_lse_n, (unsigned long long)g_wx_toggles, g_dualmap, g_xlate_ns / 1e6,
                     g_mtibtc, (unsigned long long)g_mtfill, g_futexq, (unsigned long long)g_futex_wake_fast,
                     (unsigned long long)g_futex_wake_slow, (unsigned long long)g_futex_wait_n);
+        // A3: §B shadow-return coverage. hit-rate = shret_hit / (shret_hit + shret_fb). bl_shadow /
+        // bl_leaf show how the depth-gate split call sites at translate time. PROF-only (keep dark).
+        if (getenv("PROF")) {
+            unsigned long long h = (unsigned long long)g_prof_shret_hit, f = (unsigned long long)g_prof_shret_fb;
+            double hr = (h + f) ? 100.0 * (double)h / (double)(h + f) : 0.0;
+            fprintf(stderr,
+                    "[prof] shadow_push=%llu shret_hit=%llu shret_fb=%llu hit_rate=%.1f%% bl_shadow=%llu bl_leaf=%llu\n",
+                    (unsigned long long)g_prof_shpush, h, f, hr, (unsigned long long)g_prof_bl_shadow,
+                    (unsigned long long)g_prof_bl_leaf);
+        }
 #ifdef R_REPSTR // W4-C: x86-only rep cmps/scas idiom firing counts
         if (getenv("PROF")) fprintf(stderr, "[prof] repstr=%llu repstr_elems=%llu\n",
                                     (unsigned long long)g_repstr_n, (unsigned long long)g_repstr_elems);
@@ -1342,6 +1352,8 @@ static void service_local(struct cpu *c) {
         G_PROF_EXTRA; // W5B: x86 tier-2 promotion counters
 #endif
         ep_prof_dump(); // w3e: flush epoll kevent-syscall counter (atexit is bypassed by _exit)
+        ib_dump();      // ARM-B1 IBPROF: indirect-branch traffic + stability report (no-op unless IBPROF)
+        vt_dump();      // ARM-B1 VDBETRACE: threading prototype counters (no-op unless VDBETRACE)
         if (g_noexit) { // W3D fork-server prewarm: don't kill the resident parent; unwind run_guest instead
             c->exited = 1;
             c->exit_code = (int)a0;

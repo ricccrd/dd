@@ -309,6 +309,12 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
 
     g_trace = getenv("JT") != NULL;
     g_prof = getenv("PROF") != NULL;
+    g_ibprof = getenv("IBPROF") != NULL; // ARM-B1 feasibility: indirect-branch traffic + stability log
+    g_vdbetrace = getenv("VDBETRACE") != NULL; // ARM-B1 prototype: VDBE dispatch threading PoC
+    g_vt_hitcount = getenv("VTHITCOUNT") != NULL; // ARM-B1: inline SDC guard-hit counter (diagnostic)
+    // A1: steal host x16/x17 for the engine (default on). NOSTEAL1617=1 -> legacy 3-reg stolen set
+    // (guest x16/x17 in host regs, per-branch red-zone stash/restore). Read once before any translation.
+    if (getenv("NOSTEAL1617")) g_steal1617 = 0;
     if (getenv("NOMTIBTC")) g_mtibtc = 0; // W5C: disable race-free threaded IBTC fill (A/B kill-switch)
     if (getenv("NOFUTEXQ")) g_futexq = 0; // W5C: disable per-address futex wait queues (A/B kill-switch)
     // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.

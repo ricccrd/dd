@@ -117,6 +117,12 @@ static void run_guest(struct cpu *c) {
                 jit_wprot(1);
             }
             jit_wprot(0);
+            // A3 §B-off: align each new block ENTRY to 16B. §B-off shrinks the per-bl stubs, which
+            // shifts where hot loops land in the cache and can deterministically de-align a NEON loop
+            // (e.g. sha256, which has no hot returns yet wobbled ~7%). Padding lives BEFORE the entry
+            // (branch/IBTC targets the aligned body), so the nops never execute -> zero runtime cost,
+            // just stable layout. Gated on §B-off so NOSHADOWTUNE=1 stays byte-identical to baseline.
+            if (G_BLOCK_ALIGN) while ((uintptr_t)g_cp & 15) emit32(0xD503201Fu); // nop
             g_emit_start = g_cp;
             code = translate_block(G_PC(c));
             g_prof_xlate++;
@@ -131,6 +137,11 @@ static void run_guest(struct cpu *c) {
             G_AFTER_TRANSLATE(c);
             if (g_prof) g_xlate_ns += now_ns() - _t0;
         }
+        // ARM-B1 VDBETRACE: a speculative-direct-chain (SDC) JT-dispatch site missed to here (its tag is
+        // bit0 of ic_site). (Re)specialize the SDC to the new target, then fall through to ALSO fill the
+        // shared-hash IBTC (ic_site=1 = shared-only) so non-speculated targets still hit in-cache.
+        // Per-arch seam: aarch64 is ic_site/pc-keyed; x86's IBTC keys differently (no ic_site) -> empty.
+        G_VDBE_SDC_FILL(c);
         // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
         // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).
         G_IBTC_FILL(c);
@@ -144,6 +155,10 @@ static void run_guest(struct cpu *c) {
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
         // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
         G_DISPATCH_REASON(c);
+        // ARM-B1 IBPROF: an indirect transfer was routed here for logging. c->pc already holds the
+        // guest target (treated exactly like R_BRANCH); record (site -> target) and resume.
+        // Per-arch seam: aarch64-only (ic_site/pc); x86 -> empty (measurement-only lever, never on by default).
+        G_IBPROF_LOG(c);
         // W4E tier-2: a hot self-loop's back-edge counter fired -> recompile+swap it in. pc is already =
         // loop start, so the next iteration of this dispatcher loop runs the folded block. R_TIER2 is
         // disjoint from R_SYSCALL (handled in the reason hook above) so this never double-fires.

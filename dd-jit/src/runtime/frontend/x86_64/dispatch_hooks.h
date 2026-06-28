@@ -125,6 +125,16 @@ static int smc_on_write(uint64_t a) {
 // after the flush in frontend/x86_64/dispatch.c.
 #define G_SHADOW_CLEAR(c) memset(g_xibtc, 0, sizeof g_xibtc)
 
+// A3 (aarch64-only lever): no §B-off block-entry alignment on x86. Defined so the shared jit/dispatch.c
+// compiles; expands to a compile-time 0 -> the alignment `while` is dead-stripped on x86.
+#define G_BLOCK_ALIGN 0
+
+// ARM-B1 (aarch64-only lever): no VDBE meta-trace on x86 (the x86 IBTC keys differently -- no ic_site/pc
+// seam). Defined empty so the shared jit/dispatch.c compiles for the x86_64 engine; both levers are
+// aarch64-only and default-OFF, so x86 behaviour is unchanged.
+#define G_VDBE_SDC_FILL(c) ((void)0)
+#define G_IBPROF_LOG(c) ((void)0)
+
 // Post-translate chaining. x86's translate_block() already calls patch_links_to() internally (frontend/
 // x86_64/translate.c, gated !g_threaded), so the dispatcher must NOT chain again. (aarch64 moved chaining
 // to the dispatcher; x86 keeps it in translate_block -- the per-arch placement the shared loop hides here.)
