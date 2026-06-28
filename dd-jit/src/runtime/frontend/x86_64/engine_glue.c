@@ -17,6 +17,26 @@
 static int g_trace, g_noibtc, g_itrace; // g_itrace: 1 instruction per block (per-insn register dump)
 static uint64_t g_disp_n, g_ibtc_fill;  // PROF: dispatcher round-trips, IBTC fills
 
+// ---- opt2: x86-only 2-way set-associative IBTC (gate IBTC1WAY=1) ----
+// The x86 engine gets its OWN indirect-branch-target cache here, leaving the SHARED jit/cache.c g_ibtc
+// (used by the aarch64 host engine + the W5-C ibtc_ent restructure) byte-for-byte unchanged. A tree-walk
+// interpreter (busybox awk evaluate()) returns to a handful of call sites; a direct-mapped (1-way) table
+// thrashes when two hot targets alias one slot (~100% conflict misses). 2 ways let an A/B alternation
+// coexist so both hit. Each set is two {target,body} entries = 32 bytes; the emitted probe loads the base
+// from cpu->ibtc_base (1 insn) and indexes (set<<5). Plain data (no W^X); zeroed at start + on cache flush.
+// IBTC1WAY=1 falls back to the OLD shared-g_ibtc 1-way probe/fill (exact prior behavior) for A/B + safety.
+#define XIBTC_SETS 8192
+#define XIBTC_WAYS 2
+static struct {
+    uint64_t target;
+    void *body;
+} g_xibtc[XIBTC_SETS * XIBTC_WAYS];
+static int g_ibtc1way = -1; // -1 = uninitialized; cached getenv("IBTC1WAY")
+static int ibtc1way(void) {
+    if (g_ibtc1way < 0) g_ibtc1way = (getenv("IBTC1WAY") != NULL);
+    return g_ibtc1way;
+}
+
 // ---- opt8 cold-start timing helper (COLDPROF=1; diagnostic-only, zero-cost when off) ----
 static int g_coldprof;
 static inline uint64_t coldprof_now_ns(void) {

@@ -31,6 +31,8 @@ struct cpu {
     uint64_t fpsw, fpcw; // status word (C0-C3 in bits 8/9/10/14), control word
     uint64_t x87_ea;     // m80 (80-bit long double) operand address -> handled in C via R_X87*
     uint64_t divop;      // 64-bit div/idiv divisor -> 128/64 division done in C (ARM has no 128/64 divide)
+    uint64_t ibtc_base;  // opt2: base of the x86 2-way IBTC g_xibtc (set once at run_guest entry) -> 1-insn
+                         // load on the indirect hot path (replaces the 3-insn movz/movk &table materialize)
 };
 #define OFF_IBSRC ((int)__builtin_offsetof(struct cpu, dbg_ibsrc))
 #define OFF_ICMISS ((int)__builtin_offsetof(struct cpu, ic_miss))
@@ -40,6 +42,7 @@ struct cpu {
 #define OFF_FPCW ((int)__builtin_offsetof(struct cpu, fpcw))
 #define OFF_X87EA ((int)__builtin_offsetof(struct cpu, x87_ea))
 #define OFF_DIVOP ((int)__builtin_offsetof(struct cpu, divop))
+#define OFF_IBTC ((int)__builtin_offsetof(struct cpu, ibtc_base)) // opt2: x86 2-way IBTC base (1-insn load)
 #define R_OFF(i) ((i) * 8)
 #define OFF_RIP 128
 #define OFF_NZCV 136

@@ -43,6 +43,7 @@ static int smc_on_write(uint64_t a) {
 static uint64_t g_prevpc, g_curpc; // debug: track block transitions for fault diagnosis
 static void run_guest(struct cpu *c) {
     pthread_setspecific(g_cpu_key, c);
+    c->ibtc_base = (uint64_t)g_xibtc; // opt2: emitted indirect hot path loads the 2-way IBTC base from here (1 insn)
     while (!c->exited) {
         if (c->rip == SIGRETURN_PC) do_sigreturn(c); // handler returned -> restore interrupted context
         if (g_pending) maybe_deliver_signal(c);      // async signal pending -> redirect to guest handler
@@ -94,7 +95,8 @@ static void run_guest(struct cpu *c) {
                 memset(g_map, 0, sizeof g_map);
                 g_npend = 0;
                 pthread_jit_write_protect_np(1);
-                memset(g_ibtc, 0, sizeof g_ibtc); // body pointers now stale -> drop the cache
+                memset(g_ibtc, 0, sizeof g_ibtc);   // body pointers now stale -> drop the cache (1-way fallback)
+                memset(g_xibtc, 0, sizeof g_xibtc); // opt2: same for the x86 2-way table
             }
             pthread_jit_write_protect_np(0);
             g_emit_start = g_cp;
@@ -109,9 +111,19 @@ static void run_guest(struct cpu *c) {
             if (!g_threaded) {
                 void *body = map_body(c->rip);
                 if (body) {
-                    uint32_t h = (uint32_t)((c->rip >> 2) & (IBTC_N - 1));
-                    g_ibtc[h].target = c->rip;
-                    g_ibtc[h].body = body;
+                    if (ibtc1way()) { // IBTC1WAY=1: exact prior 1-way shared-g_ibtc fill (A/B + safety)
+                        uint32_t h = (uint32_t)((c->rip >> 2) & (IBTC_N - 1));
+                        g_ibtc[h].target = c->rip;
+                        g_ibtc[h].body = body;
+                    } else { // opt2: 2-way insert -> reuse the way already holding this target, else a free
+                        uint32_t s = (uint32_t)((c->rip >> 2) & (XIBTC_SETS - 1));
+                        int w0 = s * 2, w1 = s * 2 + 1;
+                        int w = (!g_xibtc[w0].target || g_xibtc[w0].target == c->rip) ? w0
+                                : (!g_xibtc[w1].target || g_xibtc[w1].target == c->rip) ? w1
+                                                                                        : w0; // way, else evict way0
+                        g_xibtc[w].target = c->rip;
+                        g_xibtc[w].body = body;
+                    }
                     g_ibtc_fill++;
                 }
             }
