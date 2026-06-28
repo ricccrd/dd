@@ -1663,6 +1663,10 @@ static void service(struct cpu *c) {
         // fork/vfork: COW copy; child continues
         pid_t pid = fork();
         if (pid == 0) {
+            // Re-assert MAP_JIT execute mode: the per-thread W^X/APRR state isn't reliable across fork(),
+            // so the child's first run_block can instruction-abort fetching from the (non-executable) code
+            // cache -> the intermittent fork+exec SIGBUS. pthread_jit_write_protect_np(1) = RX (executable).
+            pthread_jit_write_protect_np(1);
             G_SHADOW_RESET(c); // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
             g_ndirs = 0;       // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
                                // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
