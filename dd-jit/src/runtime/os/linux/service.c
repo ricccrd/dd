@@ -120,6 +120,74 @@ static int parse_shebang(const char *host_path, char *interp, size_t ni, char *a
         arg[0] = 0;
     return 1;
 }
+// Anonymous PRIVATE mmap ranges (MAP_ANON|MAP_PRIVATE) tracked so that madvise(MADV_DONTNEED) can
+// give real Linux semantics -- re-mmap fresh zero pages over the range -- WITHOUT ever disturbing a
+// file-backed or shared mapping (re-mmapping those with MAP_ANON would discard file data / break
+// sharing). DONTNEED only acts when the advised range is fully contained in a tracked private-anon
+// region; otherwise it falls back to the safe advisory passthrough. Lock-free like g_gmap; a race can
+// only forget an entry (-> safe no-op), and the containment check gates every destructive remap.
+static struct {
+    uint64_t addr, len;
+    int prot;
+} g_anonmap[2048];
+static int g_nanonmap;
+static void anon_track(uint64_t addr, uint64_t len, int prot) {
+    if (!addr || g_nanonmap >= (int)(sizeof g_anonmap / sizeof g_anonmap[0])) return;
+    g_anonmap[g_nanonmap].addr = addr;
+    g_anonmap[g_nanonmap].len = len;
+    g_anonmap[g_nanonmap].prot = prot;
+    g_nanonmap++;
+}
+// Forget any tracked anon coverage overlapping [addr,addr+len) -- on munmap, or when a non-anon
+// mapping is laid over the range. Err toward forgetting (whole-entry drop) so a stale entry can never
+// cause a wrong anon-remap of what is now a file mapping.
+static void anon_untrack(uint64_t addr, uint64_t len) {
+    uint64_t end = addr + len;
+    for (int i = 0; i < g_nanonmap;) {
+        uint64_t a = g_anonmap[i].addr, e = a + g_anonmap[i].len;
+        if (a < end && addr < e)
+            g_anonmap[i] = g_anonmap[--g_nanonmap];
+        else
+            i++;
+    }
+}
+// prot of the tracked private-anon region fully containing [addr,addr+len), else -1 (unknown -> do
+// not remap). Full containment guarantees the range is anon, so the remap cannot corrupt a file map.
+static int anon_prot_if_contained(uint64_t addr, uint64_t len) {
+    uint64_t end = addr + len;
+    for (int i = 0; i < g_nanonmap; i++)
+        if (g_anonmap[i].addr <= addr && end <= g_anonmap[i].addr + g_anonmap[i].len) return g_anonmap[i].prot;
+    return -1;
+}
+// /proc/self/fd/N (and /proc/<pid>/fd/N for our own pid -- host pid, container pid, or init's "1")
+// names an already-open fd. macOS has no /proc, so detect this form and recover the fd number; the
+// caller then resolves it via F_GETPATH (readlinkat) or dup()/reopen (openat). Returns N>=0 on an
+// EXACT /proc/.../fd/<N> match, else -1 (anything with a trailing component falls through to normal
+// resolution). NOTE: <pid>/fd accepts only this process's pid; foreign pids are not introspectable.
+static int procfd_num(const char *p) {
+    if (!p) return -1;
+    const char *rest = NULL;
+    if (!strncmp(p, "/proc/self/fd/", 14))
+        rest = p + 14;
+    else if (!strncmp(p, "/proc/", 6)) {
+        const char *q = p + 6;
+        int i = 0;
+        char num[16];
+        while (q[i] >= '0' && q[i] <= '9' && i < 15) {
+            num[i] = q[i];
+            i++;
+        }
+        if (i == 0 || strncmp(q + i, "/fd/", 4)) return -1;
+        num[i] = 0;
+        int pid = atoi(num);
+        if (pid != (int)getpid() && pid != container_pid()) return -1;
+        rest = q + i + 4;
+    }
+    if (!rest || rest[0] < '0' || rest[0] > '9') return -1;
+    for (const char *s = rest; *s; s++)
+        if (*s < '0' || *s > '9') return -1; // trailing path component -> not a bare fd link
+    return atoi(rest);
+}
 static void service(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
@@ -1051,6 +1119,26 @@ static void service(struct cpu *c) {
         if (lf & G_O_DIRECTORY) mf |= O_DIRECTORY;
         if (lf & 0x80000) mf |= O_CLOEXEC;
         {
+            // /proc/self/fd/N -> reopen what host fd N points at. Linux reopen gives a FRESH file
+            // description (offset 0, access narrowed to the requested mode), so prefer reopening by the
+            // F_GETPATH path with the guest's flags; for fds with no path (pipe/socket/anon) fall back to
+            // dup(N), which at least hands back a working, equivalent fd.
+            int pfn = procfd_num((const char *)a1);
+            if (pfn >= 0) {
+                char gp[4200];
+                int r = -1;
+                if (fcntl(pfn, F_GETPATH, gp) == 0 && gp[0])
+                    r = open(gp, mf & ~(O_EXCL | O_CREAT), (mode_t)a3);
+                if (r < 0) r = dup(pfn); // anonymous/pipe/socket fd -> share the description
+                if (r >= 0) {
+                    char tp[4200];
+                    if (fcntl(r, F_GETPATH, tp) == 0) fd_setpath(r, tp);
+                }
+                G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+                break;
+            }
+        }
+        {
             // POSIX shm: glibc shm_open opens /dev/shm/<name>; the rootfs has no tmpfs, so back it with a
             // real host file (MAP_SHARED + fork share it). Flatten any subdirs into the single filename.
             const char *rp = (const char *)a1;
@@ -1299,6 +1387,24 @@ static void service(struct cpu *c) {
         const char *p = (const char *)a1;
         char *buf = (char *)a2;
         size_t bs = (size_t)a3;
+        // /proc/self/fd/N -> the path host fd N currently points at (recovered via F_GETPATH on macOS).
+        int pfn = procfd_num(p);
+        if (pfn >= 0) {
+            char gp[4200];
+            if (fcntl(pfn, F_GETPATH, gp) != 0) {
+                G_RET(c) = (uint64_t)(-errno); // bad fd -> EBADF
+                break;
+            }
+            // map the host path back into the guest's view (strip the rootfs prefix if jailed)
+            const char *gpath = (g_rootfs && !strncmp(gp, g_rootfs_canon, g_rootfs_canon_len)) ? gp + g_rootfs_canon_len
+                                                                                                : gp;
+            if (!gpath[0]) gpath = "/";
+            size_t l = strlen(gpath);
+            if (l > bs) l = bs;
+            memcpy(buf, gpath, l);
+            G_RET(c) = l;
+            break;
+        }
         if (p && strstr(p, "/proc/self/exe")) {
             char rp[1024];
             if (!realpath(g_exe_path, rp)) strncpy(rp, g_exe_path, sizeof rp - 1);
@@ -1564,7 +1670,10 @@ static void service(struct cpu *c) {
     case 215: {
         // munmap
         int r = munmap((void *)a0, (size_t)a1);
-        if (r == 0) gmap_del(a0); // drop from the execve() teardown registry
+        if (r == 0) {
+            gmap_del(a0); // drop from the execve() teardown registry
+            anon_untrack(a0, (size_t)a1); // and from the DONTNEED anon-range registry
+        }
         if (r == 0 && g_mem_max) {
             // uncharge (clamp >=0)
             uint64_t cur = atomic_load(&g_mem_charged), d = (uint64_t)a1;
@@ -1582,6 +1691,7 @@ static void service(struct cpu *c) {
         }
         size_t old = (size_t)a1, n = old < (size_t)a2 ? old : (size_t)a2;
         memcpy(r, (void *)a0, n);
+        anon_track((uint64_t)r, (size_t)a2, PROT_READ | PROT_WRITE); // fresh private-anon copy
         G_RET(c) = (uint64_t)r;
         break;
     }
@@ -1611,7 +1721,16 @@ static void service(struct cpu *c) {
                        (off_t)a5);
         // refund
         if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
-        if (r != MAP_FAILED) gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
+        if (r != MAP_FAILED) {
+            gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
+            // DONTNEED anon registry: record PRIVATE-ANON ranges (incl. the guard tail); for any other
+            // (file-backed/shared) mapping, forget overlapping anon coverage -- a MAP_FIXED file map may
+            // now sit where anon used to, and we must never anon-remap over it.
+            if ((a3 & 0x20) && (a3 & 0x02))
+                anon_track((uint64_t)r, (uint64_t)a1 + guard, prot);
+            else
+                anon_untrack((uint64_t)r, (uint64_t)a1 + guard);
+        }
         G_RET(c) = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -1642,6 +1761,23 @@ static void service(struct cpu *c) {
         // with an unrelated macOS one (e.g. Linux DONTFORK=10 vs macOS PAGEOUT=10), so no-op those.
         // (Note: macOS MADV_DONTNEED does not zero anonymous pages the way Linux's does.)
         int adv = (int)a2, hadv = -1;
+        // MADV_DONTNEED(4): Linux drops the pages so the NEXT access faults in fresh ZERO pages. macOS
+        // MADV_DONTNEED does not zero anon pages, so a reread would return stale data (breaks
+        // redis/jemalloc, which lean on the zeroing). For a range fully inside a tracked PRIVATE-ANON
+        // region we re-establish it with a fresh MAP_FIXED|MAP_ANON|MAP_PRIVATE mapping -> next read
+        // faults in zeros. File-backed/shared mappings are NEVER touched here (the containment check
+        // fails for them); they keep the safe advisory passthrough below.
+        if (adv == 4 && a1) {
+            int aprot = anon_prot_if_contained(a0, (size_t)a1);
+            if (aprot >= 0) {
+                void *r = mmap((void *)a0, (size_t)a1, aprot, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+                if (r != MAP_FAILED) {
+                    G_RET(c) = 0;
+                    break;
+                }
+                // remap failed (e.g. unaligned) -> never fail the guest; fall through to advisory
+            }
+        }
         if (adv >= 0 && adv <= 4) hadv = adv;
         else if (adv == 8) hadv = MADV_FREE;
         if (hadv >= 0 && madvise((void *)a0, (size_t)a1, hadv) < 0) { /* advisory: ignore */ }
@@ -2036,6 +2172,89 @@ static void service(struct cpu *c) {
             c->alt_size = *(uint64_t *)(a0 + 16);
         }
         G_RET(c) = 0;
+        break;
+    }
+    // rt_sigsuspend(const sigset_t *unewset, size_t sigsetsize): atomically install the guest's arg
+    // mask, wait until a signal that has a guest handler (and is unblocked under that mask) becomes
+    // pending, then return -EINTR -- the handler runs and only then does sigsuspend "return" (standard
+    // semantics). c->sigmask is a guest sigset_t (bit signo-1); g_pending is 1<<signo.
+    //
+    // We do NOT build the signal frame here: delivery is left to the dispatcher's maybe_deliver_signal,
+    // which fires AFTER the per-arch pc advance past the syscall (x86 pre-advances rip, aarch64 does
+    // pc+=4 post-service) -- building a frame inline would re-execute the SVC on aarch64. So we leave the
+    // awaited signal pending and arrange c->sigmask so the dispatcher delivers it, then restore the
+    // pre-suspend mask (minus the one awaited bit, which must stay unblocked for that delivery; that one
+    // bit is the only deviation from a perfect mask restore).
+    case 133: {
+        uint64_t oldmask = c->sigmask;
+        uint64_t newmask = a0 ? *(uint64_t *)a0 : 0;
+        c->sigmask = newmask;
+        // Block all host signals around the pending check so host_sigh cannot fire between the check and
+        // the sleep (lost-wakeup race); sigsuspend(&empty) then atomically unblocks + waits.
+        sigset_t allblk, prev, empty;
+        sigfillset(&allblk);
+        sigemptyset(&empty);
+        sigprocmask(SIG_BLOCK, &allblk, &prev);
+        int deliv = 0;
+        while (!c->exited) {
+            uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
+            deliv = 0;
+            for (int s = 1; s <= 64; s++) {
+                uint64_t bit = 1ull << s;
+                if (!(p & bit) || (newmask & (1ull << (s - 1)))) continue; // not pending / blocked
+                uint64_t h = g_sigact[s].handler;
+                if (h <= 1) { // SIG_DFL/IGN: host already actioned it -> consume, keep waiting
+                    __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST);
+                    continue;
+                }
+                deliv = s; // a real guest handler is runnable -> stop waiting (leave it PENDING)
+                break;
+            }
+            if (deliv) break;
+            sigsuspend(&empty); // sleep until any host signal (host_sigh sets g_pending); EINTR-returns
+        }
+        sigprocmask(SIG_SETMASK, &prev, NULL); // restore the host signal mask
+        c->sigmask = oldmask;
+        if (deliv) c->sigmask &= ~(1ull << (deliv - 1)); // keep it unblocked so the dispatcher delivers it
+        G_RET(c) = (uint64_t)(-EINTR);
+        break;
+    }
+    // rt_sigtimedwait(const sigset_t *set, siginfo_t *info, const struct timespec *timeout, size_t):
+    // SYNCHRONOUSLY dequeue one pending signal from `set` (no handler runs) and return its signo, or
+    // -EAGAIN on timeout. Poll g_pending against `set` in short slices (the in-process model has no
+    // single host primitive that covers both host-delivered and raise_guest_signal-injected pendings).
+    case 137: {
+        uint64_t set = a0 ? *(uint64_t *)a0 : 0; // guest sigset_t (bit signo-1)
+        struct timespec *to = (struct timespec *)a2;
+        // negative/zero timeout -> single non-blocking poll; else a deadline.
+        long long budget_ns = to ? (long long)to->tv_sec * 1000000000LL + to->tv_nsec : -1;
+        long long waited_ns = 0;
+        for (;;) {
+            uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
+            int got = 0;
+            for (int s = 1; s <= 64; s++)
+                if ((p & (1ull << s)) && (set & (1ull << (s - 1)))) { got = s; break; }
+            if (got) {
+                __atomic_and_fetch(&g_pending, ~(1ull << got), __ATOMIC_SEQ_CST); // dequeue
+                if (a1 && a3 >= 128) {                                            // fill siginfo_t
+                    memset((void *)a1, 0, 128);
+                    *(int *)(a1 + 0) = got;            // si_signo
+                    *(int *)(a1 + 8) = g_sigcode[got]; // si_code
+                    *(uint64_t *)(a1 + 24) = g_sigval[got];
+                    g_sigcode[got] = 0;
+                    g_sigval[got] = 0;
+                }
+                G_RET(c) = (uint64_t)got;
+                break;
+            }
+            if (budget_ns == 0 || (budget_ns > 0 && waited_ns >= budget_ns) || c->exited) {
+                G_RET(c) = (uint64_t)(-EAGAIN);
+                break;
+            }
+            struct timespec slice = {0, 2 * 1000 * 1000}; // 2ms
+            nanosleep(&slice, NULL);
+            waited_ns += 2 * 1000 * 1000;
+        }
         break;
     }
     // rt_sigaction(sig, *act, *old)
