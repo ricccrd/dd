@@ -11,6 +11,18 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 #include <sys/msg.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
+#include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
+// macOS renamex_np/renameatx_np flags (Linux renameat2 flags map onto these)
+#ifndef RENAME_SWAP
+#define RENAME_SWAP 0x00000002 // atomic swap  <- Linux RENAME_EXCHANGE(2)
+#endif
+#ifndef RENAME_EXCL
+#define RENAME_EXCL 0x00000004 // fail if dst exists <- Linux RENAME_NOREPLACE(1)
+#endif
+// Emulated pipe-buffer sizes for F_SETPIPE_SZ/F_GETPIPE_SZ (macOS has no pipe-size fcntl): we record
+// the requested (page-rounded) size per-fd and report it back, so size-probing programs see it stick.
+static int g_pipesz[1024];
 // Map a Linux `semctl` cmd to the macOS one: the GET*/SET* values differ (Linux GETVAL=12/SETVAL=16,
 // macOS GETVAL=5/SETVAL=8); IPC_RMID/SET/STAT (0/1/2) are the same.
 static int sem_cmd_l2m(int c) {
@@ -119,7 +131,13 @@ static void service(struct cpu *c) {
     switch (nr) {
     // ===================== I/O — read/write/seek (+ eventfd/timerfd/signalfd fd redirection) =====================
     case 62: {
-        off_t r = lseek((int)a0, (off_t)a1, (int)a2);
+        // lseek -- SEEK_SET/CUR/END(0/1/2) match, but SEEK_DATA/SEEK_HOLE are SWAPPED between the ABIs:
+        // Linux SEEK_DATA=3,SEEK_HOLE=4 ; macOS SEEK_HOLE=3,SEEK_DATA=4. Translate so sparse-file
+        // probing finds holes/data correctly.
+        int whence = (int)a2;
+        if (whence == 3) whence = 4;      // Linux SEEK_DATA -> macOS SEEK_DATA
+        else if (whence == 4) whence = 3; // Linux SEEK_HOLE -> macOS SEEK_HOLE
+        off_t r = lseek((int)a0, (off_t)a1, whence);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -384,10 +402,17 @@ static void service(struct cpu *c) {
         break;
     }
     case 24: {
-        // dup3(old,new,flags)
+        // dup3(old,new,flags) -- unlike dup2, equal oldfd==newfd is an error (EINVAL) on Linux
+        if ((int)a0 == (int)a1) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
         int r = dup2((int)a0, (int)a1);
-        if (r >= 0 && (int)a1 >= 0 && (int)a1 < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
-            strcpy(g_fdpath[(int)a1], g_fdpath[(int)a0]);
+        if (r >= 0) {
+            if ((int)a2 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC); // O_CLOEXEC
+            if ((int)a1 >= 0 && (int)a1 < 1024 && (int)a0 >= 0 && (int)a0 < 1024)
+                strcpy(g_fdpath[(int)a1], g_fdpath[(int)a0]);
+        }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -446,6 +471,23 @@ static void service(struct cpu *c) {
                 *(int32_t *)(lf + 24) = (int32_t)fl.l_pid;
             }
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
+            break;
+        }
+        // F_SETPIPE_SZ(1031)/F_GETPIPE_SZ(1032): macOS can't resize a pipe, so emulate -- record the
+        // requested size (rounded up to a page, >= requested) and report it back on GET.
+        if (lcmd == 1031) {
+            int want = (int)a2;
+            long pg = sysconf(_SC_PAGESIZE);
+            if (pg <= 0) pg = 4096;
+            int rounded = (int)(((want + pg - 1) / pg) * pg);
+            if (rounded < (int)pg) rounded = (int)pg;
+            if ((int)a0 >= 0 && (int)a0 < 1024) g_pipesz[(int)a0] = rounded;
+            G_RET(c) = (uint64_t)(unsigned)rounded;
+            break;
+        }
+        if (lcmd == 1032) {
+            int sz = ((int)a0 >= 0 && (int)a0 < 1024 && g_pipesz[(int)a0]) ? g_pipesz[(int)a0] : 65536;
+            G_RET(c) = (uint64_t)(unsigned)sz;
             break;
         }
         int mcmd = lcmd;
@@ -723,8 +765,15 @@ static void service(struct cpu *c) {
         break;
     }
     case 38:
-    // renameat / renameat2 (flags ignored)
+    // renameat(38) / renameat2(276): translate the renameat2 flags onto macOS renameatx_np --
+    // RENAME_NOREPLACE(1)->RENAME_EXCL (fail if dst exists), RENAME_EXCHANGE(2)->RENAME_SWAP (atomic swap).
     case 276: {
+        unsigned int rxflags = 0;
+        if (nr == 276) {
+            int lf = (int)a4;
+            if (lf & 1) rxflags |= RENAME_EXCL;
+            if (lf & 2) rxflags |= RENAME_SWAP;
+        }
         if (g_rootfs) {
             // both ends confined (TOCTOU-free)
             char ofin[512], nfin[512];
@@ -746,7 +795,7 @@ static void service(struct cpu *c) {
                 mc_evict(hp);
                 ac_evict(hp);
             }
-            int r = renameat(opfd, ofin, npfd, nfin), e = errno;
+            int r = renameatx_np(opfd, ofin, npfd, nfin, rxflags), e = errno;
             close(opfd);
             close(npfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
@@ -755,7 +804,7 @@ static void service(struct cpu *c) {
         char ob[4200], nb[4200];
         const char *op = atpath((int)a0, (const char *)a1, ob, sizeof ob);
         const char *np = atpath((int)a2, (const char *)a3, nb, sizeof nb);
-        G_RET(c) = renameat(ATFD(a0), op, ATFD(a2), np) < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = renameatx_np(ATFD(a0), op, ATFD(a2), np, rxflags) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 40:
@@ -764,13 +813,35 @@ static void service(struct cpu *c) {
     case 41: G_RET(c) = 0; break;
     case 43:
     case 44: {
-        uint8_t *b = (uint8_t *)(nr == 43 ? a1 : a1);
-        // statfs/fstatfs
+        // statfs(path,buf)/fstatfs(fd,buf): wrap the host call, then TRANSLATE the macOS struct statfs
+        // into the Linux struct statfs layout (all 8-byte fields on 64-bit; f_fsid is two 32-bit words).
+        struct statfs hs;
+        int r;
+        if (nr == 43) {
+            char pb[4200];
+            const char *p = atpath(-100, (const char *)a0, pb, sizeof pb);
+            r = statfs(p, &hs);
+        } else {
+            r = fstatfs((int)a0, &hs);
+        }
+        if (r < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        uint8_t *b = (uint8_t *)a1;
         memset(b, 0, 120);
-        *(uint64_t *)(b + 0) = 0x01021994;
-        *(uint64_t *)(b + 8) = 4096;
-        *(uint64_t *)(b + 16) = 1u << 24;
-        *(uint64_t *)(b + 24) = 1u << 23;
+        *(int64_t *)(b + 0) = 0x01021994;                // f_type (TMPFS_MAGIC; geometry is what matters)
+        *(int64_t *)(b + 8) = (int64_t)hs.f_bsize;       // f_bsize
+        *(uint64_t *)(b + 16) = (uint64_t)hs.f_blocks;   // f_blocks
+        *(uint64_t *)(b + 24) = (uint64_t)hs.f_bfree;    // f_bfree
+        *(uint64_t *)(b + 32) = (uint64_t)hs.f_bavail;   // f_bavail
+        *(uint64_t *)(b + 40) = (uint64_t)hs.f_files;    // f_files
+        *(uint64_t *)(b + 48) = (uint64_t)hs.f_ffree;    // f_ffree
+        *(int32_t *)(b + 56) = hs.f_fsid.val[0];         // f_fsid[0]
+        *(int32_t *)(b + 60) = hs.f_fsid.val[1];         // f_fsid[1]
+        *(int64_t *)(b + 64) = 255;                      // f_namelen (NAME_MAX)
+        *(int64_t *)(b + 72) = (int64_t)hs.f_bsize;      // f_frsize
+        *(int64_t *)(b + 80) = 0;                        // f_flags
         G_RET(c) = 0;
         break;
     }
@@ -782,9 +853,27 @@ static void service(struct cpu *c) {
     // ftruncate
     }
     case 47: {
+        // fallocate(fd,mode,offset,len). FALLOC_FL_PUNCH_HOLE(2)|KEEP_SIZE(1): deallocate+zero a range
+        // via macOS F_PUNCHHOLE (file stays the same size, the range reads as zeros).
+        int mode = (int)a1;
+        off_t off = (off_t)a2, len = (off_t)a3;
+        if (mode & 2) {
+#ifdef F_PUNCHHOLE
+            struct fpunchhole fph;
+            memset(&fph, 0, sizeof fph);
+            fph.fp_offset = off;
+            fph.fp_length = len;
+            int r = fcntl((int)a0, F_PUNCHHOLE, &fph);
+            fd_evict((int)a0);
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+#else
+            G_RET(c) = (uint64_t)(-EOPNOTSUPP);
+#endif
+            break;
+        }
         struct stat s;
-        // fallocate(fd,mode,offset,len): extend (no shrink)
-        off_t end = (off_t)(a2 + a3);
+        // plain fallocate: extend (no shrink)
+        off_t end = off + len;
         if (fstat((int)a0, &s) == 0 && s.st_size < end && ftruncate((int)a0, end) < 0) {}
         fd_evict((int)a0);
         G_RET(c) = 0;
@@ -879,6 +968,34 @@ static void service(struct cpu *c) {
     case 56: {
         // openat -- Linux O_* -> macOS O_* (they differ!)
         int lf = (int)a2, mf = lf & 0x3;
+        // O_TMPFILE (the __O_TMPFILE bit 0x400000 is arch-independent): create an unnamed, auto-cleaned
+        // regular file inside the named directory by making one + immediately unlinking it (macOS has no
+        // O_TMPFILE). The fd is a normal RW file with link count 0.
+        if (lf & 0x400000) {
+            char pb[4200];
+            const char *dir = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+            int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+            if (dfd < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            int fd = -1, e = ENOENT;
+            for (int t = 0; t < 64; t++) {
+                char nm[40];
+                snprintf(nm, sizeof nm, ".dd_tmpfile_%d_%d", (int)getpid(), rand());
+                fd = openat(dfd, nm, O_CREAT | O_EXCL | O_RDWR, (mode_t)(a3 ? a3 : 0600));
+                e = errno;
+                if (fd >= 0) {
+                    unlinkat(dfd, nm, 0);
+                    break;
+                }
+                if (e != EEXIST) break;
+            }
+            close(dfd);
+            if (fd >= 0 && fd < 1024) g_fdpath[fd][0] = 0; // anonymous: no tracked path
+            G_RET(c) = fd < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)fd;
+            break;
+        }
         {
             // synthesize /proc/* (macOS has no /proc)
             const char *rp = (const char *)a1;
@@ -1053,6 +1170,8 @@ static void service(struct cpu *c) {
             g_ovldir[cf][0] = 0;
             g_lo_port[cf] = 0;
             g_sock_stream[cf] = 0;
+            g_br_port[cf] = 0;
+            g_br_ip[cf] = 0;
             g_eventfd_count[cf] = 0;
             g_eventfd_sema[cf] = 0;
         // reap eventfd peer / timerfd / overlay dir / loopback
@@ -1516,10 +1635,19 @@ static void service(struct cpu *c) {
     // real boundary, and a faked namespace grants no actual privilege (program still runs as our uid).
     // mincore -> unsupported (callers fall back)
     case 232: G_RET(c) = (uint64_t)(-ENOSYS); break;
-    case 233:
+    case 233: {
+        // madvise: best-effort, advisory (never fail the guest). Only forward advice values whose
+        // meaning is identical on both kernels -- NORMAL/RANDOM/SEQUENTIAL/WILLNEED/DONTNEED(0..4)
+        // match, and Linux MADV_FREE(8) -> macOS MADV_FREE. Every OTHER Linux advice number collides
+        // with an unrelated macOS one (e.g. Linux DONTFORK=10 vs macOS PAGEOUT=10), so no-op those.
+        // (Note: macOS MADV_DONTNEED does not zero anonymous pages the way Linux's does.)
+        int adv = (int)a2, hadv = -1;
+        if (adv >= 0 && adv <= 4) hadv = adv;
+        else if (adv == 8) hadv = MADV_FREE;
+        if (hadv >= 0 && madvise((void *)a0, (size_t)a1, hadv) < 0) { /* advisory: ignore */ }
         G_RET(c) = 0;
-        // madvise
         break;
+    }
 
     // ===================== Process & scheduling — clone/exec/wait/ids/prctl/futex/caps/sched =====================
     case 90: {
@@ -2021,13 +2149,42 @@ static void service(struct cpu *c) {
         break;
     // clock_getres -> 1ns
     }
-    case 115:
-        nanosleep((const struct timespec *)a2, (struct timespec *)a3);
+    case 115: {
+        // clock_nanosleep(clockid, flags, request, remain). macOS has no clock_nanosleep, and TIMER_ABSTIME
+        // means "sleep UNTIL the absolute deadline" -- treating it as relative would sleep for ~uptime
+        // seconds and hang. Emulate ABSTIME by sleeping (deadline - now); relative falls back to nanosleep.
+        int flags = (int)a1;
+        const struct timespec *req = (const struct timespec *)a2;
+        if (flags & 1) { // TIMER_ABSTIME
+            clockid_t mc;
+            switch ((int)a0) {
+                case 2: mc = CLOCK_PROCESS_CPUTIME_ID; break;
+                case 3: mc = CLOCK_THREAD_CPUTIME_ID; break;
+                case 0: case 5: mc = CLOCK_REALTIME; break;
+                default: mc = CLOCK_MONOTONIC; break; // 1/4/6/7 -> monotonic
+            }
+            struct timespec now, d;
+            clock_gettime(mc, &now);
+            d.tv_sec = req->tv_sec - now.tv_sec;
+            d.tv_nsec = req->tv_nsec - now.tv_nsec;
+            if (d.tv_nsec < 0) { d.tv_sec--; d.tv_nsec += 1000000000L; }
+            if (d.tv_sec > 0 || (d.tv_sec == 0 && d.tv_nsec > 0)) nanosleep(&d, NULL);
+            G_RET(c) = 0; // absolute sleep has no remainder to report
+            break;
+        }
+        nanosleep(req, (struct timespec *)a3);
         G_RET(c) = 0;
-        // clock_nanosleep
         break;
-    // times
-    case 153: G_RET(c) = 0; break;
+    }
+    // times(struct tms*): real CPU accounting. The Linux + macOS struct tms layouts match (4 clock_t
+    // fields), and both count in sysconf(_SC_CLK_TCK) ticks, so the host result drops straight in.
+    case 153: {
+        struct tms tb;
+        clock_t r = times(&tb);
+        if (a0) *(struct tms *)a0 = tb;
+        G_RET(c) = (uint64_t)r;
+        break;
+    }
     case 169: {
         struct timeval tv;
         gettimeofday(&tv, 0);
@@ -2052,6 +2209,8 @@ static void service(struct cpu *c) {
             if (r < 1024) {
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && (int)a0 == AF_INET);
                 g_lo_port[r] = 0;
+                g_br_port[r] = 0;
+                g_br_ip[r] = 0;
             }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -2093,6 +2252,30 @@ static void service(struct cpu *c) {
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+        // NET bridge: bind(0.0.0.0 / own-ip / in-subnet :port) -> LISTEN on /tmp/.ddbr-<netid>/<ownip>:<port>
+        if (br_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
+            br_bind_is(sa, (socklen_t)a2)) {
+            uint16_t p = ntohs(*(uint16_t *)(sa + 2));
+            if (p == 0) p = br_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
+            char up[200];
+            br_path(g_myip, p, up, sizeof up); // we always listen on OUR endpoint IP
+            if (lo_swap((int)a0) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            unlink(up);
+            struct sockaddr_un un;
+            memset(&un, 0, sizeof un);
+            un.sun_family = AF_UNIX;
+            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
+            if (r == 0) {
+                g_br_port[(int)a0] = p ? p : 1;
+                g_br_ip[(int)a0] = g_myip;
+            }
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
         if (g_nportmap && sa && a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET) {
             uint16_t cp = ntohs(*(uint16_t *)(sa + 2)), hp = pm_host(cp);
             // remember for getsockname
@@ -2116,9 +2299,11 @@ static void service(struct cpu *c) {
         int lfd = (int)a0;
         // accept / accept4
         int pl = (lfd >= 0 && lfd < 1024) ? g_lo_port[lfd] : 0;
-        int r = pl ? accept(lfd, NULL, NULL)
-                   // private-lo: don't expose unix peer
-                   : accept(lfd, (void *)a1, (socklen_t *)a2);
+        int pbr = (lfd >= 0 && lfd < 1024) ? g_br_port[lfd] : 0;
+        uint32_t pbrip = (lfd >= 0 && lfd < 1024) ? g_br_ip[lfd] : 0;
+        int r = (pl || pbr) ? accept(lfd, NULL, NULL)
+                            // private-lo / bridge: don't expose unix peer
+                            : accept(lfd, (void *)a1, (socklen_t *)a2);
         if (r >= 0) {
             if (nr == 242) {
                 if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
@@ -2130,6 +2315,14 @@ static void service(struct cpu *c) {
                     g_sock_stream[r] = 1;
                 }
                 fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, pl);
+            } else if (pbr) {
+                if (r < 1024) {
+                    g_br_port[r] = pbr;
+                    g_br_ip[r] = pbrip;
+                    g_sock_stream[r] = 1;
+                }
+                // peer reported as our virtual listen addr (cf. lo_* simplification)
+                fill_inet_br((uint8_t *)a1, (socklen_t *)a2, pbrip, pbr);
             }
         // peer = 127.0.0.1:lport
         }
@@ -2167,6 +2360,29 @@ static void service(struct cpu *c) {
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+        // NET bridge: connect(peer-ip:port in our subnet) -> dial /tmp/.ddbr-<netid>/<peerip>:<port>
+        if (br_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
+            br_connect_is(sa, (socklen_t)a2)) {
+            uint32_t dip = *(uint32_t *)(sa + 4);
+            uint16_t p = ntohs(*(uint16_t *)(sa + 2));
+            char up[200];
+            br_path(dip, p, up, sizeof up);
+            if (lo_swap((int)a0) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            struct sockaddr_un un;
+            memset(&un, 0, sizeof un);
+            un.sun_family = AF_UNIX;
+            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
+            if (r == 0 || errno == EINPROGRESS) {
+                g_br_port[(int)a0] = p ? p : 1;
+                g_br_ip[(int)a0] = dip; // peer ip for getpeername
+            }
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
         G_RET(c) = connect((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -2175,6 +2391,11 @@ static void service(struct cpu *c) {
         int fd = (int)a0;
         if (fd >= 0 && fd < 1024 && g_lo_port[fd]) {
             fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
+            G_RET(c) = 0;
+            break;
+        }
+        if (fd >= 0 && fd < 1024 && g_br_port[fd]) {
+            fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_br_ip[fd], g_br_port[fd]);
             G_RET(c) = 0;
             break;
         }
@@ -2193,10 +2414,18 @@ static void service(struct cpu *c) {
             G_RET(c) = 0;
             break;
         }
+        if (fd >= 0 && fd < 1024 && g_br_port[fd]) {
+            fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_br_ip[fd], g_br_port[fd]);
+            G_RET(c) = 0;
+            break;
+        }
         G_RET(c) = getpeername(fd, (void *)a1, (socklen_t *)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 206: {
+        // MSG_NOSIGNAL(0x4000) has no per-call equivalent on macOS; emulate it with the SO_NOSIGPIPE
+        // socket option so the send returns EPIPE instead of raising a fatal SIGPIPE.
+        if ((int)a3 & 0x4000) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
         ssize_t r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), (void *)a4, (socklen_t)a5);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -2261,6 +2490,8 @@ static void service(struct cpu *c) {
         mh.msg_control = (void *)*(uint64_t *)(g + 32);
         mh.msg_controllen = (socklen_t) * (uint64_t *)(g + 40);
         mh.msg_flags = *(uint32_t *)(g + 48);
+        // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE (macOS has no per-call flag); EPIPE instead of SIGPIPE.
+        if (nr == 211 && ((int)a2 & 0x4000)) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
         ssize_t r =
             (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         if (nr == 212 && r >= 0) {
