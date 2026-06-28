@@ -279,12 +279,13 @@ static void service_local(struct cpu *c) {
         // FIONCLEX
         }
         // TIOCGPGRP/TIOCSPGRP -- REAL job control. The guest's children are real host processes (clone = host
-        // fork) inside the engine's session (the daemon's login_tty made the engine the session leader and the
-        // pty its controlling terminal), so the kernel's own pty foreground-group machinery works for them: a
-        // child placed in the foreground really IS the fg group, so it is not SIGTTIN-frozen and Ctrl-C reaches
-        // it. The only thing to virtualize is the INIT's identity -- the guest sees getpid()==1 while its real
-        // host pgid is g_init_hostpid -- so we translate just that pair (g_init_hostpid <-> guest pgid 1) and
-        // pass everything else (real child pgids) straight through to the real host tcget/tcsetpgrp.
+        // fork) in the engine's session (the daemon's login_tty made the engine the pty's session leader), so
+        // the kernel's own pty foreground-group machinery applies to them: a child placed in the foreground
+        // really IS the fg group -> not SIGTTIN/SIGTTOU-frozen, and Ctrl-C/Ctrl-Z reach it. Two things make it
+        // work: (1) here we virtualize only the INIT's identity -- the guest sees getpid()==1 while its real
+        // host pgid is g_init_hostpid -- translating just that pair and passing real child pgids straight
+        // through to the real host tcget/tcsetpgrp; (2) rt_sigprocmask mirrors the terminal-stop signals onto
+        // the host mask, so bash's background tcsetpgrp handoff isn't SIG_DFL-stopped by the host kernel.
         case 0x540f: { // tcgetpgrp
             pid_t fg = isatty(fd) ? tcgetpgrp(fd) : -1;
             if (fg <= 0) fg = getpgrp();
@@ -1462,8 +1463,10 @@ static void service_local(struct cpu *c) {
         break;
     }
     // getpgid / getsid -- translate the init's real host group/session id to the guest's pgid 1 so the guest's
-    // identity is self-consistent (getpid 1 == getpgrp 1 == getsid 1); bash then sees itself as session+group
-    // leader and sets up job control without the EPERM/"cannot set terminal process group" dance.
+    // identity is self-consistent (getpid 1 == getpgrp 1 == getsid 1). bash then sees itself as session+group
+    // leader and initializes job control WITHOUT the setpgid EPERM / "cannot set terminal process group"
+    // warning -- it enables job control cleanly, and the real terminal handoff works (see TIOCSPGRP above +
+    // the rt_sigprocmask stop-signal mirroring).
     case 155: { pid_t r = getpgid((pid_t)a0); if (g_init_hostpid && r == g_init_hostpid) r = 1; G_RET(c) = (uint64_t)r; break; }
     case 156: { pid_t r = getsid((pid_t)a0);  if (g_init_hostpid && r == g_init_hostpid) r = 1; G_RET(c) = (uint64_t)r; break; }
     case 158: {

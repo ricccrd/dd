@@ -261,7 +261,16 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
             if std::env::var("DD_DEBUG").is_ok() { eprintln!("[live] {} write /etc/hosts failed: {e}", &c.id[..c.id.len().min(12)]); }
         }
     }
-    let Some((prog, args)) = spawn_cfg(c, &app.volumes_dir, vols, bridge) else { return false };
+    // No launch command means the JIT engine for this guest arch isn't bundled (e.g. a darwin-only build
+    // shipped without ddjit-linux_*). Surface a CLEAN error (exit 127, like every other spawn failure) so an
+    // interactive `docker run -it` exits with a message instead of hanging forever on a stream that never
+    // opens -- the missing-engine hang that looked like a frozen, Ctrl-C-deaf shell.
+    let Some((prog, args)) = spawn_cfg(c, &app.volumes_dir, vols, bridge) else {
+        let guest = c.arch.unwrap_or(Guest::LinuxAarch64);
+        return live_fail(app, &c.id, &live,
+            format!("dd: no JIT engine for {} guests in this build (ddjit-{} missing) -- cannot start container",
+                guest.target(), guest.target())).await;
+    };
     let mut cmd = tokio::process::Command::new(prog);
     cmd.args(args);
 

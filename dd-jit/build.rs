@@ -46,6 +46,12 @@ fn main() {
                 println!("cargo:rustc-env=DDJIT_{}={}", t.to_uppercase(), bin.display());
                 built.push(*t);
             }
+            // On a real macOS host the engine MUST compile -- a missing ddjit-<t> ships a bundle that hangs the
+            // moment a guest of that arch runs. Fail the build loudly instead of silently degrading to a warning
+            // (the failure mode that shipped a darwin-only release). On a non-mac dev host the toolchain reaches
+            // through the `mac` bridge, which may legitimately be absent, so there we stay best-effort.
+            Ok(s) if on_mac => panic!("building ddjit-{t} failed ({s}); fix the C engine compile -- refusing to produce an engine-incomplete build"),
+            Err(e) if on_mac => panic!("cannot build ddjit-{t} ({e}); macOS toolchain (clang/codesign) must be present"),
             Ok(s) => println!("cargo:warning=building ddjit-{t} failed ({s}); binary unavailable"),
             Err(e) => println!("cargo:warning=cannot build ddjit-{t} ({e}); is the toolchain/`mac` bridge present?"),
         }

@@ -51,9 +51,14 @@ sed "s/@VERSION@/$VERSION/g" "$ROOT/dd-gui/package/Info.plist.in" > "$C/Info.pli
 [ -d "$ROOT/assets/images" ] && cp -R "$ROOT/assets/images" "$RES/images" || true # bundled starter images (hello-dd)
 
 # JIT engines, copied next to the daemon (resolved at runtime next to the executable / via DDJIT_DIR).
+# Every guest engine is REQUIRED: a bundle missing ddjit-linux_* installs and pulls images fine, then HANGS
+# the instant you `docker run` a Linux container (no engine -> the daemon can't spawn the guest). build.rs
+# silently downgrades a failed engine compile to a cargo:warning, so guard HERE and fail the build loudly
+# rather than ship a half-working .app -- this is exactly the bug that shipped a darwin-only v0.5.7.
 for t in linux_aarch64 linux_x86_64 darwin_aarch64; do
   f="$(find "$ROOT/target/release/build" -name "ddjit-$t" -type f 2>/dev/null | head -1)"
-  if [ -n "$f" ]; then cp "$f" "$RES/ddjit-$t"; log "  + ddjit-$t"; else log "  ! ddjit-$t not built (skipping)"; fi
+  [ -n "$f" ] || die "ddjit-$t was not built -- refusing to ship an engine-incomplete bundle. Run 'cargo clean -p ddjit --release && cargo build --release -p dd-daemon' and check build.rs's clang/codesign output."
+  cp "$f" "$RES/ddjit-$t"; log "  + ddjit-$t"
 done
 # darwinjail.dylib — the DYLD_INSERT jail dylib for `ddcli mac`; MUST ship next to the engines or
 # `ddcli mac` falls back to the build-time path and dyld can't find it on the user's machine.

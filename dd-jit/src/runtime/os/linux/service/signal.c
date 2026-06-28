@@ -188,6 +188,31 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 c->sigmask = set;
         // SIG_SETMASK
         }
+        // Mirror the terminal-stop signals (SIGTSTP/SIGTTIN/SIGTTOU) onto the REAL host mask. Job control
+        // depends on this: bash blocks these three around tcsetpgrp/tcsetattr so a process in a BACKGROUND
+        // process group can hand the controlling terminal to a new foreground job without itself being
+        // stopped (their default action stops the process). The guest runs IN-PROCESS in the engine, so a
+        // guest-only mask is invisible to the kernel -- it would deliver SIG_DFL SIGTTOU and STOP the engine
+        // mid-handoff, the tcsetpgrp never completes, and every foreground command freezes (the "no job
+        // control / Stopped" bug). Only these three need mirroring (only they stop the process on default
+        // disposition); all other signals stay on the engine's async host_sigh + c->sigmask delivery model.
+        // Fast path: only touch the host mask when THIS call could change a stop-signal's block state -- i.e.
+        // SIG_SETMASK (redefines all) or a set that names one of the three -- so the common SIG_BLOCK/UNBLOCK
+        // of SIGCHLD/SIGINT/etc. adds zero host syscalls.
+        const uint64_t STOPBITS = (1ull << 19) | (1ull << 20) | (1ull << 21); // SIGTSTP|SIGTTIN|SIGTTOU bits
+        if (a1 && (a0 == 2 || (*(uint64_t *)a1 & STOPBITS))) {
+            static const int STOPS[3] = {20, 21, 22}; // Linux SIGTSTP, SIGTTIN, SIGTTOU
+            sigset_t blk, unblk;
+            sigemptyset(&blk);
+            sigemptyset(&unblk);
+            for (int i = 0; i < 3; i++) {
+                int ms = sig_l2m(STOPS[i]);
+                if (c->sigmask & (1ull << (STOPS[i] - 1))) sigaddset(&blk, ms);
+                else sigaddset(&unblk, ms);
+            }
+            sigprocmask(SIG_BLOCK, &blk, NULL);
+            sigprocmask(SIG_UNBLOCK, &unblk, NULL);
+        }
         G_RET(c) = 0;
         break;
     }
