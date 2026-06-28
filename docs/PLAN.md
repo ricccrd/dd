@@ -1,279 +1,89 @@
 # PLAN — remaining work
 
-`dd` is a Cargo workspace: `dd-jit` (the JIT runtime + Rust bindings; `build.rs` builds the guest-arch
-binaries), `dd-daemon` (the Docker Engine API), and the desktop surface (`dd-client` / `dd-gui` /
-`dd-cli`). This file is the **work list only** — what is missing or not yet implemented.
+`dd` is a Cargo workspace: `dd-jit` (the JIT runtime + Rust bindings), `dd-daemon` (the Docker Engine
+API), and the desktop surface (`dd-client`/`dd-gui`/`dd-cli`). **This file is the work list only — what
+is missing or not yet implemented.** Validate via the Makefile: `make test` (cross-engine matrix, **~240
+green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23), `make test-realsw`,
+`make coverage` (syscall/opcode gap report).
 
-## ✅ Completed — to validate
-Validation entry points (all via the Makefile):
-- `make test` — cross-engine matrix (`dd-tests`, **~236 green** over 21 groups × 3 engines: Linux
-  aarch64 + x86_64 + **darwin**; portable `port()` guests prove identical behaviour on Linux and macOS).
-  Only non-pass: `soak/smc` (RWX, below) + the fork+exec crash (below), both xfail-tracked.
-- `make test-docker` — docker-CLI battery (**50/50**); `make test-docker-full` — full per-command
-  compliance matrix; `make test-compose` — Docker Compose (skips if compose absent);
-  `make test-docker-net` — container-to-container networking (by-name/by-IP/isolation; gaps below).
-- The `edge` group in `make test` probes obscure syscall corners (madvise/renameat2/SCM_RIGHTS/
-  fallocate-punch/SEEK_HOLE/O_TMPFILE/mprotect/abstract-sockets/…) — 13/14 are xfail-tracked gaps (below).
-- `make test-macos` — **macOS-container parity (23/23)**: the *same* `docker` lifecycle (run/logs/exec/
-  inspect/ps/stop/rm) runs a Linux container AND a native-macOS container (the `macos` darwinjail image)
-  identically — dd's signature capability, validated.
-- `make test-realsw` — real pulled software (python ✅; redis/postgres/nats gaps below).
-- `make coverage` — syscall/opcode gap report (static switch-diff + dynamic corpus). Source of truth below.
+## Large subsystems (priority order) — each has an executable design + first-PR roadmap in `docs/design/`
 
-Harness bugs (all fixed; matrix/battery green):
-- [x] aarch64 open-flag bits were x86 values → every symlink open ELOOPd (`cat /etc/os-release` on alpine).
-- [x] ELF loader resolved the exe in the overlay UPPER only, not through `--lower`s.
-- [x] jitdarwin didn't relocate `adrp` under the segment slide (darwin/adrp test).
-- [x] the listed jit86 codegen bugs were already stale — the x86 engine is 26/0.
+1. **jit86 engine dedup** → `docs/design/engine-dedup.md`. Lift the host `jit/` engine so the code cache +
+   dispatcher are cpu-agnostic (the cpu struct + x86 decoder stay per-arch). **PR1 ✅** (x86 on shared
+   `jit/cache.c`) + **PR2 ✅** (dispatch.c frontend-hook seam, aarch64 bit-identical). **Remaining: PR3/PR4**
+   — x86 hook definitions + swap the x86 target onto `jit/dispatch.c`; also hook the 5th divergence (the
+   per-block `g_trace` dump). Gate: matrix green both engines.
+2. **Networking Phase-2b — netstack** → `docs/design/netstack.md`. External egress already works; the gap is
+   L3 identity + reachability. **PR1 ✅** (daemon IPAM `172.18/12`, per-container IP, `--network` join →
+   docker-net 5/7). **Remaining: PR2** (per-network AF_UNIX virtual switch + name→IP DNS → 7/7) *(in
+   flight)*; then the optional in-process `smoltcp` stack behind `DD_NETSTACK`.
+3. **Untrusted-guest isolation — sentry process-split** → `docs/design/sentry-split.md`. **No PR yet.** The
+   trust boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on
+   `g_untrusted`, split `service()` by authority (compute/mem local, fs/net/proc → sentry over an SPSC
+   ring), deny-default Seatbelt. First PR: ring + read/write/open family behind the flag.
+4. **Tier-2 trace optimizer** → `docs/design/tier2-optimizer.md`. **No PR yet.** The win is killing the
+   stolen-register mangle (x18/x28/x30) via trace-local allocation; §B-safe (own x9–x17 only in call-free
+   spans; never drop the `gsp` check); PROF needs loop-back heat. First PR: a 2-block identity trace behind
+   `TIER2`, matrix-green when off.
+5. **x86 translator → native** → `docs/design/x86-perf.md`. **PR1 ✅** (lazy NZCV for `sub/cmp→Jcc`).
+   **Remaining:** extend to add/logical producers + carry-value consumers; `pmovmskb` (48→8 NEON); x87
+   `fptop` tracking. Inherits #1 + #4 once they land.
 
-Docker CLI (`dd-daemon`; scenarios in `dd-tests/scenarios/docker.sh`):
-- [x] `docker cp` — GET/PUT/HEAD `/archive`, bind-volume aware (scenarios `cp-*`).
-- [x] `docker build` — FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/ENTRYPOINT, **multi-stage** `COPY --from`,
-      **auto-pull** non-local base, metadata persisted + inherited at run (scenarios `build-*`).
-- [x] `docker run -e` + image ENV/WORKDIR/ENTRYPOINT honored, no host-env leak (scenarios `*env*`).
-- [x] `--network none` enforces egress isolation (loopback still allowed) (scenario `egress-none-blocked`).
-- [x] `docker pause`/`unpause` via SIGSTOP/SIGCONT (state transitions; freeze relies on standard SIGSTOP).
+## Deep bugs (root-caused; fixes scoped)
 
-JIT:
-- [x] **IPC namespace** — SysV shared memory, semaphores, message queues all work, keys namespaced
-      per-container by `DD_NETNS`; tested both engines (matrix `system/{shm,sem,msg}`). Only
-      `*ctl(IPC_STAT/IPC_SET)` introspection is deferred (returns ENOSYS, graceful).
-- [x] **Syscall/opcode gaps from the growing matrix** (all both-engine unless noted):
-      `eventfd` real accumulating counter + **EFD_SEMAPHORE** (decrement-by-1), `pselect6`(72),
-      `inotify` create/delete with filename (kqueue + dir snapshot/diff), x86 `poll`(7)→ppoll +
-      x86 `epoll_wait`(232)→epoll_pwait, **SSE `PACKUSWB`/`PACKSSWB`/`PACKSSDW`** (`66 0F 67…` →
-      SQXTUN/SQXTN; unblocked `heavy/bigmem` + `posix/mmapshared`), `prctl PR_SET/GET_NAME`,
-      `sigqueue` si_value payload (rt_sigqueueinfo → sigframe `si_code`/`si_value`),
-      POSIX `shm_open` (`/dev/shm` → host-file backing), `memfd_create`(279, unlinked tmpfile),
-      `glob("*")` (stale getdents `DIR*` cache invalidated on close + dropped in fork children).
-      Matrix is **~236 green**; the only non-pass is `soak/smc` (RWX limitation, below) plus the
-      intermittent fork+exec crash (below).
+- **fork()+execve() non-PIE crash (gcc toolchain).** `execve` biases a non-PIE `ET_EXEC` off its fixed
+  vaddr (`__PAGEZERO` forces it); post-`fork` the dense layout makes its un-relocated absolute refs fault.
+  Landed: execve address-space teardown + the dispatcher PC-redirect (advances code-jump fault → data-ref
+  fault). `-pagezero_size 0x1000` + pinning the non-PIE low **fully fixes it** but broke the PIE common case
+  (reverted). **Achievable fix:** small `__PAGEZERO` + force every *other* mapping (PIE image/heap/stack/
+  mmaps) to a high hint so only the non-PIE uses the low region (or an arm64 load/store fault-fixup at
+  `+bias`). Unblocks the `compile` group (xfail today).
+- **busybox flaky fork+exec tail** → `docs/design/research-busybox-crash.md` + **`docs/design/dual-map-cache.md`**.
+  Root cause: W^X/`MAP_JIT` execute-permission fault in the fork child (per-thread APRR isn't reliable across
+  fork). First mitigation applied (re-assert execute in the child) — insufficient. **Robust fix (PR-ready):**
+  the **dual-mapped RX/RW code cache** (`mach_vm_remap` a RW alias, route cache stores through `cw()`,
+  execute stays RX in the page tables → survives fork). Also closes the `soak/smc` RWX gap below.
+- **`soak/smc` / RWX guest-JIT pages.** `mmap(PROT_READ|WRITE|EXEC)` returns EPERM (W^X). Any guest that JITs
+  its own code (JVM/V8/LuaJIT/.NET/PyPy) needs executable pages — fixed by the same dual-map cache (intercept
+  RWX/`PROT_EXEC` maps, back with MAP_JIT, re-translate on writes). *(Endurance otherwise holds:
+  `soak/{codecache,indirect,threadchurn,forkchurn,allocchurn}` pass.)*
+- **postgres:alpine** — root-caused: the initial loader `load_elf` had no `#!` check (entry is a shebang
+  script). **Fix landed** (shared `parse_shebang` in `jit_run`); next gap downstream is daemonize/initdb.
+  Daemon-side: the local `postgres` image's `dd-image.json` lacks `entrypoint`/`env`.
 
-## Next work (priority order) — large subsystems
-**Each now has an executable design + first-PR roadmap in `docs/design/` (deep code investigation, the
-exact seams/files, a safety argument, and the smallest matrix-green first PR). Execute the first PRs one
-at a time with the cross-engine matrix as the regression gate.**
+## Coverage gaps — syscalls
 
-1. **Finish the jit86 engine dedup.** → **`docs/design/engine-dedup.md`**. *Half done* (x86 shares all of
-   `os/linux/`; what's left is the host `jit/` engine). Design: `cache.c` is the clean first merge
-   (`G_GPC_HASH_SHIFT` + lock-aliasing + the dormant `is_bl` path), `dispatch.c` needs 4 frontend hooks
-   (IBTC `ic_site` vs `ic_miss`, post-`run_block` reason switch, the two trampolines, x86 debug), `emit`
-   stays per-arch. ✅ **PR1 DONE** (x86 lifted onto shared `jit/cache.c` via `G_GPC_HASH_SHIFT` + a new
-   `engine_glue.c`; aarch64 bit-identical; **matrix 240 green both engines**). **Next PR:** the 4 dispatch
-   hooks → lift `dispatch.c`. ✅ **PR2 DONE** (dispatch.c hook seam: G_DISPATCH_DEBUG/SHADOW_CLEAR/IBTC_FILL/
-   DISPATCH_REASON in a new aarch64 `dispatch_hooks.h`; aarch64 bit-identical, matrix 240). **Next:** PR3/4
-   (x86 hook defs + the dispatch swap; also hook the 5th divergence, the per-block g_trace dump).
-2. **Networking Phase-2b — userspace netstack.** → **`docs/design/netstack.md`**. Reframing: external
-   egress already works root-free (a guest socket *is* a host socket); the real gap is L3 **identity**
-   (per-container IP) — what breaks `docker-net.sh` (3/7). ✅ **PR1 DONE** (daemon IPAM `172.18/12` +
-   per-container IP + `--network`-join fix; verified live: container IP `172.18.0.2`, `network inspect`
-   lists members → 5/7). **Next PR:** per-network AF_UNIX virtual switch (the `reach-by-name`/`-ip` data
-   path) → 7/7; then the optional in-process `smoltcp` stack behind `DD_NETSTACK`.
-3. **Untrusted-guest isolation — the sentry process-split.** → **`docs/design/sentry-split.md`**. The trust
-   boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on `g_untrusted`.
-   `service()` splits by authority (compute/mem local, fs/net/proc → sentry over an SPSC ring); deny-default
-   Seatbelt. **First PR:** ring + read/write/open family behind the flag, lockdown stubbed.
-4. **Tier-2 trace optimizer.** → **`docs/design/tier2-optimizer.md`**. Corrected premise: chains already
-   avoid the per-block spill; the real win is killing the **stolen-register mangle** (x18/x28/x30) via
-   trace-local allocation. §B-safe (own x9–x17 only in call-free spans; never drop the `gsp` check). PROF
-   needs loop-back heat. **First PR:** degenerate 2-block identity trace behind `TIER2`, matrix-green off.
-5. **Optimize the x86 (jit86) translator toward native.** → **`docs/design/x86-perf.md`**. The flag model
-   keeps an ARM-NZCV substrate but wastes a mem+sysreg round-trip per op (`e_nzcv_save`/`_load`); the live
-   NZCV already survives producer→consumer, so a `cmp;je` is 6 host instrs where 2 suffice (−67%). Design:
-   a translate-time pending-flags state machine + cc-mapping, boundary materialize keeps the cross-block
-   flag ABI byte-identical (intra-block-only = safe). Warts: `pmovmskb` (48→8 NEON), x87 `fptop`. **First
-   PR:** the `sub/cmp→Jcc` fast path only (~3 sites, revertible). ✅ **PR1 DONE** (lazy NZCV, drops the
-   save/load round-trip; intra-block so the flag ABI is byte-identical; **matrix 240 green, x86 zero
-   fails**). **Next PR:** extend to add/logical producers + carry-value consumers + `pmovmskb` + x87.
-   Inherits #1's optimizations + #4 once they land.
+*Source: `make coverage`. Static **178/323 handled** at last snapshot (many since landed).*
+- **Signals:** `rt_sigtimedwait`(137), `rt_sigsuspend`(133) — need guest-mask-aware signal waiting.
+- **Edge corners** (`edge` group; xfail-tracked, fix → XPASS) *(batch in flight: renameat2 flags, fallocate
+  PUNCH_HOLE, lseek SEEK_HOLE/DATA, O_TMPFILE, statfs/fstatfs layout, times, madvise MADV_DONTNEED, mprotect
+  PROT_NONE)*. Likely still after: **SCM_RIGHTS fd-passing** over AF_UNIX (cmsg translation — breaks
+  systemd/Docker/D-Bus), **abstract-namespace AF_UNIX** (`sun_path[0]==0` — X11/D-Bus/systemd),
+  `clock_nanosleep(TIMER_ABSTIME)` treated as relative (hangs), `MSG_NOSIGNAL` ignored (SIGPIPE instead of
+  EPIPE), `pipe2(O_DIRECT)` packet mode, `F_SETPIPE_SZ`, `/proc/self/fd` synth.
+- **Host-limited (emulate or leave ENOSYS):** POSIX mqueue `mq_*`(180-185), `timer_create`/`timer_*`(107-111)
+  *(could ride kqueue)*; `pidfd`/`io_uring`/NUMA/keyring/module/`ptrace` out of scope.
 
-## Smaller remaining items
-- **`docker build` BuildKit cache** — layer/step caching (today every build re-runs from the base).
-- **IPC `*ctl(IPC_STAT/IPC_SET)`** — the macOS `*_ds` layouts differ from the guest ABI; rare
-  introspection, returns ENOSYS today.
+## Docker API — remaining field/behaviour fidelity (Engine API v1.43, single-node; Swarm out of scope)
 
-## Coverage gaps — unimplemented syscalls / opcodes / Docker API
-*Source of truth: `make coverage` (static switch-diff of `os/linux/service.c` + `frontend/x86_64/sysmap.h`
-against the kernel ABI, plus a dynamic corpus run that aggregates the engine's own
-`unhandled syscall N` / `UNIMPL opcode 0xNN` diagnostics). Snapshot below; re-run to refresh.*
-Static: **178/323 canonical syscalls handled, 145 missing.** Surfaced by the dd-tests `linuxsys`/`ipc`
-groups + the dynamic corpus.
+| Area | What's left | Pri |
+|------|-------------|:---:|
+| `docker stats` | real-ish CPU/mem + streaming *(in flight; runtime has no cgroup metrics → best-effort)* | P1 |
+| `docker logs` | `-f`/follow, `--since` (tail/timestamps/raw done) | P1 |
+| `docker ps` | `--size`, remaining `--filter` keys (status/name/label done) | P1 |
+| `docker exec` | `-u` (needs a `SpawnConfig` uid field), `--privileged` (`-e`/`-w`/`-d` done) | P1 |
+| `docker run` opts | `--user` (uid not applied), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` (`--label` done) | P2 |
+| `docker build` | BuildKit/layer cache (every build re-runs from base) — args/target/nocache/labels/digest-IDs done | P2 |
+| image inspect | surface `Config.Labels` (stored at build; inspect still emits `{}`) | P2 |
+| `docker cp` | non-default-driver named volumes (default `<volumes_dir>/<name>` *in flight*) | P3 |
+| IPC | `*ctl(IPC_STAT/IPC_SET)` introspection (macOS `*_ds` layout differs; ENOSYS today) | P3 |
 
-**Syscalls worth implementing (macOS has the primitive — mostly a wire-up):**
-- **Process/session:** ~~`setsid`(157), `setregid`(143), `setfsuid/gid`(151/152), `getcpu`(168),
-  `waitid`(95)~~ **done** (waitid translates the macOS→Linux siginfo)
-- **File I/O:** ~~`flock`(32), `preadv/pwritev`(69/70), `preadv2/pwritev2`(286/287),
-  `sync_file_range`(84→fsync), `readahead`(213→noop), `truncate`(45, by-path)~~ **done**
-- **Memory:** ~~`memfd_create`(279), `mlockall/munlockall`(230/231), `mlock2`(284)~~ **done** (no-op locks)
-- **Timers/clocks:** ~~`getitimer/setitimer`(102/103)~~ **done** (host wrap), ~~`clock_settime`(112)~~ **done**
-  (EPERM, no CAP_SYS_TIME), ~~`clock_adjtime`(266)~~ **done** (EPERM)
-- **Scheduling:** ~~`sched_get/setscheduler`(119/120), `sched_get/setparam`(118/121),
-  `sched_get_priority_max/min`(125/126), `sched_rr_get_interval`(127), `sched_get/setattr`(274/275)~~ **done**
-- **Resource:** ~~`getrlimit/setrlimit`(163/164)~~ **done** (aliased to prlimit64)
-- **Signals:** ~~`rt_tgsigqueuei`(240)~~ **done** (mirrors rt_sigqueueinfo), ~~`sigqueue` si_value path~~ **done**;
-  still `rt_sigtimedwait`(137), `rt_sigsuspend`(133) (need guest-mask aware signal waiting)
-- **Misc (all done):** ~~`prctl PR_GET_NAME`~~ (stores the set name), ~~POSIX `shm_open`~~ (`/dev/shm`→
-  host-file backing), ~~`glob("*")`~~ (it was a stale getdents `DIR*` cache, not `d_type` — invalidated
-  on `close`, dropped in fork children)
-
-**Host-limited (no macOS primitive — emulate or leave ENOSYS):** POSIX mqueue `mq_*`(180-185),
-`timer_create`/`timer_*`(107-111) *(could ride kqueue)*, plus the already-listed `pidfd`/`io_uring`.
-NUMA/keyring/module/`ptrace` are out of scope. (`eventfd` **EFD_SEMAPHORE** and `inotify` create/delete
-**with filename** are now **done** — a real accumulating counter with decrement-by-1, and a kqueue
-`EVFILT_VNODE` watch backed by a directory snapshot/diff to recover the changed name.)
-
-**Opcodes:** the dynamic corpus currently hits **0 `UNIMPL`** (the SSE `packuswb` `66 0F 67` gap that
-`heavy/bigmem` + `posix/mmapshared` exposed is fixed). `make coverage dynamic` is the way to catch new ones.
-
-**Edge cases — obscure syscall corners (the `edge` group; 13/14 diverge from real Linux, all
-xfail-tracked, found by reading `os/linux/service.c` + frontends).** Each is a differential (oracle) or
-verdict test; fix → XPASS:
-- `madvise(MADV_DONTNEED)` is a **no-op** — anon pages aren't dropped, a reread returns stale data
-  instead of zeros (this is why **redis/jemalloc** misbehave). Implement DONTNEED (re-`mmap` the range
-  `MAP_FIXED|ANON`, or `madvise` the host mapping).
-- `renameat2` **flags dropped** — `RENAME_NOREPLACE` overwrites, `RENAME_EXCHANGE` doesn't swap.
-- **`SCM_RIGHTS` fd-passing over AF_UNIX broken** — `recvmsg` yields no fd (the cmsg control block
-  isn't translated). Breaks systemd socket-activation / Docker / D-Bus patterns.
-- `fallocate(FALLOC_FL_PUNCH_HOLE)` ignored — region keeps old data (only ftruncate-extend handled).
-- `lseek(SEEK_HOLE/SEEK_DATA)` unsupported — no hole/data offsets on a sparse file.
-- `open(O_TMPFILE)` **fails** — no unnamed-temp-file support.
-- `pipe2(O_DIRECT)` packet mode ignored — writes coalesce instead of preserving message boundaries.
-- abstract-namespace AF_UNIX (`sun_path[0]==0`) **bind fails** — Linux-only; X11/D-Bus/systemd use it.
-- `F_SETPIPE_SZ`/`F_GETPIPE_SZ` no-op and `dup3(fd,fd,0)` doesn't return EINVAL.
-- **`mprotect` is a no-op** — `PROT_NONE` doesn't fault (darwin native DOES — `edge/mprotect` passes on
-  darwin, fails on the Linux JIT). RELRO/guard pages and GC write-barriers are unenforced.
-- `clock_nanosleep(TIMER_ABSTIME)` treated as **relative** → sleeps for the absolute value (**hangs**).
-- `MSG_NOSIGNAL` ignored — a write to a closed socket delivers a fatal **SIGPIPE** instead of EPIPE.
-- `/proc/self/fd` not synthesized — readlink/enumerate of the live fd table fails.
-- (Works: `recv` `MSG_PEEK` + `MSG_DONTWAIT`/EAGAIN — `edge/msgflags` passes.)
-
-**RWX / guest-JIT pages (`soak/smc`):** `mmap(PROT_READ|WRITE|EXEC)` returns **EPERM** under the JIT
-(macOS W^X blocks RWX without `MAP_JIT`). Any guest that JITs its own code — JVM, V8/Node, LuaJIT,
-.NET, PyPy — can't get executable pages. Fix needs the runtime to intercept RWX/`PROT_EXEC` maps and
-back them with a `MAP_JIT` region or an RW+RX dual-mapping, and to re-translate on writes to executable
-pages (the `__builtin___clear_cache` / coherency path the soak test patches 200k×). Endurance otherwise
-holds: `soak/{codecache,indirect,threadchurn,forkchurn,allocchurn}` pass on all three engines
-(sustained block-chaining/IBTC churn + thread/fork/heap churn over thousands of cycles).
-
-**fork()+execve() crash — DIAGNOSED, main reliability gap.** Root cause: **`execve` (service.c case 221)
-never `munmap`s the inherited address space, and `load_elf` (os/linux/elf.c) relocates even a non-PIE
-`ET_EXEC` off its fixed link-time vaddr (forced — macOS `__PAGEZERO` reserves the low 4 GB; see Platform
-limitations). The bias is survivable in a fresh exec's sparse layout but not in the dense post-`fork()`
-layout, where the non-PIE image's baked absolute (un-relocated) references land on live memory → SIGSEGV.**
-The marquee victim is the **GCC toolchain** (`compile` group): `gcc-14`/`cc1` are `ET_EXEC` non-PIE
-(entry `0x433880`). Evidence (deterministic, gcc-bundle image):
-- `sh -c 'gcc-14 --version'` (fork → execve) → **SIGSEGV (rc 139), 6/6**; `env gcc-14 --version` and
-  `sh -c 'exec gcc-14 --version'` (execve, **no fork**) and gcc as the initial image → **rc 0**. ⇒ the
-  trigger is *fork-then-execve*, not gcc codegen. **`perl` (PIE) fork+exec works** — PIE is fully
-  relocatable, so only non-PIE images crash.
-- `JT=1` `[LOADED]` traces: the no-fork run spreads gcc to an isolated high base (`0x11ec98000`); the
-  crashing fork run packs dash+ld.so+gcc+ld.so into a dense `0x100da0000–0x10124f000` window.
-- The **intermittent** tail (`busybox/{find,seq}`, `containersw/nc-loopback`) flakes under full-matrix
-  load; `soak/forkchurn` (fork *without* exec) is rock-solid. **But `busybox` is `ET_DYN`/PIE** (verified:
-  `e_type == 3`), so the flaky tail is a **DISTINCT bug from the non-PIE gcc crash** — PIE is fully
-  relocatable and immune to the bias issue. The tail is some *other* fork+exec race (SIGSEGV, code 139, in
-  the exec'd child; `diag_crash` never fires even with `SA_ONSTACK`, so the fault bypasses the POSIX signal
-  handler — suspect the Mach exception path). (`container/symlink`'s "failure" is unrelated: leftover `/l`
-  in the overlay UPPER from a prior run, an overlay-cleanup issue.)
-
-**Fix — MECHANISM CONFIRMED, partial fix landed, full fix has a tradeoff.** Captured the exact fault (the
-`mac` bridge drops the ambient env, so `CRASHDBG` never reached the jit — `SpawnConfig` now forwards it +
-the fork child clears its inherited Mach exception port so the POSIX `diag_crash` fires):
-
-    [CRASH] sig=11 fault=0x42b440 pc=0x42b440      (then, after the redirect: pc=biased, fault=0x4c90d9)
-
-So `pc == fault == a low non-PIE link vaddr`: the guest takes an **absolute jump to a link vaddr** (the
-un-relocated ref), the JIT reads guest code there 1:1, but the image is biased high → unmapped → SIGSEGV.
-Landed so far:
-- **execve address-space teardown** — kernel-like reset, fixes a real per-exec leak (256MB heap + image +
-  stack leaked every exec). Necessary but not sufficient.
-- **dispatcher PC-redirect** (`g_nonpie_*` set by `load_elf` for `ET_EXEC`) — redirects absolute *code*
-  jumps from the link vaddr into the biased image. This advances the crash from a code-jump fault to a
-  **data-ref fault** (pc now real biased code; fault still a low link vaddr = an un-relocated data pointer).
-- **`-pagezero_size 0x1000` + pinning the non-PIE at its link vaddr (MAP_FIXED, bias 0)** — **fully fixes
-  the non-PIE crash** (`gcc-14 --version`: SIGSEGV 6/6 → **rc 0**; code+data refs resolve natively). **But
-  it broke the PIE common case hard** (43/195 — basic PIE guests exit 255), so it was **reverted**. Too
-  global: shrinking __PAGEZERO perturbs every PIE load + the heap/stack placement.
-
-**The achievable full fix** is the shrunk-__PAGEZERO approach made safe: keep __PAGEZERO small so the
-non-PIE can pin low, but force **every other** guest mapping (PIE image+interp, heap, stack, anon mmaps)
-to a **high hint** so the PIE world is unchanged and only the non-PIE uses the low region. (Alternative:
-an arm64 load/store fault-fixup handler that re-does a link-range data access at `+bias` — heavier.) Either
-way the diagnostic plumbing (`CRASHDBG` forwarding + `[CRASH]`) is now in place to iterate.
-
-**Separately, the flaky busybox tail is ROOT-CAUSED** (research, live ESR probe): a **W^X/`MAP_JIT`
-execute-permission fault in the `fork()` child** — the child's first `run_block` instruction-fetches from
-the code cache while the per-thread JIT execute (APRR) state isn't reliable across fork (`pc`=ld-musl
-`_Fork`, `esr=0x8200000f` = instruction-abort permission fault inside the cache; intermittent under load,
-PIE/non-PIE irrelevant). First mitigation applied (re-assert `pthread_jit_write_protect_np(1)` in the fork
-child) but a single run still flaked — the **robust fix is a dual-mapped RX/RW code cache** (execute lives
-in the page tables, survives fork; also closes the `soak/smc` RWX gap) in `jit/cache.c`. See
-`docs/design/research-busybox-crash.md`.
-
-**Docker API compliance** — goal is a faithful Engine API **v1.43** for the **everyday developer
-workflow** so the stock `docker` CLI + bollard work unmodified. **Swarm / services / nodes / tasks /
-secrets / configs / managed plugins are out of scope** (single-node, local dev — `/info` reports
-`Swarm: inactive`).
-
-_Done 2026-06-27:_ `dd-daemon` decomposed (1805-line `main.rs` → `model`/`util`/`system`/`images`/
-`containers`/`build`/`archive`/`volumes`/`networks`/`runtime` modules); `dd-client` rewrapped on
-**bollard** (GUI + CLI share it). Added routes/behaviour: global Docker headers (`Api-Version`… → CLI
-handshake + `GET`/`HEAD /_ping`), `POST /auth`, `GET /system/df`, `GET /events` (open stream), prune
-(containers/volumes/networks/images/build), `/containers/{id}/{changes,export,update}`, image
-`history`/`search`/`distribution`, `VirtualSize` on `images/json` (bollard strict-deserialize fix),
-`tag`-query honoring, `version`/`info` fills. _(every everyday route now returns a Docker-shaped
-response — no 404s; what's left is field/behaviour fidelity.)_
-
-Remaining — what still needs to be figured out / built (priority):
-
-| Area | What needs work | Pri |
-|------|-----------------|:---:|
-| `docker inspect` (container) | ~~`NetworkSettings` (ports → fixes `docker port`, + membership), `Name`, `Mounts`, `Config.Image/Env`~~ **done**; still: `State.{Pid,StartedAt,FinishedAt}` (not tracked yet) | P1 |
-| `docker logs` | ~~`--tail`/`--timestamps`, **raw** stream for `-t`~~ **done**; still `-f`/follow, `--since` | P1 |
-| `docker ps` | ~~human `Status`, `--filter` (status/name/label), `Labels`~~ **done**; still `--size`, `--filter` (other keys) | P1 |
-| `docker exec` | ~~`-e`/`-w`, `exec -d` → 200~~ **done**; still `-u` (needs a `SpawnConfig` uid field), `--privileged` | P1 |
-| `docker events` | ~~lifecycle event bus — container + image + network + volume create/start/stop/die/destroy~~ **done** (verified live) | P1 |
-| `docker inspect` State | ~~`State.{Pid,StartedAt,FinishedAt}`~~ **done** (RFC3339; Pid from live) | P1 |
-| `docker stats` | real CPU/mem accounting from the JIT runtime + streaming *(design: runtime has no cgroup metrics)* | P1 |
-| networks | ~~per-container IP/IPAM + `network inspect` member IPs~~ **PR1 done** (172.18/12, verified `172.18.0.2`); still **container-to-container reachability** (`docker-net.sh` `reach-by-name`/`-ip`): the data path — a per-network AF_UNIX virtual switch + embedded name→IP DNS — see netstack #2 next PR. Cross-network isolation trivially holds. | P2 |
-| `docker build` | ~~`buildargs`/`target`/`nocache`, `LABEL`+`--label`, real sha256 content-digest IDs~~ **done**; still (BuildKit cache, above) | P2 |
-| `docker run` opts | ~~`--label` (stored → `Config.Labels`)~~ **done**; still `--user` (uid not applied — needs a `SpawnConfig` uid field), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` | P2 |
-| volumes | ~~`409` in use, RFC3339 `CreatedAt`, `--driver`/`--opt`/`--label`~~ **done** | P2 |
-| `docker pull`/`push` | per-layer progress bars; push returns final `aux{Digest}` | P2 |
-| image inspect/history | ~~real `Size`/`Entrypoint`/`Env`/`Cmd`/`WorkingDir`/`Created`~~ **done**; `Labels` stored (build), inspect-surface pending | P2 |
-| `docker cp` | ~~redirect a `cp` into a bind-mount path~~ **done** (longest-prefix bind match); still named-volume paths (handlers lack the volume list) | P2 |
-| `save`/`load`/`import` | ~~`images/get` + `images/load` + `fromSrc`~~ **done** (dd-native rootfs tar + manifest) | P3 |
-| stop/kill/restart | honor `signal`/`t` + real signal delivery (containers run synchronously today) | P3 |
-
-Hard problems (not plumbing): **live resource metrics** for `stats`, an **event bus**, and a real
-**network/IPAM model** over the loopback-netns isolation.
-
-## Real software — `make test-realsw` (pulled from Docker Hub) + the `compile` group
-Real, syscall/fork/thread/mmap-heavy production binaries run with deterministic workloads. Snapshot:
-- **python:alpine** ✅ — a mixed workload (lru_cache fib(35), dict aggregation, sort) runs correctly; a
-  large C runtime (bytecode VM, import machinery) is solid.
-- **GCC-14 toolchain** (`compile` group, gcc-bundle image) ❌ — `gcc`/`g++`/`cc1` **segfault**: this IS
-  the fork()+execve()/non-PIE crash diagnosed above (driver is always fork+exec'd by the shell).
-  xfail-tracked (`compile/{hello,c-primes,cpp-stl}`); XPASS fires when the execve address-space-reset lands.
-- **redis:alpine** ✅ **FIXED** — root-caused (research): `mprotect`(226) is a no-op so a guest
-  `PROT_READ`→`R|W` upgrade was dropped → SIGBUS on the next store (`checkLinuxMadvFreeForkBug`). Fix: anon
-  `mmap` now maps writable up front. (`MADV_DONTNEED` was a red herring — jemalloc falls back to memset.)
-- **postgres:alpine** — root-caused (research): the crash is in the JIT's **initial `load_elf`** (0 guest
-  syscalls) — the entry `docker-entrypoint.sh` is a `#!` script but only `execve` handles shebangs; the
-  initial loader parses it as a bogus ELF. **Fix in progress** (reuse execve's shebang logic in `jit_run`).
-  setuid/setgid drop already works; daemonize/initdb is the *next* gap, downstream of this. (Also: the local
-  `postgres` image's `dd-image.json` lacks `entrypoint`/`env` — a daemon-side metadata gap.)
-- **nats:latest** — ~~arch-detect~~ **fixed**: distroless pulls now fall back to the manifest `architecture` (then native aarch64) instead of failing
-  on a distroless/scratch image (the arch sniffer in `containers_create`/`detect_arch` scans for an ELF
-  where there is none — needs a manifest-`platform` fallback). A `dd-daemon` image-arch-detection gap.
-
-### Platform limitations (macOS host — need Linux primitives the host can't provide; off the work-list)
-Non-PIE **ET_EXEC** (macOS `__PAGEZERO` reserves the low 4 GB the fixed vaddr needs), **cpu/io throttling**
-(no cpu/io cgroup — mem+pids ARE enforced via rlimit), **`pidfd`** and **`io_uring`** (no macOS primitive).
-These can't be implemented on a macOS host; they'd come for free on a linux→linux build.
+## Platform limitations (macOS host — can't provide the Linux primitive; off the work-list)
+Non-PIE `ET_EXEC` fixed-vaddr (the `__PAGEZERO` low-4GB reservation — see the deep bug above for the
+achievable workaround), cpu/io throttling (no cpu/io cgroup; mem+pids *are* enforced via rlimit), `pidfd`,
+`io_uring`. These would come for free on a linux→linux build.
 
 ## Portability matrix (seams exist; only darwin-host / both-guests built)
-Host OS × host ISA × guest ISA × guest OS. The decomposition isolates each:
 `hal/<os>` (darwin built; linux = mprotect/SIGSEGV-ucontext/seccomp), `jit/emit_<isa>` (arm64 built),
 `frontend/<arch>` (aarch64 + x86_64 built), `os/<os>` (linux built). Eventual targets: linux→darwin,
-darwin→linux, linux→linux (docker copy), darwin→darwin.
+darwin→linux, linux→linux, darwin→darwin.
