@@ -355,6 +355,17 @@ static int pm_published(uint16_t cport) {
         if (g_portmap[i].cport == cport) return 1;
     return 0;
 }
+// Host ports we've already spun up a TCP / UDP forwarder for (idempotent across re-listen()/re-bind under
+// SO_REUSEADDR). A port is marked BEFORE its forwarder thread is created and the thread UNMARKS it if its
+// own bind() fails, so a transient EADDRINUSE doesn't permanently disable forwarding for that port (F7).
+static uint16_t g_fwd_started[32];
+static int g_nfwd;
+static uint16_t g_udp_fwd_started[32];
+static int g_nudpfwd;
+static void fwd_unmark(uint16_t *arr, int *n, uint16_t hport) {
+    for (int i = 0; i < *n; i++)
+        if (arr[i] == hport) { arr[i] = arr[--(*n)]; return; }
+}
 // One relay connection: pump bytes between host TCP fd `a` and switch AF_UNIX fd `b` until either EOF.
 struct fwd_relay {
     int a, b;
@@ -408,6 +419,7 @@ static void *fwd_listen_thread(void *p) {
     sin.sin_addr.s_addr = htonl(INADDR_ANY); // 0.0.0.0:HOST_PORT (docker's default publish address)
     if (bind(ls, (struct sockaddr *)&sin, sizeof sin) < 0 || listen(ls, 128) < 0) {
         close(ls); // host port busy (e.g. another container already published it) -> no forwarding
+        fwd_unmark(g_fwd_started, &g_nfwd, fl.hport); // transient busy: allow a later listen() to retry (F7)
         return NULL;
     }
     for (;;) {
@@ -435,9 +447,6 @@ static void *fwd_listen_thread(void *p) {
     close(ls);
     return NULL;
 }
-// Host ports we've already spun up a forwarder for (idempotent across re-listen()/SO_REUSEADDR restart).
-static uint16_t g_fwd_started[32];
-static int g_nfwd;
 // Called from listen(): if `fd` is a published switch-backed listening socket, start its host forwarder.
 static void fwd_maybe_start(int fd) {
     if (fd < 0 || fd >= 1024) return;
@@ -455,10 +464,10 @@ static void fwd_maybe_start(int fd) {
     if (!fl) return;
     fl->hport = hport;
     snprintf(fl->upath, sizeof fl->upath, "%s", upath);
+    g_fwd_started[g_nfwd++] = hport; // mark BEFORE create (closes the dedup window); thread unmarks on bind fail
     pthread_t t;
-    if (pthread_create(&t, NULL, fwd_listen_thread, fl) != 0) { free(fl); return; }
+    if (pthread_create(&t, NULL, fwd_listen_thread, fl) != 0) { free(fl); g_nfwd--; return; }
     pthread_detach(t);
-    g_fwd_started[g_nfwd++] = hport;
 }
 
 // ---- Published-port host UDP forwarder (`docker run -p HOST:CONTAINER/udp`) ----------------------
@@ -525,19 +534,27 @@ static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t 
         if (f->peers[slot].used) close(f->peers[slot].gs);
         f->peers[slot].used = 0;
     }
+    // On any failure after an eviction (!appended) we already cleared peers[slot].used above; also drop the
+    // slot from npeers so we don't leave a permanently-dead slot in the table (F5). (Append never bumped
+    // npeers yet -- it is incremented only on success below -- so its failures need no adjustment.)
     int gs = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (gs < 0) return -1;
+    if (gs < 0) { if (!appended) f->npeers--; return -1; }
     struct sockaddr_un un;
     memset(&un, 0, sizeof un);
     un.sun_family = AF_UNIX;
     snprintf(un.sun_path, sizeof un.sun_path, "%s/%u", f->pdir, f->pseq++);
     unlink(un.sun_path);
-    if (bind(gs, (struct sockaddr *)&un, sizeof un) < 0) { close(gs); return -1; }
+    if (bind(gs, (struct sockaddr *)&un, sizeof un) < 0) { close(gs); if (!appended) f->npeers--; return -1; }
     struct sockaddr_un gu;
     memset(&gu, 0, sizeof gu);
     gu.sun_family = AF_UNIX;
     snprintf(gu.sun_path, sizeof gu.sun_path, "%s", f->upath);
-    if (connect(gs, (struct sockaddr *)&gu, sizeof gu) < 0) { close(gs); unlink(un.sun_path); return -1; }
+    if (connect(gs, (struct sockaddr *)&gu, sizeof gu) < 0) {
+        close(gs);
+        unlink(un.sun_path);
+        if (!appended) f->npeers--;
+        return -1;
+    }
     if (appended) f->npeers++;
     f->peers[slot].used = 1;
     f->peers[slot].gs = gs;
@@ -548,7 +565,7 @@ static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t 
 static void *udp_fwd_thread(void *p) {
     struct udp_fwd *f = (struct udp_fwd *)p; // heap-owned by this thread for its lifetime
     int hs = socket(AF_INET, SOCK_DGRAM, 0);
-    if (hs < 0) { free(f); return NULL; }
+    if (hs < 0) { fwd_unmark(g_udp_fwd_started, &g_nudpfwd, f->hport); free(f); return NULL; }
     int on = 1;
     setsockopt(hs, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     struct sockaddr_in sin;
@@ -558,6 +575,7 @@ static void *udp_fwd_thread(void *p) {
     sin.sin_addr.s_addr = htonl(INADDR_ANY); // 0.0.0.0:HOST_PORT (docker's default publish address)
     if (bind(hs, (struct sockaddr *)&sin, sizeof sin) < 0) { // host port busy -> no forwarding
         close(hs);
+        fwd_unmark(g_udp_fwd_started, &g_nudpfwd, f->hport); // transient busy: allow a later bind() to retry (F7)
         free(f);
         return NULL;
     }
@@ -596,7 +614,9 @@ static void *udp_fwd_thread(void *p) {
             for (int j = 1; j < n; j++)
                 if (pf[j].fd == f->peers[i].gs && (pf[j].revents & (POLLIN | POLLERR))) { hit = 1; break; }
             if (!hit) continue;
-            ssize_t r = recv(f->peers[i].gs, buf, sizeof buf, 0);
+            // Non-blocking: the pre-poll pf[] readiness can match a REUSED fd-number of an evicted+recreated
+            // peer socket; a blocking recv() would then hang forever. EAGAIN -> spurious wakeup, just skip (F4).
+            ssize_t r = recv(f->peers[i].gs, buf, sizeof buf, MSG_DONTWAIT);
             if (r >= 0)
                 sendto(hs, buf, (size_t)r, 0, (struct sockaddr *)&f->peers[i].caddr, f->peers[i].calen);
         }
@@ -607,9 +627,6 @@ static void *udp_fwd_thread(void *p) {
     free(f);
     return NULL;
 }
-// Host ports we've already spun up a UDP forwarder for (idempotent across re-bind / SO_REUSEADDR).
-static uint16_t g_udp_fwd_started[32];
-static int g_nudpfwd;
 // Called from the UDP bind hook once a published switch-backed datagram socket is bound: start its host
 // forwarder. Mirrors fwd_maybe_start() but triggers at bind (UDP has no listen) and keys off g_*_port,
 // which the bind hook just set on this fd.
@@ -629,10 +646,10 @@ static void udp_fwd_maybe_start(int fd) {
     if (!f) return;
     f->hport = hport;
     snprintf(f->upath, sizeof f->upath, "%s", upath);
+    g_udp_fwd_started[g_nudpfwd++] = hport; // mark BEFORE create; thread unmarks on bind fail (F7)
     pthread_t t;
-    if (pthread_create(&t, NULL, udp_fwd_thread, f) != 0) { free(f); return; }
+    if (pthread_create(&t, NULL, udp_fwd_thread, f) != 0) { free(f); g_nudpfwd--; return; }
     pthread_detach(t);
-    g_udp_fwd_started[g_nudpfwd++] = hport;
 }
 // UDP bind hook: if `fd` is an AF_INET datagram socket binding a PUBLISHED container port on the bridge
 // (0.0.0.0/own-ip/in-subnet) or private loopback, swap it onto an AF_UNIX/SOCK_DGRAM switch socket and

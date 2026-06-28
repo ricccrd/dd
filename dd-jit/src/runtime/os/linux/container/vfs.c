@@ -120,10 +120,18 @@ static int memf_attach(int fd, off_t init, off_t pos) {
     if (!m) return 0;
     if (init > 0) {
         if (memf_reserve(m, (size_t)init)) { free(m); return 0; }
+        off_t got = 0;
         for (off_t o = 0; o < init;) { // slurp existing bytes from the real fd into RAM
             ssize_t r = pread(fd, m->buf + o, (size_t)(init - o), o);
             if (r <= 0) break;
             o += r;
+            got = o;
+        }
+        if (got != init) { // unreadable fd / short read: zero-filling the tail would read back as zeros and
+            free(m->buf);  // a later memf_materialize would pwrite those zeros over real on-disk bytes (data
+            free(m);       // loss). Abort the adoption and fall back to the plain host fd (F1).
+            g_memf[fd] = NULL;
+            return 0;
         }
         m->size = (size_t)init;
     }
@@ -265,7 +273,9 @@ static void memf_try_adopt(uint64_t dev, uint64_t ino) {
     if (found < 0) return;
     struct stat s;
     if (fstat(found, &s) != 0 || !S_ISREG(s.st_mode) || s.st_nlink != 0) return;
-    memf_attach(found, s.st_size, lseek(found, 0, SEEK_CUR));
+    int fl = fcntl(found, F_GETFL); // only adopt an O_RDWR fd: a RAM cache serves both reads and writes, so
+    if (fl < 0 || (fl & O_ACCMODE) != O_RDWR) return; // adopting an O_RDONLY/O_WRONLY scratch fd would accept
+    memf_attach(found, s.st_size, lseek(found, 0, SEEK_CUR)); // I/O the kernel would reject with EBADF (F2).
 }
 
 #include "vfs/gmap.c"

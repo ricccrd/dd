@@ -104,7 +104,19 @@ static void service_local(struct cpu *c) {
         case 67:                                                  // pread64(fd, BUF, count, off)
         case 68:                                                  // pwrite64(fd, BUF, count, off)
         case 65:                                                  // readv(fd, IOVEC, n)  -- array base only
+        case 200:                                                 // bind(fd, SOCKADDR, alen)
+        case 203:                                                 // connect(fd, SOCKADDR, alen)
+        case 204:                                                 // getsockname(fd, ADDR, alen)
+        case 205:                                                 // getpeername(fd, ADDR, alen)
+        case 202:                                                 // accept(fd, ADDR, alen)
+        case 242:                                                 // accept4(fd, ADDR, alen, flags)
+        case 61:                                                  // getdents64(fd, DIRENT_BUF, count)
+        case 113:                                                 // clock_gettime(clkid, TIMESPEC)
         case 66: a1 = nonpie_p(a1); break;                        // writev(fd, IOVEC, n) -- array base only
+        case 17:                                                  // getcwd(BUF, size)
+        case 160:                                                 // uname(UTSBUF)
+        case 73: a0 = nonpie_p(a0); break;                        // ppoll(FDS, n, tmo, sigmask, sz)
+        case 207:                                                 // recvfrom(fd, BUF, len, fl, SRCADDR, alen)
         case 206: a1 = nonpie_p(a1); a4 = nonpie_p(a4); break;    // sendto(fd, BUF, len, fl, SOCKADDR, alen)
         case 211:                                                 // sendmsg(fd, MSGHDR, flags) -- top only
         case 212: a1 = nonpie_p(a1); break;                       // recvmsg(fd, MSGHDR, flags) -- top only
