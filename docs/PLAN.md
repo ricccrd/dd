@@ -37,13 +37,17 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
   fault). `-pagezero_size 0x1000` + pinning the non-PIE low **fully fixes it** but broke the PIE common case
   (reverted). **Achievable fix:** small `__PAGEZERO` + force every *other* mapping (PIE image/heap/stack/
   mmaps) to a high hint so only the non-PIE uses the low region (or an arm64 load/store fault-fixup at
-  `+bias`). Unblocks the `compile` group (xfail today).
+  `+bias`). **Attempted + REVERTED:** shrinking `__PAGEZERO` crashes the aarch64 JIT *host* binary (its own
+  segments + the PROT_NONE guard land in the freed low band → all aarch64 guests fail). Confirms this is a
+  genuine platform limitation; needs a host-layout-safe approach or stays off-the-list. `docs/design/fix-nonpie-crash.md`.
 - **busybox flaky fork+exec tail** → `docs/design/research-busybox-crash.md` + **`docs/design/dual-map-cache.md`**.
   Root cause: W^X/`MAP_JIT` execute-permission fault in the fork child (per-thread APRR isn't reliable across
   fork). First mitigation applied (re-assert execute in the child) — insufficient. **Robust fix (PR-ready):**
   the **dual-mapped RX/RW code cache** (`mach_vm_remap` a RW alias, route cache stores through `cw()`,
-  execute stays RX in the page tables → survives fork). Also closes the `soak/smc` RWX gap below.
-- **x86 busybox `sort` SIGSEGV** — ROOT-CAUSED + **fix applied** (pending matrix gate): the `0x90` NOP
+  execute stays RX in the page tables → survives fork). Also closes the `soak/smc` RWX gap below. **Spine
+  designed; activation deferred** — needs ~20 frontend emit sites routed through `cw()` first (else the live
+  alias APRR-faults every block); the inert spine was reverted from the safe batch.
+- **x86 busybox `sort` SIGSEGV** — ✅ **FIXED** (committed, matrix 240 green): the `0x90` NOP
   handler ignored `REX.B`, so `49 90` (`xchg rax,r8`, the `call malloc; xchg %rax,%r8` allocator idiom) was
   dropped → stale `r8` → wild memset → SIGSEGV. Differential-proven (qemu 66 vs jit 153); data-INDEPENDENT
   (the "large input" framing was an empty-piped-stdin artifact). See `docs/design/fix-x86-busybox-sort.md`.
