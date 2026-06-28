@@ -188,6 +188,58 @@ static int procfd_num(const char *p) {
         if (*s < '0' || *s > '9') return -1; // trailing path component -> not a bare fd link
     return atoi(rest);
 }
+// ===== w3e EPOLL FAST PATH (gate: NOEPOLLOPT=1 reverts to the original per-ctl kevent path) =====
+// The baseline emulates epoll over a per-epoll-fd kqueue, but issues a *separate* kevent() syscall
+// for every epoll_ctl (and one per filter), then another for epoll_wait. For server event loops that
+// rearm (EPOLLONESHOT) or toggle EPOLLOUT every request, that is one extra kevent round-trip per
+// request. This path instead BUFFERS the epoll_ctl changes per epoll-fd and submits them as the
+// *changelist* argument of the next epoll_wait kevent() — folding all pending registration changes
+// into the single wait syscall (the classic libevent/libev kqueue batching). It also tracks the
+// armed read/write filter per guest fd so EPOLL_CTL_MOD correctly removes a dropped filter (the
+// baseline leaves a stale EVFILT_WRITE armed on a MOD from IN|OUT->IN), without emitting spurious
+// EV_DELETEs that would error.  Tables are indexed by fd<1024 (matches every other fd table here);
+// epfd/fd >= 1024 fall back to the immediate path.
+static int g_epopt = -1;                       // -1 unknown, 0 off, 1 on
+static struct kevent *g_ep_chg[1024];          // deferred changelist per epoll fd
+static int g_ep_chgn[1024], g_ep_chgcap[1024];
+static uint8_t g_ep_rd[1024], g_ep_wr[1024];   // per guest fd: read/write filter currently armed
+static uint8_t g_ep_os[1024];                  // per guest fd: EPOLLONESHOT requested (kernel auto-removes on fire)
+static unsigned long long g_ep_kevent_calls;   // PROF: kevent() syscalls issued by the epoll path
+static int g_epprof = -1;
+static int epopt_on(void) {
+    if (g_epopt < 0) { const char *e = getenv("NOEPOLLOPT"); g_epopt = (e && e[0] == '1') ? 0 : 1; }
+    return g_epopt;
+}
+static void ep_prof_dump(void) {
+    if (g_epprof == 1) fprintf(stderr, "[ddepollprof] epoll_kevent_syscalls=%llu\n", g_ep_kevent_calls);
+}
+static void ep_count(void) {
+    if (g_epprof < 0) { const char *e = getenv("DDEPOLLPROF"); g_epprof = (e && e[0] == '1') ? 1 : 0;
+                        if (g_epprof) atexit(ep_prof_dump); }
+    if (g_epprof == 1) g_ep_kevent_calls++;
+}
+// append a change to epfd's buffer, coalescing on (ident,filter) so repeated ctls collapse.
+static void ep_push(int ep, uintptr_t ident, int16_t filt, uint16_t flags, void *udata) {
+    if (ep < 0 || ep >= 1024) return;
+    struct kevent *a = g_ep_chg[ep];
+    for (int i = 0; i < g_ep_chgn[ep]; i++)
+        if (a[i].ident == ident && a[i].filter == filt) { EV_SET(&a[i], ident, filt, flags, 0, 0, udata); return; }
+    if (g_ep_chgn[ep] >= g_ep_chgcap[ep]) {
+        int nc = g_ep_chgcap[ep] ? g_ep_chgcap[ep] * 2 : 16;
+        struct kevent *na = realloc(a, (size_t)nc * sizeof *na);
+        if (!na) return;
+        g_ep_chg[ep] = na; g_ep_chgcap[ep] = nc; a = na;
+    }
+    EV_SET(&a[g_ep_chgn[ep]++], ident, filt, flags, 0, 0, udata);
+}
+// reset epoll armed-state for a guest fd (called from close(): kqueue auto-removes a closed fd, so the
+// armed map must follow to avoid a later stale EV_DELETE on a reused fd number).
+static void ep_fd_reset(int fd) {
+    if (fd < 0 || fd >= 1024) return;
+    g_ep_rd[fd] = g_ep_wr[fd] = g_ep_os[fd] = 0;
+    if (g_ep_chg[fd]) { free(g_ep_chg[fd]); g_ep_chg[fd] = NULL; } // if fd was an epoll fd, drop its pending changelist
+    g_ep_chgn[fd] = g_ep_chgcap[fd] = 0;
+}
 static void service(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
@@ -1295,6 +1347,7 @@ static void service(struct cpu *c) {
             g_br_ip[cf] = 0;
             g_eventfd_count[cf] = 0;
             g_eventfd_sema[cf] = 0;
+            ep_fd_reset(cf); // w3e: drop epoll armed-state (kqueue auto-removes a closed fd)
         // reap eventfd peer / timerfd / overlay dir / loopback
         }
         dirs_drop(cf); // invalidate the getdents DIR* cache so a reused fd re-opendir's
@@ -1852,6 +1905,7 @@ static void service(struct cpu *c) {
                     (unsigned long long)g_prof_cross, (unsigned long long)g_prof_sys, (unsigned long long)g_prof_miss,
                     (unsigned long long)(g_prof_cross - g_prof_sys - g_prof_miss), (unsigned long long)g_prof_xlate,
                     (unsigned long long)g_lse_n);
+        ep_prof_dump(); // w3e: flush epoll kevent-syscall counter (atexit is bypassed by _exit)
         _exit((int)a0);
     case 96:
         G_RET(c) = (uint64_t)getpid();
@@ -3046,13 +3100,25 @@ static void service(struct cpu *c) {
             memcpy(&data, (void *)(a3 + 4), 8);
         // struct epoll_event {u32 events; u64 data} packed
         }
+        // op: 1=ADD 2=DEL 3=MOD ; EPOLLET=0x80000000 -> EV_CLEAR ; EPOLLONESHOT=0x40000000 -> EV_ONESHOT
+        uint16_t xf = (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0));
+        int want_rd = (op != 2) && (ev & 0x1);   // EPOLLIN
+        int want_wr = (op != 2) && (ev & 0x4);   // EPOLLOUT
+        if (epopt_on() && (int)a0 >= 0 && (int)a0 < 1024 && fd >= 0 && fd < 1024) {
+            // W3E fast path: track armed filters, defer the change to the next epoll_wait kevent().
+            int ep = (int)a0;
+            if (want_rd) { ep_push(ep, fd, EVFILT_READ, EV_ADD | xf, (void *)data); g_ep_rd[fd] = 1; }
+            else if (g_ep_rd[fd]) { ep_push(ep, fd, EVFILT_READ, EV_DELETE, (void *)data); g_ep_rd[fd] = 0; }
+            if (want_wr) { ep_push(ep, fd, EVFILT_WRITE, EV_ADD | xf, (void *)data); g_ep_wr[fd] = 1; }
+            else if (g_ep_wr[fd]) { ep_push(ep, fd, EVFILT_WRITE, EV_DELETE, (void *)data); g_ep_wr[fd] = 0; }
+            g_ep_os[fd] = (op != 2 && (ev & 0x40000000u)) ? 1 : 0;
+            G_RET(c) = 0;
+            break;
+        }
+        // ---- original immediate path (NOEPOLLOPT=1 or fd/epfd out of range) ----
         struct kevent kv[2];
         int n = 0;
-        // op: 1=ADD 2=DEL 3=MOD
         uint16_t base = (op == 2) ? EV_DELETE : EV_ADD;
-        uint16_t xf =
-            // EPOLLET/ONESHOT
-            (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0));
         if (op == 2 || (ev & 0x1)) {
             EV_SET(&kv[n], fd, EVFILT_READ, base | xf, 0, 0, (void *)data);
             n++;
@@ -3063,9 +3129,11 @@ static void service(struct cpu *c) {
             n++;
         // EPOLLOUT
         }
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
             // per-filter so DEL of an absent one is ignored
             kevent((int)a0, &kv[i], 1, NULL, 0, NULL);
+            ep_count();
+        }
         G_RET(c) = 0;
         break;
     }
@@ -3081,22 +3149,58 @@ static void service(struct cpu *c) {
             ts.tv_nsec = (long)((int)a3 % 1000) * 1000000L;
             tp = &ts;
         }
-        int r = kevent((int)a0, NULL, 0, kv, maxev, tp);
+        uint8_t *out = (uint8_t *)a1;
+        int ep = (int)a0;
+        int opt = epopt_on() && ep >= 0 && ep < 1024;
+        // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall.
+        struct kevent *chg = opt ? g_ep_chg[ep] : NULL;
+        int nchg = opt ? g_ep_chgn[ep] : 0;
+        int r = kevent(ep, chg, nchg, kv, maxev, tp);
+        ep_count();
+        if (opt) g_ep_chgn[ep] = 0; // consumed
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        uint8_t *out = (uint8_t *)a1;
-        for (int i = 0; i < r; i++) {
+        int oi = 0;
+        for (int i = 0; i < r && oi < maxev; i++) {
+            // An EV_ERROR entry is a *changelist* processing result (errno in .data), NOT a readiness
+            // event. With correct armed-state tracking these do not occur; skip them if they do.
+            if (opt && (kv[i].flags & EV_ERROR)) continue;
             uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
             // EPOLLHUP
             if (kv[i].flags & EV_EOF) ev |= 0x10u;
-            // EPOLLERR
-            if (kv[i].flags & EV_ERROR) ev |= 0x8u;
-            *(uint32_t *)(out + i * 12) = ev;
-            memcpy(out + i * 12 + 4, &kv[i].udata, 8);
+            // EPOLLERR (immediate-path semantics preserved when opt is off)
+            if (!opt && (kv[i].flags & EV_ERROR)) ev |= 0x8u;
+            *(uint32_t *)(out + oi * 12) = ev;
+            memcpy(out + oi * 12 + 4, &kv[i].udata, 8);
+            // EPOLLONESHOT: the kernel auto-removed this registration; keep our armed map in sync.
+            if (opt && kv[i].ident < 1024 && g_ep_os[kv[i].ident]) {
+                if (kv[i].filter == EVFILT_READ) g_ep_rd[kv[i].ident] = 0;
+                else if (kv[i].filter == EVFILT_WRITE) g_ep_wr[kv[i].ident] = 0;
+            }
+            oi++;
         }
-        G_RET(c) = (uint64_t)r;
+        // Safety net: if the combined call returned only change-errors (no readiness) yet the guest
+        // asked to block, honor the wait with a clean no-change kevent so it can't busy-spin.
+        if (opt && oi == 0 && r > 0 && nchg > 0 && (int)a3 != 0) {
+            int r2 = kevent(ep, NULL, 0, kv, maxev, tp);
+            ep_count();
+            if (r2 < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            for (int i = 0; i < r2 && oi < maxev; i++) {
+                if (kv[i].flags & EV_ERROR) continue;
+                uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
+                if (kv[i].flags & EV_EOF) ev |= 0x10u;
+                *(uint32_t *)(out + oi * 12) = ev;
+                memcpy(out + oi * 12 + 4, &kv[i].udata, 8);
+                if (kv[i].ident < 1024 && g_ep_os[kv[i].ident]) {
+                    if (kv[i].filter == EVFILT_READ) g_ep_rd[kv[i].ident] = 0;
+                    else if (kv[i].filter == EVFILT_WRITE) g_ep_wr[kv[i].ident] = 0;
+                }
+                oi++;
+            }
+        }
+        G_RET(c) = (uint64_t)oi;
         break;
     }
     case 26: {
