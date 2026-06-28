@@ -69,6 +69,45 @@ static void dirs_drop(int fd) {
     for (int i = 0; i < g_ndirs; i++)
         if (g_dirs[i].fd == fd) { closedir(g_dirs[i].d); g_dirs[i] = g_dirs[--g_ndirs]; return; }
 }
+// Parse a "#!" shebang line. `host_path` is the RESOLVED HOST path of a candidate program. If the file
+// begins with "#!", fills `interp` (size ni) with the interpreter path and `arg` (size na) with the
+// optional single argument (arg[0]==0 when there is none) and returns 1. Returns 0 when it is not a
+// shebang script, -1 when the file can't be opened/read. Shared by execve (case 221) and the initial
+// program loader (jit_run): both then rewrite argv to [interp, (arg), scriptpath, args...] and load the
+// INTERPRETER instead of the script. load_elf has no ELF-magic/#! check, so the script bytes would
+// otherwise be parsed as a bogus ELF and fault.
+static int parse_shebang(const char *host_path, char *interp, size_t ni, char *arg, size_t na) {
+    int fd = open(host_path, O_RDONLY);
+    char hdr[258];
+    ssize_t k = fd >= 0 ? read(fd, hdr, sizeof hdr - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (k < 0) return -1;
+    if (k <= 3 || hdr[0] != '#' || hdr[1] != '!') return 0;
+    hdr[k] = 0;
+    char *nl = strchr(hdr, '\n');
+    if (nl) *nl = 0;
+    char *s = hdr + 2;
+    while (*s == ' ' || *s == '\t')
+        // interpreter path
+        s++;
+    char *e = s;
+    while (*e && *e != ' ' && *e != '\t')
+        e++;
+    char *a = NULL;
+    if (*e) {
+        *e = 0;
+        a = e + 1;
+        while (*a == ' ' || *a == '\t')
+            a++;
+        if (!*a) a = NULL;
+    }
+    snprintf(interp, ni, "%s", s);
+    if (a)
+        snprintf(arg, na, "%s", a);
+    else
+        arg[0] = 0;
+    return 1;
+}
 static void service(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
@@ -1702,56 +1741,28 @@ static void service(struct cpu *c) {
             ac++;
         }
         argv[ac] = NULL;
-        // shebang: exec the #! interpreter instead
+        // shebang: exec the #! interpreter instead (parse_shebang is shared with the initial loader)
         char sh_interp[256], sh_arg[256], shpb[4200];
-        {
-            int sfd = open(p, O_RDONLY);
-            char hdr[258];
-            ssize_t k = sfd >= 0 ? read(sfd, hdr, sizeof hdr - 1) : -1;
-            if (sfd >= 0) close(sfd);
-            if (k > 3 && hdr[0] == '#' && hdr[1] == '!') {
-                hdr[k] = 0;
-                char *nl = strchr(hdr, '\n');
-                if (nl) *nl = 0;
-                char *s = hdr + 2;
-                while (*s == ' ' || *s == '\t')
-                    // interpreter path
-                    s++;
-                char *e = s;
-                while (*e && *e != ' ' && *e != '\t')
-                    e++;
-                char *arg = NULL;
-                if (*e) {
-                    *e = 0;
-                    arg = e + 1;
-                    while (*arg == ' ' || *arg == '\t')
-                        arg++;
-                    if (!*arg) arg = NULL;
-                }
-                snprintf(sh_interp, sizeof sh_interp, "%s", s);
-                char *na[258];
-                int ni = 0;
-                // [interp, (optarg), scriptpath, args...]
-                na[ni++] = sh_interp;
-                if (arg) {
-                    snprintf(sh_arg, sizeof sh_arg, "%s", arg);
-                    na[ni++] = sh_arg;
-                }
-                // the guest script path (interp re-opens it)
-                na[ni++] = (char *)a0;
-                for (int i = 1; i < ac && ni < 256; i++)
-                    na[ni++] = argv[i];
-                na[ni] = NULL;
-                // load the interpreter, not the script
-                p = xresolve_exec(sh_interp, shpb, sizeof shpb);
-                if (access(p, F_OK) != 0) {
-                    G_RET(c) = (uint64_t)(-2);
-                    break;
-                }
-                for (int i = 0; i <= ni; i++)
-                    argv[i] = na[i];
-                ac = ni;
+        if (parse_shebang(p, sh_interp, sizeof sh_interp, sh_arg, sizeof sh_arg) == 1) {
+            char *na[258];
+            int ni = 0;
+            // [interp, (optarg), scriptpath, args...]
+            na[ni++] = sh_interp;
+            if (sh_arg[0]) na[ni++] = sh_arg;
+            // the guest script path (interp re-opens it)
+            na[ni++] = (char *)a0;
+            for (int i = 1; i < ac && ni < 256; i++)
+                na[ni++] = argv[i];
+            na[ni] = NULL;
+            // load the interpreter, not the script
+            p = xresolve_exec(sh_interp, shpb, sizeof shpb);
+            if (access(p, F_OK) != 0) {
+                G_RET(c) = (uint64_t)(-2);
+                break;
             }
+            for (int i = 0; i <= ni; i++)
+                argv[i] = na[i];
+            ac = ni;
         }
         // Tear down the inherited guest address space before loading the new image: a post-fork exec
         // otherwise keeps the parent's DENSE layout, and load_elf must bias a non-PIE ET_EXEC off its

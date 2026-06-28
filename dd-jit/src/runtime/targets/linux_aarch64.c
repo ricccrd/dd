@@ -306,6 +306,30 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     const char *prog_host =
         // resolve through the overlay (upper, then lowers) + follow the entry symlink (/bin/sh->busybox)
         xresolve_overlay(prog, pb, sizeof pb);
+
+    // Initial-exec shebang handling -- mirror of execve case 221 via the shared parse_shebang() helper.
+    // The container entry may itself be a "#!" script (e.g. postgres' docker-entrypoint.sh). load_elf has
+    // no ELF-magic/#! check, so it would parse the script text as a bogus ELF and fault before any guest
+    // syscall runs. If the entry is a shebang, rewrite argv to [interp, (optarg), scriptpath, args...] and
+    // load the INTERPRETER instead. A missing/non-shebang ELF falls straight through unchanged below.
+    char sh_interp[256], sh_arg[256];
+    char *sb_argv[256];
+    if (parse_shebang(prog_host, sh_interp, sizeof sh_interp, sh_arg, sizeof sh_arg) == 1) {
+        int sb_argc = 0;
+        sb_argv[sb_argc++] = sh_interp;
+        if (sh_arg[0]) sb_argv[sb_argc++] = sh_arg;
+        // the guest script path (interp re-opens it through the jail); `prog` is pre-shebang, find_in_path-resolved
+        sb_argv[sb_argc++] = (char *)prog;
+        for (int i = 1; i < argc && sb_argc < 255; i++)
+            sb_argv[sb_argc++] = (char *)argv[i];
+        sb_argv[sb_argc] = NULL;
+        argc = sb_argc;
+        argv = (char *const *)sb_argv;
+        // resolve the interpreter through the overlay/jail, exactly as the main program was resolved above
+        prog = sh_interp;
+        g_exe_path = sh_interp; // the binary actually loaded (matches /proc/self/exe for a script exec)
+        prog_host = xresolve_overlay(sh_interp, pb, sizeof pb);
+    }
     struct loaded lm;
     load_elf(prog_host, &lm);
 
