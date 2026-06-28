@@ -503,9 +503,9 @@ fn resolve_cli() -> Option<PathBuf> {
     }
     let names = ["ddcli", "dd"]; // whichever the CLI is built as
     // Prefer the *installed* bundle so the symlink stays valid across relaunches and updates
-    // (which replace /Applications/dd-app.app in place), not the dev copy we run from.
+    // (which replace /Applications/dd.app in place), not the dev copy we run from.
     for n in names {
-        let p = PathBuf::from("/Applications/dd-app.app/Contents/Resources").join(n);
+        let p = PathBuf::from("/Applications/dd.app/Contents/Resources").join(n);
         if p.exists() {
             return Some(p);
         }

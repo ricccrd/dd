@@ -30,14 +30,14 @@ bench: jit      ## speed: same Linux binary in the VM (native/qemu) vs through d
 	cargo run -q -p dd-tests --release --bin bench
 fmt:            ## clang-format the decomposed C (jit/ os/linux/ frontend/ include/ targets/)
 	cd dd-jit/src/runtime && find jit os/linux frontend include targets -name '*.c' -o -name '*.h' | xargs clang-format -i
-app:            ## build + assemble & ad-hoc-sign build/dd-app.app (the GTK GUI bundle; macOS)
+app:            ## build + assemble & ad-hoc-sign build/dd.app (the GTK GUI bundle; macOS)
 	@chmod +x tools/bundle.sh tools/make-dmg.sh
 	cargo build --release -p dd-daemon -p dd-cli   # native toolchain: builds + allow-jit-signs the ddjit-* engines
 	DD_VERSION=$(VERSION) $(NIX_DEV) tools/bundle.sh $(VERSION)   # DD_VERSION -> baked into the dd-app binary
 dmg: app        ## build dist/dd-<ver>-<arch>.dmg from the app bundle (macOS)
 	$(NIX_DEV) tools/make-dmg.sh $(VERSION)
 install: app    ## copy the app to /Applications and run `dd install` (per-user, no root)
-	rm -rf /Applications/dd-app.app && cp -R target/dd-app.app /Applications/
+	rm -rf /Applications/dd.app && cp -R target/dd.app /Applications/
 	cargo run -q -p dd-cli -- install
 uninstall:      ## remove the daemon agent + docker context (keeps ~/.dd unless --purge)
 	cargo run -q -p dd-cli -- uninstall

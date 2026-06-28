@@ -649,7 +649,7 @@ pub(crate) fn cat_row(icon: &str, label: &str) -> gtk::ListBoxRow {
 
 // ---- bundle environment ----------------------------------------------------
 
-/// When running from inside `dd-app.app`, point GTK at the bundled runtime data. No-op for a dev
+/// When running from inside `dd.app`, point GTK at the bundled runtime data. No-op for a dev
 /// build (the Resources/Frameworks dirs won't exist), and never overrides an env var already set.
 pub fn setup_bundle_env() {
     let Ok(exe) = std::env::current_exe() else { return };

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 pub const AGENT_LABEL: &str = "com.dd.daemon";
 
 /// Installed app-bundle location (where `dd install` expects the signed `.app`).
-pub const APP_BUNDLE: &str = "/Applications/dd-app.app";
+pub const APP_BUNDLE: &str = "/Applications/dd.app";
 
 /// `$HOME`, or `.` as a last resort.
 pub fn home() -> PathBuf {

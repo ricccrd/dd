@@ -83,6 +83,16 @@ jobs:
           name: ${{ steps.dmg.outputs.name }}
           path: ${{ steps.dmg.outputs.path }}
 
+      # Drop any assets from a prior run of this tag (e.g. an old-named .dmg) so the
+      # release ends up with exactly the current dd.dmg, not a pile of stale files.
+      - name: Remove stale release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" --json assets -q '.assets[].name' 2>/dev/null \
+            | while read -r a; do [ -n "$a" ] && gh release delete-asset "${{ github.ref_name }}" "$a" --yes || true; done || true
+
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2

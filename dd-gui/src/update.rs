@@ -1,5 +1,5 @@
 //! Dead-simple self-update: ask GitHub for the latest release and, if it's newer than the running
-//! version, download its `.dmg` and swap `/Applications/dd-app.app`. Uses `curl` + `hdiutil`
+//! version, download its `.dmg` and swap `/Applications/dd.app`. Uses `curl` + `hdiutil`
 //! (always present on macOS), so no HTTP/TLS dependencies.
 
 use serde::Deserialize;
@@ -51,7 +51,7 @@ pub fn check(current: &str) -> Option<Release> {
     Some(Release { version, dmg, page: gh.html_url })
 }
 
-/// Download the release `.dmg`, replace `/Applications/dd-app.app`, clear quarantine and reopen.
+/// Download the release `.dmg`, replace `/Applications/dd.app`, clear quarantine and reopen.
 /// Blocking; the caller should quit after this succeeds (the new copy is already launching).
 pub fn install(rel: &Release) -> Result<(), String> {
     let tmp = std::env::temp_dir().join("dd-update");
@@ -64,7 +64,7 @@ pub fn install(rel: &Release) -> Result<(), String> {
         .ok()
         .and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "app")))
         .ok_or("no .app inside the dmg")?;
-    let dest = "/Applications/dd-app.app";
+    let dest = "/Applications/dd.app";
     let _ = std::fs::remove_dir_all(dest);
     let copied = sh("cp", &["-R", &app.to_string_lossy(), "/Applications/"]);
     let _ = sh("hdiutil", &["detach", &mnt.to_string_lossy(), "-force"]);

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Build a distributable .dmg from build/dd-app.app. Run after tools/bundle.sh.
+# Build a distributable .dmg from build/dd.app. Run after tools/bundle.sh.
 #   nix develop "path:$PWD/nix" --command tools/make-dmg.sh   (Makefile `dmg` target)
 #
 # The .dmg is unsigned/ad-hoc like the app: on first launch users must right-click -> Open,
-# or run `xattr -dr com.apple.quarantine /Applications/dd-app.app` (also printed by `dd doctor`).
+# or run `xattr -dr com.apple.quarantine /Applications/dd.app` (also printed by `dd doctor`).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-0.1.0}"
-APP="$ROOT/target/dd-app.app"
+APP="$ROOT/target/dd.app"
 ARCH="$(uname -m)"
 DIST="$ROOT/target/dist"
-OUT="$DIST/dd-$VERSION-$ARCH.dmg"
+OUT="$DIST/dd.dmg"
 
 [ -d "$APP" ] || { echo "missing $APP — run tools/bundle.sh first" >&2; exit 1; }
 mkdir -p "$DIST"
@@ -22,9 +22,9 @@ if command -v create-dmg >/dev/null; then
   create-dmg \
     --volname "dd $VERSION" \
     --window-pos 200 120 --window-size 640 400 --icon-size 120 \
-    --icon "dd-app.app" 160 200 \
+    --icon "dd.app" 160 200 \
     --app-drop-link 480 200 \
-    --hide-extension "dd-app.app" \
+    --hide-extension "dd.app" \
     --no-internet-enable \
     "$OUT" "$APP" || true
 fi

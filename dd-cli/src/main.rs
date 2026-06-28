@@ -152,7 +152,7 @@ fn cmd_app() -> i32 {
             }
         }
     }
-    eprintln!("dd-app not found. Install it (drag dd-app.app to /Applications) or build with `make app`.");
+    eprintln!("dd-app not found. Install it (drag dd.app to /Applications) or build with `make app`.");
     1
 }
 
@@ -272,7 +272,7 @@ fn cmd_doctor() -> i32 {
         }
     } else {
         line(false, &format!("app not installed at {}", paths::APP_BUNDLE));
-        println!("    install: build with `make dmg`, then drag dd-app.app to /Applications");
+        println!("    install: build with `make dmg`, then drag dd.app to /Applications");
     }
 
     if !ok {

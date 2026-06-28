@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Assemble a self-contained, ad-hoc-signed dd-app.app on macOS.
+# Assemble a self-contained, ad-hoc-signed dd.app on macOS.
 #
 # Must run inside the GTK dev shell so the GTK build/runtime data and tools are on PATH:
 #   nix develop "path:$PWD/nix" --command tools/bundle.sh
 # (the Makefile `app` target does this for you).
 #
-# Produces build/dd-app.app with:
+# Produces build/dd.app with:
 #   Contents/MacOS/dd-app                     the GTK GUI
 #   Contents/Resources/dd-daemon, ddjit-*     the daemon + JIT engines (allow-jit signed)
 #   Contents/Frameworks/*.dylib               the relocated GTK dylib graph (dylibbundler)
@@ -16,7 +16,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-0.1.0}"
-APP="$ROOT/target/dd-app.app"   # under target/ (gitignored) — kept out of the repo root
+APP="$ROOT/target/dd.app"   # under target/ (gitignored) — kept out of the repo root
 C="$APP/Contents"; MACOS="$C/MacOS"; RES="$C/Resources"; FW="$C/Frameworks"
 ENT="$ROOT/dd-jit/jit.entitlements"
 
