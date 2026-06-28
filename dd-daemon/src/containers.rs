@@ -142,24 +142,98 @@ pub(crate) async fn containers_start(State(a): State<App>, Path(id): Path<String
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// stop / kill: containers run to completion synchronously, so there is no live process left to signal --
-/// mark the container exited and return success (docker treats 204 as "stopped"). A long-running model
-/// (background process + real signal delivery) is future work; the CLI verbs work today either way.
-pub(crate) async fn containers_stop(State(a): State<App>, Path(id): Path<String>) -> Response {
-    let mut g = a.inner.lock().await;
-    match resolve_cid(&g, &id) {
-        Some(full) => {
-            if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
-            crate::events::emit_event(&a.events, "container", "stop", &full, json!({}));
-            save_state(&g, &a.state_path);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        None => no_such(&id),
+#[derive(Deserialize)]
+pub(crate) struct StopQ { t: Option<i64>, signal: Option<String> }
+
+#[derive(Deserialize)]
+pub(crate) struct KillQ { signal: Option<String> }
+
+/// Map a docker signal token ("SIGTERM"/"TERM"/"15"/"9"/"SIGKILL"/...) to its libc number.
+/// Numeric tokens are taken verbatim; names are matched case-insensitively with or without the
+/// "SIG" prefix. Anything unrecognised falls back to `default`.
+fn parse_signal(s: &str, default: i32) -> i32 {
+    let t = s.trim();
+    if t.is_empty() { return default; }
+    if let Ok(n) = t.parse::<i32>() { return n; }
+    match t.to_ascii_uppercase().trim_start_matches("SIG") {
+        "TERM" => libc::SIGTERM,
+        "KILL" => libc::SIGKILL,
+        "INT"  => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "HUP"  => libc::SIGHUP,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        "STOP" => libc::SIGSTOP,
+        "CONT" => libc::SIGCONT,
+        _ => default,
     }
 }
 
-/// restart: just re-run the container in place.
-pub(crate) async fn containers_restart(a: State<App>, id: Path<String>) -> Response { containers_start(a, id).await }
+/// stop: deliver a REAL signal to the live JIT process (same mechanism as pause's
+/// `libc::kill(pid, SIGSTOP)`), wait up to `t` seconds for the guest to exit on its own, then
+/// SIGKILL if it's still alive. Containers with no live process keep the old mark-exited behavior.
+/// The wait polls the reaper-maintained container status without holding the inner lock across the
+/// `tokio::time::sleep`, and is bounded by `t` so the handler never hangs indefinitely.
+async fn do_stop(a: &App, id: &str, sig: i32, t: i64) -> Response {
+    // resolve + grab the live pid, then release the lock before any waiting.
+    let (full, pid) = {
+        let g = a.inner.lock().await;
+        let Some(full) = resolve_cid(&g, id) else { return no_such(id) };
+        let pid = g.live.get(&full).and_then(|l| *l.pid.lock().unwrap());
+        (full, pid)
+    };
+    if let Some(pid) = pid {
+        unsafe { libc::kill(pid as i32, sig); }                  // mirror of freeze()'s libc::kill
+        // give the guest up to `t` seconds to exit on its own; the spawn reaper (runtime.rs) flips
+        // status to "exited" when the process dies, so poll that rather than racing on pid reuse.
+        let mut waited = 0i64;
+        loop {
+            let exited = {
+                let g = a.inner.lock().await;
+                g.containers.get(&full).map(|c| c.status == "exited").unwrap_or(true)
+            };
+            if exited { break; }
+            if waited >= t * 1000 { unsafe { libc::kill(pid as i32, libc::SIGKILL); } break; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            waited += 100;
+        }
+    }
+    // mark exited (as before); the reaper sets the real exit_code when the signalled process dies.
+    let mut g = a.inner.lock().await;
+    if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
+    crate::events::emit_event(&a.events, "container", "stop", &full, json!({}));
+    save_state(&g, &a.state_path);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /containers/:id/stop?t=N&signal=SIG -- default signal SIGTERM, default t=10s.
+pub(crate) async fn containers_stop(State(a): State<App>, Path(id): Path<String>, Query(q): Query<StopQ>) -> Response {
+    let sig = q.signal.as_deref().map(|s| parse_signal(s, libc::SIGTERM)).unwrap_or(libc::SIGTERM);
+    let t = q.t.unwrap_or(10).max(0);
+    do_stop(&a, &id, sig, t).await
+}
+
+/// POST /containers/:id/kill?signal=SIG -- default signal SIGKILL, delivered immediately.
+pub(crate) async fn containers_kill(State(a): State<App>, Path(id): Path<String>, Query(q): Query<KillQ>) -> Response {
+    let mut g = a.inner.lock().await;
+    let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+    let sig = q.signal.as_deref().map(|s| parse_signal(s, libc::SIGKILL)).unwrap_or(libc::SIGKILL);
+    if let Some(pid) = g.live.get(&full).and_then(|l| *l.pid.lock().unwrap()) {
+        unsafe { libc::kill(pid as i32, sig); }                  // mirror of freeze()'s libc::kill
+    }
+    if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
+    crate::events::emit_event(&a.events, "container", "kill", &full, json!({}));
+    save_state(&g, &a.state_path);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// restart: stop the live process (real signal, via the new stop path) then re-run it in place.
+pub(crate) async fn containers_restart(State(a): State<App>, Path(id): Path<String>, Query(q): Query<StopQ>) -> Response {
+    let sig = q.signal.as_deref().map(|s| parse_signal(s, libc::SIGTERM)).unwrap_or(libc::SIGTERM);
+    let t = q.t.unwrap_or(10).max(0);
+    let _ = do_stop(&a, &id, sig, t).await;
+    containers_start(State(a), Path(id)).await
+}
 
 
 /// POST /containers/:id/attach -- hijack the connection and stream the guest's IO. `docker run` (no -d)

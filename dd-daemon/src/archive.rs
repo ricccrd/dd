@@ -40,23 +40,30 @@ pub(crate) struct ArchiveQ { path: String }
 /// Map a container path to its host path. A path inside a bind volume maps to the host volume dir (so
 /// `docker cp` to e.g. ddcli's mounted cwd hits the real files); otherwise it lands in the container
 /// rootfs (the overlay upper). `..` is lexically clamped inside whichever base so it can't escape.
-pub(crate) fn archive_host_path(rootfs: &str, binds: &[String], path: &str) -> std::path::PathBuf {
-    // bind volumes first (host:container with an absolute host source), same precedence as the JIT jail.
-    // The most specific (longest container-dest) bind wins so nested binds resolve to the right source;
-    // a requested path under a bind hits the HOST source, and only otherwise do we fall back to the rootfs.
-    let mut best: Option<(&str, &str)> = None; // (host source, container dest)
+pub(crate) fn archive_host_path(rootfs: &str, binds: &[String], volumes_dir: &str, path: &str) -> std::path::PathBuf {
+    // bind volumes first (host:container), same precedence as the JIT jail. The most specific
+    // (longest container-dest) bind wins so nested binds resolve to the right source; a requested path
+    // under a bind hits the HOST source, and only otherwise do we fall back to the rootfs.
+    let mut best: Option<(String, &str)> = None; // (host source dir, container dest)
     for b in binds {
         let Some((host, cont)) = b.split_once(':') else { continue };
-        if !host.starts_with('/') { continue; } // named volumes carry no absolute host source here
+        // A bind whose source is an absolute path is a host bind-mount; otherwise it's a NAMED VOLUME
+        // (`name:/path`) whose host dir is its directory under volumes_dir -- matching spawn_cfg's
+        // default-driver resolution (`<volumes_dir>/<name>`, which is the volume's mountpoint).
+        let src = if host.starts_with('/') {
+            host.to_string()
+        } else {
+            std::path::Path::new(volumes_dir).join(host).to_string_lossy().into_owned()
+        };
         let cont = cont.trim_end_matches('/');
         if path == cont || path.strip_prefix(cont).is_some_and(|r| r.starts_with('/')) {
-            if best.map_or(true, |(_, bc)| cont.len() > bc.len()) {
-                best = Some((host, cont));
+            if best.as_ref().map_or(true, |(_, bc)| cont.len() > bc.len()) {
+                best = Some((src, cont));
             }
         }
     }
     if let Some((host, cont)) = best {
-        return clamp_join(host, &path[cont.len()..]);
+        return clamp_join(&host, &path[cont.len()..]);
     }
     clamp_join(rootfs, path)
 }
@@ -105,7 +112,7 @@ pub(crate) fn path_stat_b64(host: &std::path::Path) -> Option<String> {
 pub(crate) async fn archive_head(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
     let g = a.inner.lock().await;
     let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-    match path_stat_b64(&archive_host_path(&c.rootfs, &c.binds, &q.path)) {
+    match path_stat_b64(&archive_host_path(&c.rootfs, &c.binds, &a.volumes_dir, &q.path)) {
         Some(stat) => (StatusCode::OK, [("X-Docker-Container-Path-Stat", stat)]).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(),
     }
@@ -116,7 +123,7 @@ pub(crate) async fn archive_get(State(a): State<App>, Path(id): Path<String>, Qu
     let (rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
         (c.rootfs.clone(), c.binds.clone()) };
-    let host = archive_host_path(&rootfs, &binds, &q.path);
+    let host = archive_host_path(&rootfs, &binds, &a.volumes_dir, &q.path);
     let Some(stat) = path_stat_b64(&host) else {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(); };
     let parent = host.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
@@ -134,7 +141,7 @@ pub(crate) async fn archive_put(State(a): State<App>, Path(id): Path<String>, Qu
     let (rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
         (c.rootfs.clone(), c.binds.clone()) };
-    let host = archive_host_path(&rootfs, &binds, &q.path);
+    let host = archive_host_path(&rootfs, &binds, &a.volumes_dir, &q.path);
     if !host.is_dir() {
         return (StatusCode::BAD_REQUEST, Json(json!({"message": format!("extraction point {} is not a directory", q.path)}))).into_response(); }
     let tmp = std::env::temp_dir().join(format!("dd-cp-{}.tar", std::process::id()));

@@ -142,7 +142,7 @@ pub(crate) async fn images_create(State(a): State<App>, Query(q): Query<ImageCre
     if a.inner.lock().await.images.iter()
         .any(|i| repo_tag(&i.name) == want && want_arch.map_or(true, |a| docker_arch(i.arch) == a))
     {
-        return pull_progress(&name, &tag, Ok(true));
+        return pull_progress(&name, &tag, Ok(true), "", 0);
     }
     let creds = registry_auth(&headers);
     let archs = platform_archs(q.platform.as_deref());
@@ -151,13 +151,17 @@ pub(crate) async fn images_create(State(a): State<App>, Query(q): Query<ImageCre
         .unwrap_or_else(|e| Err(format!("pull task crashed: {e}")));
     match res {
         Ok(img) => {
+            // Capture the synthetic content digest + rootfs size BEFORE the image is moved into state,
+            // so the progress stream can report a docker-shaped per-layer download for it.
+            let digest = format!("sha256:{}", fake_id(&img.name));
+            let size = image_size(&img.rootfs, &img.name);
             let mut g = a.inner.lock().await;
             g.images.retain(|i| repo_tag(&i.name) != want); // a re-pull (e.g. a new platform) replaces the old
             g.images.push(img);
             crate::events::emit_event(&a.events, "image", "pull", &want, json!({"name": want}));
-            pull_progress(&name, &tag, Ok(false))
+            pull_progress(&name, &tag, Ok(false), &digest, size)
         }
-        Err(e) => pull_progress(&name, &tag, Err(e)),
+        Err(e) => pull_progress(&name, &tag, Err(e), "", 0),
     }
 }
 
@@ -169,17 +173,34 @@ pub(crate) fn registry_auth(headers: &axum::http::HeaderMap) -> Credentials {
 }
 
 
-/// docker-style pull progress: a stream of JSON status lines the CLI renders.
-pub(crate) fn pull_progress(name: &str, tag: &str, result: Result<bool, String>) -> Response {
+/// docker-style pull progress: a newline-delimited stream of JSON status lines the CLI renders.
+///
+/// `digest`/`size` describe the pulled image (its synthetic content digest and on-disk rootfs size);
+/// they drive a docker-shaped per-layer progress sequence on a fresh pull. dd squashes an image to a
+/// single rootfs, so we surface ONE synthetic layer (id = first 12 hex of the digest) rather than the
+/// registry's real per-blob layers. See the registry note in the push helper for what real byte
+/// progress would require.
+pub(crate) fn pull_progress(name: &str, tag: &str, result: Result<bool, String>, digest: &str, size: i64) -> Response {
     let body = match result {
         Ok(true) => format!("{}\r\n", json!({ "status": format!("Status: Image is up to date for {name}:{tag}") })),
-        Ok(false) => [
-            json!({ "status": format!("Pulling from {}", image_ref(name, tag).repository) }).to_string(),
-            json!({ "status": "Verifying Checksum" }).to_string(),
-            json!({ "status": "Download complete" }).to_string(),
-            json!({ "status": "Pull complete" }).to_string(),
-            json!({ "status": format!("Status: Downloaded newer image for {name}:{tag}") }).to_string(),
-        ].join("\r\n") + "\r\n",
+        Ok(false) => {
+            let repo = image_ref(name, tag).repository;
+            let layer_id = digest.trim_start_matches("sha256:").chars().take(12).collect::<String>();
+            let layer = layer_id.as_str();
+            let half = (size / 2).max(0);
+            [
+                json!({ "status": format!("Pulling from {repo}"), "id": tag }).to_string(),
+                json!({ "status": "Pulling fs layer", "id": layer }).to_string(),
+                json!({ "status": "Downloading", "progressDetail": { "current": half, "total": size }, "id": layer }).to_string(),
+                json!({ "status": "Downloading", "progressDetail": { "current": size, "total": size }, "id": layer }).to_string(),
+                json!({ "status": "Verifying Checksum", "id": layer }).to_string(),
+                json!({ "status": "Download complete", "id": layer }).to_string(),
+                json!({ "status": "Extracting", "progressDetail": { "current": size, "total": size }, "id": layer }).to_string(),
+                json!({ "status": "Pull complete", "id": layer }).to_string(),
+                json!({ "status": format!("Digest: {digest}") }).to_string(),
+                json!({ "status": format!("Status: Downloaded newer image for {name}:{tag}") }).to_string(),
+            ].join("\r\n") + "\r\n"
+        }
         Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
     };
     (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()
@@ -322,18 +343,22 @@ pub(crate) async fn image_push(State(a): State<App>, Path(name): Path<String>, Q
             .cloned()
     };
     let Some(img) = img else {
-        return push_progress(&name, Err(format!("No such image: {name}"))).into_response();
+        return push_progress(&name, &want_tag, 0, Err(format!("No such image: {name}"))).into_response();
     };
     let tag = want_tag;
     let iref = image_ref(&img.name, &tag);
     let arch = docker_arch(img.arch).to_string();
     let os = img.arch.os().to_string(); // "darwin" for mac images, else "linux"
     let creds = registry_auth(&headers);
+    // On-disk rootfs size, captured before `img` is moved into the push task; reported as the layer
+    // `Size` in the push progress/aux lines (a real registry manifest size would need registry.rs to
+    // surface it — see note below).
+    let size = image_size(&img.rootfs, &img.name);
     let work = std::path::PathBuf::from(format!("{}/.push-{}", a.images_dir, std::process::id()));
     let res = tokio::task::spawn_blocking(move || {
         Client::new(iref, creds).push(std::path::Path::new(&img.rootfs), &img.cmd, &arch, &os, &work)
     }).await.unwrap_or_else(|e| Err(format!("push task crashed: {e}")));
-    push_progress(&name, res).into_response()
+    push_progress(&name, &tag, size, res).into_response()
 }
 
 
@@ -358,14 +383,33 @@ pub(crate) fn platform_archs(platform: Option<&str>) -> Vec<&'static str> {
 }
 
 
-/// docker-style push progress (a stream of JSON status lines, or an error line).
-pub(crate) fn push_progress(name: &str, result: Result<String, String>) -> Response {
+/// docker-style push progress: a newline-delimited stream of JSON status lines (or an error line).
+///
+/// `digest` is the manifest digest returned by `Client::push` (the registry's `Docker-Content-Digest`),
+/// `size` is the image's on-disk rootfs size used as the layer/aux `Size`. The stream ends with the
+/// `aux` line (which the docker CLI parses to print `digest: … size: …`) followed by the matching
+/// status line, so `docker push` reports the real pushed digest instead of a hardcoded `latest:`.
+///
+/// REPORT-only: a fully accurate `Size` would be the manifest byte length, not the rootfs size. The
+/// registry client computes both the layer size and the manifest bytes internally; if `Client::push`
+/// returned `(digest, manifest_size, layer_size)` instead of just the digest, dd could emit Docker's
+/// exact `size:` value and real per-blob byte progress here.
+pub(crate) fn push_progress(name: &str, tag: &str, size: i64, result: Result<String, String>) -> Response {
     let body = match result {
-        Ok(digest) => [
-            json!({ "status": format!("The push refers to repository [{name}]") }).to_string(),
-            json!({ "status": "Pushed" }).to_string(),
-            json!({ "status": format!("latest: digest: {digest}") }).to_string(),
-        ].join("\r\n") + "\r\n",
+        Ok(digest) => {
+            let layer_id = digest.trim_start_matches("sha256:").chars().take(12).collect::<String>();
+            let layer = layer_id.as_str();
+            let half = (size / 2).max(0);
+            [
+                json!({ "status": format!("The push refers to repository [{name}]") }).to_string(),
+                json!({ "status": "Preparing", "id": layer }).to_string(),
+                json!({ "status": "Pushing", "progressDetail": { "current": half, "total": size }, "id": layer }).to_string(),
+                json!({ "status": "Pushing", "progressDetail": { "current": size, "total": size }, "id": layer }).to_string(),
+                json!({ "status": "Pushed", "id": layer }).to_string(),
+                json!({ "progressDetail": {}, "aux": { "Tag": tag, "Digest": digest.as_str(), "Size": size } }).to_string(),
+                json!({ "status": format!("{tag}: digest: {digest} size: {size}") }).to_string(),
+            ].join("\r\n") + "\r\n"
+        }
         Err(e) => json!({ "errorDetail": { "message": e.clone() }, "error": e }).to_string() + "\r\n",
     };
     (StatusCode::OK, [("Content-Type", "application/json")], body).into_response()

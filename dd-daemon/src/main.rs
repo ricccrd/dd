@@ -107,7 +107,7 @@ async fn main() {
         .route("/containers/:id/start", post(containers_start))
         .route("/containers/:id/attach", post(containers_attach))
         .route("/containers/:id/stop", post(containers_stop))
-        .route("/containers/:id/kill", post(containers_stop))
+        .route("/containers/:id/kill", post(containers_kill))
         .route("/containers/:id/restart", post(containers_restart))
         .route("/containers/:id/pause", post(containers_pause))
         .route("/containers/:id/unpause", post(containers_unpause))
