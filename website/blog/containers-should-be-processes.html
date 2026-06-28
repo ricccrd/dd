@@ -134,9 +134,25 @@
     </table>
   </div>
 
-  <p class="mt-6 leading-relaxed text-muted">For <strong class="text-txt">arm64 images</strong> there's no emulation to beat — it's native either way, and the bar is a native Linux VM (the hardest one). dd matches it on compute (int sieve, SHA-256, n-body, mandelbrot all at or above parity) and the honest losses are <strong class="text-txt">allocation/syscall-heavy</strong> work — qsort (~1.7×) and SQLite (~2×) — because a userspace kernel pays for every syscall. That's the optimization frontier I'm on (a throughput-bound server like redis loses ~3× today). I'd rather show it than hide it.</p>
+  <p class="mt-6 leading-relaxed text-muted">For <strong class="text-txt">arm64 images</strong> there's no emulation to beat — it's native either way, so the bar is a <em>native</em> Linux VM, the hardest one. dd is at or above parity on compute and the honest losses are <strong class="text-txt">allocation/syscall-heavy</strong> work:</p>
 
-  <p class="mt-5 leading-relaxed text-muted2 text-sm">Numbers measured, median of 7 on Apple Silicon; reproduce with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">make bench</code>. The dd lane even pays a small per-run bridge tax the shipping app doesn't, so sub-0.2s rows are conservative.</p>
+  <div class="mt-6 overflow-x-auto rounded-xl border border-edge bg-panel">
+    <table class="w-full border-collapse text-[13px] sm:text-sm">
+      <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">arm64 workload</th><th class="p-3">native VM</th><th class="p-3 text-blue1">dd (no VM)</th><th class="p-3">dd vs VM</th></tr></thead>
+      <tbody class="[&>tr]:border-t [&>tr]:border-edge">
+        <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">0.74s</td><td class="p-3">0.52s</td><td class="p-3 font-semibold text-emerald-400">1.43× faster</td></tr>
+        <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">0.76s</td><td class="p-3">0.71s</td><td class="p-3 font-semibold text-emerald-400">1.07× faster</td></tr>
+        <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">0.17s</td><td class="p-3">0.17s</td><td class="p-3 text-muted">~parity</td></tr>
+        <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">0.75s</td><td class="p-3">0.76s</td><td class="p-3 text-muted">~parity</td></tr>
+        <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">0.78s</td><td class="p-3">1.34s</td><td class="p-3 text-muted">1.7× slower</td></tr>
+        <tr><td class="p-3 font-medium">SQLite (600k)</td><td class="p-3 text-muted">0.33s</td><td class="p-3">0.68s</td><td class="p-3 text-muted">~2× slower</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="mt-6 leading-relaxed text-muted">The gaps are SQLite (~2×) and qsort (~1.7×) — a userspace kernel pays for every syscall and allocation. That's the optimization frontier I'm on (a throughput-bound server like redis loses ~3× today). I'd rather show it than hide it.</p>
+
+  <p class="mt-5 leading-relaxed text-muted2 text-sm">Numbers measured, median of 7 on Apple Silicon; reproduce with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">make bench</code>. The dd lane even pays a small per-run bridge tax the shipping app doesn't, so the fastest sub-0.2s arm64 rows (omitted here) are conservative.</p>
 
   <!-- WHAT -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">What you get today</h2>
