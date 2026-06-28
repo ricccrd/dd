@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dd — Roadmap: run anything, anywhere, at native speed</title>
+<meta name="description" content="The dd roadmap: Linux as a host (and macOS containers on Linux), full Metal rendering, declarative secure dev environments, a cross-platform terminal, first-class LLM/GPU support — all converging on native performance on any OS and architecture." />
+<meta property="og:title" content="dd — Roadmap" />
+<meta property="og:description" content="Where dd is going: any OS as host, GPU-accelerated rendering, perfect DX, a cross-platform terminal, run any LLM — all at near-native speed on any arch." />
+<meta property="og:type" content="website" />
+<meta property="og:image" content="./assets/logo@2x.png" />
+<link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon.png" />
+<link rel="icon" type="image/png" sizes="64x64" href="./assets/favicon-64.png" />
+<link rel="apple-touch-icon" href="./assets/apple-touch-icon.png" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: {
+      colors: {
+        ink:'#0c1322', ink2:'#11192b', panel:'#131c30', panel2:'#18233b', edge:'#25324d', code:'#0a101e',
+        blue1:'#97cdff', blue2:'#81b5ff', blue3:'#4f88ff', blue4:'#4a81ff', blue5:'#2f6fe6', blue6:'#215fe7',
+        txt:'#e8eefc', muted:'#9fb0cd', muted2:'#7286a8',
+      },
+      fontFamily: { mono:['ui-monospace','SF Mono','Menlo','monospace'] },
+      maxWidth: { wrap:'64rem' },
+    }}
+  }
+</script>
+</head>
+<body class="bg-ink text-txt font-sans antialiased">
+
+<!-- nav -->
+<header class="sticky top-0 z-20 border-b border-edge bg-ink/70 backdrop-blur-md">
+  <div class="mx-auto flex h-14 max-w-wrap items-center gap-4 px-5">
+    <a href="./index.html" class="flex items-center gap-2 font-bold text-lg"><img src="./assets/logo.png" alt="" class="h-7 w-7 rounded-md" /> dd</a>
+    <nav class="ml-auto flex items-center gap-5 text-sm">
+      <a href="./index.html#features" class="hidden text-muted hover:text-txt md:inline">Features</a>
+      <a href="./index.html#speed" class="hidden text-muted hover:text-txt md:inline">Speed</a>
+      <a href="./roadmap.html" class="text-txt">Roadmap</a>
+      <a href="./blog/index.html" class="text-muted hover:text-txt">Blog</a>
+      <a href="https://github.com/ricccrd/dd" class="rounded-lg border border-edge px-3 py-1.5 font-semibold hover:border-blue3">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<!-- hero -->
+<section class="relative overflow-hidden" style="background:linear-gradient(to top left,#1c52c8 0%,#2f6fe6 28%,#4f88ff 55%,#81b5ff 80%,#97cdff 100%)">
+  <div class="absolute inset-0" style="background:radial-gradient(1100px 520px at 80% 120%,rgba(12,19,34,.55),transparent 60%)"></div>
+  <div class="relative mx-auto max-w-wrap px-5 py-16 text-center md:py-24">
+    <div class="mb-4"><span class="inline-flex items-center gap-1.5 rounded-full border border-white/30 bg-white/15 px-3 py-1 text-xs font-bold uppercase tracking-wider text-white"><span class="h-1.5 w-1.5 rounded-full bg-white"></span>Roadmap</span></div>
+    <h1 class="mx-auto max-w-3xl text-3xl font-extrabold leading-tight tracking-tight text-white md:text-5xl">Run anything, anywhere — at native speed.</h1>
+    <p class="mx-auto mt-4 max-w-2xl text-base text-blue-50/90 md:text-lg">Today dd runs Linux &amp; macOS containers on Apple-Silicon macOS with no VM. The roadmap takes the same idea — <strong>a userspace kernel + a JIT, not a hypervisor</strong> — to every host, every architecture, and beyond containers: graphics, dev environments, a terminal, and AI.</p>
+    <p class="mx-auto mt-4 max-w-2xl text-sm text-blue-50/80">This is a direction, not a dated commitment. Status labels below are honest about where each pillar stands.</p>
+  </div>
+</section>
+
+<!-- the north star -->
+<section class="px-5 py-14 md:py-20">
+  <div class="mx-auto max-w-wrap">
+    <p class="text-xs font-bold uppercase tracking-widest text-blue3">The north star</p>
+    <h2 class="mt-2 text-2xl font-bold tracking-tight md:text-4xl">Near-native performance, everywhere</h2>
+    <p class="mt-3 max-w-2xl text-base text-muted md:text-lg">Every pillar serves one goal: an app should run as smoothly as if it were compiled for the machine it's on — regardless of the OS or CPU it was built for. The compute runs as native instructions; only the boundaries (syscalls, GPU, I/O) are bridged.</p>
+    <div class="mt-8 grid gap-4 sm:grid-cols-3">
+      <div class="rounded-2xl border border-edge bg-panel p-5"><div class="text-2xl font-extrabold text-blue1">Any host</div><p class="mt-1 text-sm text-muted">macOS &amp; Linux as first-class hosts.</p></div>
+      <div class="rounded-2xl border border-edge bg-panel p-5"><div class="text-2xl font-extrabold text-blue1">Any guest</div><p class="mt-1 text-sm text-muted">Linux arm64 · x86-64 · macOS — cross-arch.</p></div>
+      <div class="rounded-2xl border border-edge bg-panel p-5"><div class="text-2xl font-extrabold text-blue1">Native speed</div><p class="mt-1 text-sm text-muted">Compute runs native; boundaries are bridged.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- pillars -->
+<section class="border-t border-edge px-5 py-14 md:py-20">
+  <div class="mx-auto max-w-wrap">
+    <p class="text-xs font-bold uppercase tracking-widest text-blue3">The pillars</p>
+    <h2 class="mt-2 text-2xl font-bold tracking-tight md:text-4xl">Six things we're building</h2>
+
+    <div class="mt-10 space-y-5">
+
+      <!-- 1: Universal host -->
+      <article class="rounded-2xl border border-edge bg-panel p-6 md:p-7">
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue6/20 font-mono font-bold text-blue1">01</span>
+          <h3 class="text-xl font-bold tracking-tight">Linux as a host — and macOS containers on Linux</h3>
+          <span class="rounded-full border border-blue3/40 bg-blue6/15 px-2.5 py-0.5 text-xs font-semibold text-blue1 sm:ml-auto">Designed · seams in place</span>
+        </div>
+        <p class="mt-3 text-muted">Today dd hosts on macOS. Next: the same engine running on <strong>Linux</strong> — Linux <em>and</em> macOS containers, on a Linux box — so the host stops mattering. The runtime is already split along host/guest seams (HAL, per-ISA emitters, OS personalities); the work is wiring the Linux host primitives and the Mach-O/Darwin guest path on Linux.</p>
+        <p class="mt-2 text-sm text-muted2">Why it matters: run your Mac's containers on a Linux server, and Linux's on your Mac — one runtime, any host.</p>
+      </article>
+
+      <!-- 2: Rendering -->
+      <article class="rounded-2xl border border-edge bg-panel p-6 md:p-7">
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue6/20 font-mono font-bold text-blue1">02</span>
+          <h3 class="text-xl font-bold tracking-tight">Full rendering on macOS — Metal access + a universal render bridge</h3>
+          <span class="rounded-full border border-blue3/40 bg-blue6/15 px-2.5 py-0.5 text-xs font-semibold text-blue1 sm:ml-auto">Designed</span>
+        </div>
+        <p class="mt-3 text-muted">Let containerized apps drive the GPU through <strong>Metal</strong>, and ship a <strong>rendering bridge</strong> so any app — Linux GUI, game, creative tool — paints to a native macOS window. A guest's graphics calls map onto Metal/Core&nbsp;Animation instead of a remote framebuffer.</p>
+        <p class="mt-2 text-sm text-muted2">Why it matters: GUI and GPU workloads, not just headless services — at native frame rates.</p>
+      </article>
+
+      <!-- 3: Dev environments -->
+      <article class="rounded-2xl border border-edge bg-panel p-6 md:p-7">
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue6/20 font-mono font-bold text-blue1">03</span>
+          <h3 class="text-xl font-bold tracking-tight">Secure, declarative dev environments — perfect DX</h3>
+          <span class="rounded-full border border-blue3/40 bg-blue6/15 px-2.5 py-0.5 text-xs font-semibold text-blue1 sm:ml-auto">Planned</span>
+        </div>
+        <p class="mt-3 text-muted">Describe what you need in a <strong>config file</strong> and get a reproducible, <strong>sandboxed</strong> environment in seconds — the right toolchain, services, and isolation, on any machine. Untrusted code runs behind a real trust boundary (the sentry split), so "just try this repo" is safe by default.</p>
+        <p class="mt-2 text-sm text-muted2">Why it matters: it should be trivial to work on anything, anywhere — no "works on my machine," no VM tax.</p>
+      </article>
+
+      <!-- 4: Terminal -->
+      <article class="rounded-2xl border border-edge bg-panel p-6 md:p-7">
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue6/20 font-mono font-bold text-blue1">04</span>
+          <h3 class="text-xl font-bold tracking-tight">A cross-platform terminal emulator</h3>
+          <span class="rounded-full border border-blue3/40 bg-blue6/15 px-2.5 py-0.5 text-xs font-semibold text-blue1 sm:ml-auto">Planned</span>
+        </div>
+        <p class="mt-3 text-muted">An iTerm2-class terminal built on dd — but able to drop you into a shell for <strong>any OS and architecture</strong> the runtime emulates, with the same UX everywhere. Interactive TTYs already work end-to-end (real pty, signals, resize); the terminal makes that the front door.</p>
+        <p class="mt-2 text-sm text-muted2">Why it matters: one terminal, any OS/arch shell — local, containerized, or cross-platform.</p>
+      </article>
+
+      <!-- 5: AI / LLM -->
+      <article class="rounded-2xl border border-edge bg-panel p-6 md:p-7">
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue6/20 font-mono font-bold text-blue1">05</span>
+          <h3 class="text-xl font-bold tracking-tight">First-class agents &amp; LLMs — optimized CUDA/Metal bindings</h3>
+          <span class="rounded-full border border-blue3/40 bg-blue6/15 px-2.5 py-0.5 text-xs font-semibold text-blue1 sm:ml-auto">Researching</span>
+        </div>
+        <p class="mt-3 text-muted">Run LLMs and agent workloads of any kind, with <strong>optimized CUDA and Metal bindings</strong> so model code reaches the GPU at full speed — whether it was written for one accelerator or the other. The container brings the model; dd bridges it to whatever silicon is present.</p>
+        <p class="mt-2 text-sm text-muted2">Why it matters: portable AI — the same model and agent stack runs on a Mac's Metal or a server's CUDA.</p>
+      </article>
+
+      <!-- 6: Performance (the throughline) -->
+      <article class="rounded-2xl border border-blue3/40 bg-gradient-to-br from-panel2 to-panel p-6 md:p-7">
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-blue6/30 font-mono font-bold text-blue1">06</span>
+          <h3 class="text-xl font-bold tracking-tight">Native performance everywhere — the throughline</h3>
+          <span class="rounded-full border border-blue1/40 bg-blue1/15 px-2.5 py-0.5 text-xs font-semibold text-blue1 sm:ml-auto">In progress · continuous</span>
+        </div>
+        <p class="mt-3 text-muted">The mission under all five pillars: an app should run as if it were compiled for the machine it's on, no matter the source OS or CPU. Straight-line compute already runs at — and sometimes <em>above</em> — native; ongoing work closes the remaining gaps (indirect-branch dispatch, syscall and I/O paths, GPU bridging) so cross-arch isn't a tax.</p>
+        <p class="mt-2 text-sm text-muted2">Why it matters: portability with no performance penalty is the whole point.</p>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="border-t border-edge px-5 py-16 text-center md:py-20">
+  <div class="mx-auto max-w-wrap">
+    <h2 class="text-2xl font-bold tracking-tight md:text-3xl">Follow along — or help build it.</h2>
+    <p class="mx-auto mt-3 max-w-xl text-muted">dd is open source and in active development. The roadmap evolves in the open.</p>
+    <div class="mt-7 flex flex-col items-stretch justify-center gap-3 sm:flex-row">
+      <a href="https://github.com/ricccrd/dd" class="rounded-xl bg-gradient-to-br from-blue3 to-blue6 px-6 py-3 font-semibold text-white shadow-lg transition hover:-translate-y-0.5">View on GitHub</a>
+      <a href="./index.html#download" class="rounded-xl border border-edge px-6 py-3 font-semibold text-txt hover:border-blue3">Download for macOS</a>
+    </div>
+  </div>
+</section>
+
+<!-- footer -->
+<footer class="border-t border-edge px-5 py-10 text-muted2">
+  <div class="mx-auto flex max-w-wrap flex-wrap items-center gap-4">
+    <span class="flex items-center gap-2 font-bold text-txt"><img src="./assets/logo.png" alt="" class="h-6 w-6 rounded-md" /> dd</span>
+    <span class="text-sm">Run anything, anywhere, at native speed. MIT licensed.</span>
+    <nav class="flex flex-wrap gap-5 text-sm sm:ml-auto">
+      <a href="./roadmap.html" class="text-muted hover:text-txt">Roadmap</a>
+      <a href="./blog/index.html" class="text-muted hover:text-txt">Blog</a>
+      <a href="https://github.com/ricccrd/dd" class="text-muted hover:text-txt">GitHub</a>
+      <a href="https://github.com/ricccrd/dd/releases" class="text-muted hover:text-txt">Releases</a>
+      <a href="mailto:huttarichard@gmail.com" class="text-muted hover:text-txt">Contact</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>
