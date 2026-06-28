@@ -269,7 +269,7 @@ static int trap_head(uint64_t a) {
 // Counts DOWN from g_t2thresh; on reaching zero it exits R_TIER2 (rip = loop start) so the dispatcher
 // promotes the block, after which this stub is dead.
 static void emit_t2_counter_x86(int slot, uint64_t start, void *body) {
-    e_movconst(16, (uint64_t)&g_t2cnt[slot]); // x16 = &g_t2cnt[slot]  (plain RW data)
+    emit_host_ptr(16, (uint64_t)&g_t2cnt[slot], PRELOC_HOSTGLOBAL); // x16 = &g_t2cnt[slot]  (plain RW data)
     e_ldr(17, 16, 0);                         // x17 = count
     e_subi(17, 17, 1, 1);                      // --count (sub-imm: flag-free)
     e_str(17, 16, 0);
@@ -539,9 +539,9 @@ static void emit_rep_string(int movs, int w, int shift) {
     e_movconst(3, (uint64_t)w);            // x3 = element width
     if (movs) {
         if (shift) e_lsl_i(2, 2, shift, 1); // x2 = nbytes = count << shift
-        e_movconst(16, (uint64_t)(uintptr_t)&dd_rep_movs);
+        emit_host_ptr(16, (uint64_t)(uintptr_t)&dd_rep_movs, PRELOC_HOSTGLOBAL);
     } else {
-        e_movconst(16, (uint64_t)(uintptr_t)&dd_rep_stos);
+        emit_host_ptr(16, (uint64_t)(uintptr_t)&dd_rep_stos, PRELOC_HOSTGLOBAL);
     }
     emit32(0xD63F0000u | (16 << 5)); // blr x16
     // membank still holds the pre-call rcx/rdi/rsi (the helper takes its args by value):
@@ -2537,7 +2537,7 @@ static void report_unimpl(uint64_t pc, struct insn *I) {
     e_str(16, 28, OFF_RIP);
     e_movconst(16, 99);
     e_str(16, 28, OFF_RSN); // reason 99 -> dispatcher aborts
-    e_movconst(16, (uint64_t)block_return);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
     e_br(16);
 }
 

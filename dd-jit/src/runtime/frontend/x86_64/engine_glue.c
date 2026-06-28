@@ -16,6 +16,40 @@
 
 static int g_trace, g_noibtc, g_itrace; // g_itrace: 1 instruction per block (per-insn register dump)
 static uint64_t g_disp_n, g_ibtc_fill;  // PROF: dispatcher round-trips, IBTC fills
+
+// ---- opt8 cold-start timing helper (COLDPROF=1; diagnostic-only, zero-cost when off) ----
+static int g_coldprof;
+static inline uint64_t coldprof_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// ---- opt8 persistent translated-code cache (DDJIT_PCACHE=1; default OFF) ----
+// Deterministic guest/arena bases let us persist the translated arena + block map and mmap it back on
+// the next run of the same binary, skipping retranslation. Emitted blocks bake a handful of HOST pointers
+// (block_return, &g_ibtc, &g_fast_count, &g_pending, &g_t2cnt[], &dd_rep_movs/stos, the inline-fastsys
+// counters) -- every one lives in THIS PIE binary's image, which dyld slides by ONE vmaddr_slide per run.
+// We record each baked slot's arena offset (g_reloc; emitted as a fixed 4-insn movz/movk so it is
+// rewritable to any address) and, on load, add (block_return_now - block_return_at_save) -- the single
+// image slide -- to each. All x86-only, all gated by g_pcache; default OFF -> emit is byte-identical.
+static int g_pcache;          // persistent cache feature on (DDJIT_PCACHE set)
+static int g_pcache_loaded;   // cache hit this run (translation skipped)
+static uint64_t g_pc_binid;   // identity of (guest binary + interp)
+static uint64_t g_pc_entry;   // initial guest rip (cache-validity sanity)
+static uint64_t g_force_base; // if nonzero, load_elf() maps the next image MAP_FIXED here (one-shot)
+// Documentary kinds (relocation is slide-based + kind-agnostic; these only label save dumps / call sites).
+enum {
+    PRELOC_BLOCKRET = 1,
+    PRELOC_IBTC = 2,
+    PRELOC_HOSTGLOBAL = 3 // any other &host-global / &host-func baked into a block (slid by the image slide)
+};
+static struct {
+    uint32_t off; // byte offset into the arena of a fixed 4-insn movz/movk host-pointer load
+    uint8_t kind; // PRELOC_* (documentary)
+} g_reloc[1 << 16];
+static int g_nreloc;
+
 static uint64_t g_tracecap;             // if >0 under trace: stop after this many blocks (runaway guard)
 int g_diag;                             // diagnostics (FAULT_ON): print LOADED bases etc. (extern'd by elf.c)
 static int g_nochain;                   // WATCH file: disable chaining (exact per-block rip attribution)

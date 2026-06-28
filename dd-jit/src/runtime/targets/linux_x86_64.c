@@ -66,6 +66,7 @@
 #include "../frontend/x86_64/emit.c"         // x86 engine: arm64 emitters + SSE + x87
 #include "../frontend/x86_64/decode.c"       // x86-64 decoder
 #include "../frontend/x86_64/translate.c"    // x86-64 translate_block + trampolines
+#include "../frontend/x86_64/pcache.c"       // opt8: persistent translated-code cache (DDJIT_PCACHE=1)
 #include "../os/linux/thread.c"              // SHARED: clone->pthread, per-thread cpu, futex
 #include "../os/linux/signal.c"              // SHARED: signal delivery driver + translation
 #include "../frontend/x86_64/sigframe.c"     // x86-64 rt_sigframe build/restore (uses signal.c state)
@@ -224,20 +225,27 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 
     static char pb[4200];
     const char *prog_host = xresolve_overlay(prog, pb, sizeof pb); // upper, then lowers (pure --lower image)
+    // opt8: load the guest image + interp at FIXED VAs so the translated arena is byte-identical across
+    // runs (one-shot g_force_base, cleared inside load_elf). Only when the persistent cache is enabled.
+    if (g_pcache) g_force_base = PC_IMG_BASE;
     load_elf(prog_host, lm);
     g_loadbase = lm->base;
     *jump = lm->entry;
     *at_base = 0;
     *have_interp = 0;
+    const char *interp_host = NULL;
     char interp[256];
     if (elf_interp(prog_host, interp, sizeof interp) == 0) {
         static char ib[4200];
-        const char *ihost = xresolve_overlay(interp, ib, sizeof ib);
-        load_elf(ihost, li);
+        interp_host = xresolve_overlay(interp, ib, sizeof ib);
+        if (g_pcache) g_force_base = PC_INTERP_BASE;
+        load_elf(interp_host, li);
         *jump = li->entry;
         *at_base = li->base;
         *have_interp = 1;
     }
+    // opt8: key the cache by the identity (dev/ino/size/mtime) of the guest binary AND its interpreter.
+    if (g_pcache) g_pc_binid = pcache_make_id(prog_host, interp_host);
     return prog;
 }
 
@@ -270,14 +278,26 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
 
 int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return 2;
+    // opt8 persistent translated-code cache: OPT-IN via DDJIT_PCACHE (default OFF -> byte-identical to the
+    // baseline; the cross-engine matrix never sets it, so it is unaffected). Read once.
+    g_coldprof = getenv("COLDPROF") != NULL;
+    g_pcache = getenv("DDJIT_PCACHE") != NULL;
     container_init(rootfs);
     int rc = engine_global_init();
     if (rc) return rc;
     struct loaded lm, li;
     uint64_t jump, at_base;
     int have_interp;
-    load_program(argv[0], &lm, &li, &jump, &at_base, &have_interp);
-    return run_loaded(argc, argv, &lm, jump, at_base);
+    load_program(argv[0], &lm, &li, &jump, &at_base, &have_interp); // (sets g_pc_binid + fixed bases when g_pcache)
+    if (g_pcache) {
+        g_pc_entry = jump;
+        int hit = pcache_load(jump); // graceful MISS on any stale/corrupt/truncated cache -> translate fresh
+        if (g_coldprof)
+            fprintf(stderr, "[pcache] %s reloc=%d\n", hit ? "HIT (translation skipped)" : "MISS", g_nreloc);
+    }
+    int ec = run_loaded(argc, argv, &lm, jump, at_base);
+    pcache_save(); // exit via syscall 93 returns here; syscall 94 saves before _exit (idempotent atomic rename)
+    return ec;
 }
 
 #include "../frontend/x86_64/forkserver.c" // W3D: resident ddjitd fork-server (server/client/worker)

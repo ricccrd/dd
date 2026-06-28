@@ -23,6 +23,29 @@ static void e_movconst(int rd, uint64_t v) {
     if ((v >> 32) & 0xffff) e_movk(rd, (v >> 32) & 0xffff, 2);
     if ((v >> 48) & 0xffff) e_movk(rd, (v >> 48) & 0xffff, 3);
 }
+// opt8: always-4-instruction movconst -- a fixed-width slot the persistent-cache loader can rewrite to
+// ANY new host address, and whose arena offset we record for relocation.
+static void e_movconst_fixed(int rd, uint64_t v) {
+    e_movz(rd, v & 0xffff, 0);
+    e_movk(rd, (v >> 16) & 0xffff, 1);
+    e_movk(rd, (v >> 32) & 0xffff, 2);
+    e_movk(rd, (v >> 48) & 0xffff, 3);
+}
+// opt8: emit a host pointer baked into a block. With the persistent cache OFF this is the normal compact
+// movconst (no relocation needed -- byte-identical to baseline). With the cache ON we lay a fixed 4-insn
+// slot and record its arena offset so pcache_load() can rewrite it for the live process's block_return/g_ibtc.
+static void emit_host_ptr(int rd, uint64_t v, int kind) {
+    if (!g_pcache) {
+        e_movconst(rd, v);
+        return;
+    }
+    if (g_nreloc < (int)(sizeof g_reloc / sizeof g_reloc[0])) {
+        g_reloc[g_nreloc].off = (uint32_t)(g_cp - g_cache);
+        g_reloc[g_nreloc].kind = (uint8_t)kind;
+        g_nreloc++;
+    }
+    e_movconst_fixed(rd, v);
+}
 // width-typed load/store at [rn, #0]. w = 1/2/4/8 bytes. (zero-extends on load)
 static void e_load(int w, int rt, int rn) {
     uint32_t b = w == 1 ? 0x39400000u : w == 2 ? 0x79400000u : w == 4 ? 0xB9400000u : 0xF9400000u;
@@ -364,7 +387,7 @@ static void emit_exit_const(uint64_t rip, uint64_t reason) {
     e_str(16, 28, OFF_RIP);
     e_movconst(16, reason);
     e_str(16, 28, OFF_RSN);
-    e_movconst(16, (uint64_t)block_return);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
     e_br(16); // block_return uses x28 (still cpu)
 }
 // ---------------- S1: inline vDSO-style time fast path (cntvct-based) ----------------
@@ -462,7 +485,7 @@ static void emit_fast_syscall(uint64_t next) {
     e_msub(27, 26, 25, 24, 1);            // nsec = total - sec*1e9
     e_str(26, 6, 0);                      // ts->tv_sec   (rsi=x6)
     e_str(27, 6, 8);                      // ts->tv_nsec
-    e_movconst(20, (uint64_t)&g_fast_count);
+    emit_host_ptr(20, (uint64_t)&g_fast_count, PRELOC_HOSTGLOBAL);
     e_ldr(21, 20, 0);
     e_addi(21, 21, 1, 1);
     e_str(21, 20, 0);    // g_fast_count++
@@ -492,7 +515,7 @@ static void emit_fast_syscall(uint64_t next) {
     e_udiv(27, 27, 20, 1); // usec = nsec/1000
     e_str(26, 7, 0);       // tv->tv_sec   (rdi=x7)
     e_str(27, 7, 8);       // tv->tv_usec
-    e_movconst(20, (uint64_t)&g_fast_count);
+    emit_host_ptr(20, (uint64_t)&g_fast_count, PRELOC_HOSTGLOBAL);
     e_ldr(21, 20, 0);
     e_addi(21, 21, 1, 1);
     e_str(21, 20, 0);
@@ -523,7 +546,7 @@ static void emit_fast_syscall(uint64_t next) {
         // deferred boundary is unobservable, so this is provably bit-exact. (c->sigmask has no async
         // reader: host_sigh only ORs g_pending; the sole consumer is the synchronous
         // maybe_deliver_signal at the dispatcher-loop top, so the store is plain program-order.)
-        e_movconst(20, (uint64_t)&g_pending);
+        emit_host_ptr(20, (uint64_t)&g_pending, PRELOC_HOSTGLOBAL);
         e_ldr(21, 20, 0);       // x21 = g_pending
         e_subi_s(21, 21, 0, 1); // Z = (g_pending == 0)
         to_slow[nsl++] = (uint32_t *)g_cp;
@@ -558,7 +581,7 @@ static void emit_fast_syscall(uint64_t next) {
         *d2 = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - d2) & 0x3FFFFFF);
         *no_set = (*no_set & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - no_set) & 0x7FFFF) << 5);
         e_str(19, 28, OFF_SM);  // c->sigmask = x19
-        e_movconst(20, (uint64_t)&g_sig_inline_count);
+        emit_host_ptr(20, (uint64_t)&g_sig_inline_count, PRELOC_HOSTGLOBAL);
         e_ldr(21, 20, 0);
         e_addi(21, 21, 1, 1);
         e_str(21, 20, 0);       // g_sig_inline_count++
@@ -572,7 +595,7 @@ static void emit_fast_syscall(uint64_t next) {
         e_subi_s(16, 0, 24, 1); // subs x16, x0, #24
         to_slow[nsl++] = (uint32_t *)g_cp;
         e_bcond(1, 0);          // b.ne -> slow
-        e_movconst(20, (uint64_t)&g_yield_inline_count);
+        emit_host_ptr(20, (uint64_t)&g_yield_inline_count, PRELOC_HOSTGLOBAL);
         e_ldr(21, 20, 0);
         e_addi(21, 21, 1, 1);
         e_str(21, 20, 0);       // g_yield_inline_count++
@@ -626,12 +649,12 @@ static void emit_ibranch(void) {
         emit_spill();
         e_movconst(16, R_BRANCH);
         e_str(16, 28, OFF_RSN);
-        e_movconst(16, (uint64_t)block_return);
+        emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
         e_br(16);
         return;
     }
     emit32(0xD3423800u | (16 << 5) | 17);                          // ubfx x17, x16, #2, #13  ((tgt>>2)&0x1FFF)
-    e_movconst(19, (uint64_t)g_ibtc);                              // x19 = &g_ibtc
+    emit_host_ptr(19, (uint64_t)g_ibtc, PRELOC_IBTC);              // x19 = &g_ibtc
     emit32(0x8B000000u | (17 << 16) | (4 << 10) | (19 << 5) | 19); // add x19, x19, x17, lsl #4   (slot)
     e_ldr(20, 19, 0);                                              // x20 = slot.target
     emit32(0xCB000000u | (16 << 16) | (20 << 5) | 20);             // sub x20, x20, x16  (NOT subs: keep nzcv)
@@ -646,7 +669,7 @@ static void emit_ibranch(void) {
     e_str(16, 28, OFF_RSN);
     e_movconst(16, 1);
     e_str(16, 28, OFF_ICMISS); // dispatcher fills g_ibtc for cpu->rip
-    e_movconst(16, (uint64_t)block_return);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
     e_br(16);
     *p_cbnz = 0xB5000000u | (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 20;
 }

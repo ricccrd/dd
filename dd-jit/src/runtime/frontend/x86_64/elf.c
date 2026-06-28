@@ -66,7 +66,18 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     uint64_t basepage = minv & ~0xFFFull;
     uint64_t span = (maxv - basepage + 0xFFFF) & ~0xFFFFull;
-    uint8_t *base = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    // opt8: the persistent cache needs deterministic guest bases across runs so the translated bytes
+    // (RIP-relative leas, baked branch targets, block-map keys) are byte-identical. When g_force_base is
+    // set, map MAP_FIXED at the caller-requested address; the image is PIE so basepage is ~0 and the chosen
+    // base becomes out->base, deriving all guest PCs/addresses identically each run. One-shot per image.
+    uint8_t *base;
+    if (g_force_base) {
+        base = mmap((void *)(g_force_base + basepage), span, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        g_force_base = 0;
+    } else {
+        base = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
     if (base == MAP_FAILED) {
         perror("mmap base");
         exit(1);
