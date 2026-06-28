@@ -63,10 +63,11 @@ static uint8_t g_eventfd_sema[1024]; // EFD_SEMAPHORE: read() returns 1 and decr
 // post-fork exec keeps the PARENT's dense layout, and load_elf must bias a non-PIE ET_EXEC off its fixed
 // vaddr (macOS __PAGEZERO reserves the low 4 GB) -> the image's baked absolute refs collide with the
 // densely-packed inherited maps -> SIGSEGV. Resetting reproduces the clean fresh-exec layout that works.
-static struct { uint64_t addr, len; } g_gmap[1024];
+#define GMAP_N 8192 // was 1024 -- a heavy guest overflowed it, leaking the untracked mappings at execve teardown
+static struct { uint64_t addr, len; } g_gmap[GMAP_N];
 static int g_ngmap;
 static void gmap_add(uint64_t addr, uint64_t len) {
-    if (!addr || addr == (uint64_t)-1 || len == 0 || g_ngmap >= 1024) return;
+    if (!addr || addr == (uint64_t)-1 || len == 0 || g_ngmap >= GMAP_N) return;
     g_gmap[g_ngmap].addr = addr;
     g_gmap[g_ngmap].len = len;
     g_ngmap++;
