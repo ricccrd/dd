@@ -32,6 +32,10 @@ pub(crate) fn render_home(home: &gtk::Box, m: &AppModel, sender: &ComponentSende
     stats.append(&sparkline_card("Disk", &format!("{disk_gb:.1} GB"), ser(|s| s.disk_gb), false));
     home.append(&stats);
 
+    // Docker context — view/switch which daemon `docker` talks to. Crash-safe: when the docker CLI
+    // isn't installed `snap.docker_context` is None and we show a note instead of a control.
+    home.append(&context_section(m, sender));
+
     if let Some(rel) = &m.update {
         home.append(&update_card(&rel.version, sender));
     }
@@ -74,4 +78,96 @@ pub(crate) fn render_home(home: &gtk::Box, m: &AppModel, sender: &ComponentSende
     card.append(&code);
 
     home.append(&card);
+}
+
+// ---- Docker context selector ----------------------------------------------
+// A field to view + switch the active `docker` context (which daemon the CLI talks to). It reuses
+// the existing crash-safe machinery: `snap.docker_context`/`docker_contexts` come from the docker
+// CLI via `.ok()` (never panic), and a change emits `Msg::SetContext` (the same handler the
+// top-right selector uses). When the docker CLI isn't installed, `docker_context` is None and we
+// render an informational card with an "Install CLI" action instead of a control — no subprocess,
+// no panic, dd keeps running.
+fn context_section(m: &AppModel, sender: &ComponentSender<AppModel>) -> gtk::Box {
+    let snap = &m.snap;
+    let wrap = gtk::Box::new(gtk::Orientation::Vertical, 8);
+
+    let h = gtk::Label::new(Some("Docker context"));
+    h.set_xalign(0.0);
+    h.add_css_class("dd-h2");
+    wrap.append(&h);
+
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    card.add_css_class("dd-step-card");
+
+    match &snap.docker_context {
+        // docker CLI present -> a real selector of the available contexts
+        Some(active) => {
+            let mut ctxs = snap.docker_contexts.clone();
+            if ctxs.is_empty() {
+                ctxs.push(active.clone());
+            }
+            if !ctxs.iter().any(|c| c == active) {
+                ctxs.insert(0, active.clone());
+            }
+
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            let lbl = gtk::Label::new(Some("Active context"));
+            lbl.set_xalign(0.0);
+            lbl.set_hexpand(true); // pushes the dropdown to the right
+            row.append(&lbl);
+
+            let refs: Vec<&str> = ctxs.iter().map(|s| s.as_str()).collect();
+            let dropdown = gtk::DropDown::from_strings(&refs);
+            dropdown.add_css_class("dd-seg");
+            dropdown.set_tooltip_text(Some("Switch which Docker context (daemon) the `docker` CLI uses"));
+            // Select the active context BEFORE connecting the signal so this programmatic set
+            // doesn't fire the handler (which would loop: set_context -> refetch -> re-render).
+            if let Some(i) = ctxs.iter().position(|c| c == active) {
+                dropdown.set_selected(i as u32);
+            }
+            let ctxs_cb = ctxs.clone();
+            let active_cb = active.clone();
+            let s = sender.clone();
+            dropdown.connect_selected_notify(move |dd| {
+                if let Some(name) = ctxs_cb.get(dd.selected() as usize) {
+                    // only act on a real user change (guards against any spurious notify)
+                    if name != &active_cb {
+                        s.input(Msg::SetContext(name.clone()));
+                    }
+                }
+            });
+            row.append(&dropdown);
+            card.append(&row);
+
+            let hint = gtk::Label::new(Some(
+                "Pick which daemon `docker` commands talk to. Choose 'dd' to use the no-VM runtime.",
+            ));
+            hint.set_xalign(0.0);
+            hint.set_wrap(true);
+            hint.add_css_class("dd-sub");
+            card.append(&hint);
+        }
+        // docker CLI absent -> friendly note + install action, never a crash
+        None => {
+            let note = gtk::Label::new(Some(
+                "Docker CLI not detected. Install the dd CLI to add the 'dd' context and switch here \
+                 — dd keeps running either way.",
+            ));
+            note.set_xalign(0.0);
+            note.set_wrap(true);
+            note.add_css_class("dd-sub");
+            card.append(&note);
+            card.append(&action_row(
+                "Install the dd CLI",
+                "Sets up the `dd`/`docker` context so you can select it here.",
+                "Install CLI",
+                false,
+                sender,
+                || Msg::InstallCli,
+            ));
+        }
+    }
+
+    wrap.append(&card);
+    wrap
 }
