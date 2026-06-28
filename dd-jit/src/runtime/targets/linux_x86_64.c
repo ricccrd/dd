@@ -88,7 +88,7 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
         g_rootfs_canon_len = strlen(g_rootfs_canon);
         g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
     }
-    {
+    if (!getenv("JIT86_NONETNS")) { // opt-out: leave g_netns empty -> 127/8 uses the REAL host TCP stack
         const char *ns = getenv("JIT86_NETNS"); // private-loopback dir: inherit across exec, else create one
         if (ns && ns[0])
             snprintf(g_netns, sizeof g_netns, "%s", ns);

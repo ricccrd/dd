@@ -42,19 +42,6 @@ static key_t ipc_ns_key(key_t k) {
     key_t hk = (key_t)((uint32_t)k ^ (salt & 0x7fffffffu));
     return hk == IPC_PRIVATE ? hk + 1 : hk;
 }
-// SysV IPC *ctl(IPC_STAT): fill the Linux 64-bit ipc64_perm (48 bytes, aarch64 asm-generic layout) at `d`
-// from a macOS `struct ipc_perm`. Owner/creator uid+gid are reported as the container ids (cuid/cgid) so a
-// `--user N:M` guest sees IPC objects it created as owned by itself; mode/seq/key pass through from the host.
-static void ipc_perm_m2l(uint8_t *d, const struct ipc_perm *p) {
-    memset(d, 0, 48);
-    *(int32_t *)(d + 0) = (int32_t)p->_key;    // key
-    *(uint32_t *)(d + 4) = (uint32_t)cuid();   // uid
-    *(uint32_t *)(d + 8) = (uint32_t)cgid();   // gid
-    *(uint32_t *)(d + 12) = (uint32_t)cuid();  // cuid
-    *(uint32_t *)(d + 16) = (uint32_t)cgid();  // cgid
-    *(uint32_t *)(d + 20) = (uint32_t)p->mode; // mode
-    *(uint16_t *)(d + 24) = (uint16_t)p->_seq; // seq
-}
 // list a directory's entries (minus . / ..) as a newline-joined, NUL-terminated malloc'd string (for the
 // inotify-on-a-directory diff). NULL on error.
 static char *dir_snapshot(const char *path) {
@@ -1878,14 +1865,13 @@ static void service(struct cpu *c) {
         G_RET(c) = (r == -1 && errno) ? (uint64_t)(-errno) : (uint64_t)(20 - r);
         break;
     }
-    // setuid/setgid family: the guest already runs as DD_UID/DD_GID in dd's model, so any privilege drop
-    // succeeds as a no-op -- never fail a drop to the configured uid/gid (docker run --user / exec -u).
-    case 144: // setgid
-    case 145: // setreuid
-    case 146: // setuid
-    case 147: // setresuid
-    case 149: // setresgid
-        G_RET(c) = 0; break;
+    case 144:
+    case 146:
+    case 147:
+    // setgid/setfsuid/setresuid/setresgid -> ok
+    case 149: G_RET(c) = 0; break;
+    // getpgid
+    case 145: G_RET(c) = (uint64_t)getpgrp(); break;
     case 148: {
         // getresuid(r,e,s)
         if (a0) *(uint32_t *)a0 = cuid();
@@ -2462,8 +2448,8 @@ static void service(struct cpu *c) {
     // ===================== Network — sockets; port-map (-p) + NET-ns private loopback =====================
     case 198: {
         int ty = (int)a1;
-        // socket
-        int r = socket((int)a0, ty & 0xf, (int)a2);
+        // socket (translate Linux domain -> macOS: AF_INET6 10->30, others unchanged)
+        int r = socket(af_l2m((int)a0), ty & 0xf, (int)a2);
         if (r >= 0) {
             if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
@@ -2479,8 +2465,8 @@ static void service(struct cpu *c) {
     }
     case 199: {
         int sv[2];
-        // socketpair
-        int r = socketpair((int)a0, (int)a1 & 0xf, (int)a2, sv);
+        // socketpair (translate Linux domain -> macOS)
+        int r = socketpair(af_l2m((int)a0), (int)a1 & 0xf, (int)a2, sv);
         if (r == 0) {
             ((int *)a3)[0] = sv[0];
             ((int *)a3)[1] = sv[1];
@@ -2561,11 +2547,24 @@ static void service(struct cpu *c) {
                 memcpy(buf, sa, L);
                 // publish on :H instead of :C (port @2)
                 *(uint16_t *)(buf + 2) = htons(hp);
-                G_RET(c) = bind((int)a0, (struct sockaddr *)buf, L) < 0 ? (uint64_t)(-errno) : 0;
+                // Linux->macOS sockaddr translation (sin_len/family) before the real host bind.
+                struct sockaddr_storage ss;
+                socklen_t hl = sa_l2m(buf, L, &ss);
+                int br = (hl != (socklen_t)-1) ? bind((int)a0, (struct sockaddr *)&ss, hl)
+                                               : bind((int)a0, (struct sockaddr *)buf, L);
+                G_RET(c) = br < 0 ? (uint64_t)(-errno) : 0;
                 break;
             }
         }
-        G_RET(c) = bind((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
+        // Real host bind: translate Linux AF_INET/INET6 sockaddr -> macOS (sin_len/family); AF_UNIX
+        // and others pass through unchanged. (Was: raw bind of the Linux struct -> AF_UNSPEC bind.)
+        {
+            struct sockaddr_storage ss;
+            socklen_t hl = sa_l2m(sa, (socklen_t)a2, &ss);
+            int br = (hl != (socklen_t)-1) ? bind((int)a0, (struct sockaddr *)&ss, hl)
+                                           : bind((int)a0, (void *)a1, (socklen_t)a2);
+            G_RET(c) = br < 0 ? (uint64_t)(-errno) : 0;
+        }
         break;
     }
     case 201: G_RET(c) = listen((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
@@ -2576,13 +2575,28 @@ static void service(struct cpu *c) {
         int pl = (lfd >= 0 && lfd < 1024) ? g_lo_port[lfd] : 0;
         int pbr = (lfd >= 0 && lfd < 1024) ? g_br_port[lfd] : 0;
         uint32_t pbrip = (lfd >= 0 && lfd < 1024) ? g_br_ip[lfd] : 0;
+        // Real host accept writes a macOS sockaddr; receive into a host scratch then translate the
+        // peer addr back to Linux layout for the guest. (private-lo / bridge: don't expose unix peer.)
+        struct sockaddr_storage hss;
+        socklen_t hsl = sizeof hss;
+        int want_peer = (!pl && !pbr && a1);
         int r = (pl || pbr) ? accept(lfd, NULL, NULL)
-                            // private-lo / bridge: don't expose unix peer
-                            : accept(lfd, (void *)a1, (socklen_t *)a2);
+                            : accept(lfd, want_peer ? (struct sockaddr *)&hss : NULL,
+                                     want_peer ? &hsl : (socklen_t *)a2);
         if (r >= 0) {
             if (nr == 242) {
                 if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
                 if ((int)a3 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
+            }
+            if (want_peer) {
+                socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;
+                int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a1, gcap);
+                if (ll < 0) { // non-inet peer (e.g. AF_UNIX): copy raw host bytes
+                    socklen_t n = hsl < gcap ? hsl : gcap;
+                    if (gcap) memcpy((void *)a1, &hss, n);
+                    if (a2) *(socklen_t *)a2 = hsl;
+                } else if (a2)
+                    *(socklen_t *)a2 = (socklen_t)ll;
             }
             if (pl) {
                 if (r < 1024) {
@@ -2671,7 +2685,14 @@ static void service(struct cpu *c) {
             G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
             break;
         }
-        G_RET(c) = connect((int)a0, (void *)a1, (socklen_t)a2) < 0 ? (uint64_t)(-errno) : 0;
+        // Real host connect: translate Linux AF_INET/INET6 sockaddr -> macOS; others pass through.
+        {
+            struct sockaddr_storage ss;
+            socklen_t hl = sa_l2m(sa, (socklen_t)a2, &ss);
+            int cr = (hl != (socklen_t)-1) ? connect((int)a0, (struct sockaddr *)&ss, hl)
+                                           : connect((int)a0, (void *)a1, (socklen_t)a2);
+            G_RET(c) = cr < 0 ? (uint64_t)(-errno) : 0;
+        }
         break;
     }
     case 204: {
@@ -2687,10 +2708,25 @@ static void service(struct cpu *c) {
             G_RET(c) = 0;
             break;
         }
-        int r = getsockname(fd, (void *)a1, (socklen_t *)a2);
-        if (r == 0 && g_nportmap && a1 && fd >= 0 && fd < 1024 && g_fd_cport[fd])
-            // app sees the port it asked for (port @2)
-            *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]);
+        // Real host getsockname returns a macOS sockaddr; receive into host scratch, translate back to
+        // Linux layout for the guest (fixes sin_family/sin_len), preserving the portmap port rewrite.
+        struct sockaddr_storage hss;
+        socklen_t hsl = sizeof hss;
+        int r = getsockname(fd, (struct sockaddr *)&hss, &hsl);
+        if (r == 0 && a1) {
+            socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;
+            int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a1, gcap);
+            if (ll < 0) {
+                socklen_t n = hsl < gcap ? hsl : gcap;
+                if (gcap) memcpy((void *)a1, &hss, n);
+                if (a2) *(socklen_t *)a2 = hsl;
+            } else {
+                if (a2) *(socklen_t *)a2 = (socklen_t)ll;
+                if (g_nportmap && fd >= 0 && fd < 1024 && g_fd_cport[fd] && gcap >= 4)
+                    // app sees the port it asked for (port @2)
+                    *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]);
+            }
+        }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -2707,19 +2743,53 @@ static void service(struct cpu *c) {
             G_RET(c) = 0;
             break;
         }
-        G_RET(c) = getpeername(fd, (void *)a1, (socklen_t *)a2) < 0 ? (uint64_t)(-errno) : 0;
+        // Real host getpeername: translate macOS sockaddr back to Linux layout for the guest.
+        struct sockaddr_storage hss;
+        socklen_t hsl = sizeof hss;
+        int r = getpeername(fd, (struct sockaddr *)&hss, &hsl);
+        if (r == 0 && a1) {
+            socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;
+            int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a1, gcap);
+            if (ll < 0) {
+                socklen_t n = hsl < gcap ? hsl : gcap;
+                if (gcap) memcpy((void *)a1, &hss, n);
+                if (a2) *(socklen_t *)a2 = hsl;
+            } else if (a2)
+                *(socklen_t *)a2 = (socklen_t)ll;
+        }
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
     case 206: {
         // MSG_NOSIGNAL(0x4000) has no per-call equivalent on macOS; emulate it with the SO_NOSIGPIPE
         // socket option so the send returns EPIPE instead of raising a fatal SIGPIPE.
         if ((int)a3 & 0x4000) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
-        ssize_t r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), (void *)a4, (socklen_t)a5);
+        // dest addr (UDP): translate Linux AF_INET/INET6 sockaddr -> macOS; NULL/non-inet pass through.
+        struct sockaddr_storage dss;
+        socklen_t dhl = a4 ? sa_l2m((uint8_t *)a4, (socklen_t)a5, &dss) : (socklen_t)-1;
+        const void *dst = (dhl != (socklen_t)-1) ? (void *)&dss : (void *)a4;
+        socklen_t dl = (dhl != (socklen_t)-1) ? dhl : (socklen_t)a5;
+        ssize_t r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), dst, dl);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 207: {
-        ssize_t r = recvfrom((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), (void *)a4, (socklen_t *)a5);
+        // src addr: receive into host scratch (macOS layout) then translate back to Linux for the guest.
+        struct sockaddr_storage hss;
+        socklen_t hsl = sizeof hss;
+        int want = a4 != 0;
+        ssize_t r = recvfrom((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
+                             want ? (struct sockaddr *)&hss : NULL, want ? &hsl : NULL);
+        if (r >= 0 && want) {
+            socklen_t gcap = a5 ? *(socklen_t *)a5 : 0;
+            int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a4, gcap);
+            if (ll < 0) {
+                socklen_t n = hsl < gcap ? hsl : gcap;
+                if (gcap) memcpy((void *)a4, &hss, n);
+                if (a5) *(socklen_t *)a5 = hsl;
+            } else if (a5)
+                *(socklen_t *)a5 = (socklen_t)ll;
+        }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -2776,6 +2846,20 @@ static void service(struct cpu *c) {
         mh.msg_iov = (void *)*(uint64_t *)(g + 16);
         mh.msg_iovlen = (int)*(uint64_t *)(g + 24);
         mh.msg_flags = *(uint32_t *)(g + 48);
+        // msg_name sockaddr: Linux<->macOS translation through a host scratch (AF_INET/INET6 only).
+        struct sockaddr_storage nss;
+        uint8_t *gname = (uint8_t *)mh.msg_name;
+        socklen_t gnamelen = mh.msg_namelen;
+        if (nr == 211 && gname && gnamelen) { // sendmsg: guest -> host
+            socklen_t hl = sa_l2m(gname, gnamelen, &nss);
+            if (hl != (socklen_t)-1) {
+                mh.msg_name = &nss;
+                mh.msg_namelen = hl;
+            }
+        } else if (nr == 212 && gname && gnamelen) { // recvmsg: receive into host scratch
+            mh.msg_name = &nss;
+            mh.msg_namelen = sizeof nss;
+        }
         // Ancillary data: the guest control buf is Linux-cmsg layout; macOS reads a different cmsghdr,
         // so route it through a host-layout scratch buffer (NULL-control left untouched, so edge/msgflags
         // with no control buffer stays on the old path).
@@ -2796,7 +2880,13 @@ static void service(struct cpu *c) {
             (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         if (nr == 212 && r >= 0) {
             // recvmsg writes back name len + (host->guest) control + translated flags
-            *(uint32_t *)(g + 8) = mh.msg_namelen;
+            if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
+                int ll = sa_m2l((struct sockaddr *)&nss, gname, gnamelen);
+                *(uint32_t *)(g + 8) = (ll >= 0) ? (uint32_t)ll : mh.msg_namelen;
+                if (ll < 0 && mh.msg_namelen) // non-inet: copy raw host bytes back
+                    memcpy(gname, &nss, mh.msg_namelen < gnamelen ? mh.msg_namelen : gnamelen);
+            } else
+                *(uint32_t *)(g + 8) = mh.msg_namelen;
             size_t ln = (gc && gcl) ? (size_t)cmsg_m2l(&mh, gc, gcl) : 0;
             *(uint64_t *)(g + 40) = ln;
             *(uint32_t *)(g + 48) = (uint32_t)msgflags_m2l((int)mh.msg_flags);
@@ -2822,6 +2912,20 @@ static void service(struct cpu *c) {
             mh.msg_iov = (void *)*(uint64_t *)(g + 16);
             mh.msg_iovlen = (int)*(uint64_t *)(g + 24);
             mh.msg_flags = *(uint32_t *)(g + 48);
+            // msg_name sockaddr: Linux<->macOS translation through a host scratch (AF_INET/INET6 only).
+            struct sockaddr_storage nss;
+            uint8_t *gname = (uint8_t *)mh.msg_name;
+            socklen_t gnamelen = mh.msg_namelen;
+            if (nr == 269 && gname && gnamelen) { // sendmmsg: guest -> host
+                socklen_t hl = sa_l2m(gname, gnamelen, &nss);
+                if (hl != (socklen_t)-1) {
+                    mh.msg_name = &nss;
+                    mh.msg_namelen = hl;
+                }
+            } else if (nr == 243 && gname && gnamelen) { // recvmmsg: receive into host scratch
+                mh.msg_name = &nss;
+                mh.msg_namelen = sizeof nss;
+            }
             // Ancillary data: route the per-submessage control buf through a host-layout scratch buffer.
             uint8_t *gc = (void *)*(uint64_t *)(g + 32);
             size_t gcl = *(uint64_t *)(g + 40);
@@ -2845,7 +2949,13 @@ static void service(struct cpu *c) {
             // msg_len
             *(uint32_t *)(g + 56) = (uint32_t)r;
             if (nr == 243) {
-                *(uint32_t *)(g + 8) = mh.msg_namelen;
+                if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
+                    int ll = sa_m2l((struct sockaddr *)&nss, gname, gnamelen);
+                    *(uint32_t *)(g + 8) = (ll >= 0) ? (uint32_t)ll : mh.msg_namelen;
+                    if (ll < 0 && mh.msg_namelen)
+                        memcpy(gname, &nss, mh.msg_namelen < gnamelen ? mh.msg_namelen : gnamelen);
+                } else
+                    *(uint32_t *)(g + 8) = mh.msg_namelen;
                 size_t ln = (gc && gcl) ? (size_t)cmsg_m2l(&mh, gc, gcl) : 0;
                 *(uint64_t *)(g + 40) = ln;
                 *(uint32_t *)(g + 48) = (uint32_t)msgflags_m2l((int)mh.msg_flags);
@@ -3151,33 +3261,9 @@ static void service(struct cpu *c) {
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 195: { // shmctl(shmid, cmd, buf): IPC_RMID + IPC_STAT/IPC_SET (macOS<->Linux struct translation)
-        int cmd = (int)a1;
-        if (cmd == IPC_RMID) {
+    case 195: { // shmctl(shmid, cmd, buf): IPC_RMID supported; STAT/SET deferred (macOS struct differs)
+        if ((int)a1 == IPC_RMID) {
             int r = shmctl((int)a0, IPC_RMID, NULL);
-            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
-        } else if (cmd == IPC_STAT) {
-            struct shmid_ds ds;
-            if (shmctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
-            uint8_t *d = (uint8_t *)a2;
-            if (!d) { G_RET(c) = (uint64_t)(-EFAULT); break; }
-            memset(d, 0, 112); // sizeof(struct shmid64_ds) on aarch64
-            ipc_perm_m2l(d, &ds.shm_perm);
-            *(uint64_t *)(d + 48) = (uint64_t)ds.shm_segsz;                  // shm_segsz
-            *(int64_t *)(d + 56) = (int64_t)ds.shm_atime;                    // shm_atime
-            *(int64_t *)(d + 64) = (int64_t)ds.shm_dtime;                    // shm_dtime
-            *(int64_t *)(d + 72) = (int64_t)ds.shm_ctime;                    // shm_ctime
-            *(int32_t *)(d + 80) = (int32_t)ds.shm_cpid;                     // shm_cpid
-            *(int32_t *)(d + 84) = (int32_t)ds.shm_lpid;                     // shm_lpid
-            *(uint64_t *)(d + 88) = (uint64_t)(unsigned short)ds.shm_nattch; // shm_nattch
-            G_RET(c) = 0;
-        } else if (cmd == IPC_SET) {
-            struct shmid_ds ds; // STAT-then-modify: only the mode is portable (host keeps real ownership)
-            if (shmctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
-            const uint8_t *s = (const uint8_t *)a2;
-            if (!s) { G_RET(c) = (uint64_t)(-EFAULT); break; }
-            ds.shm_perm.mode = (mode_t)(*(const uint32_t *)(s + 20) & 0xfff);
-            int r = shmctl((int)a0, IPC_SET, &ds);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         } else {
             G_RET(c) = (uint64_t)(-ENOSYS);
@@ -3203,28 +3289,7 @@ static void service(struct cpu *c) {
         if (lc == 16) { arg.val = (int)a3; r = semctl((int)a0, (int)a1, mc, arg); }                       // SETVAL
         else if (lc == 13 || lc == 17) { arg.array = (unsigned short *)a3; r = semctl((int)a0, (int)a1, mc, arg); } // GET/SETALL
         else if (lc == 0 || lc == 11 || lc == 12 || lc == 14 || lc == 15) { r = semctl((int)a0, (int)a1, mc); }    // RMID/GETPID/GETVAL/GETNCNT/GETZCNT
-        else if (lc == 2) { // IPC_STAT: macOS semid_ds -> Linux semid64_ds (aarch64)
-            struct semid_ds ds; arg.buf = &ds;
-            if (semctl((int)a0, 0, IPC_STAT, arg) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
-            uint8_t *d = (uint8_t *)a3;
-            if (!d) { G_RET(c) = (uint64_t)(-EFAULT); break; }
-            memset(d, 0, 88); // sizeof(struct semid64_ds) on aarch64
-            ipc_perm_m2l(d, &ds.sem_perm);
-            *(int64_t *)(d + 48) = (int64_t)ds.sem_otime;   // sem_otime
-            *(int64_t *)(d + 56) = (int64_t)ds.sem_ctime;   // sem_ctime
-            *(uint64_t *)(d + 64) = (uint64_t)ds.sem_nsems; // sem_nsems
-            G_RET(c) = 0; break;
-        }
-        else if (lc == 1) { // IPC_SET: apply mode only (host keeps real ownership)
-            struct semid_ds ds; arg.buf = &ds;
-            if (semctl((int)a0, 0, IPC_STAT, arg) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
-            const uint8_t *s = (const uint8_t *)a3;
-            if (!s) { G_RET(c) = (uint64_t)(-EFAULT); break; }
-            ds.sem_perm.mode = (mode_t)(*(const uint32_t *)(s + 20) & 0xfff);
-            arg.buf = &ds;
-            G_RET(c) = semctl((int)a0, 0, IPC_SET, arg) < 0 ? (uint64_t)(-errno) : 0; break;
-        }
-        else { G_RET(c) = (uint64_t)(-ENOSYS); break; }                                                   // SEM_STAT/SEM_INFO: unsupported
+        else { G_RET(c) = (uint64_t)(-ENOSYS); break; }                                                   // IPC_STAT/SET: struct differs
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -3245,35 +3310,9 @@ static void service(struct cpu *c) {
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 187: { // msgctl(msqid, cmd, buf): IPC_RMID + IPC_STAT/IPC_SET (macOS<->Linux struct translation)
-        int cmd = (int)a1;
-        if (cmd == IPC_RMID) {
+    case 187: { // msgctl(msqid, cmd, buf): IPC_RMID supported; STAT/SET deferred (macOS struct differs)
+        if ((int)a1 == IPC_RMID) {
             int r = msgctl((int)a0, IPC_RMID, NULL);
-            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
-        } else if (cmd == IPC_STAT) {
-            struct msqid_ds ds;
-            if (msgctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
-            uint8_t *d = (uint8_t *)a2;
-            if (!d) { G_RET(c) = (uint64_t)(-EFAULT); break; }
-            memset(d, 0, 120); // sizeof(struct msqid64_ds) on aarch64
-            ipc_perm_m2l(d, &ds.msg_perm);
-            *(int64_t *)(d + 48) = (int64_t)ds.msg_stime;    // msg_stime
-            *(int64_t *)(d + 56) = (int64_t)ds.msg_rtime;    // msg_rtime
-            *(int64_t *)(d + 64) = (int64_t)ds.msg_ctime;    // msg_ctime
-            *(uint64_t *)(d + 72) = (uint64_t)ds.msg_cbytes; // msg_cbytes (current bytes on queue)
-            *(uint64_t *)(d + 80) = (uint64_t)ds.msg_qnum;   // msg_qnum
-            *(uint64_t *)(d + 88) = (uint64_t)ds.msg_qbytes; // msg_qbytes (max bytes on queue)
-            *(int32_t *)(d + 96) = (int32_t)ds.msg_lspid;    // msg_lspid
-            *(int32_t *)(d + 100) = (int32_t)ds.msg_lrpid;   // msg_lrpid
-            G_RET(c) = 0;
-        } else if (cmd == IPC_SET) {
-            struct msqid_ds ds; // STAT-then-modify: apply mode + the writable msg_qbytes
-            if (msgctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
-            const uint8_t *s = (const uint8_t *)a2;
-            if (!s) { G_RET(c) = (uint64_t)(-EFAULT); break; }
-            ds.msg_perm.mode = (mode_t)(*(const uint32_t *)(s + 20) & 0xfff);
-            ds.msg_qbytes = *(const uint64_t *)(s + 88);
-            int r = msgctl((int)a0, IPC_SET, &ds);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         } else {
             G_RET(c) = (uint64_t)(-ENOSYS);
@@ -3327,7 +3366,7 @@ static void service(struct cpu *c) {
         break;
     case 84: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break; // sync_file_range -> fsync
     case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
-    case 143: G_RET(c) = 0; break; // setregid: no-op success (guest already runs as DD_GID; never fail a drop)
+    case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
     case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
     case 152: G_RET(c) = (uint64_t)cgid(); break; // setfsgid -> previous fsgid
     case 168: // getcpu(cpu, node, tcache) -> cpu 0 / node 0

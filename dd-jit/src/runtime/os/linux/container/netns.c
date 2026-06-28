@@ -318,6 +318,84 @@ static void fill_inet_br(uint8_t *sa, socklen_t *l, uint32_t ip_be, uint16_t por
     if (l) *l = 16;
 }
 
+// ===== Linux <-> macOS sockaddr translation (AF_INET / AF_INET6) — gate: NOSOCKADDR=1 =====
+// The non-isolated socket paths (real host TCP/UDP via bind/connect/accept/getsockname/getpeername/
+// sendto/recvfrom/sendmsg) used to hand the guest's *Linux*-layout sockaddr straight to a macOS
+// syscall (and vice-versa on output). The two layouts differ in the first two bytes:
+//   Linux  sockaddr_in  = { u16 sin_family;  u16 sin_port; u32 sin_addr;  u8 pad[8] }   (AF_INET =2)
+//   macOS  sockaddr_in  = { u8 sin_len; u8 sin_family; u16 sin_port; u32 sin_addr; ... } (AF_INET =2)
+//   Linux  sockaddr_in6 = { u16 sin6_family; u16 port; u32 flow; u8 addr[16]; u32 scope}(AF_INET6=10)
+//   macOS  sockaddr_in6 = { u8 len; u8 sin6_family; u16 port; u32 flow; u8 addr[16]; u32 scope}(=30)
+// So a guest AF_INET(2) read as macOS becomes sin_len=2/sin_family=0 (AF_UNSPEC) -> the server never
+// really binds; and host output read back as Linux yields sin_family = 0x0210 = 528 (garbage). AF_INET6
+// additionally differs in the family *value* (10 vs 30). port/addr/flow/scope share offsets+encoding
+// (network byte order) so only family/len need fixing. AF_UNIX and other families pass through.
+#define LX_AF_INET 2
+#define LX_AF_INET6 10
+static int g_saxl = -1;
+static int saxl_on(void) {
+    if (g_saxl < 0) g_saxl = getenv("NOSOCKADDR") ? 0 : 1;
+    return g_saxl;
+}
+// guest domain (Linux) -> host (macOS), for socket()/socketpair(). AF_INET(2)/AF_UNIX(1) match.
+static int af_l2m(int d) { return (saxl_on() && d == LX_AF_INET6) ? AF_INET6 : d; }
+// guest(Linux) sockaddr -> host(macOS) into `out`; returns host socklen, or -1 if not AF_INET/INET6
+// (or gated off) — caller then uses the original guest pointer/len unchanged.
+static socklen_t sa_l2m(const uint8_t *g, socklen_t glen, struct sockaddr_storage *out) {
+    if (!saxl_on() || !g || glen < 2) return (socklen_t)-1;
+    int fam = *(const uint16_t *)g;
+    if (fam == LX_AF_INET && glen >= 8) {
+        struct sockaddr_in *m = (struct sockaddr_in *)out;
+        memset(m, 0, sizeof *m);
+        m->sin_len = sizeof *m;
+        m->sin_family = AF_INET;
+        memcpy(&m->sin_port, g + 2, 2); // port (BE), same offset
+        memcpy(&m->sin_addr, g + 4, 4); // addr (BE), same offset
+        return (socklen_t)sizeof *m;    // 16
+    }
+    if (fam == LX_AF_INET6 && glen >= 24) {
+        struct sockaddr_in6 *m = (struct sockaddr_in6 *)out;
+        memset(m, 0, sizeof *m);
+        m->sin6_len = sizeof *m;
+        m->sin6_family = AF_INET6;
+        memcpy(&m->sin6_port, g + 2, 2);
+        memcpy(&m->sin6_flowinfo, g + 4, 4);
+        memcpy(&m->sin6_addr, g + 8, 16);
+        if (glen >= 28) memcpy(&m->sin6_scope_id, g + 24, 4);
+        return (socklen_t)sizeof *m; // 28
+    }
+    return (socklen_t)-1;
+}
+// host(macOS) sockaddr -> guest(Linux) layout written to `g` (capacity gcap, may be 0/NULL). Returns
+// the FULL Linux length of the address (16/28) even if it exceeds gcap (Linux truncates the copy but
+// reports the full length via *addrlen), or -1 if not AF_INET/INET6 (caller copies raw host bytes).
+static int sa_m2l(const struct sockaddr *m, uint8_t *g, socklen_t gcap) {
+    if (!saxl_on() || !m) return -1;
+    if (m->sa_family == AF_INET) {
+        const struct sockaddr_in *s = (const struct sockaddr_in *)m;
+        uint8_t t[16];
+        memset(t, 0, sizeof t);
+        *(uint16_t *)t = LX_AF_INET;
+        memcpy(t + 2, &s->sin_port, 2);
+        memcpy(t + 4, &s->sin_addr, 4);
+        if (g && gcap) memcpy(g, t, gcap < 16 ? gcap : 16);
+        return 16;
+    }
+    if (m->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)m;
+        uint8_t t[28];
+        memset(t, 0, sizeof t);
+        *(uint16_t *)t = LX_AF_INET6;
+        memcpy(t + 2, &s->sin6_port, 2);
+        memcpy(t + 4, &s->sin6_flowinfo, 4);
+        memcpy(t + 8, &s->sin6_addr, 16);
+        memcpy(t + 24, &s->sin6_scope_id, 4);
+        if (g && gcap) memcpy(g, t, gcap < 28 ? gcap : 28);
+        return 28;
+    }
+    return -1;
+}
+
 // ---- abstract-namespace AF_UNIX (sun_path[0]=='\0'): macOS has no abstract namespace, so map the
 // abstract name to a real filesystem socket under a per-namespace dir keyed by DD_NETNS (same key as
 // ipc_ns_key), so two guests in one container rendezvous and different containers stay isolated. The
