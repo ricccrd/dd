@@ -42,6 +42,19 @@ static key_t ipc_ns_key(key_t k) {
     key_t hk = (key_t)((uint32_t)k ^ (salt & 0x7fffffffu));
     return hk == IPC_PRIVATE ? hk + 1 : hk;
 }
+// SysV IPC *ctl(IPC_STAT): fill the Linux 64-bit ipc64_perm (48 bytes, aarch64 asm-generic layout) at `d`
+// from a macOS `struct ipc_perm`. Owner/creator uid+gid are reported as the container ids (cuid/cgid) so a
+// `--user N:M` guest sees IPC objects it created as owned by itself; mode/seq/key pass through from the host.
+static void ipc_perm_m2l(uint8_t *d, const struct ipc_perm *p) {
+    memset(d, 0, 48);
+    *(int32_t *)(d + 0) = (int32_t)p->_key;    // key
+    *(uint32_t *)(d + 4) = (uint32_t)cuid();   // uid
+    *(uint32_t *)(d + 8) = (uint32_t)cgid();   // gid
+    *(uint32_t *)(d + 12) = (uint32_t)cuid();  // cuid
+    *(uint32_t *)(d + 16) = (uint32_t)cgid();  // cgid
+    *(uint32_t *)(d + 20) = (uint32_t)p->mode; // mode
+    *(uint16_t *)(d + 24) = (uint16_t)p->_seq; // seq
+}
 // list a directory's entries (minus . / ..) as a newline-joined, NUL-terminated malloc'd string (for the
 // inotify-on-a-directory diff). NULL on error.
 static char *dir_snapshot(const char *path) {
@@ -1849,13 +1862,14 @@ static void service(struct cpu *c) {
         G_RET(c) = (r == -1 && errno) ? (uint64_t)(-errno) : (uint64_t)(20 - r);
         break;
     }
-    case 144:
-    case 146:
-    case 147:
-    // setgid/setfsuid/setresuid/setresgid -> ok
-    case 149: G_RET(c) = 0; break;
-    // getpgid
-    case 145: G_RET(c) = (uint64_t)getpgrp(); break;
+    // setuid/setgid family: the guest already runs as DD_UID/DD_GID in dd's model, so any privilege drop
+    // succeeds as a no-op -- never fail a drop to the configured uid/gid (docker run --user / exec -u).
+    case 144: // setgid
+    case 145: // setreuid
+    case 146: // setuid
+    case 147: // setresuid
+    case 149: // setresgid
+        G_RET(c) = 0; break;
     case 148: {
         // getresuid(r,e,s)
         if (a0) *(uint32_t *)a0 = cuid();
@@ -3121,9 +3135,33 @@ static void service(struct cpu *c) {
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    case 195: { // shmctl(shmid, cmd, buf): IPC_RMID supported; STAT/SET deferred (macOS struct differs)
-        if ((int)a1 == IPC_RMID) {
+    case 195: { // shmctl(shmid, cmd, buf): IPC_RMID + IPC_STAT/IPC_SET (macOS<->Linux struct translation)
+        int cmd = (int)a1;
+        if (cmd == IPC_RMID) {
             int r = shmctl((int)a0, IPC_RMID, NULL);
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        } else if (cmd == IPC_STAT) {
+            struct shmid_ds ds;
+            if (shmctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            uint8_t *d = (uint8_t *)a2;
+            if (!d) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+            memset(d, 0, 112); // sizeof(struct shmid64_ds) on aarch64
+            ipc_perm_m2l(d, &ds.shm_perm);
+            *(uint64_t *)(d + 48) = (uint64_t)ds.shm_segsz;                  // shm_segsz
+            *(int64_t *)(d + 56) = (int64_t)ds.shm_atime;                    // shm_atime
+            *(int64_t *)(d + 64) = (int64_t)ds.shm_dtime;                    // shm_dtime
+            *(int64_t *)(d + 72) = (int64_t)ds.shm_ctime;                    // shm_ctime
+            *(int32_t *)(d + 80) = (int32_t)ds.shm_cpid;                     // shm_cpid
+            *(int32_t *)(d + 84) = (int32_t)ds.shm_lpid;                     // shm_lpid
+            *(uint64_t *)(d + 88) = (uint64_t)(unsigned short)ds.shm_nattch; // shm_nattch
+            G_RET(c) = 0;
+        } else if (cmd == IPC_SET) {
+            struct shmid_ds ds; // STAT-then-modify: only the mode is portable (host keeps real ownership)
+            if (shmctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            const uint8_t *s = (const uint8_t *)a2;
+            if (!s) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+            ds.shm_perm.mode = (mode_t)(*(const uint32_t *)(s + 20) & 0xfff);
+            int r = shmctl((int)a0, IPC_SET, &ds);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         } else {
             G_RET(c) = (uint64_t)(-ENOSYS);
@@ -3149,7 +3187,28 @@ static void service(struct cpu *c) {
         if (lc == 16) { arg.val = (int)a3; r = semctl((int)a0, (int)a1, mc, arg); }                       // SETVAL
         else if (lc == 13 || lc == 17) { arg.array = (unsigned short *)a3; r = semctl((int)a0, (int)a1, mc, arg); } // GET/SETALL
         else if (lc == 0 || lc == 11 || lc == 12 || lc == 14 || lc == 15) { r = semctl((int)a0, (int)a1, mc); }    // RMID/GETPID/GETVAL/GETNCNT/GETZCNT
-        else { G_RET(c) = (uint64_t)(-ENOSYS); break; }                                                   // IPC_STAT/SET: struct differs
+        else if (lc == 2) { // IPC_STAT: macOS semid_ds -> Linux semid64_ds (aarch64)
+            struct semid_ds ds; arg.buf = &ds;
+            if (semctl((int)a0, 0, IPC_STAT, arg) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            uint8_t *d = (uint8_t *)a3;
+            if (!d) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+            memset(d, 0, 88); // sizeof(struct semid64_ds) on aarch64
+            ipc_perm_m2l(d, &ds.sem_perm);
+            *(int64_t *)(d + 48) = (int64_t)ds.sem_otime;   // sem_otime
+            *(int64_t *)(d + 56) = (int64_t)ds.sem_ctime;   // sem_ctime
+            *(uint64_t *)(d + 64) = (uint64_t)ds.sem_nsems; // sem_nsems
+            G_RET(c) = 0; break;
+        }
+        else if (lc == 1) { // IPC_SET: apply mode only (host keeps real ownership)
+            struct semid_ds ds; arg.buf = &ds;
+            if (semctl((int)a0, 0, IPC_STAT, arg) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            const uint8_t *s = (const uint8_t *)a3;
+            if (!s) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+            ds.sem_perm.mode = (mode_t)(*(const uint32_t *)(s + 20) & 0xfff);
+            arg.buf = &ds;
+            G_RET(c) = semctl((int)a0, 0, IPC_SET, arg) < 0 ? (uint64_t)(-errno) : 0; break;
+        }
+        else { G_RET(c) = (uint64_t)(-ENOSYS); break; }                                                   // SEM_STAT/SEM_INFO: unsupported
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -3170,9 +3229,35 @@ static void service(struct cpu *c) {
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
-    case 187: { // msgctl(msqid, cmd, buf): IPC_RMID supported; STAT/SET deferred (macOS struct differs)
-        if ((int)a1 == IPC_RMID) {
+    case 187: { // msgctl(msqid, cmd, buf): IPC_RMID + IPC_STAT/IPC_SET (macOS<->Linux struct translation)
+        int cmd = (int)a1;
+        if (cmd == IPC_RMID) {
             int r = msgctl((int)a0, IPC_RMID, NULL);
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        } else if (cmd == IPC_STAT) {
+            struct msqid_ds ds;
+            if (msgctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            uint8_t *d = (uint8_t *)a2;
+            if (!d) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+            memset(d, 0, 120); // sizeof(struct msqid64_ds) on aarch64
+            ipc_perm_m2l(d, &ds.msg_perm);
+            *(int64_t *)(d + 48) = (int64_t)ds.msg_stime;    // msg_stime
+            *(int64_t *)(d + 56) = (int64_t)ds.msg_rtime;    // msg_rtime
+            *(int64_t *)(d + 64) = (int64_t)ds.msg_ctime;    // msg_ctime
+            *(uint64_t *)(d + 72) = (uint64_t)ds.msg_cbytes; // msg_cbytes (current bytes on queue)
+            *(uint64_t *)(d + 80) = (uint64_t)ds.msg_qnum;   // msg_qnum
+            *(uint64_t *)(d + 88) = (uint64_t)ds.msg_qbytes; // msg_qbytes (max bytes on queue)
+            *(int32_t *)(d + 96) = (int32_t)ds.msg_lspid;    // msg_lspid
+            *(int32_t *)(d + 100) = (int32_t)ds.msg_lrpid;   // msg_lrpid
+            G_RET(c) = 0;
+        } else if (cmd == IPC_SET) {
+            struct msqid_ds ds; // STAT-then-modify: apply mode + the writable msg_qbytes
+            if (msgctl((int)a0, IPC_STAT, &ds) < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            const uint8_t *s = (const uint8_t *)a2;
+            if (!s) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+            ds.msg_perm.mode = (mode_t)(*(const uint32_t *)(s + 20) & 0xfff);
+            ds.msg_qbytes = *(const uint64_t *)(s + 88);
+            int r = msgctl((int)a0, IPC_SET, &ds);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         } else {
             G_RET(c) = (uint64_t)(-ENOSYS);
@@ -3226,7 +3311,7 @@ static void service(struct cpu *c) {
         break;
     case 84: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break; // sync_file_range -> fsync
     case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
-    case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
+    case 143: G_RET(c) = 0; break; // setregid: no-op success (guest already runs as DD_GID; never fail a drop)
     case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
     case 152: G_RET(c) = (uint64_t)cgid(); break; // setfsgid -> previous fsgid
     case 168: // getcpu(cpu, node, tcache) -> cpu 0 / node 0
