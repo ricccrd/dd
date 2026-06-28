@@ -1,6 +1,6 @@
 [package]
 name = "dd-tests"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "dd engine test harness — declarative groups of guest tests, run across every JIT engine."
 
