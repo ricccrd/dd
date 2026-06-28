@@ -13,6 +13,14 @@ surface. **This is the only plan — a work list of what is NOT yet implemented.
 > leak, the **vfs.c / translate.c / daemon containers.rs refactor splits**, and the full **Docker-API** fidelity
 > (HostConfig / build-cache / `commit` / `--name`·rm·exec·`--rm`·events·logs-interleave·`:ro`).
 
+## In flight (critical) — validating the landed sentry
+
+The sentry code is fully landed and proven **inert when gated off**, but it had **zero `DDJIT_UNTRUSTED` test
+coverage** — it was never actually executed, so "run untrusted images" is code-complete but **unproven**. An
+agent is adding harness `.untrusted()` support + golden tests (fs read/write/stat, socket echo, getdents —
+sandbox-forwarded output compared against the trusted baseline) and statically shaking out the ring/forwarding
+path. Until these pass, treat the sentry as unvalidated.
+
 ## Residual — NOT clearable by a mechanical agent pass
 
 **Perf (needs iterative profiling, not a one-shot change):**
