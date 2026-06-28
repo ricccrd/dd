@@ -5,6 +5,11 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 // binary into the COW arena and a worker can report its exit code before dying. 0 on every normal
 // (standalone) run -> exit_group behaves exactly as before.
 int g_noexit;
+// W6A item 3: set the first time a guest requests a PROT_EXEC (RWX) anonymous mapping -- i.e. a
+// guest with its own in-process JIT (JVM/V8/LuaJIT/.NET/PyPy). Normal guests never set it, so the
+// SMC write-fault invalidation path (frontend/x86_64) stays completely inert for the whole existing
+// test matrix (g_rwx_guest==0 -> smc_protect()/smc_on_write() are no-ops -> bit-exact).
+int g_rwx_guest;
 // dd/runtime/os/linux -- service(): the Linux syscall layer (the "kernel" the guest talks to).
 // Dispatches the guest syscall number to the host, translating the ABI (errno, struct layouts, flags,
 // fd semantics); every path argument is resolved through the container VFS jail. One sorted switch,
@@ -1885,6 +1890,19 @@ static void service(struct cpu *c) {
         // PROT_READ|WRITE upgrade would be silently dropped. Map ANON memory writable up front so the
         // upgrade is already in effect (redis' checkLinuxMadvFreeForkBug mmaps R then mprotects RW then stores).
         int prot = (a3 & 0x20) ? ((int)a2 | PROT_READ | PROT_WRITE) : (int)a2;
+        // W6A item 3: guest RWX / PROT_EXEC mmaps (JVM/V8/LuaJIT/.NET/PyPy JIT arenas). On macOS a
+        // non-MAP_JIT mmap that requests PROT_EXEC fails with EPERM under the hardened W^X policy, so
+        // these guests can't allocate their code arena. But this is a DBT: the host NEVER executes guest
+        // pages natively -- guest "execution" is translate_block() reading the page's bytes and emitting
+        // host code into the (separately RX) code cache. So PROT_EXEC on a guest mapping is meaningless to
+        // the host and only triggers the EPERM. Strip it: the page is mapped R+W, the guest writes its
+        // generated code, "executes" it (guest PC enters the page -> map_host miss -> translate), and runs.
+        // Setting g_rwx_guest also arms the (otherwise inert) SMC write-fault invalidation in frontend/x86_64
+        // so a guest that OVERWRITES already-translated code re-translates. NORWXFIX=1 disables the strip.
+        if (!getenv("NORWXFIX") && (a3 & 0x20) && (prot & PROT_EXEC)) {
+            prot = (prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE;
+            g_rwx_guest = 1; // a JIT guest is present (informational + SMC gate)
+        }
         void *r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4,
                        (off_t)a5);
         // refund

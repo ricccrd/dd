@@ -1,5 +1,13 @@
 // dd/runtime/frontend/x86_64 -- ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
 
+// W6A: the x86 target (linux_x86_64.c) does not pull in the mach VM headers (only the aarch64 target
+// does, for item 2's dual map). The lazy-fault budget classifier (item 4) queries the real VM map via
+// mach_vm_region, and the non-PIE data fixup (item 1) reads the arm64 thread state out of the ucontext.
+// Include guards make these idempotent if the unity build ever includes them earlier.
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <sys/ucontext.h>
+
 // ---------------- minimal ELF loader (load high; copied from jit.c) ----------------
 static uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) {
@@ -83,6 +91,21 @@ static void load_elf(const char *path, struct loaded *out) {
         exit(1);
     }
     uint64_t bias = (uint64_t)base - basepage;
+    // W6A item 1: a non-PIE ET_EXEC (etype==2) links at a fixed low vaddr (e.g. 0x400000) but macOS
+    // __PAGEZERO reserves the low 4GB, so the loader (above) biases it to a high mmap. Its un-relocated
+    // ABSOLUTE refs then point at the original low vaddr (unmapped/__PAGEZERO) and fault. Record the
+    // original link range + bias so the dispatcher can redirect absolute CODE jumps and the SIGSEGV
+    // handler (nonpie_fixup) can serve absolute DATA loads/stores at +bias. PIE/static-PIE leave these
+    // 0 -> no redirect, no fixup, byte-identical. Coexists with the opt8 g_force_base path above (that
+    // only fires for PIE images under DDJIT_PCACHE; a non-PIE ET_EXEC takes the NULL-hint branch).
+    // NONPIE_NOFIXUP=1 disables (legacy: code jump still faults on the low vaddr). g_nonpie_* live in the
+    // shared os/linux/container/vfs.c; service.c resets them across execve (case 221) for re-loaded images.
+    int etype = rd16(f + 16);
+    if (etype == 2 && !getenv("NONPIE_NOFIXUP")) {
+        g_nonpie_lo = basepage;
+        g_nonpie_hi = basepage + span;
+        g_nonpie_bias = bias;
+    }
     for (int i = 0; i < phnum; i++) {
         uint8_t *ph = f + phoff + (uint64_t)i * phentsize;
         if (rd32(ph) != 1) continue;
@@ -183,23 +206,147 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 // zero and retry: the zero terminator makes strlen/memchr return the correct result, and
 // vectorized loads mask out the bytes past the real end. Bounded so genuine wild
 // accesses (a real bug) still abort once the budget is spent.
-static _Atomic int g_lazymaps;
-void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
-    (void)uc;
-    void *a = si ? si->si_addr : NULL;
-    if (a && g_lazymaps < 4096) {
-        uintptr_t pg = (uintptr_t)a & ~(uintptr_t)0xFFF;
-        // macOS won't MAP_FIXED over a sub-range of an existing VM entry (EINVAL); try
-        // mprotect first (the page often exists as a PROT_NONE guard), then a fresh map.
-        if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE) == 0) {
-            g_lazymaps++;
-            return;
+static _Atomic int g_lazymaps; // isolated/wild faults (small bounded budget)
+static _Atomic int g_growmaps; // adjacent (stack-grow / over-read) faults: large bounded budget
+// W6A item 4: the original cap was a single global, monotonic, never-reset budget of 4096 pages shared
+// by BOTH legitimate growth (stack-down, SSE over-reads adjacent to a real allocation) AND genuine wild
+// pointers. A long-running / large-working-set guest that legitimately faults >4096 DISTINCT guard pages
+// exhausts it and the next legitimate fault is re-raised as a fatal SIGSEGV (exit 139). Fix: classify the
+// fault by adjacency to an existing mapping. A fault page whose immediate neighbor (above OR below) is
+// already mapped is provably legitimate (stack growth is one page below the committed stack; an SSE
+// over-read is one page past a real buffer) -> map it against a large grow budget. A fault with NO mapped
+// neighbor is an isolated wild pointer -> the small bounded budget still catches it and aborts (safety
+// net PRESERVED). Page contents + retry are unchanged, so this is bit-identical for any workload the old
+// code completed. Gate: NOLAZYFIX=1 reverts to the single 4096 monotonic budget (everything on g_lazymaps);
+// LAZYBUDGET=<n> overrides the small cap (repro/testing); LAZYDIAG=1 prints final counts at exit.
+static int lazy_addr_mapped(uintptr_t a) {
+    // mincore() is useless here -- on macOS it returns 0 for ANY address, mapped or not. Query the real
+    // VM map: mach_vm_region returns the first region at-or-above `a`; `a` is mapped iff it falls inside
+    // that region's [start,start+size).
+    mach_vm_address_t addr = a;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr =
+        mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj);
+    if (kr != KERN_SUCCESS) return 0; // nothing at/above -> unmapped
+    return a >= (uintptr_t)addr && a < (uintptr_t)addr + (uintptr_t)size;
+}
+static int lazy_neighbor_mapped(uintptr_t pg) {
+    // A fault adjacent to a live mapping is legitimate growth/over-read: the byte just below the fault
+    // page is the end of a real region (over-read), or the page just above is the committed stack
+    // (grow-down). An isolated fault (both neighbors unmapped) is a candidate wild pointer. Use the 16KB
+    // macOS hardware page granularity for the "above" probe.
+    if (pg >= 1 && lazy_addr_mapped(pg - 1)) return 1;
+    if (lazy_addr_mapped(pg + 0x4000)) return 1;
+    return 0;
+}
+static int lazy_budget(void) {
+    static int b = -1;
+    if (b < 0) {
+        const char *e = getenv("LAZYBUDGET");
+        b = (e && *e) ? atoi(e) : 4096;
+    }
+    return b;
+}
+static int lazy_nofix(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("NOLAZYFIX") ? 1 : 0;
+    return v;
+}
+static void lazy_diag(void) {
+    if (getenv("LAZYDIAG"))
+        fprintf(stderr, "[lazy] grow=%d wild=%d (budget=%d nofix=%d)\n", (int)g_growmaps, (int)g_lazymaps,
+                lazy_budget(), lazy_nofix());
+}
+// W6A item 1: emulate a faulting host load/store against the biased non-PIE image. A non-PIE guest's
+// absolute ref resolves to the original low link vaddr (in [g_nonpie_lo,g_nonpie_hi)); the real data
+// lives at that vaddr + g_nonpie_bias. We decode the faulting emitted arm64 load/store, perform the
+// access at +bias, and skip the instruction. Covers the integer ld/st-register family (scaled +
+// unscaled, signed/unsigned, b/h/w/x) the x86 memory paths emit -- the absolute DATA ref that __PAGEZERO
+// otherwise makes fatal. Returns 1 if handled. (SIMD-Q `ldr q` and LSE atomic-RMW forms are left to the
+// normal path -> a clean abort rather than silent wrong data; documented residual.) Gated on g_nonpie_lo
+// (set only for ET_EXEC) -> PIE/static-PIE never enter here.
+static int nonpie_fixup(siginfo_t *si, void *ucv) {
+    if (!g_nonpie_lo || !ucv || !si) return 0;
+    uint64_t va = (uint64_t)si->si_addr;
+    if (va < g_nonpie_lo || va >= g_nonpie_hi) return 0;
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint32_t insn = *(uint32_t *)(uc->uc_mcontext->__ss.__pc);
+    uint64_t real = va + g_nonpie_bias; // the actual mapped location of the datum
+    uint32_t top = insn >> 24;          // size(2) | family bits
+    int size = insn >> 30;              // 0=B 1=H 2=W 3=X
+    int v = (insn >> 26) & 1;           // SIMD?
+    int opc = (insn >> 22) & 3;         // 01=load(zext) 00=store 10=load-sext(64) 11=ldrsw
+    int rt = insn & 0x1F;
+    // family: bits[29:27]==111 and bit[25:24] select scaled(01)/unscaled-or-reg(00). We accept the scaled
+    // unsigned-immediate (xx111001...) and unscaled ldur/stur (xx111000...0) integer forms.
+    int is_ls = ((insn >> 27) & 7) == 7 && !v; // 0b111 in [29:27], integer
+    if (!is_ls) return 0;
+    uint64_t *X = uc->uc_mcontext->__ss.__x; // __x[0..28]; 29=fp 30=lr 31=zr/sp
+    uint64_t val;
+    if (opc == 0) { // store: write rt's low `size` bytes
+        val = (rt == 31) ? 0 : X[rt];
+        switch (size) {
+        case 0: *(uint8_t *)real = (uint8_t)val; break;
+        case 1: *(uint16_t *)real = (uint16_t)val; break;
+        case 2: *(uint32_t *)real = (uint32_t)val; break;
+        default: *(uint64_t *)real = val; break;
         }
-        void *r = mmap((void *)pg, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-        if (r != MAP_FAILED) {
-            g_lazymaps++;
-            return;
-        } // retry the faulting instruction
+    } else { // load
+        switch (size) {
+        case 0: val = *(uint8_t *)real; if (opc == 2) val = (uint64_t)(int64_t)(int8_t)val; break;
+        case 1: val = *(uint16_t *)real; if (opc == 2) val = (uint64_t)(int64_t)(int16_t)val; break;
+        case 2: val = *(uint32_t *)real; if (opc == 2 || opc == 3) val = (uint64_t)(int64_t)(int32_t)val; break;
+        default: val = *(uint64_t *)real; break;
+        }
+        if (rt != 31) X[rt] = val;
+    }
+    uc->uc_mcontext->__ss.__pc += 4; // skip the faulting load/store
+    (void)top;
+    return 1;
+}
+void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
+    // W6A item 1: a non-PIE absolute DATA ref into the low link range -> serve the access at +bias and
+    // advance the host PC. Inert unless g_nonpie_lo is set (ET_EXEC only).
+    if (nonpie_fixup(si, uc)) return;
+    // W6A item 3 (SMC): a guest write to a translated, write-protected JIT code page. Drop the cached
+    // translations + IBTC (they're stale; do NOT reset g_cp -> the currently-running block's host code
+    // stays intact, orphaned translations are reclaimed by the normal wholesale flush), unprotect the
+    // page (smc_on_write retries + the write lands), and let the modified bytes re-translate on next
+    // execution. smc_on_write is inert unless a JIT guest is present (g_rwx_guest) -> matrix bit-exact.
+    if (si && si->si_addr && smc_on_write((uint64_t)si->si_addr)) {
+        memset(g_map, 0, sizeof g_map);
+        memset(g_ibtc, 0, sizeof g_ibtc);
+        g_npend = 0;
+        return;
+    }
+    void *a = si ? si->si_addr : NULL;
+    if (a) {
+        uintptr_t pg = (uintptr_t)a & ~(uintptr_t)0xFFF;
+        // W6A item 4: classify by adjacency. A fault adjacent to an existing mapping is legitimate
+        // growth/over-read and draws on the large grow budget; an isolated fault is a candidate wild
+        // pointer on the small budget. NOLAZYFIX=1 forces the legacy single small monotonic budget.
+        int adjacent = !lazy_nofix() && lazy_neighbor_mapped(pg);
+        int ok = adjacent ? (g_growmaps < (256 << 10)) /* 1GB of grow pages */ : (g_lazymaps < lazy_budget());
+        if (ok) {
+            static int hooked;
+            if (!hooked) { hooked = 1; atexit(lazy_diag); }
+            // macOS won't MAP_FIXED over a sub-range of an existing VM entry (EINVAL); try mprotect
+            // first (the page often exists as a PROT_NONE guard), then a fresh map.
+            if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE) == 0) {
+                if (adjacent) g_growmaps++;
+                else g_lazymaps++;
+                return;
+            }
+            void *r = mmap((void *)pg, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+            if (r != MAP_FAILED) {
+                if (adjacent) g_growmaps++;
+                else g_lazymaps++;
+                return;
+            } // retry the faulting instruction
+        }
     }
     signal(sig, SIG_DFL);
     raise(sig); // out of budget / mmap failed -> real crash

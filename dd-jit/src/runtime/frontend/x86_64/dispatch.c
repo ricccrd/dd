@@ -1,5 +1,44 @@
 // dd/runtime/frontend/x86_64 -- the dispatcher loop (translate-on-miss; service syscalls).
 
+// ---- W6A item 3: SMC (self-modifying code) for in-process JIT guests ----  gate NOSMC=1
+// Once a guest takes a PROT_EXEC (RWX) mmap (g_rwx_guest, set in os/linux/service.c), it may overwrite
+// code it already executed (and we translated+cached). We can't see the write otherwise, so after
+// translating a block we mprotect its source 16KB page READ-ONLY; a guest write then traps in
+// jit86_lazyguard (frontend/x86_64/elf.c), which calls smc_on_write() to unprotect the page + drop the
+// stale translations (g_map/g_ibtc), so the modified bytes re-translate. Entirely inert unless
+// g_rwx_guest is set (smc_protect returns immediately) -> zero effect on the normal (non-JIT) matrix.
+// g_rwx_guest is defined in service.c, included before this TU in the x86 unity build.
+extern int g_rwx_guest;
+#define SMC_MAX 8192
+static uint64_t g_smc_pg[SMC_MAX];
+static int g_smc_n;
+static uint64_t g_smc_flushes; // PROF: number of SMC re-translate events
+static int g_nosmc = -1;
+static void smc_protect(uint64_t pc) {
+    if (!g_rwx_guest) return; // no JIT guest -> inert (matrix bit-exact)
+    if (g_nosmc < 0) g_nosmc = (getenv("NOSMC") != NULL);
+    if (g_nosmc) return;
+    uint64_t pg = pc & ~0x3FFFull; // 16KB macOS hardware page
+    for (int i = 0; i < g_smc_n; i++)
+        if (g_smc_pg[i] == pg) return; // already protected
+    if (mprotect((void *)pg, 0x4000, PROT_READ) != 0) return; // code page -> read-only; writes trap
+    if (g_smc_n < SMC_MAX) g_smc_pg[g_smc_n++] = pg;
+}
+// If `a` falls in a protected SMC page, unprotect+forget it and return 1 (caller drops translations).
+// Re-protected the next time the page is translated. Called from jit86_lazyguard (elf.c, after this TU).
+static int smc_on_write(uint64_t a) {
+    if (!g_rwx_guest) return 0;
+    uint64_t pg = a & ~0x3FFFull;
+    for (int i = 0; i < g_smc_n; i++)
+        if (g_smc_pg[i] == pg) {
+            mprotect((void *)pg, 0x4000, PROT_READ | PROT_WRITE); // let the guest's write through
+            g_smc_pg[i] = g_smc_pg[--g_smc_n];                    // re-protected on next translate
+            g_smc_flushes++;
+            return 1;
+        }
+    return 0;
+}
+
 // ---------------- dispatcher ----------------
 static uint64_t g_prevpc, g_curpc; // debug: track block transitions for fault diagnosis
 static void run_guest(struct cpu *c) {
@@ -7,6 +46,11 @@ static void run_guest(struct cpu *c) {
     while (!c->exited) {
         if (c->rip == SIGRETURN_PC) do_sigreturn(c); // handler returned -> restore interrupted context
         if (g_pending) maybe_deliver_signal(c);      // async signal pending -> redirect to guest handler
+        // W6A item 1: a non-PIE ET_EXEC's un-relocated absolute CODE jump lands on its original low link
+        // vaddr (unmapped/__PAGEZERO); redirect into the biased image so we translate the real code.
+        // g_nonpie_lo is 0 for PIE/static-PIE (set only for ET_EXEC in load_elf) -> inert otherwise.
+        // Mirrors the aarch64 engine's jit/dispatch.c redirect; coexists with the W5-B R_TIER2 hook below.
+        if (g_nonpie_lo && c->rip >= g_nonpie_lo && c->rip < g_nonpie_hi) c->rip += g_nonpie_bias;
         g_prevpc = g_curpc;
         g_curpc = c->rip;
         g_disp_n++;
@@ -57,6 +101,7 @@ static void run_guest(struct cpu *c) {
             code = translate_block(c->rip);
             pthread_jit_write_protect_np(1);
             sys_icache_invalidate(g_emit_start, (size_t)(g_cp - g_emit_start));
+            smc_protect(c->rip); // W6A item 3: guard this source page so a JIT guest's overwrite is seen
         }
         if (c->ic_miss) { // IBTC: an indirect branch missed -> cache {target -> body}
             // The IBTC probe in emitted code reads g_ibtc unlocked; a concurrent torn fill -> wrong body.
