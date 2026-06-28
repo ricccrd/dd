@@ -188,14 +188,14 @@ fn split_log_lines(buf: &[u8]) -> Vec<Vec<u8>> {
 
 /// Frame a chunk of guest output for the docker logs wire. TTY containers stream raw bytes (no demux
 /// header); non-TTY uses Docker's multiplexed framing (8-byte header, stream id 1=stdout / 2=stderr).
-/// With `--timestamps` the chunk is split into lines and each gets an RFC3339 prefix (dd stores no
-/// per-line emit time, so the CURRENT time is used -- best-effort) so the stamp survives demuxing
-/// exactly as dockerd writes it.
-fn frame_chunk(stream: u8, data: &[u8], tty: bool, timestamps: bool) -> Vec<u8> {
+/// With `--timestamps` the chunk is split into lines and each gets an RFC3339 prefix using `ts_secs`
+/// (the chunk's recorded emit time for buffered replay, or the current time for live follow) so the
+/// stamp survives demuxing exactly as dockerd writes it.
+fn frame_chunk(stream: u8, data: &[u8], tty: bool, timestamps: bool, ts_secs: i64) -> Vec<u8> {
     if !timestamps {
         return if tty { data.to_vec() } else { log_frame(stream, data) };
     }
-    let ts = fmt_rfc3339(now_secs());
+    let ts = fmt_rfc3339(ts_secs);
     let mut out = Vec::new();
     for line in split_log_lines(data) {
         let mut p = Vec::with_capacity(ts.len() + 1 + line.len());
@@ -205,6 +205,17 @@ fn frame_chunk(stream: u8, data: &[u8], tty: bool, timestamps: bool) -> Vec<u8> 
         if tty { out.extend_from_slice(&p); } else { out.extend(log_frame(stream, &p)); }
     }
     out
+}
+
+/// Fallback ordered log built from the per-stream persisted snapshots (`cc.stdout`/`cc.stderr`) for when
+/// the Live's chronological `log_chunks` is gone (daemon restart). Without per-chunk times the true
+/// interleave is unrecoverable, so we emit stdout then stderr, stamped with the run's start/finish time
+/// so `--since`/`--until`/`--timestamps` still behave as they did before the ordered log existed.
+fn persisted_ordered(out: Vec<u8>, err: Vec<u8>, start_t: i64, end_t: i64) -> Vec<(i64, u8, Vec<u8>)> {
+    let mut v = Vec::new();
+    if !out.is_empty() { v.push((start_t, 1u8, out)); }
+    if !err.is_empty() { v.push((end_t, 2u8, err)); }
+    v
 }
 
 pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>, Query(q): Query<LogsQ>) -> Response {
@@ -241,37 +252,41 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
     let out_sub = if follow_live { live.as_ref().map(|l| l.out.subscribe()) } else { None };
     let exit_sub = live.as_ref().map(|l| l.exit_rx.clone());
 
-    // Buffered output: the live buffers while running; once exited those are emptied into c.stdout/stderr.
-    let (sout, serr) = match &live {
+    // Buffered output, as the single chronological record `(emit-secs, stream, bytes)`. While the Live
+    // exists (running, or exited-but-retained for non-`--rm`) we read its ordered `log_chunks` directly,
+    // so stdout/stderr replay interleaved. Once the ordered log is gone (e.g. a daemon restart, where the
+    // per-stream persisted buffers are also empty since they aren't serialized) we fall back to an
+    // approximate stdout-then-stderr ordering from `cc.stdout`/`cc.stderr`, the best possible then.
+    let chunks: Vec<(i64, u8, Vec<u8>)> = match &live {
         Some(l) => {
-            let so = l.stdout_buf.lock().await.clone();
-            let se = l.stderr_buf.lock().await.clone();
-            (if so.is_empty() { persisted_out } else { so },
-             if se.is_empty() { persisted_err } else { se })
+            let lc = l.log_chunks.lock().await;
+            if !lc.is_empty() { lc.clone() }
+            else { drop(lc); persisted_ordered(persisted_out, persisted_err, start_t, end_t) }
         }
-        None => (persisted_out, persisted_err),
+        None => persisted_ordered(persisted_out, persisted_err, start_t, end_t),
     };
 
-    // `--since`/`--until`: dd stores no per-line timestamps, so the buffered block is filtered as a
-    // WHOLE against the container's run window [start_t, end_t]. The buffer is kept unless that entire
-    // window lies outside [since, until]; finer per-line filtering isn't possible without stored times.
-    let include_buffer = since.map_or(true, |s| end_t >= s) && until.map_or(true, |u| start_t <= u);
-
-    // Replay: collect lines as (stream_id, bytes), stdout first then stderr, apply `--tail` across the
-    // combined set, then per-line timestamp + framing.
-    // LIMITATION: the live buffers (`stdout_buf`/`stderr_buf`) store raw bytes with NO per-chunk emit
-    // time, so a chronological stdout/stderr merge of the buffered REPLAY isn't possible — stderr is
-    // appended after stdout. The follow path streams the single ordered `Live.out` broadcast, so newly
-    // produced output IS interleaved correctly in real time; only the historical replay is segregated.
-    // True replay interleave would require timestamping each chunk (a Live-buffer schema change).
-    let mut replay = Vec::new();
-    if include_buffer {
-        let mut entries: Vec<(u8, Vec<u8>)> = Vec::new();
-        if want_out { for line in split_log_lines(&sout) { entries.push((1, line)); } }
-        if want_err { for line in split_log_lines(&serr) { entries.push((2, line)); } }
-        if let Some(n) = tail { if entries.len() > n { entries.drain(0..entries.len() - n); } }
-        for (stream, line) in entries { replay.extend(frame_chunk(stream, &line, tty, timestamps)); }
+    // Replay: walk the ordered log, coalescing adjacent same-stream chunks into runs so line-splitting
+    // sees contiguous stream output (clean lines) while stream switches stay interleave points. Each run
+    // carries its first chunk's emit time, which drives `--since`/`--until` (per-line, by recorded time)
+    // and `--timestamps`. Then `--tail` keeps the last N lines of the combined ordered set, and each line
+    // is per-line timestamped + framed (multiplexed 8-byte header for non-TTY, raw bytes for TTY).
+    let mut runs: Vec<(i64, u8, Vec<u8>)> = Vec::new();
+    for (ts, stream, data) in &chunks {
+        match runs.last_mut() {
+            Some((_, s, buf)) if *s == *stream => buf.extend_from_slice(data),
+            _ => runs.push((*ts, *stream, data.clone())),
+        }
     }
+    let mut entries: Vec<(i64, u8, Vec<u8>)> = Vec::new();
+    for (ts, stream, data) in &runs {
+        if (*stream == 1 && !want_out) || (*stream == 2 && !want_err) { continue; }
+        if since.map_or(false, |s| *ts < s) || until.map_or(false, |u| *ts > u) { continue; }
+        for line in split_log_lines(data) { entries.push((*ts, *stream, line)); }
+    }
+    if let Some(n) = tail { if entries.len() > n { entries.drain(0..entries.len() - n); } }
+    let mut replay = Vec::new();
+    for (ts, stream, line) in &entries { replay.extend(frame_chunk(*stream, line, tty, timestamps, *ts)); }
 
     // Non-follow (or nothing live to follow): serve the buffer and end, as before.
     if !follow_live {
@@ -295,7 +310,7 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
                 // exit; flush whatever is still buffered with try_recv, then end the stream.
                 while let Ok((kind, chunk)) = out_rx.try_recv() {
                     if want(kind) {
-                        let f = frame_chunk(kind, &chunk, tty, timestamps);
+                        let f = frame_chunk(kind, &chunk, tty, timestamps, now_secs());
                         if tx.send(f).await.is_err() { return; }
                     }
                 }
@@ -307,7 +322,7 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
                 msg = out_rx.recv() => match msg {
                     Ok((kind, chunk)) => {
                         if want(kind) {
-                            let f = frame_chunk(kind, &chunk, tty, timestamps);
+                            let f = frame_chunk(kind, &chunk, tty, timestamps, now_secs());
                             if tx.send(f).await.is_err() { return; }
                         }
                     }

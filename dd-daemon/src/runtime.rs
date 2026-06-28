@@ -248,8 +248,8 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
                 Ok(n) => {
                     let chunk = buf[..n].to_vec();
                     let _ = live.out.send((kind, chunk.clone()));
-                    let b = if kind == 1 { &live.stdout_buf } else { &live.stderr_buf };
-                    b.lock().await.extend_from_slice(&chunk);
+                    // Append to the single ordered log (arrival order) so the buffered replay interleaves.
+                    live.log_chunks.lock().await.push((now_secs(), kind, chunk));
                 }
             }
         }
@@ -312,7 +312,8 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
                     Ok(Ok(n)) => {
                         let chunk = buf[..n].to_vec();
                         let _ = lr.out.send((1, chunk.clone()));
-                        lr.stdout_buf.lock().await.extend_from_slice(&chunk);
+                        // TTY: one merged raw stream, all stdout (kind 1), recorded in arrival order.
+                        lr.log_chunks.lock().await.push((now_secs(), 1, chunk));
                     }
                     Err(_would_block) => continue,
                 }
@@ -364,8 +365,16 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
                 cc.status = "exited".into();
                 cc.exit_code = code;
                 cc.finished_at = now_secs();
-                cc.stdout = std::mem::take(&mut *live.stdout_buf.lock().await);
-                cc.stderr = std::mem::take(&mut *live.stderr_buf.lock().await);
+                // Finalize the per-stream snapshots downstream code reads (cc.stdout/cc.stderr) by
+                // filtering the ordered log by stream. The ordered log itself is LEFT INTACT on the
+                // retained Live so `docker logs` can still replay stdout/stderr interleaved after exit
+                // (the Live stays in the map for non-`--rm` containers).
+                let (mut so, mut se) = (Vec::new(), Vec::new());
+                for (_, kind, data) in live.log_chunks.lock().await.iter() {
+                    if *kind == 1 { so.extend_from_slice(data); } else { se.extend_from_slice(data); }
+                }
+                cc.stdout = so;
+                cc.stderr = se;
             }
             let (cname, cimage) = g.containers.get(&cid).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
             crate::events::emit_event(&app.events, "container", "die", &cid, serde_json::json!({"exitCode": code.to_string(), "name": cname, "image": cimage}));
@@ -444,7 +453,7 @@ fn maybe_restart<'a>(app: &'a App, cid: &'a str, code: i64)
 /// Record the failure on a Live and finalize the container as exit 127. Returns false (spawn failed).
 pub(crate) async fn live_fail(app: &App, cid: &str, live: &Arc<Live>, msg: String) -> bool {
     let _ = live.out.send((2, format!("{msg}\n").into_bytes()));
-    *live.stderr_buf.lock().await = format!("{msg}\n").into_bytes();
+    live.log_chunks.lock().await.push((now_secs(), 2, format!("{msg}\n").into_bytes()));
     let _ = live.exit.send(Some(127));
     if let Some(cc) = app.inner.lock().await.containers.get_mut(cid) { cc.status = "exited".into(); cc.exit_code = 127; }
     false

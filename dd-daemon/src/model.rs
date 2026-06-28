@@ -144,8 +144,11 @@ pub(crate) struct Live {
     pub(crate) out: broadcast::Sender<(u8, Vec<u8>)>, // (1=stdout, 2=stderr, chunk)
     pub(crate) stdin_tx: mpsc::Sender<Vec<u8>>,        // attach writes here; an empty Vec = stdin EOF
     pub(crate) stdin_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>, // start() takes it and feeds the guest
-    pub(crate) stdout_buf: Mutex<Vec<u8>>,
-    pub(crate) stderr_buf: Mutex<Vec<u8>>,
+    /// Chronological `docker logs` replay record: one entry per output chunk, in arrival order, as
+    /// `(emit unix-secs, stream 1=stdout/2=stderr, bytes)`. A single ordered log (replacing the old
+    /// per-stream `stdout_buf`/`stderr_buf`) so the buffered replay interleaves stdout/stderr exactly as
+    /// the live `out` broadcast does. The reaper derives the per-stream `cc.stdout`/`cc.stderr` from it.
+    pub(crate) log_chunks: Mutex<Vec<(i64, u8, Vec<u8>)>>,
     pub(crate) exit: watch::Sender<Option<i64>>, // Some(code) once exited
     pub(crate) exit_rx: watch::Receiver<Option<i64>>,
     pub(crate) started: std::sync::atomic::AtomicBool, // start() spawns the process exactly once
@@ -160,8 +163,8 @@ impl Live {
         let (out, _) = broadcast::channel(1024);
         let (exit, exit_rx) = watch::channel(None);
         let (stdin_tx, stdin_rx) = mpsc::channel(256);
-        Arc::new(Live { out, stdin_tx, stdin_rx: Mutex::new(Some(stdin_rx)), stdout_buf: Mutex::new(Vec::new()),
-            stderr_buf: Mutex::new(Vec::new()), exit, exit_rx,
+        Arc::new(Live { out, stdin_tx, stdin_rx: Mutex::new(Some(stdin_rx)), log_chunks: Mutex::new(Vec::new()),
+            exit, exit_rx,
             started: std::sync::atomic::AtomicBool::new(false),
             stop_requested: std::sync::atomic::AtomicBool::new(false), tty,
             pty_master: std::sync::Mutex::new(None), pid: std::sync::Mutex::new(None) })
