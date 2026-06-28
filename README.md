@@ -45,8 +45,9 @@ docker run -p 8080:80 -m 256m alpine sh -c 'echo hi from $(hostname)'
   existing `docker run / ps / images / build` commands work unchanged.
 - **The JIT is the kernel.** Namespaces, cgroups, overlay image layers and networking are ordinary
   userspace state — a userspace kernel in the gVisor / PRoot lineage, with none of a VM's cost.
-- **aarch64 *and* x86-64 guests.** Run native arm64 Linux images, or x86-64 images via a JIT
-  (`jit86`) that decodes x86, synthesizes its flags, and lowers SSE/x87 onto NEON. glibc binaries run.
+- **Three guest runtimes, one engine.** Native **arm64 Linux** images; **x86-64 Linux** images via a JIT
+  (`jit86`) that decodes x86, synthesizes its flags, and lowers SSE/x87 onto NEON (glibc binaries run);
+  and **macOS arm64** guests (`ddcli mac`) — no VM in any of them.
 - **Real container isolation.** Overlay image layers (copy-up / `.wh.` whiteout, merged `getdents`),
   a TOCTOU-free path-jail VFS, PID / UTS / USER namespaces, a private loopback netns with `-p` port
   publishing, and cgroup memory + pids limits (OOM at the limit).

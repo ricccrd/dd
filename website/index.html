@@ -59,7 +59,7 @@
     <div class="mt-7 flex flex-wrap justify-center gap-2 text-xs font-semibold text-blue-50">
       <span class="rounded-full border border-white/25 bg-white/15 px-3 py-1">Apple Silicon</span>
       <span class="rounded-full border border-white/25 bg-white/15 px-3 py-1">Docker Engine API</span>
-      <span class="rounded-full border border-white/25 bg-white/15 px-3 py-1">Linux + macOS guests</span>
+      <span class="rounded-full border border-white/25 bg-white/15 px-3 py-1">3 runtimes: Linux arm64 · x86-64 · macOS</span>
       <span class="rounded-full border border-white/25 bg-white/15 px-3 py-1">Installs without root</span>
     </div>
   </div>
@@ -80,8 +80,8 @@
       </div>
       <div class="rounded-2xl border border-edge bg-panel p-6 transition hover:-translate-y-1 hover:border-blue4">
         <div class="mb-4 grid h-11 w-11 place-items-center rounded-xl border border-blue3/30 bg-gradient-to-br from-blue2/20 to-blue6/20 text-blue1"><svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 12l10 5 10-5"/><path d="M2 17l10 5 10-5"/></svg></div>
-        <h3 class="text-lg font-semibold">Linux <em>and</em> macOS guests</h3>
-        <p class="mt-2 text-sm text-muted">Native arm64 Linux images, x86-64 images via the JIT — and <strong>macOS</strong> guest binaries too. One runtime, both worlds.</p>
+        <h3 class="text-lg font-semibold">Three guest runtimes</h3>
+        <p class="mt-2 text-sm text-muted">Native <strong>arm64 Linux</strong>, <strong>x86-64 Linux</strong> via the JIT, and <strong>macOS</strong> — one engine, three runtimes, no VM in any of them.</p>
       </div>
       <div class="rounded-2xl border border-edge bg-panel p-6 transition hover:-translate-y-1 hover:border-blue4">
         <div class="mb-4 grid h-11 w-11 place-items-center rounded-xl border border-blue3/30 bg-gradient-to-br from-blue2/20 to-blue6/20 text-blue1"><svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg></div>
@@ -156,10 +156,12 @@
           <table class="w-full border-collapse text-[13px] sm:text-sm">
             <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">Workload</th><th class="p-3">VM</th><th class="p-3 text-blue1">dd</th><th class="p-3">dd vs VM</th></tr></thead>
             <tbody class="[&>tr]:border-t [&>tr]:border-edge">
-              <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">0.78s</td><td class="p-3">0.55s</td><td class="p-3 font-semibold text-emerald-400">1.43× faster</td></tr>
+              <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">0.74s</td><td class="p-3">0.52s</td><td class="p-3 font-semibold text-emerald-400">1.43× faster</td></tr>
+              <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">0.76s</td><td class="p-3">0.71s</td><td class="p-3 font-semibold text-emerald-400">1.07× faster</td></tr>
               <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">0.17s</td><td class="p-3">0.17s</td><td class="p-3">~parity</td></tr>
-              <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">0.81s</td><td class="p-3">0.76s</td><td class="p-3 font-semibold text-emerald-400">1.07× faster</td></tr>
-              <tr><td class="p-3 font-medium">SQLite 600k</td><td class="p-3 text-muted">0.35s</td><td class="p-3">0.71s</td><td class="p-3 text-muted">0.49×</td></tr>
+              <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">0.75s</td><td class="p-3">0.76s</td><td class="p-3">~parity</td></tr>
+              <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">0.78s</td><td class="p-3">1.34s</td><td class="p-3 text-muted">1.7× slower</td></tr>
+              <tr><td class="p-3 font-medium">SQLite 600k</td><td class="p-3 text-muted">0.33s</td><td class="p-3">0.68s</td><td class="p-3 text-muted">~2× slower</td></tr>
             </tbody>
           </table>
         </div>
@@ -170,17 +172,23 @@
           <table class="w-full border-collapse text-[13px] sm:text-sm">
             <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">Workload</th><th class="p-3">VM</th><th class="p-3 text-blue1">dd</th><th class="p-3">dd vs VM</th></tr></thead>
             <tbody class="[&>tr]:border-t [&>tr]:border-edge">
-              <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.32s</td><td class="p-3">0.97s</td><td class="p-3 font-semibold text-emerald-400">1.36× faster</td></tr>
-              <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.42s</td><td class="p-3">0.26s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
-              <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.74s</td><td class="p-3">2.39s</td><td class="p-3 font-semibold text-emerald-400">1.15× faster</td></tr>
-              <tr><td class="p-3 font-medium">SQLite</td><td class="p-3 text-muted">2.97s</td><td class="p-3">0.94s</td><td class="p-3 font-semibold text-emerald-400">3.16× faster</td></tr>
+              <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">5.27s</td><td class="p-3">0.25s</td><td class="p-3 font-semibold text-emerald-400">21× faster</td></tr>
+              <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">7.66s</td><td class="p-3">0.82s</td><td class="p-3 font-semibold text-emerald-400">9.3× faster</td></tr>
+              <tr><td class="p-3 font-medium">matrix multiply</td><td class="p-3 text-muted">1.46s</td><td class="p-3">0.17s</td><td class="p-3 font-semibold text-emerald-400">8.8× faster</td></tr>
+              <tr><td class="p-3 font-medium">SQLite 600k</td><td class="p-3 text-muted">2.88s</td><td class="p-3">0.87s</td><td class="p-3 font-semibold text-emerald-400">3.3× faster</td></tr>
+              <tr><td class="p-3 font-medium">memcpy</td><td class="p-3 text-muted">0.24s</td><td class="p-3">0.11s</td><td class="p-3 font-semibold text-emerald-400">2.1× faster</td></tr>
+              <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">3.83s</td><td class="p-3">1.84s</td><td class="p-3 font-semibold text-emerald-400">2.1× faster</td></tr>
+              <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">1.25s</td><td class="p-3">0.89s</td><td class="p-3 font-semibold text-emerald-400">1.4× faster</td></tr>
+              <tr><td class="p-3 font-medium">text scan</td><td class="p-3 text-muted">0.32s</td><td class="p-3">0.24s</td><td class="p-3 font-semibold text-emerald-400">1.35× faster</td></tr>
+              <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">2.58s</td><td class="p-3">2.29s</td><td class="p-3 font-semibold text-emerald-400">1.13× faster</td></tr>
+              <tr><td class="p-3 font-medium">base64</td><td class="p-3 text-muted">0.70s</td><td class="p-3">0.83s</td><td class="p-3 text-muted">1.2× slower</td></tr>
             </tbody>
           </table>
         </div>
       </div>
     </div>
-    <p class="mt-7 text-base font-semibold">The goal is to beat the VM on <em>every</em> benchmark — parity-or-better everywhere. Where dd is still behind (syscall-heavy arm64 SQLite) is exactly the optimization frontier.</p>
-    <p class="mt-3 text-sm text-muted2">Compute micro-benchmarks (<code class="font-mono">make bench</code>). arm64 SQLite is syscall- and allocation-heavy, so the userspace-kernel tax shows; a Rosetta-backed VM would narrow the x86 gap.</p>
+    <p class="mt-7 text-base font-semibold">Across 10 workloads, dd beats qemu-in-a-VM on <em>9 of 10</em> for x86, and matches a native arm64 VM on compute. Where it's behind — allocation/syscall-heavy work (arm64 SQLite, qsort) — is exactly the optimization frontier.</p>
+    <p class="mt-3 text-sm text-muted2">Compute micro-benchmarks, median of 7, same static binary timed two ways (<code class="font-mono">make bench</code>). The userspace-kernel tax shows on syscall-heavy work; a Rosetta-backed VM would narrow the x86 gap.</p>
   </div>
 </section>
 
