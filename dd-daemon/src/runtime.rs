@@ -33,7 +33,7 @@ use ddjit::{Guest, PortMap, SpawnConfig, Volume};
 /// Named-volume binds (`name:/path`, no leading `/`) are resolved against `volumes_dir`.
 /// Build the (program, args) that launches this container in the matching guest's JIT. `None` if no JIT
 /// was built for the image's arch.
-pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol]) -> Option<(String, Vec<String>)> {
+pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: Option<(String, String)>) -> Option<(String, Vec<String>)> {
     let guest = c.arch.unwrap_or(Guest::LinuxAarch64);
     let mut cfg = SpawnConfig::new(String::new(), c.rootfs.clone()); // work_dir is the HOST cwd; leave empty
     cfg.argv = c.cmd.clone();
@@ -49,6 +49,8 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol]) -> Optio
     cfg.netns = (c.network_mode != "host").then(|| c.id[..c.id.len().min(40)].to_string());
     // `--network none`: no external egress -- the JIT refuses non-loopback connects (DD_NET_ISOLATE).
     if c.network_mode == "none" { cfg.env.push(("DD_NET_ISOLATE".into(), "1".into())); }
+    // netstack PR2 — per-network AF_UNIX virtual switch: container<->container TCP for in-subnet peers.
+    if let Some((netid, ip)) = bridge { cfg.env.push(("DD_NETBR".into(), netid)); cfg.env.push(("DD_IP".into(), ip)); }
     cfg.volumes = c.binds.iter().filter_map(|b| b.split_once(':').map(|(host, dst)| {
         // A bind whose source isn't an absolute path is a named volume.
         let host = if host.starts_with('/') {
@@ -100,7 +102,12 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
     if live.started.swap(true, Ordering::SeqCst) {
         return true; // already started
     }
-    let Some((prog, args)) = spawn_cfg(c, &app.volumes_dir, vols) else { return false };
+    // netstack PR2: this container's (network-id, assigned-ip) from PR1's per-network endpoints map.
+    let bridge = {
+        let g = app.inner.lock().await;
+        g.networks.iter().find_map(|n| n.endpoints.get(&c.id).map(|e| (n.id.clone(), e.ip.clone())))
+    };
+    let Some((prog, args)) = spawn_cfg(c, &app.volumes_dir, vols, bridge) else { return false };
     let mut cmd = tokio::process::Command::new(prog);
     cmd.args(args);
 
