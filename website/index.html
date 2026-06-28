@@ -132,7 +132,7 @@
         </tbody>
       </table>
     </div>
-    <p class="mt-5 text-sm text-muted2"><strong class="text-muted">Honest trade-off:</strong> a userspace kernel is only as complete as the syscalls it implements, and today dd runs as a single process — great for <em>trusted</em> images. A VM still gives a harder isolation boundary for untrusted code; dd's sentry process-split is the roadmap answer there.</p>
+    <p class="mt-5 text-sm text-muted2"><strong class="text-muted">Honest trade-off:</strong> by default the guest runs in one process — fast, and great for code you <em>trust</em>. For <em>untrusted</em> code there's now an opt-in <strong class="text-muted">sentry split</strong> (the gVisor shape: a deny-default Seatbelt-sandboxed worker with no host authority + a trusted sentry serving syscalls over a shared-memory ring). It's early — core file syscalls today, sockets/exec/fork in progress — so a VM still exposes a narrower attack surface for fully hostile code.</p>
   </div>
 </section>
 

@@ -78,8 +78,12 @@ bottleneck — the `virtiofs`/FUSE bridge between macOS and the VM — simply do
 VFS *is* the host filesystem behind a path jail.
 
 > **Honest trade-off:** a userspace kernel is only as complete as the syscalls it implements, and today
-> dd runs as a single process — great for *trusted* images. A VM still gives a harder isolation boundary
-> for untrusted code; dd's sentry process-split is the roadmap answer there.
+> By default the guest runs in **one process** — fast, and the right call for code you trust (your dev
+> environment, CI, your own tools). For **untrusted** code there's now an opt-in **sentry split**
+> (`DDJIT_UNTRUSTED`): the guest runs in a deny-default Seatbelt sandbox holding no host fs/net authority,
+> while a trusted *sentry* process owns the real resources and serves syscalls across a shared-memory
+> ring — the gVisor shape. It's early (the core file syscalls — read/write/open/close/lseek — forward
+> today; sockets/exec/fork are landing), so for fully hostile code a VM still exposes a narrower surface.
 
 ## Performance
 
