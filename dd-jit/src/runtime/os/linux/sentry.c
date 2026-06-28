@@ -83,6 +83,40 @@ static int g_sentry_sandbox = 0; // DDJIT_SANDBOX:   wrap the worker in a deny-d
 #define SENTRY_OPT_OFF   (SENTRY_SLEN_OFF + 64u)              // setsockopt/getsockopt optval window
 #define SENTRY_OPTCAP    4096u                                // optval cap (real socket options are tiny)
 
+// sendmsg/recvmsg (item 2). The guest msghdr GRAPH (msghdr + msg_name + scatter/gather msg_iov + the
+// msg_control cmsg buffer) is flattened into the ring: the 56-byte msghdr COPY lives at [0,64); its
+// msg_iov is a `struct iovec[]` at MSGIOV_OFF whose iov_base fields hold buf-relative OFFSETS, followed
+// by the gathered (send) / reserved (recv) data; msg_name reuses the sockaddr tail window and msg_control
+// reuses the optval tail window (a sendmsg never also does getsockopt, so the windows may alias per-op).
+// The sentry rebases every offset to a ring pointer before service_local() runs the real Linux<->macOS
+// translating sendmsg/recvmsg, so no guest pointer crosses. SCM_RIGHTS "just works": a guest fd in the
+// control buffer is ALREADY a sentry-owned fd (every openat/socket/accept returns a sentry fd), so the
+// marshaled cmsg carries fd integers the sentry can use verbatim -- no fd translation needed.
+#define SENTRY_MSGHDR_SZ   56u                  // Linux LP64 struct msghdr (both guest arches identical)
+#define SENTRY_MSGIOV_OFF  64u                  // iovec[] header start (after the 56B msghdr copy, aligned)
+#define SENTRY_MSGNAME_OFF SENTRY_SADDR_OFF     // msg_name window (tail; reuses the sockaddr window)
+#define SENTRY_MSGCTL_OFF  SENTRY_OPT_OFF       // msg_control window (tail; reuses the optval window)
+#define SENTRY_MSGCTLCAP   SENTRY_OPTCAP        // control buffer cap (real SCM_RIGHTS payloads are tiny)
+
+// Multiplexing windows (item 3): poll/ppoll pollfd array at buf[0] (8B/entry) + its timeout timespec in
+// the sockaddr tail window; pselect's three fd_sets at 0/128/256 + timeout at 384 (each fd_set <=128B);
+// epoll_pwait out-events at buf[0] (12B/entry). All sentry-owned fds, so the blocking call MUST run in
+// the sentry (the fd lives there). fcntl flock / ioctl arg in/out windows reuse buf[0].
+#define SENTRY_PSEL_RD  0u
+#define SENTRY_PSEL_WR  128u
+#define SENTRY_PSEL_EX  256u
+#define SENTRY_PSEL_TMO 384u
+#define SENTRY_POLL_TMO SENTRY_SADDR_OFF        // ppoll timeout timespec (tail; clear of the pollfd array)
+#define SENTRY_EPEV_SZ  12u                     // packed Linux struct epoll_event {u32 events; u64 data}
+#define SENTRY_IOCTLCAP 256u                    // ioctl arg in/out window (winsize/int/termios all fit)
+#define SENTRY_FLOCKSZ  32u                     // Linux struct flock (fcntl F_GETLK/SETLK/SETLKW)
+
+// Worker<->sentry fd passing (item 3). A sentry-owned fd that a LOCAL worker syscall must touch (a
+// file-backed mmap's fd) is lent to the worker via SCM_RIGHTS over a per-ring AF_UNIX control socketpair:
+// the worker maps it locally, then drops the borrowed fd -- so the worker's fds stay virtual and memory
+// authority stays worker-side. Encoded as a sentinel in `rawnr` so the lend rides the SAME ring round-trip.
+#define SENTRY_OP_FDPASS 0xFFFFFFFEu
+
 // ------------------------------------------------------------------ per-context ring pool
 // THE SCALING FIX. A single SPSC ring is single-producer: but a guest thread is a HOST pthread
 // (os/linux/thread.c spawn_thread -> pthread_create) and EVERY host thread drives run_guest -> service
@@ -103,8 +137,9 @@ static int g_sentry_sandbox = 0; // DDJIT_SANDBOX:   wrap the worker in a deny-d
 // executes it. Strict ping-pong (no third state) => deadlock-free and, with release/acquire on turn,
 // torn-message-free (all field writes happen-before the token flip the peer acquires).
 struct sentry_ring {
-    _Atomic uint32_t turn; // 0 = worker owns (build request), 1 = sentry owns (execute)
-    _Atomic uint32_t busy; // worker-side producer lock: held across one round-trip (uncontended at <=N threads)
+    _Atomic uint32_t turn;  // 0 = worker owns (build request), 1 = sentry owns (execute)
+    _Atomic uint32_t busy;  // worker-side producer lock: held across one round-trip (uncontended at <=N threads)
+    _Atomic uint32_t owner; // ring-pool free-list: 0 = free lane, else the owning worker thread's token
     // request: the post-normalize syscall registers (frontend-agnostic via G_RAWNR / G_A0..G_A5)
     uint64_t rawnr; // raw syscall-number register (so the sentry's G_NR re-derives the canonical nr)
     uint64_t a[6];  // a0..a5 (G_A0..G_A5)
@@ -136,14 +171,133 @@ struct sentry_shm {
 
 static struct sentry_shm *g_shm;
 static pid_t g_sentry_pid;
-static __thread int t_ring = -1; // this worker thread's claimed ring index (claimed lazily on first use)
+static int g_ctl[SENTRY_NRINGS][2];   // per-ring AF_UNIX control socketpair: [.][0]=worker end, [.][1]=sentry
+static pid_t g_worker_pid;            // this worker process's pid (changes in a forked-child worker)
+static pid_t g_sentry_owner_pid;      // ONLY the process that forked the sentry may signal-quit + reap it
+static _Atomic int g_guest_children;  // live guest-forked child WORKER processes owned by THIS worker proc
+static __thread int t_ring = -1;      // this worker thread's claimed ring index (claimed lazily on first use)
+static __thread uint32_t t_token = 0; // this worker thread's unique nonzero ring-ownership token
 
-// Claim (once per worker thread) a ring from the pool. <=N threads => each gets a private lane; beyond
-// N, threads share a lane and are serialized by the ring's `busy` producer lock (correctness preserved).
+// Claim (once per worker thread) a ring from the pool. A reclaim-aware free-list: scan for a lane whose
+// `owner` is 0 and CAS-claim it with this thread's unique token; at <=N concurrent threads every thread
+// wins a private lane (zero contention). Beyond N (all lanes owned) overflow threads SHARE a lane keyed by
+// token, serialized by the ring's `busy` producer lock (correctness preserved). ring_release() frees a
+// lane on thread/process exit so a forking guest doesn't permanently exhaust the pool.
 static struct sentry_ring *ring_for_thread(void) {
-    if (t_ring < 0)
-        t_ring = (int)(atomic_fetch_add_explicit(&g_shm->claim, 1, memory_order_relaxed) % SENTRY_NRINGS);
+    if (t_ring < 0) {
+        if (!t_token) // unique nonzero token from the shared claim counter (distinct across threads AND forked workers)
+            t_token = atomic_fetch_add_explicit(&g_shm->claim, 1, memory_order_relaxed) + 1u;
+        for (int i = 0; i < SENTRY_NRINGS; i++) {
+            uint32_t expect = 0;
+            if (atomic_compare_exchange_strong_explicit(&g_shm->ring[i].owner, &expect, t_token,
+                                                        memory_order_acq_rel, memory_order_relaxed)) {
+                t_ring = i;
+                return &g_shm->ring[i];
+            }
+        }
+        t_ring = (int)(t_token % SENTRY_NRINGS); // pool full: share a lane (busy-serialized)
+    }
     return &g_shm->ring[t_ring];
+}
+
+// Release this thread's lane back to the pool (thread/process exit). CAS owner==t_token->0 so a SHARED
+// (non-owned) lane is left untouched -- we only free a lane we actually own.
+static void ring_release(void) {
+    if (t_ring >= 0) {
+        uint32_t mine = t_token;
+        atomic_compare_exchange_strong_explicit(&g_shm->ring[t_ring].owner, &mine, 0, memory_order_acq_rel,
+                                                memory_order_relaxed);
+        t_ring = -1;
+    }
+}
+
+// A worker that just forked itself (guest clone/clone3 without CLONE_THREAD) calls this in the CHILD: the
+// child is a real process running the JIT, but it inherited the parent's ring lane + sentry-ownership +
+// child bookkeeping. Adopt a fresh identity so the child draws its OWN lane (next forwarded syscall),
+// never tears down the SHARED sentry, and tracks only its own children. NB: do NOT ring_release() here --
+// the inherited owner token still belongs to the PARENT's still-live lane.
+static void sentry_fork_child(void) {
+    g_worker_pid = getpid(); // != g_sentry_owner_pid now -> sentry_shutdown() becomes a no-op in this child
+    t_ring = -1;             // drop the inherited lane index; claim a fresh one lazily
+    t_token = 0;             // mint a fresh ownership token on the next claim
+    g_guest_children = 0;    // the child starts with no children of its own
+}
+
+// SCM_RIGHTS fd passing over a control socketpair. sentry_send_fd lends one fd; sentry_recv_fd borrows it.
+// A NULL control message (fd<0) is still sent so the worker's recv stays in lockstep with the round-trip.
+static void sentry_send_fd(int sock, int fd) {
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    char b = 0;
+    struct iovec io = {&b, 1};
+    m.msg_iov = &io;
+    m.msg_iovlen = 1;
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } u;
+    if (fd >= 0) {
+        memset(u.buf, 0, sizeof u.buf);
+        m.msg_control = u.buf;
+        m.msg_controllen = sizeof u.buf;
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    }
+    while (sendmsg(sock, &m, 0) < 0 && errno == EINTR) {}
+}
+static int sentry_recv_fd(int sock) {
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    char b = 0;
+    struct iovec io = {&b, 1};
+    m.msg_iov = &io;
+    m.msg_iovlen = 1;
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } u;
+    m.msg_control = u.buf;
+    m.msg_controllen = sizeof u.buf;
+    ssize_t r;
+    while ((r = recvmsg(sock, &m, 0)) < 0 && errno == EINTR) {}
+    if (r < 0) return -1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+        int fd;
+        memcpy(&fd, CMSG_DATA(c), sizeof(int));
+        return fd;
+    }
+    return -1;
+}
+
+// ioctl arg sizing (item 3). Marshaling a fixed window would clobber guest memory on copy-back (an
+// FIONREAD's 4-byte int would get 256 bytes splattered over it). Modern ioctl numbers encode their size +
+// direction (_IOC_SIZE/_IOC_DIR); the legacy 0x54xx terminal numbers don't, so table those. Returns the
+// exact in (arg->kernel) and out (kernel->arg) byte counts for every request service_local() handles.
+static void sentry_ioctl_sizes(unsigned long rq, uint32_t *insz, uint32_t *outsz) {
+    uint32_t enc = (uint32_t)((rq >> 16) & 0x3fffu); // _IOC_SIZE
+    uint32_t dir = (uint32_t)((rq >> 30) & 0x3u);    // 1=_IOC_WRITE(arg->kernel) 2=_IOC_READ(kernel->arg)
+    if (enc) {
+        *insz = (dir & 1u) ? enc : 0;
+        *outsz = (dir & 2u) ? enc : 0;
+        if (!dir) { *insz = enc; *outsz = enc; } // _IOC_NONE w/ a size: be permissive
+        return;
+    }
+    switch (rq) {
+    case 0x5401: *insz = 0;  *outsz = 36; return; // TCGETS    (struct termios out)
+    case 0x5402:                                  // TCSETS
+    case 0x5403:                                  // TCSETSW
+    case 0x5404: *insz = 36; *outsz = 0;  return; // TCSETSF   (struct termios in)
+    case 0x5413: *insz = 0;  *outsz = 8;  return; // TIOCGWINSZ(struct winsize out)
+    case 0x5414: *insz = 8;  *outsz = 0;  return; // TIOCSWINSZ(struct winsize in)
+    case 0x5421: *insz = 4;  *outsz = 0;  return; // FIONBIO   (int in)
+    case 0x541b:                                  // FIONREAD  (int out)
+    case 0x540f: *insz = 0;  *outsz = 4;  return; // TIOCGPGRP (int out)
+    default:     *insz = 0;  *outsz = 0;  return; // FIOCLEX/FIONCLEX/TIOCSCTTY/.../unknown: no arg payload
+    }
 }
 
 // ------------------------------------------------------------------ authority split
@@ -182,9 +336,26 @@ static int sentry_forwarded(uint64_t nr) {
     case 208: // setsockopt   (in-optval a3, len a4)
     case 209: // getsockopt   (out-optval a3, in/out optlen a4)
     case 210: // shutdown     (no pointer args)
+    // --- sendmsg/recvmsg + SCM_RIGHTS (item 2): nested msghdr graph marshaled to the ring ---
+    case 211: // sendmsg      (msghdr: msg_name + scatter/gather msg_iov + msg_control)
+    case 212: // recvmsg      (msghdr out: name + scattered data + control + flags)
+    // --- multiplexing over sentry-owned fds (item 3): these BLOCK on an fd that lives in the sentry ---
+    case 72:  // pselect6     (three fd_sets in/out + timeout)
+    case 73:  // ppoll        (pollfd array in/out + timeout)
+    case 20:  // epoll_create1(returns a sentry-owned kqueue fd)
+    case 21:  // epoll_ctl    (in epoll_event; operates on sentry fds)
+    case 22:  // epoll_pwait  (out events buffer)
+    // --- fd-table ops on sentry-owned fds (item 3): keep the guest fd space entirely sentry-side ---
+    case 23:  // dup          (returns a sentry fd)
+    case 24:  // dup3         (operates on / returns sentry fds)
+    case 25:  // fcntl        (F_SETFL nonblock, F_DUPFD, F_GETLK/SETLK flock in/out)
+    case 29:  // ioctl        (FIONBIO/FIONREAD/winsize/termios arg in/out)
+    case 59:  // pipe2        (out int[2] -- both ends sentry-owned)
+    case 199: // socketpair   (out int[2] -- both ends sentry-owned)
         return 1;
-    // --- NEXT (need fd-passing / process marshaling; see roadmap at bottom) ---
-    // 221 execve, 220 clone(fork), 260 wait4, 203/211 sendmsg/recvmsg (SCM_RIGHTS), ...
+    // --- handled SPECIALLY in syscall_route (NOT via this table): 220/435 clone(fork) lane, 221 execve
+    //     (stays local -- it reloads the guest image in-process, keeping the worker's ring/sentry), 260
+    //     wait4 (reaps child WORKERS), 222 file-backed mmap (SCM_RIGHTS fd-lend). See syscall_route. ---
     default:
         return 0;
     }
@@ -238,6 +409,16 @@ static void worker_sandbox(void) {
 // bytes. NOTE: it MUST call service_local() (the canonical switch), not service() -- service() would
 // re-enter syscall_route() in this (g_untrusted) process and recurse onto the ring.
 static void sentry_service_one(struct sentry_ring *R) {
+    // fd-lend (item 3): not a syscall -- send a sentry-owned fd to the worker over THIS ring's control
+    // socketpair (SCM_RIGHTS). Worker mmaps it locally then drops it. Detected before any cpu reconstruction.
+    if (R->rawnr == SENTRY_OP_FDPASS) {
+        int idx = (int)(R - g_shm->ring);
+        int fd = (int)(int64_t)R->a[0];
+        sentry_send_fd(g_ctl[idx][1], fd);
+        R->ret = (fd >= 0) ? 0 : -EBADF;
+        R->nserved++;
+        return;
+    }
     struct cpu tmp;
     memset(&tmp, 0, sizeof tmp);
     G_RAWNR(&tmp) = R->rawnr; // service_local() re-runs G_NORMALIZE on this as a no-op (already *at)
@@ -267,6 +448,36 @@ static void sentry_service_one(struct sentry_ring *R) {
                 iv[k].iov_len = 0;
             } else
                 iv[k].iov_base = R->buf + boff;
+        }
+    }
+    // sendmsg/recvmsg (item 2): a1 was redirected to the marshaled 56-byte msghdr COPY at buf[0]; its
+    // msg_name/msg_iov/msg_control are buf-relative OFFSETS (0 == NULL, since a real field never sits at
+    // offset 0) that we rebase to ring pointers here -- and each msg_iov[].iov_base offset too. After this
+    // service_local() reads a fully ring-internal msghdr graph. (R->iovn stays 0 for these so the plain
+    // iovec block above is skipped.)
+    if (!bad) {
+        uint64_t snr = G_NR(&tmp);
+        if (snr == 211 || snr == 212) {
+            uint8_t *h = R->buf;
+            uint64_t noff = *(uint64_t *)(h + 0), ioff = *(uint64_t *)(h + 16), in = *(uint64_t *)(h + 24),
+                     coff = *(uint64_t *)(h + 32);
+            if (noff >= SENTRY_BUFSZ || ioff >= SENTRY_BUFSZ || coff >= SENTRY_BUFSZ) bad = 1;
+            if (!bad) {
+                if (noff) *(uint64_t *)(h + 0) = (uint64_t)(R->buf + noff);   // msg_name -> ring ptr
+                if (coff) *(uint64_t *)(h + 32) = (uint64_t)(R->buf + coff);  // msg_control -> ring ptr
+                if (ioff) {
+                    struct iovec *iv = (struct iovec *)(R->buf + ioff);
+                    for (uint64_t k = 0; k < in; k++) {
+                        uint64_t boff = (uint64_t)(uintptr_t)iv[k].iov_base, len = iv[k].iov_len;
+                        if (boff > SENTRY_BUFSZ || len > SENTRY_BUFSZ || boff + len > SENTRY_BUFSZ) {
+                            iv[k].iov_base = R->buf;
+                            iv[k].iov_len = 0;
+                        } else
+                            iv[k].iov_base = R->buf + boff;
+                    }
+                    *(uint64_t *)(h + 16) = (uint64_t)(R->buf + ioff); // msg_iov -> ring ptr
+                }
+            }
         }
     }
     if (bad) {
@@ -326,7 +537,16 @@ static void sentry_init(void) {
     for (int i = 0; i < SENTRY_NRINGS; i++) {
         atomic_store_explicit(&g_shm->ring[i].turn, 0, memory_order_relaxed);
         atomic_store_explicit(&g_shm->ring[i].busy, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_shm->ring[i].owner, 0, memory_order_relaxed);
+        // Per-ring control socketpair (SCM_RIGHTS fd-lend, item 3). Created BEFORE the fork so BOTH the
+        // worker and the sentry inherit both ends at the same fd numbers; each is used point-to-point by
+        // the single worker thread + single sentry servicer that own that lane. A failure leaves the lane
+        // without fd-lend (only file-backed mmap needs it) -- mark it -1 so we never touch a stale fd.
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ctl[i]) < 0) { g_ctl[i][0] = -1; g_ctl[i][1] = -1; }
     }
+    g_worker_pid = getpid();
+    g_sentry_owner_pid = getpid(); // only this process may signal-quit + reap the sentry
+    g_guest_children = 0;
     pid_t pid = fork(); // sentry forks AFTER load -> inherits the fd table / jail config / auxv / cwd
     if (pid < 0) {
         perror("[sentry] fork");
@@ -342,6 +562,9 @@ static void sentry_init(void) {
 
 static void sentry_shutdown(void) {
     if (!g_shm || !g_sentry_pid) return;
+    // A forked-CHILD worker inherited g_sentry_pid but does NOT own the shared sentry: it must never set
+    // quit (that would tear the sentry down under the still-live parent + sibling workers) or reap it.
+    if (getpid() != g_sentry_owner_pid) { g_sentry_pid = 0; return; }
     atomic_store_explicit(&g_shm->quit, 1, memory_order_release);
     int st;
     waitpid(g_sentry_pid, &st, 0);
@@ -365,11 +588,79 @@ static void syscall_route(struct cpu *c) {
     // a return of 1 means it was fully handled locally (arch_prctl/TLS) -- it must stay here.
     if (G_NORMALIZE(c)) return;
     uint64_t nr = G_NR(c);
-    if (nr == 93 || nr == 94) { // exit / exit_group: service_local() _exit()s the worker -> reap sentry FIRST
-        sentry_shutdown();
+
+    // exit(93)/exit_group(94): service_local() _exit()s this worker. exit_group ends the PROCESS so the
+    // owner reaps the sentry FIRST (sentry_shutdown is owner-gated -> a forked child just releases its
+    // lane). exit(93) ends only THIS THREAD: free its lane but DON'T tear the sentry down (siblings need it).
+    if (nr == 93 || nr == 94) {
+        if (nr == 94) sentry_shutdown();
+        ring_release();
         service_local(c);
         return;
     }
+
+    // --- fork/exec/wait lane (item 1) -------------------------------------------------------------------
+    // clone(220)/clone3(435): a guest THREAD is a host pthread (stays this process; gets its own lane
+    // lazily). A guest FORK is a real worker fork() (the guest address space is worker-side COW memory the
+    // sentry cannot duplicate) done LOCALLY by service_local. The freshly forked CHILD inherited the
+    // parent's lane + sentry-ownership, so re-init its bookkeeping; the PARENT counts the new child so a
+    // later wait4 with no real children doesn't deadlock on the hidden sentry child.
+    if (nr == 220 || nr == 435) {
+        int is_thread = (nr == 220) ? ((G_A0(c) & 0x10000) != 0)
+                                    : (G_A0(c) ? ((*(uint64_t *)G_A0(c) & 0x10000) != 0) : 0);
+        service_local(c); // spawn_thread (CLONE_THREAD) or fork() -- both worker-local
+        if (getpid() != g_worker_pid) { sentry_fork_child(); return; } // we are the new child worker
+        if (!is_thread && (int64_t)G_RET(c) > 0) atomic_fetch_add(&g_guest_children, 1); // parent: a child appeared
+        return;
+    }
+    // execve(221) stays LOCAL: service_local reloads the guest image IN THIS PROCESS (it is not a host
+    // execve), so the worker keeps its pid, ring lane, control sockets, sentry, and confinement across it.
+    if (nr == 221) {
+        service_local(c);
+        return;
+    }
+    // wait4(260): reap the guest's child WORKER processes locally. The sentry is ALSO a child of the owner,
+    // so a blocking wait-any with no GUEST children would hang on it -> short-circuit to -ECHILD; and never
+    // surface the sentry's own pid to the guest. A specific-pid wait passes straight through.
+    if (nr == 260) {
+        int64_t wpid = (int64_t)(int)G_A0(c);
+        if (wpid <= 0 && atomic_load(&g_guest_children) <= 0) { G_RET(c) = (uint64_t)(-ECHILD); return; }
+        service_local(c);
+        int64_t r = (int64_t)G_RET(c);
+        if (r > 0) {
+            if (g_sentry_pid && r == (int64_t)g_sentry_pid) { G_RET(c) = (uint64_t)(-ECHILD); return; }
+            atomic_fetch_sub(&g_guest_children, 1);
+        }
+        return;
+    }
+    // file-backed mmap(222): the mapping must live in the WORKER (memory authority) but the fd is
+    // sentry-owned and invalid here. Borrow the real fd over this lane's control socket (SCM_RIGHTS), map
+    // it locally with the borrowed number, then drop it -- so the worker holds the real fd only for the
+    // single mmap. Anonymous mmap (MAP_ANON 0x20) needs no fd and stays fully local below.
+    if (nr == 222 && !(G_A3(c) & 0x20) && (int)G_A4(c) >= 0) {
+        struct sentry_ring *R = ring_for_thread();
+        while (atomic_exchange_explicit(&R->busy, 1, memory_order_acquire)) sched_yield();
+        int idx = t_ring;
+        R->rawnr = SENTRY_OP_FDPASS;
+        R->a[0] = (uint64_t)(uint32_t)(int)G_A4(c);
+        R->iovn = 0;
+        for (int i = 0; i < 6; i++) R->redir[i] = -1;
+        atomic_store_explicit(&R->turn, 1, memory_order_release);
+        uint32_t sp = 0;
+        while (atomic_load_explicit(&R->turn, memory_order_acquire) != 0)
+            if (++sp > 256) { sched_yield(); sp = 0; }
+        // The sentry ALWAYS sends a control datagram (with the fd, or empty on -EBADF), so we MUST always
+        // receive it -- skipping on failure would leave a stale message to desync the next lend on this lane.
+        int lfd = (idx >= 0 && g_ctl[idx][0] >= 0) ? sentry_recv_fd(g_ctl[idx][0]) : -1;
+        atomic_store_explicit(&R->busy, 0, memory_order_release);
+        uint64_t saved = G_A4(c);
+        G_A4(c) = (uint64_t)(int64_t)lfd;       // -1 if the lend failed -> service_local mmap returns EBADF
+        service_local(c);                        // real worker-side mmap on the borrowed fd
+        G_A4(c) = saved;                         // restore the guest's r8/a4 (preserved across a syscall)
+        if (lfd >= 0) close(lfd);                // drop the borrowed fd: worker fds stay virtual
+        return;
+    }
+
     if (!sentry_forwarded(nr)) {
         service_local(c); // LOCAL authority (its G_NORMALIZE re-runs as a no-op on already-*at registers)
         return;
@@ -546,7 +837,115 @@ static void syscall_route(struct cpu *c) {
         if (G_A3(c)) R->redir[3] = SENTRY_OPT_OFF;                   // out optval -> opt window
         break;
     }
-    default: break; // 57 close / 62 lseek / 198 socket / 201 listen / 210 shutdown: no buffer.
+    // ---- sendmsg/recvmsg (item 2): flatten the guest msghdr GRAPH into the ring ----
+    case 211:   // sendmsg(fd, a1=msghdr, flags)
+    case 212: { // recvmsg(fd, a1=msghdr, flags)
+        uint8_t *g = (uint8_t *)G_A1(c);
+        if (!g) { memset(R->buf, 0, SENTRY_MSGHDR_SZ); R->redir[1] = 0; break; } // NULL msghdr: ship a clean
+                                                                                 // zero hdr so the sentry never
+                                                                                 // derefs NULL (no crash)
+        uint64_t g_name = *(uint64_t *)(g + 0);
+        uint32_t g_namelen = *(uint32_t *)(g + 8);
+        uint64_t g_iov = *(uint64_t *)(g + 16), g_iovlen = *(uint64_t *)(g + 24);
+        uint64_t g_ctl = *(uint64_t *)(g + 32), g_ctllen = *(uint64_t *)(g + 40);
+        uint32_t g_flags = *(uint32_t *)(g + 48);
+        uint8_t *h = R->buf; // the 56-byte msghdr COPY at [0,56)
+        memset(h, 0, SENTRY_MSGHDR_SZ);
+        // msg_name: offset into the sockaddr tail window (send copies the addr; recv just reserves it).
+        if (g_name && g_namelen) {
+            uint32_t nl = g_namelen > SENTRY_SADDRCAP ? SENTRY_SADDRCAP : g_namelen;
+            if (nr == 211) memcpy(R->buf + SENTRY_MSGNAME_OFF, (const void *)g_name, nl);
+            *(uint64_t *)(h + 0) = SENTRY_MSGNAME_OFF;               // nonzero offset == present
+            *(uint32_t *)(h + 8) = nl;                              // capped to the ring window (real addrs fit)
+        }
+        // msg_iov: iovec[] header (iov_base = OFFSET) + data, flattened like readv/writev, capped to DATACAP.
+        const struct iovec *giov = (const struct iovec *)g_iov;
+        uint32_t n = g_iovlen > SENTRY_IOVMAX ? SENTRY_IOVMAX : (uint32_t)g_iovlen;
+        if (!giov) n = 0;
+        struct iovec *biov = (struct iovec *)(R->buf + SENTRY_MSGIOV_OFF);
+        uint32_t cur = SENTRY_MSGIOV_OFF + n * (uint32_t)sizeof(struct iovec);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t room = (cur < SENTRY_DATACAP) ? (SENTRY_DATACAP - cur) : 0; // keep data clear of the tail
+            uint32_t want = (giov && giov[i].iov_len < room) ? (uint32_t)giov[i].iov_len : room;
+            if (nr == 211 && want && giov) memcpy(R->buf + cur, giov[i].iov_base, want); // gather (send)
+            biov[i].iov_base = (void *)(uintptr_t)cur;
+            biov[i].iov_len = want;
+            cur += want;
+        }
+        *(uint64_t *)(h + 16) = SENTRY_MSGIOV_OFF;
+        *(uint64_t *)(h + 24) = n;
+        // msg_control: offset into the optval tail window (send copies the cmsg; recv reserves it). SCM_RIGHTS
+        // fds inside are sentry fds, so the bytes cross verbatim.
+        if (g_ctl && g_ctllen) {
+            uint32_t cl = g_ctllen > SENTRY_MSGCTLCAP ? SENTRY_MSGCTLCAP : (uint32_t)g_ctllen;
+            if (nr == 211) memcpy(R->buf + SENTRY_MSGCTL_OFF, (const void *)g_ctl, cl);
+            *(uint64_t *)(h + 32) = SENTRY_MSGCTL_OFF;               // nonzero offset == present
+            *(uint64_t *)(h + 40) = cl;                             // controllen (send: actual; recv: cap)
+        }
+        *(uint32_t *)(h + 48) = g_flags;
+        R->redir[1] = 0; // a1 -> msghdr copy; the sentry rebases the inner offsets (snr 211/212)
+        R->inlen = cur;
+        break;
+    }
+    // ---- multiplexing over sentry-owned fds (item 3) ----
+    case 73: { // ppoll(fds, nfds, timeout_ts, sigmask, sigsetsz)
+        uint32_t nfds = (uint32_t)G_A1(c);
+        uint32_t bytes = nfds * 8u;                                  // sizeof(struct pollfd) == 8
+        if (bytes > SENTRY_DATACAP) { bytes = SENTRY_DATACAP; nfds = bytes / 8u; }
+        if (G_A0(c) && bytes) memcpy(R->buf, (const void *)G_A0(c), bytes);
+        R->redir[0] = 0;
+        R->a[1] = nfds;
+        if (G_A2(c)) { memcpy(R->buf + SENTRY_POLL_TMO, (const void *)G_A2(c), 16); R->redir[2] = SENTRY_POLL_TMO; }
+        else R->a[2] = 0;                                            // NULL timeout == block forever
+        R->a[3] = 0; R->a[4] = 0;                                    // sigmask ignored by service_local
+        break;
+    }
+    case 72: { // pselect6(nfds, rd, wr, ex, timeout_ts, sigmask)
+        uint32_t nfds = (uint32_t)G_A0(c);
+        uint32_t fb = (nfds + 7u) / 8u;
+        if (fb > 128u) fb = 128u;                                    // fd_set caps at FD_SETSIZE/8 == 128
+        if (G_A1(c)) { memcpy(R->buf + SENTRY_PSEL_RD, (const void *)G_A1(c), fb); R->redir[1] = SENTRY_PSEL_RD; } else R->a[1] = 0;
+        if (G_A2(c)) { memcpy(R->buf + SENTRY_PSEL_WR, (const void *)G_A2(c), fb); R->redir[2] = SENTRY_PSEL_WR; } else R->a[2] = 0;
+        if (G_A3(c)) { memcpy(R->buf + SENTRY_PSEL_EX, (const void *)G_A3(c), fb); R->redir[3] = SENTRY_PSEL_EX; } else R->a[3] = 0;
+        if (G_A4(c)) { memcpy(R->buf + SENTRY_PSEL_TMO, (const void *)G_A4(c), 16); R->redir[4] = SENTRY_PSEL_TMO; } else R->a[4] = 0;
+        R->a[5] = 0;
+        break;
+    }
+    case 21: // epoll_ctl(epfd, op, fd, a3=event): in epoll_event (12B)
+        if (G_A3(c)) { memcpy(R->buf, (const void *)G_A3(c), SENTRY_EPEV_SZ); R->redir[3] = 0; }
+        break;
+    case 22: // epoll_pwait(epfd, a1=events_out, maxevents, timeout, sigmask): reserve out window, drop sigmask
+        R->redir[1] = 0;
+        R->a[4] = 0;
+        break;
+    // ---- fd-table ops on sentry-owned fds (item 3) ----
+    case 25: // fcntl(fd, cmd, arg): only F_GETLK/SETLK/SETLKW (5/6/7) carry a flock* in a2. Always redir a2
+             // to the ring for those (so the sentry's flock deref can never hit a guest/NULL pointer); copy
+             // the inbound lock only if the guest pointer is real.
+        if ((int)G_A1(c) >= 5 && (int)G_A1(c) <= 7) {
+            if (G_A2(c)) memcpy(R->buf, (const void *)G_A2(c), SENTRY_FLOCKSZ);
+            R->redir[2] = 0;
+        }
+        break;
+    case 29: { // ioctl(fd, req, arg): always redir arg to the ring so the sentry never derefs a guest/NULL
+               // pointer; copy in exactly the _IOC_SIZE/table byte count (unsized/unknown -> nothing -> ENOTTY)
+        if (G_A2(c)) {
+            uint32_t isz, osz;
+            sentry_ioctl_sizes((unsigned long)G_A1(c), &isz, &osz);
+            if (isz > SENTRY_IOCTLCAP) isz = SENTRY_IOCTLCAP;
+            if (isz) memcpy(R->buf, (const void *)G_A2(c), isz);
+        }
+        R->redir[2] = 0;
+        break;
+    }
+    case 59:  // pipe2(a0=int[2], flags): out fd pair
+        R->redir[0] = 0;
+        break;
+    case 199: // socketpair(domain, type, proto, a3=int[2]): out fd pair
+        R->redir[3] = 0;
+        break;
+    default: break; // 57 close / 62 lseek / 198 socket / 201 listen / 210 shutdown / 20 epoll_create1 /
+                    // 23 dup / 24 dup3: no buffer.
     }
 
     // ---- ring round-trip ----
@@ -640,36 +1039,114 @@ static void syscall_route(struct cpu *c) {
             }
         }
         break;
-    default: break; // 56 openat / 57 close / 62 lseek / 64 write / 66 writev / 68 pwrite /
-                    // 198 socket / 200 bind / 203 connect / 206 sendto / 208 setsockopt / 210 shutdown: no out bytes
+    // ---- recvmsg (item 2): scatter received data + write back name/control/flags into the guest msghdr ----
+    case 212:
+        if (ret >= 0 && G_A1(c)) {
+            uint8_t *g = (uint8_t *)G_A1(c);                          // the original guest msghdr
+            uint8_t *h = R->buf;                                      // the ring msghdr copy service_local filled
+            uint64_t g_name = *(uint64_t *)(g + 0);
+            uint32_t g_namecap = *(uint32_t *)(g + 8);               // guest-supplied name capacity (unmodified yet)
+            uint32_t outnl = *(uint32_t *)(h + 8);                   // length the sentry reported
+            if (g_name && g_namecap) {
+                uint32_t cpy = outnl < g_namecap ? outnl : g_namecap;
+                if (cpy > SENTRY_SADDRCAP) cpy = SENTRY_SADDRCAP;
+                memcpy((void *)g_name, R->buf + SENTRY_MSGNAME_OFF, cpy);
+            }
+            *(uint32_t *)(g + 8) = outnl;                            // updated msg_namelen
+            uint64_t g_ctl = *(uint64_t *)(g + 32), g_ctlcap = *(uint64_t *)(g + 40);
+            uint64_t outcl = *(uint64_t *)(h + 40);                  // control length the sentry wrote
+            if (g_ctl && g_ctlcap) {
+                uint64_t cpy = outcl < g_ctlcap ? outcl : g_ctlcap;
+                if (cpy > SENTRY_MSGCTLCAP) cpy = SENTRY_MSGCTLCAP;
+                memcpy((void *)g_ctl, R->buf + SENTRY_MSGCTL_OFF, cpy); // SCM_RIGHTS fds here are sentry fds == guest fds
+            }
+            *(uint64_t *)(g + 40) = outcl;                           // updated msg_controllen
+            *(uint32_t *)(g + 48) = *(uint32_t *)(h + 48);           // updated msg_flags (MSG_TRUNC/CTRUNC/...)
+            // scatter the ret payload bytes back into the guest's iovec segments
+            if (ret > 0) {
+                const struct iovec *giov = (const struct iovec *)*(uint64_t *)(g + 16);
+                const struct iovec *biov = (const struct iovec *)(R->buf + SENTRY_MSGIOV_OFF);
+                uint32_t n = (uint32_t)*(uint64_t *)(h + 24), remaining = (uint32_t)ret;
+                for (uint32_t i = 0; i < n && remaining && giov; i++) {
+                    uint32_t seg = (uint32_t)biov[i].iov_len;
+                    if (seg > remaining) seg = remaining;
+                    memcpy(giov[i].iov_base, biov[i].iov_base, seg); // biov[i].iov_base rebased to ring VA (shared)
+                    remaining -= seg;
+                }
+            }
+        }
+        break;
+    // ---- multiplexing copy-back (item 3) ----
+    case 73: // ppoll: revents updated in place in the ring pollfd array
+        if (ret >= 0 && G_A0(c)) memcpy((void *)G_A0(c), R->buf, (uint32_t)R->a[1] * 8u);
+        break;
+    case 72: // pselect6: the three fd_sets were narrowed in place
+        if (ret >= 0) {
+            uint32_t fb = ((uint32_t)G_A0(c) + 7u) / 8u;
+            if (fb > 128u) fb = 128u;
+            if (G_A1(c)) memcpy((void *)G_A1(c), R->buf + SENTRY_PSEL_RD, fb);
+            if (G_A2(c)) memcpy((void *)G_A2(c), R->buf + SENTRY_PSEL_WR, fb);
+            if (G_A3(c)) memcpy((void *)G_A3(c), R->buf + SENTRY_PSEL_EX, fb);
+        }
+        break;
+    case 22: // epoll_pwait: ret ready events (12B each) landed at buf[0]
+        if (ret > 0 && G_A1(c)) {
+            uint32_t mx = (uint32_t)G_A2(c);
+            uint32_t got = (uint32_t)ret < mx ? (uint32_t)ret : mx;
+            memcpy((void *)G_A1(c), R->buf, got * SENTRY_EPEV_SZ);
+        }
+        break;
+    case 25: // fcntl F_GETLK: the conflicting lock was written back into the ring flock
+        if ((int)G_A1(c) == 5 && ret >= 0 && G_A2(c)) memcpy((void *)G_A2(c), R->buf, SENTRY_FLOCKSZ);
+        break;
+    case 29: // ioctl: write back exactly the out bytes the request defines (never clobber past them)
+        if (ret >= 0 && G_A2(c)) {
+            uint32_t isz, osz;
+            sentry_ioctl_sizes((unsigned long)G_A1(c), &isz, &osz);
+            if (osz > SENTRY_IOCTLCAP) osz = SENTRY_IOCTLCAP;
+            if (osz) memcpy((void *)G_A2(c), R->buf, osz);
+        }
+        break;
+    case 59:  // pipe2: out fd pair (both ends sentry fds, virtual to the guest)
+        if (ret == 0 && G_A0(c)) memcpy((void *)G_A0(c), R->buf, 8);
+        break;
+    case 199: // socketpair: out fd pair
+        if (ret == 0 && G_A3(c)) memcpy((void *)G_A3(c), R->buf, 8);
+        break;
+    default: break; // 56 openat / 57 close / 62 lseek / 64 write / 66 writev / 68 pwrite / 198 socket /
+                    // 200 bind / 203 connect / 206 sendto / 208 setsockopt / 210 shutdown / 211 sendmsg /
+                    // 20 epoll_create1 / 21 epoll_ctl / 23 dup / 24 dup3: no out bytes
     }
     G_RET(c) = (uint64_t)ret;
     atomic_store_explicit(&R->busy, 0, memory_order_release); // release the producer lock (round-trip done)
 }
 
 // ------------------------------------------------------------------ NEXT sentry PR (roadmap)
-// 1. Per-context rings -- DONE this PR (PoC pool): SENTRY_NRINGS independent rings, one claimed per
-//    worker thread (lazy, monotonic counter mod N), serviced by N sentry THREADS in the one sentry
-//    process (one process so the host fd table is shared across servicers). At <=N concurrent worker
-//    threads every thread owns a private lane; beyond N, overflow threads share a lane behind the
-//    per-ring `busy` producer lock. FOLLOW-UP for a full pool: size/grow the pool or hash by tid so
-//    overflow never serializes; key by pid for forked-PROCESS workers (claim counter is already in
-//    shared memory so forked workers draw distinct lanes, but the sentry does not yet TRACK a forked
-//    child's lifetime -- that lands with execve/clone(fork) below).
-// 2. Complete the fs/net/proc forwarded set. DONE this PR: the socket lifecycle -- socket/bind/listen/
-//    connect/accept/accept4/getsockname/getpeername/sendto/recvfrom/setsockopt/getsockopt/shutdown
-//    (sockaddr in/out + in/out socklen, optval in/out, send/recv data over the tail windows; the
-//    sentry owns the real socket fd, the worker holds only the virtual fd number). Plus the prior fs
-//    set (two-buffer stat family, iovec readv/writev, getdents64, pread64/pwrite64). STILL LOCAL /
-//    NEXT: (a) sendmsg/recvmsg (211/212) -- nested msghdr/iovec + SCM_RIGHTS (item 3); (b) the
-//    MULTIPLEXING family over a forwarded socket fd -- poll/ppoll/select/epoll_wait and the
-//    nonblocking fcntl(F_SETFL)/ioctl(FIONBIO) -- these block/poll a sentry-owned fd, so they need
-//    either fd-passing (item 3) or forwarding the whole poll set; (c) execve/clone(fork)/wait4
-//    (process creation -- the sentry must fork+register a new worker lane and proxy the child fd table).
-// 3. SCM_RIGHTS fd passing: for a guest fd a LOCAL worker syscall must touch (file-backed mmap), the
-//    sentry sendmsg()es the fd to the worker over a control socketpair; the worker's fds stay virtual.
-//    Also needed for AF_UNIX SCM_RIGHTS payloads inside guest sendmsg/recvmsg.
-// 4. Futex/__ulock wakeup: replace the per-ring spin with a process-shared futex on `turn` to drop
-//    idle CPU (N idle servicer threads now spin -- a process-shared futex wake matters more with N).
+// 1. Ring pool + fork/exec/wait lane -- DONE: SENTRY_NRINGS rings, RECLAIM-AWARE free-list (ring_for_thread
+//    CAS-claims a free lane by per-thread token; ring_release frees it on thread/process exit), serviced by
+//    N sentry THREADS in the one sentry process (shared host fd table). FORK: a guest clone/clone3 forks the
+//    WORKER (the guest address space is worker-side COW the sentry cannot duplicate); the child adopts a
+//    fresh identity (sentry_fork_child: drops the inherited lane, mints a new token, is NOT the sentry owner)
+//    so it draws its own lane and never tears the shared sentry down. EXECVE stays local (it reloads the
+//    image in-process, keeping ring/sentry/confinement). WAIT4 reaps child WORKERS, short-circuits a
+//    wait-any with no guest children to -ECHILD (so it can't block on the hidden sentry child) and never
+//    surfaces the sentry's pid. exit_group reap is OWNER-GATED.  FOLLOW-UP: PER-PROCESS sentry fd tables --
+//    forked workers currently SHARE the sentry's fd table (correct for the fork+exec inherit pattern that
+//    sh/popen use, but two long-lived post-fork processes that independently mutate fds would alias).
+// 2. fs/net/proc forwarded set -- DONE this PR: sendmsg/recvmsg (211/212) with the full nested msghdr graph
+//    (msg_name + scatter/gather msg_iov + msg_control flattened to the ring, rebased by the sentry) and
+//    SCM_RIGHTS that "just works" -- a guest fd in the cmsg is ALREADY a sentry fd, so the control bytes
+//    cross verbatim and a recvmsg lands a usable virtual fd. Prior PRs: socket lifecycle + two-buffer stat
+//    family + iovec readv/writev + getdents64 + pread/pwrite.
+// 3. Multiplexing + fd passing -- DONE this PR: ppoll/pselect6/epoll_create1/epoll_ctl/epoll_pwait forwarded
+//    (they block on a sentry-owned fd, so they MUST run in the sentry; pollfd/fd_set/epoll_event marshaled
+//    in+out); fd-table ops dup/dup3/pipe2/socketpair/fcntl(F_SETFL,F_DUPFD,F_GETLK flock)/ioctl(FIONBIO/
+//    FIONREAD/winsize/termios, exact-size in/out) forwarded so the guest fd space stays entirely sentry-side.
+//    SCM_RIGHTS worker<->sentry fd LEND: a sentry-owned fd a LOCAL worker syscall must touch (file-backed
+//    mmap) is sent over a per-ring AF_UNIX control socketpair, mapped locally, then dropped.  FOLLOW-UP for
+//    full soundness: forward eventfd2/timerfd/signalfd4/inotify (today they make WORKER-local fds that a
+//    forwarded read/epoll_ctl then can't see); select(non-pselect)/epoll_pwait2; sendmmsg/recvmmsg (243/269).
+// 4. Futex/__ulock wakeup -- STILL A SPIN (perf only, not correctness): N idle servicer threads + the worker
+//    busy-wait `turn`; a process-shared futex/os_sync wake would drop idle CPU. Deferred.
 // 5. Sentry-side policy: add an allow/deny layer (path allowlists, net egress) so the sentry ENFORCES
 //    rather than merely executes.
