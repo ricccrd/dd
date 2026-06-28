@@ -25,3 +25,13 @@ static uint8_t g_w8v;                   // debug byte-watchpoint (armed via magi
 static uint64_t g_malloc_n;             // debug: count of __libc_malloc_impl entries
 static const char *g_exe_path = "";
 static const char *g_self_path = "";    // host path to this jit86 binary (for execve re-exec)
+
+// ---- W3b SSE/string-SIMD idiom upgrade (gate NOSSEOPT=1) ----
+// g_pmovmskb_n: # of `pmovmskb` sites lowered to the cascading-shift NEON sequence
+// (vs the old per-byte scalar spill loop). Printed under PROF.
+static uint64_t g_pmovmskb_n;
+static int g_nosseopt = -1; // -1 = uninitialized; cached getenv("NOSSEOPT")
+static int nosseopt(void) {
+    if (g_nosseopt < 0) g_nosseopt = (getenv("NOSSEOPT") != NULL);
+    return g_nosseopt;
+}

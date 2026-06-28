@@ -1469,7 +1469,26 @@ static void *translate_block(uint64_t gpc) {
                     emit32(lo | (sz << 22) | (vd << 5) | 17);             // narrow dst's lanes -> v17 low
                     emit32(hi | (sz << 22) | (s << 5) | 17);              // narrow src's lanes -> v17 high
                     e_vmov(vd, 17);
-                } else if (op == 0xD7) {       // pmovmskb: byte MSBs -> GPR (reg)
+                } else if (op == 0xD7 && !nosseopt()) { // pmovmskb -> NEON (W3b SSE-SIMD idiom upgrade)
+                    // Gather the 16 byte-MSBs into the low 16 bits of I.reg with a cascading
+                    // shift-accumulate that needs NO memory round-trip and NO constant load
+                    // (the proven sse2neon _mm_movemask_epi8 sequence). 7 host insns vs ~51.
+                    //   ushr v17.16b, vm.16b, #7      ; t[i] = byte[i] MSB  (bit0 of each byte)
+                    //   usra v17.8h,  v17.8h,  #7     ; pack 2 bits -> low byte of each halfword
+                    //   usra v17.4s,  v17.4s,  #14    ; pack 4 bits -> low byte of each word
+                    //   usra v17.2d,  v17.2d,  #28    ; pack 8 bits -> byte[0] and byte[8]
+                    //   umov w16,   v17.b[0]          ; mask bits 0..7
+                    //   umov wREG,  v17.b[8]          ; mask bits 8..15
+                    //   orr  wREG,  w16, wREG, lsl #8 ; combine (W-form zero-extends to 64)
+                    g_pmovmskb_n++;
+                    e_vshr_imm(17, vm, 8, 7, 0);                          // ushr v17.16b, vm.16b, #7
+                    emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17);  // usra v17.8h, v17.8h, #7
+                    emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17);  // usra v17.4s, v17.4s, #14
+                    emit32(0x6F001400u | (100u << 16) | (17 << 5) | 17); // usra v17.2d, v17.2d, #28
+                    emit32(0x0E003C00u | (1u << 16) | (17 << 5) | 16);   // umov w16, v17.b[0]
+                    emit32(0x0E003C00u | (17u << 16) | (17 << 5) | I.reg); // umov wREG, v17.b[8]
+                    e_rrr(A_ORR, I.reg, 16, I.reg, 0, 8);                // orr wREG, w16, wREG, lsl #8
+                } else if (op == 0xD7) {       // pmovmskb scalar fallback (NOSSEOPT=1 -> baseline codegen)
                     e_str_q(vm, 28, OFF_MM);   // spill the 16 bytes to scratch
                     e_addi(17, 28, OFF_MM, 1); // x17 = &scratch
                     e_movz(I.reg, 0, 0);       // result = 0
@@ -1621,6 +1640,18 @@ static void *translate_block(uint64_t gpc) {
                     }
                     emit32((I.p66 ? 0x1E602000u : 0x1E202000u) | (s << 16) | (vd << 5)); // FCMP Dvd, Ds  (Rd=0)
                     e_nzcv_save(); // CF/ZF/PF substrate: ARM FCMP C/Z align with x86 unsigned cc
+                } else if (op == 0xF4) { // pmuludq: vd.u64[i] = (u32)vd.even32[i] * (u32)src.even32[i]
+                    // W3b: was UNIMPL -> blocked glibc strchr/strrchr (byte-broadcast via pmuludq).
+                    // Gather the even (0,2) 32-bit lanes of each operand into the low 2 lanes (UZP1),
+                    // then widening multiply -> two 64-bit products. Bit-exact, 3 NEON insns.
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    emit32(0x4E801800u | (vd << 16) | (vd << 5) | 17); // uzp1 v17.4s, vd.4s, vd.4s -> [d0,d2,..]
+                    emit32(0x4E801800u | (s << 16) | (s << 5) | 18);   // uzp1 v18.4s, s.4s,  s.4s  -> [s0,s2,..]
+                    emit32(0x2EA0C000u | (18 << 16) | (17 << 5) | vd); // umull vd.2d, v17.2s, v18.2s
                 } else
                     handled = 0;
                 if (handled) {
