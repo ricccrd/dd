@@ -380,12 +380,27 @@ static uint64_t g_cal_mono_ns;    // CLOCK_MONOTONIC ns at calibration
 static uint64_t g_cal_real_ns;    // CLOCK_REALTIME  ns at calibration
 static uint64_t g_cal_mult;       // tick->ns multiplier (Q30): round(1e9 * 2^FAST_SHIFT / cntfrq)
 #define FAST_SHIFT 30
+// ---------------- W4F: inline pure-userspace-state syscalls (rt_sigprocmask / sched_yield) --------
+// Some guest syscalls touch ONLY dd-jit's own per-cpu state and need no host syscall, yet still pay
+// the full spill->block_return->service()->run_block round-trip. We serve them inline at the `0F 05`
+// site (reusing S1's emit_fast_syscall ladder) and fall through without exiting the block.
+// g_pending is the async-signal pending bitmask owned by os/linux/signal.c (included LATER in this
+// unity TU); we add an identical forward tentative definition so the emitted code can take its
+// address. Two `static` tentative defs of the same object coalesce into one (standard C) -- no
+// second storage, no link conflict; the bare-`static` real def in signal.c is unchanged.
+static volatile uint64_t g_pending;   // FORWARD decl; real (identical) def lives in os/linux/signal.c
+static int g_siginline = 1;           // W4F switch (JIT86_NOSIGINLINE=1 disables ONLY the W4F arms)
+static uint64_t g_sig_inline_count;   // # rt_sigprocmask served inline (written by emitted code)
+static uint64_t g_sig_slow_count;     // # rt_sigprocmask that reached service() (pending-signal fallback)
+static uint64_t g_yield_inline_count; // # sched_yield served inline
 static void s1_calibrate(void) {
     const char *off = getenv("JIT86_NOFASTSYS");
     if (off && off[0] && off[0] != '0') {
         g_fastsys = 0;
         return;
     }
+    const char *nosi = getenv("JIT86_NOSIGINLINE");
+    if (nosi && nosi[0] && nosi[0] != '0') g_siginline = 0;
     uint64_t freq;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     if (!freq) {
@@ -411,10 +426,10 @@ static void s1_calibrate(void) {
 // chained branch to `next`); we never continue decoding past the syscall (would run off the end).
 static void emit_fast_syscall(uint64_t next) {
     emit32(0xD53B4211u); // mrs x17, nzcv   (preserve guest flags across our compares)
-    uint32_t *after[2];
-    int na = 0; // slots: b L_after
-    uint32_t *to_slow[2];
-    int nsl = 0; // slots: b.ne slow_restore
+    uint32_t *after[8];
+    int na = 0; // slots: b L_after            [W4F: grew 2->8 for the inline-syscall arms]
+    uint32_t *to_slow[8];
+    int nsl = 0; // slots: b.ne slow_restore   [W4F: grew 2->8]
 
     // ---- clock_gettime: rax == 228 ----
     e_subi_s(16, 0, 228, 1); // subs x16, x0, #228
@@ -459,8 +474,8 @@ static void emit_fast_syscall(uint64_t next) {
     // ---- gettimeofday: rax == 96 ----
     *m1 = (*m1 & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - m1) & 0x7FFFF) << 5);
     e_subi_s(16, 0, 96, 1); // subs x16, x0, #96
-    to_slow[nsl++] = (uint32_t *)g_cp;
-    e_bcond(1, 0);                 // b.ne -> slow
+    uint32_t *gtod_miss = (uint32_t *)g_cp; // W4F: rax!=96 -> fall into the W4F arms (was straight to slow)
+    e_bcond(1, 0);                 // b.ne -> W4F arms (or slow when g_siginline off)
     e_movconst(19, g_cal_real_ns); // gettimeofday is REALTIME
     emit32(0xD53BE050u);           // mrs x16, cntvct_el0
     e_movconst(20, g_cal_base_ticks);
@@ -485,6 +500,89 @@ static void emit_fast_syscall(uint64_t next) {
     emit32(0xD51B4211u); // msr nzcv, x17
     after[na++] = (uint32_t *)g_cp;
     emit32(0x14000000u); // b L_after
+
+    // ===================== W4F: pure-userspace-state syscalls (no host syscall) ==================
+    // rt_sigprocmask (read/update the per-cpu guest signal mask) + sched_yield (return 0). These
+    // touch ONLY dd-jit's own state, so we serve them inline and fall through -- no spill, no
+    // dispatch, no service(). Same ladder/contract as S1: guest nzcv saved in x17 + restored on
+    // EVERY path, guest GPRs untouched except rax(=return); scratch in x16/x19-x22.
+    if (g_siginline) {
+        const int OFF_SM = (int)__builtin_offsetof(struct cpu, sigmask);
+        // gettimeofday miss (rax != 96) lands here instead of going straight to the slow exit:
+        *gtod_miss = (*gtod_miss & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - gtod_miss) & 0x7FFFF) << 5);
+
+        // ---- rt_sigprocmask: rax == 14   (how=rdi=x7, set=rsi=x6, oldset=rdx=x2) ----
+        e_subi_s(16, 0, 14, 1); // subs x16, x0, #14
+        uint32_t *spm_miss = (uint32_t *)g_cp;
+        e_bcond(1, 0); // b.ne -> sched_yield
+        // Pending-signal fallback: if g_pending != 0 take the UNCHANGED slow exit, so the
+        // dispatcher's maybe_deliver_signal runs with the post-update mask at the SAME block
+        // boundary, against the SAME mask, as the unmodified engine. When nothing is pending the
+        // inline mask update cannot trigger any immediate delivery, and every future signal is
+        // checked against the fresh c->sigmask by maybe_deliver_signal at each boundary -> the
+        // deferred boundary is unobservable, so this is provably bit-exact. (c->sigmask has no async
+        // reader: host_sigh only ORs g_pending; the sole consumer is the synchronous
+        // maybe_deliver_signal at the dispatcher-loop top, so the store is plain program-order.)
+        e_movconst(20, (uint64_t)&g_pending);
+        e_ldr(21, 20, 0);       // x21 = g_pending
+        e_subi_s(21, 21, 0, 1); // Z = (g_pending == 0)
+        to_slow[nsl++] = (uint32_t *)g_cp;
+        e_bcond(1, 0);          // b.ne -> slow (a signal is pending: exact-timing path)
+        e_ldr(19, 28, OFF_SM);  // x19 = c->sigmask (old)
+        e_subi_s(20, 2, 0, 1);  // rdx == 0 ?  (no oldset)
+        uint32_t *no_old = (uint32_t *)g_cp;
+        e_bcond(0, 0);          // b.eq -> skip oldset store
+        e_str(19, 2, 0);        // *(uint64_t*)oldset = old mask
+        *no_old = (*no_old & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - no_old) & 0x7FFFF) << 5);
+        e_subi_s(20, 6, 0, 1);  // rsi == 0 ?  (no new set -> mask unchanged)
+        uint32_t *no_set = (uint32_t *)g_cp;
+        e_bcond(0, 0);          // b.eq -> store (writes old back: no-op, matches service())
+        e_ldr(22, 6, 0);        // x22 = set = *(uint64_t*)rsi
+        e_subi_s(20, 7, 0, 1);  // how == 0 (SIG_BLOCK) ?
+        uint32_t *not_block = (uint32_t *)g_cp;
+        e_bcond(1, 0);          // b.ne -> check unblock
+        e_rrr(A_ORR, 19, 19, 22, 1, 0); // SIG_BLOCK: x19 = old | set
+        uint32_t *d1 = (uint32_t *)g_cp;
+        emit32(0x14000000u);    // b -> store
+        *not_block = (*not_block & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - not_block) & 0x7FFFF) << 5);
+        e_subi_s(20, 7, 1, 1);  // how == 1 (SIG_UNBLOCK) ?
+        uint32_t *not_unblock = (uint32_t *)g_cp;
+        e_bcond(1, 0);          // b.ne -> setmask
+        e_rrr(A_BIC, 19, 19, 22, 1, 0); // SIG_UNBLOCK: x19 = old & ~set
+        uint32_t *d2 = (uint32_t *)g_cp;
+        emit32(0x14000000u);    // b -> store
+        *not_unblock = (*not_unblock & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - not_unblock) & 0x7FFFF) << 5);
+        e_mov_rr(19, 22, 1);    // else SIG_SETMASK: x19 = set
+        // store label (d1, d2, no_set all converge here):
+        *d1 = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - d1) & 0x3FFFFFF);
+        *d2 = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - d2) & 0x3FFFFFF);
+        *no_set = (*no_set & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - no_set) & 0x7FFFF) << 5);
+        e_str(19, 28, OFF_SM);  // c->sigmask = x19
+        e_movconst(20, (uint64_t)&g_sig_inline_count);
+        e_ldr(21, 20, 0);
+        e_addi(21, 21, 1, 1);
+        e_str(21, 20, 0);       // g_sig_inline_count++
+        e_movconst(0, 0);       // rax = 0
+        emit32(0xD51B4211u);    // msr nzcv, x17  (restore guest flags)
+        after[na++] = (uint32_t *)g_cp;
+        emit32(0x14000000u);    // b L_after
+
+        // ---- sched_yield: rax == 24   (pure: returns 0, no state, no host work) ----
+        *spm_miss = (*spm_miss & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - spm_miss) & 0x7FFFF) << 5);
+        e_subi_s(16, 0, 24, 1); // subs x16, x0, #24
+        to_slow[nsl++] = (uint32_t *)g_cp;
+        e_bcond(1, 0);          // b.ne -> slow
+        e_movconst(20, (uint64_t)&g_yield_inline_count);
+        e_ldr(21, 20, 0);
+        e_addi(21, 21, 1, 1);
+        e_str(21, 20, 0);       // g_yield_inline_count++
+        e_movconst(0, 0);       // rax = 0
+        emit32(0xD51B4211u);    // msr nzcv, x17
+        after[na++] = (uint32_t *)g_cp;
+        emit32(0x14000000u);    // b L_after
+    } else {
+        to_slow[nsl++] = gtod_miss; // W4F off (JIT86_NOSIGINLINE): gtod miss -> slow, exactly as S1
+    }
 
     // ---- slow path: restore guest flags, take the unchanged full R_SYSCALL exit ----
     for (int i = 0; i < nsl; i++) {

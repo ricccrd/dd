@@ -2491,6 +2491,7 @@ static void service(struct cpu *c) {
     }
     // rt_sigprocmask(how, *set, *old)
     case 135: {
+        // (W4F slow-path counter removed: it lived in x86 emit.c, undefined in the shared/aarch64 TU)
         if (a2) *(uint64_t *)a2 = c->sigmask;
         if (a1) {
             uint64_t set = *(uint64_t *)a1;
