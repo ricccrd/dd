@@ -1,8 +1,8 @@
 [package]
 name = "dd-client"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "Typed Docker-Engine-API v1.43 client over a unix socket, shared by the dd GUI and CLI."
+description = "Docker-Engine-API v1.43 client over a unix socket (wraps bollard), shared by the dd GUI and CLI."
 license = "MIT"
 
 [lib]
@@ -10,9 +10,8 @@ name = "ddclient"
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Mature Docker-Engine-API client; this crate is a thin façade over it with dd view models.
+bollard = "0.21"
+futures-util = "0.3"
+bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"

@@ -1,6 +1,6 @@
 [package]
 name = "dd-gui"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "dd-app — a GTK4/libadwaita desktop UI for the dd VM-less container runtime."
 license = "MIT"
@@ -10,6 +10,7 @@ name = "dd-app"
 path = "src/main.rs"
 
 [dependencies]
+# Shared dd daemon client (a thin façade over bollard); GUI + CLI both use it.
 dd-client = { path = "../dd-client" }
 # GUI stack (GTK4 via Relm4). Needs pkg-config + the GTK4 dev libs at build time, which only
 # exist on the macOS host (via the Nix devShell in ./nix) — that's why dd-gui is excluded from
@@ -20,6 +21,9 @@ dd-client = { path = "../dd-client" }
 # native without the libadwaita *library*.
 relm4 = "0.9"
 gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+# VTE terminal widget (for the container exec terminal). 0.8 pairs with gtk4 0.9 (both on glib 0.20).
+# C lib `vte-2.91-gtk4` comes from the nix devShell (pkgs.vte-gtk4, darwin-supported).
+vte4 = "0.8"
 tokio = { version = "1", features = ["time", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
