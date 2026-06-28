@@ -2980,9 +2980,15 @@ static void service(struct cpu *c) {
                 break;
             }
         // translate SOL_SOCKET; ignore unknown
+        } else if (lvl == 6) { // IPPROTO_TCP: optnames diverge — translate, ignore unknown (never cork by accident)
+            opt = tcp_opt_l2m((int)a2);
+            if (opt < 0) {
+                G_RET(c) = 0;
+                break;
+            }
         }
         int r = setsockopt((int)a0, lvl, opt, (void *)a3,
-                           // other levels (TCP/IP) pass through (TCP_NODELAY matches)
+                           // other levels (IP/IPv6) pass through
                            (socklen_t)a4);
         G_RET(c) = r < 0 ? 0 : 0;
         (void)r;
@@ -3001,6 +3007,13 @@ static void service(struct cpu *c) {
                 break;
             }
         // unknown -> report 0
+        } else if (lvl == 6) { // IPPROTO_TCP: translate optname, report 0 for unknown
+            opt = tcp_opt_l2m((int)a2);
+            if (opt < 0) {
+                if (a4 && *(socklen_t *)a4 >= 4 && a3) *(int *)a3 = 0;
+                G_RET(c) = 0;
+                break;
+            }
         }
         int r = getsockopt((int)a0, lvl, opt, (void *)a3, (socklen_t *)a4);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -3701,6 +3714,19 @@ static void service(struct cpu *c) {
         G_RET(c) = 0;
         break;
     }
+
+    // x86-only `time` (x86 nr 201, no aarch64 equivalent) — glibc has no vDSO here and issues the raw
+    // syscall on a hot path (redis server-cron / per-command clock). Serve it directly: seconds since epoch,
+    // optionally written through the result pointer in a0. Without this it spams the unhandled-syscall log
+    // on every call (a per-op fprintf + ENOSYS), which both breaks the guest's clock and tanks throughput.
+#ifdef CANON_X86ONLY
+    case (CANON_X86ONLY | 201): { // time (x86-only nr 201; no aarch64 equivalent) -- redis hot clock path
+        time_t t = time(NULL);
+        if (a0) *(int64_t *)a0 = (int64_t)t;
+        G_RET(c) = (uint64_t)(int64_t)t;
+        break;
+    }
+#endif
 
     // ===================== unhandled =====================
     default:

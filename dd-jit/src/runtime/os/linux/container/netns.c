@@ -163,6 +163,21 @@ static int so_opt_l2m(int o) {
     default: return -1;
     }
 }
+// IPPROTO_TCP optname Linux -> macOS. CRITICAL: these numbers diverge, and a raw pass-through maps
+// Linux TCP_KEEPIDLE(4)/TCP_CORK(3) onto macOS TCP_NOPUSH(4)/TCP_NOOPT(3) — TCP_NOPUSH *corks* the
+// socket so a server's reply is never delivered until close (breaks redis & every keepalive-setting
+// server). Map the known ones; ignore (-1) unknown rather than pass through and accidentally cork.
+static int tcp_opt_l2m(int o) {
+    switch (o) {
+    case 1: return 0x01;  // TCP_NODELAY  (same)
+    case 2: return 0x02;  // TCP_MAXSEG   (same)
+    case 3: return 0x04;  // Linux TCP_CORK     -> macOS TCP_NOPUSH (deliberate; guest asked to cork)
+    case 4: return 0x10;  // Linux TCP_KEEPIDLE -> macOS TCP_KEEPALIVE (seconds)
+    case 5: return 0x101; // Linux TCP_KEEPINTVL-> macOS TCP_KEEPINTVL
+    case 6: return 0x102; // Linux TCP_KEEPCNT  -> macOS TCP_KEEPCNT
+    default: return -1;   // unknown -> ignore (never pass a Linux number straight to macOS IPPROTO_TCP)
+    }
+}
 // ---- NET namespace: per-container private loopback. A container's explicit 127.0.0.0/8 TCP sockets
 // are routed to AF_UNIX sockets under a per-namespace host dir the guest can't name (it's path-jailed),
 // so each container's localhost is isolated from the host + other containers. 0.0.0.0/external stay

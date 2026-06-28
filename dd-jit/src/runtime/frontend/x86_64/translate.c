@@ -1900,6 +1900,10 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             } // nop r/m
+            if (op == 0x18 || op == 0x0D || (op >= 0x19 && op <= 0x1D)) {
+                gpc = next;
+                continue;
+            } // prefetch{nta,t0,t1,t2} (0F 18) / prefetchw (0F 0D) / reserved multi-byte NOP hints — hint only -> NOP
             // shld/shrd (0F A4 imm8, 0F A5 cl, 0F AC imm8, 0F AD cl):  dst=r/m, src=reg, count
             if (op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) {
                 int isleft = (op == 0xA4 || op == 0xA5), bycl = (op == 0xA5 || op == 0xAD);
