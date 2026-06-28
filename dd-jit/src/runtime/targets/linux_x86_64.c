@@ -158,6 +158,9 @@ static int engine_global_init(void) {
     g_cp = g_cache;
     g_trace = getenv("JT") != NULL;
     g_prof = getenv("PROF") != NULL;
+    // W5B adaptive tier-2 controls (x86 engine)
+    g_notier2x = getenv("NOTIER2X") != NULL;
+    { const char *t = getenv("TIER2X_THRESHOLD"); if (t && atoll(t) > 0) g_t2thresh = (uint64_t)atoll(t); }
     // The OrbStack `mac` bridge does NOT propagate env vars; trace via a trigger file
     // and redirect stderr to a shared log (visible from the Linux side).
     int want_trace =

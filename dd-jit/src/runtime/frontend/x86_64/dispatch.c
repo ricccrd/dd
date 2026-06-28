@@ -105,6 +105,11 @@ static void run_guest(struct cpu *c) {
             c->exit_code = 70;
             break;
         }
+        if (c->reason == R_TIER2) {
+            // W5B: a hot self-loop's back-edge counter fired; recompile+swap it in. rip already = loop start.
+            tier2_promote(c->rip);
+            continue;
+        }
         if (c->reason == R_CPUID) {
             do_cpuid(c);
             continue;

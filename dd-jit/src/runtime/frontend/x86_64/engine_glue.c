@@ -44,3 +44,28 @@ static int noeaopt(void) {
     if (g_noeaopt < 0) g_noeaopt = (getenv("NOEAOPT") != NULL);
     return g_noeaopt;
 }
+
+// ---- W5B adaptive tier-2 (x86 engine) — x86-only glue over the SHARED W4E substrate ----
+// The hotness counter table (g_t2cnt/g_t2gpc/g_t2n), the dedup slot allocator (t2_slot), the promotion
+// threshold (g_t2thresh, default 1000), the tier-2-build flag (g_tier2_build), the last-body handoff
+// (g_last_body) and the promotion counter (g_prof_t2) all live in the shared jit/cache.c (the W4E
+// substrate, #included right after this TU). We DON'T redeclare them here — that would be a redefinition
+// in the x86 unity build. The x86 engine only adds the two pieces the shared substrate does not carry:
+//
+//   * its own kill switch NOTIER2X (the shared one is NOTIER2; x86 keeps a distinct env name and gate so
+//     the substrate's g_notier2/tier2_env_init -- aarch64-only, never called in the x86 TU -- stay inert),
+//   * the flag-save-elision PROF counter g_prof_t2fold (an x86-specific transform with no aarch64 analogue;
+//     the shared g_prof_t2 has no field for it).
+//
+// On the x86->arm64 engine, a tier-1 hot loop carries TWO cross-ISA per-iteration redundancies the
+// same-ISA aarch64 engine does not: (1) the conditional back-edge trampoline (`b.cond Ltaken; b body`
+// = 2 taken branches/iter) and (2) per-iteration NZCV materialization (`mrs;str cpu->nzcv`) that is dead
+// on the back-edge when the loop re-overwrites flags before reading them. Tier-2 folds the back-edge to
+// one `b.cond body` AND (for the deferred sub/cmp case proven flag-dead at loop top) hoists the flag save
+// onto the loop-exit edge. See frontend/x86_64/translate.c (emit_selfloop_x86 / tier2_promote).
+static int g_notier2x = -1;    // NOTIER2X=1 kill switch (pure tier-1 baseline); -1 = uninitialized
+static uint64_t g_prof_t2fold; // PROF: of the promoted loops, how many also elided the per-iteration flag save
+static int notier2x(void) {
+    if (g_notier2x < 0) g_notier2x = (getenv("NOTIER2X") != NULL);
+    return g_notier2x;
+}

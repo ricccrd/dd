@@ -58,5 +58,9 @@ struct cpu {
 #define R_X87FSTP 4 // fstp m80 -> C converts ST0 double -> 80-bit, pops
 #define R_DIV 5     // 64-bit div  -> C: rax,rdx = (rdx:rax) /,% divop  (unsigned 128/64)
 #define R_IDIV 6    // 64-bit idiv -> C: signed 128/64
+// W5B tier-2: a hot single-block self-loop's in-cache back-edge counter hit threshold -> the dispatcher
+// recompiles (promotes) the block (folded back-edge + dead-flag-save elision), swaps it in live, resumes
+// (rip already == loop start). See frontend/x86_64/translate.c tier2_promote().
+#define R_TIER2 7
 // x86 register encodings (== host reg numbers)
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };

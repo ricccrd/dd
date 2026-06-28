@@ -42,3 +42,13 @@
 // O_DIRECTORY/O_NOFOLLOW group, distinct from aarch64's asm-generic ones (see frontend/aarch64/abi.h).
 #define G_O_DIRECTORY 0x10000 // x86-64 O_DIRECTORY = 0200000
 #define G_O_NOFOLLOW  0x20000 // x86-64 O_NOFOLLOW  = 0400000
+
+// W5B tier-2: extra PROF line at exit_group (x86 engine only; aarch64 leaves G_PROF_EXTRA undefined).
+// g_prof_t2 lives in the shared jit/cache.c, g_prof_t2fold in frontend/x86_64/engine_glue.c -- both
+// defined before the shared service.c is #included in the x86 unity TU.
+#define G_PROF_EXTRA                                                                                                    \
+    do {                                                                                                                \
+        if (getenv("PROF"))                                                                                            \
+            fprintf(stderr, "[prof] tier2=%llu tier2_fold_elide=%llu\n", (unsigned long long)g_prof_t2,               \
+                    (unsigned long long)g_prof_t2fold);                                                                 \
+    } while (0)
