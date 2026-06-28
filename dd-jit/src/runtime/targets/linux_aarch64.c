@@ -226,26 +226,15 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         if (g_uid < 0) g_uid = 0;
         // container default: run as root (0); unless DD_UID/--uid set
         if (g_gid < 0) g_gid = 0;
-        // bind-mount volumes: "guestpath:hostdir,..."
+        // bind-mount volumes: "[ro:]guestpath:hostdir,..." -- delegate to add_vol() (the shared vfs.c
+        // parser) so the optional `ro:` read-only marker is handled in ONE place for both engines.
         const char *vspec = getenv("DDVOL");
         if (vspec) {
             char tmp[4096];
             snprintf(tmp, sizeof tmp, "%s", vspec);
             char *sv = NULL;
-            for (char *t = strtok_r(tmp, ",", &sv); t && g_nvols < 32; t = strtok_r(NULL, ",", &sv)) {
-                char *col = strchr(t, ':');
-                if (!col || t[0] != '/') continue;
-                *col = 0;
-                struct vol *v = &g_vols[g_nvols];
-                snprintf(v->guest, sizeof v->guest, "%s", t);
-                v->glen = strlen(v->guest);
-                while (v->glen > 1 && v->guest[v->glen - 1] == '/')
-                    v->guest[--v->glen] = 0;
-                if (!realpath(col + 1, v->hcanon)) continue;
-                v->hlen = strlen(v->hcanon);
-                if ((v->fd = open(v->hcanon, O_RDONLY | O_DIRECTORY)) < 0) continue;
-                g_nvols++;
-            }
+            for (char *t = strtok_r(tmp, ",", &sv); t; t = strtok_r(NULL, ",", &sv))
+                add_vol(t);
         }
         // docker -w / initial working directory: start the guest in DD_CWD (must be reachable inside the
         // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.

@@ -85,8 +85,10 @@ impl Guest {
 pub struct PortMap { pub host: u16, pub container: u16 }
 
 /// A bind mount: a host directory mounted at a path inside the container (`docker -v HOST:CONTAINER`).
+/// `ro` marks the mount read-only (`-v HOST:CONTAINER:ro`): the JIT then fails write-intent syscalls
+/// under `container` with EROFS. Default `false` = read-write (the normal `-v src:dst`).
 #[derive(Clone, Debug)]
-pub struct Volume { pub container: String, pub host: String }
+pub struct Volume { pub container: String, pub host: String, pub ro: bool }
 
 /// Everything needed to launch one container in the JIT. Mirrors the JIT's flag/env contract:
 /// `--rootfs/--lower/--hostname/--mem-max/--pids-max/--uid/--gid/--publish` + `DDVOL`/`DD_NETNS` env.
@@ -167,7 +169,14 @@ impl SpawnConfig {
             // (the JIT installs its crash diagnostics on getenv("CRASHDBG")).
             if std::env::var("CRASHDBG").is_ok() { env += "CRASHDBG=1 "; }
             if !self.volumes.is_empty() {
-                let v = self.volumes.iter().map(|v| format!("{}:{}", v.container, v.host)).collect::<Vec<_>>().join(",");
+                // Per-volume token is `guest:host`; a read-only bind gets a leading `ro:` marker. A guest
+                // path always starts with '/', so the `ro:` prefix is unambiguous even if `host` contains
+                // colons, and rw volumes serialize EXACTLY as before (byte-identical -> zero matrix change).
+                let v = self.volumes.iter().map(|v| if v.ro {
+                    format!("ro:{}:{}", v.container, v.host)
+                } else {
+                    format!("{}:{}", v.container, v.host)
+                }).collect::<Vec<_>>().join(",");
                 env += &format!("DDVOL={} ", shq(&v));
             }
             if let Some(ns) = &self.netns { env += &format!("DD_NETNS={} ", shq(ns)); }
@@ -229,7 +238,7 @@ mod tests {
         c.hostname = Some("box".into());
         c.mem_max = 256 << 20;
         c.publish = vec![PortMap { host: 18080, container: 80 }];
-        c.volumes = vec![Volume { container: "/data".into(), host: "/h".into() }];
+        c.volumes = vec![Volume { container: "/data".into(), host: "/h".into(), ro: false }];
         c.argv = vec!["/bin/sh".into()];
         if let Some(s) = c.script(Guest::LinuxAarch64) {
             assert!(s.contains("--rootfs 'img/upper'") && s.contains("--lower 'img/l0'"));
@@ -240,11 +249,24 @@ mod tests {
     #[test]
     fn darwin_script_uses_rootfs_volume() {
         let mut c = SpawnConfig::new("", "/jail");
-        c.volumes = vec![Volume { container: "/data".into(), host: "/h".into() }];
+        c.volumes = vec![Volume { container: "/data".into(), host: "/h".into(), ro: false }];
         c.argv = vec!["/bin/app".into()];
         if let Some(s) = c.script(Guest::DarwinAarch64) {
             assert!(s.contains("--rootfs '/jail'") && s.contains("--volume '/h':'/data'"));
             assert!(!s.contains("--mem-max") && !s.contains("DDVOL")); // darwin contract is leaner
+        }
+    }
+    #[test]
+    fn linux_ro_volume_encodes_prefix() {
+        let mut c = SpawnConfig::new("/work", "img/upper");
+        // one rw, one ro: rw stays `guest:host` (byte-identical), ro gets the leading `ro:` marker.
+        c.volumes = vec![
+            Volume { container: "/rw".into(), host: "/h1".into(), ro: false },
+            Volume { container: "/ro".into(), host: "/h2".into(), ro: true },
+        ];
+        c.argv = vec!["/bin/sh".into()];
+        if let Some(s) = c.script(Guest::LinuxAarch64) {
+            assert!(s.contains("DDVOL='/rw:/h1,ro:/ro:/h2'"));
         }
     }
 }

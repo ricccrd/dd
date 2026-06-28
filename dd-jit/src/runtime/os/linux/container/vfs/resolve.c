@@ -1,6 +1,25 @@
 // Extracted from ../vfs.c: TOCTOU-free path-jail walk (resolve_at + jail_at)
 // Not standalone -- #included by ../vfs.c at the original position (verbatim move, identical
 // preprocessed TU). Relies on ../vfs.c's preceding globals/headers; see vfs.c for context.
+// Read-only bind-mount enforcement. Returns 1 if the absolute guest path `abs` falls under a volume
+// marked read-only (`-v …:ro`); the syscall layer then fails any write-intent op with -EROFS, exactly
+// as the Linux kernel does for a write to a read-only mount. Prefix match mirrors jail_pick() so RO
+// detection is consistent with which jail a path is routed to. No RO volumes -> always 0 (rw is
+// byte-identical: g_vols[].ro is zero-initialized for every legacy/read-write bind).
+static int jail_ro(const char *abs) {
+    for (int i = 0; i < g_nvols; i++)
+        if (g_vols[i].ro && !strncmp(abs, g_vols[i].guest, g_vols[i].glen) &&
+            (abs[g_vols[i].glen] == '/' || abs[g_vols[i].glen] == 0))
+            return 1;
+    return 0;
+}
+// Convenience: resolve a (dirfd, raw) target to its guest abs path (same as abs_guest) and test RO.
+static int jail_ro_at(int dirfd, const char *raw) {
+    if (g_nvols == 0) return 0; // no volumes -> skip work; behavior identical to before
+    char abs[8192];
+    abs_guest(dirfd, raw, abs, sizeof abs);
+    return jail_ro(abs);
+}
 // TOCTOU-FREE confinement. Resolve `guest` (absolute) one component at a time on PINNED dir-fds,
 // never following a symlink out of the jail. Returns a fresh dir-fd to the confined parent (caller
 // closes) + the final component in `final`. -1 on escape/error. No check/use gap: each step

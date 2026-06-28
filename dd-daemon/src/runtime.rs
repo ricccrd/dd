@@ -146,20 +146,19 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
     };
     // `-v src:dst[:opts]` / Binds: parse off the mount options so the container path is the bare `dst`
     // (the old `split_once(':')` left `dst:ro` as the literal mount target — a bug). `ro` marks the
-    // mount read-only; ENFORCEMENT GAP: ddjit's `Volume{container,host}` has no read-only flag, so dd
-    // cannot make the bind read-only at the JIT layer — `docker inspect` reports RW:false (see
-    // containers.rs::parse_bind / the inspect Mounts), but writes through the mount are NOT blocked yet.
-    cfg.volumes = c.binds.iter().filter_map(|b| parse_bind(b).map(|(host, dst, _ro)| {
-        Volume { container: dst.into(), host: resolve_src(host) }
+    // mount read-only; we now thread that through to `Volume.ro` so the JIT fails write-intent syscalls
+    // under the mount with EROFS (matching what `docker inspect` already reports as RW:false).
+    cfg.volumes = c.binds.iter().filter_map(|b| parse_bind(b).map(|(host, dst, ro)| {
+        Volume { container: dst.into(), host: resolve_src(host), ro }
     })).collect();
     // `--mount` / HostConfig.Mounts: wire bind/volume mounts into the rootfs via the same Volume list.
     // type=bind -> Source is a host path; type=volume -> Source is a named volume (resolved like `-v`).
-    // ReadOnly is metadata only (ddjit's Volume can't mark a mount read-only), so it's not enforced here.
+    // `ReadOnly` is honored the same as `-v …:ro` (JIT enforces write-intent EROFS under the mount).
     for m in &c.mounts {
         if m.target.is_empty() { continue; }
         let host = if m.typ == "bind" { m.source.clone() } else { resolve_src(&m.source) };
         if host.is_empty() { continue; }
-        cfg.volumes.push(Volume { container: m.target.clone(), host });
+        cfg.volumes.push(Volume { container: m.target.clone(), host, ro: m.read_only });
     }
     cfg.publish = c.publish.split(',').filter(|s| !s.is_empty()).filter_map(|p| p.split_once(':'))
         .filter_map(|(h, cc)| Some(PortMap { host: h.parse().ok()?, container: cc.parse().ok()? })).collect();

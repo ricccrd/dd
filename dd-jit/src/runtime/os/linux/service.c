@@ -682,6 +682,7 @@ static void service_local(struct cpu *c) {
     }
     // mknodat(dirfd, path, mode, dev)
     case 33: {
+        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
@@ -713,6 +714,7 @@ static void service_local(struct cpu *c) {
     }
     // mkdirat(dirfd, path, mode) -- confined
     case 34: {
+        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
@@ -743,6 +745,7 @@ static void service_local(struct cpu *c) {
     }
     // unlinkat(dirfd, path, flags) -- confined
     case 35: {
+        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         // RAM-backed scratch adoption: SQLite et al. open a temp file O_CREAT|O_EXCL then unlink it while
         // still open (delete-on-close). After this unlink drops its last link the file is anonymous, so we
         // may adopt it into RAM. Cheap pre-filter (avoid the fd scan on ordinary unlinks): a temp-dir path
@@ -818,8 +821,9 @@ static void service_local(struct cpu *c) {
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    // symlinkat(target, newdirfd, linkpath)
+    // symlinkat(target, newdirfd, linkpath) -- the link is CREATED at (newdirfd, linkpath)
     case 36: {
+        if (jail_ro_at((int)a1, (const char *)a2)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         const char *target =
             // target is the link CONTENT (unresolved); follow-time confinement guards it
             (const char *)a0;
@@ -840,8 +844,12 @@ static void service_local(struct cpu *c) {
         G_RET(c) = symlinkat(target, ATFD(a1), p) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    // linkat(odir,opath,ndir,npath,flags)
+    // linkat(odir,opath,ndir,npath,flags) -- writes both ends (new link + source link count)
     case 37: {
+        if (jail_ro_at((int)a0, (const char *)a1) || jail_ro_at((int)a2, (const char *)a3)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         int fl = (a4 & 0x400) ? AT_SYMLINK_FOLLOW : 0;
         if (g_rootfs) {
             // both ends confined via TOCTOU-free resolver
@@ -873,6 +881,10 @@ static void service_local(struct cpu *c) {
     // renameat(38) / renameat2(276): translate the renameat2 flags onto macOS renameatx_np --
     // RENAME_NOREPLACE(1)->RENAME_EXCL (fail if dst exists), RENAME_EXCHANGE(2)->RENAME_SWAP (atomic swap).
     case 276: {
+        if (jail_ro_at((int)a0, (const char *)a1) || jail_ro_at((int)a2, (const char *)a3)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         unsigned int rxflags = 0;
         if (nr == 276) {
             int lf = (int)a4;
@@ -1035,6 +1047,7 @@ static void service_local(struct cpu *c) {
     case 53:
     // fchmodat(dirfd,path,mode,flags) / fchmodat2
     case 452: {
+        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 0);
@@ -1062,6 +1075,7 @@ static void service_local(struct cpu *c) {
     }
     // fchownat(dirfd,path,uid,gid,flags) -- best-effort (rootless)
     case 54: {
+        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a4 & 0x100) ? 1 : 0);
@@ -1090,6 +1104,15 @@ static void service_local(struct cpu *c) {
     case 56: {
         // openat -- Linux O_* -> macOS O_* (they differ!)
         int lf = (int)a2, mf = lf & 0x3;
+        // Read-only bind mount: any write-intent open (O_WRONLY/O_RDWR/O_CREAT/O_TRUNC/O_APPEND, incl.
+        // O_TMPFILE which carries O_RDWR) under an `-v …:ro` volume fails EROFS -- exactly as the kernel
+        // rejects a write-open on a read-only mount. A pure O_RDONLY open still succeeds. Checked up front
+        // so neither O_TMPFILE nor the memoized open-cache walk below can slip a write through.
+        if (((lf & 3) || (lf & 0x40) || (lf & 0x200) || (lf & 0x400)) &&
+            jail_ro_at((int)a0, (const char *)a1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         // O_TMPFILE (the __O_TMPFILE bit 0x400000 is arch-independent): create an unnamed, auto-cleaned
         // regular file inside the named directory by making one + immediately unlinking it (macOS has no
         // O_TMPFILE). The fd is a normal RW file with link count 0.
@@ -1583,6 +1606,7 @@ static void service_local(struct cpu *c) {
             break;
         // path NULL -> futimens(fd)
         }
+        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a3 & 0x100) ? 1 : 0);
@@ -3140,6 +3164,7 @@ static void service_local(struct cpu *c) {
     // truncate(path, length): resolve the guest path through the overlay (same helper execve uses), then
     // truncate by host path. Evict the stat cache so the new size is observed.
     case 45: {
+        if (jail_ro_at(-100, (const char *)a0)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
         char pb[4200];
         const char *p = xresolve_overlay((const char *)a0, pb, sizeof pb);
         int r = truncate(p, (off_t)a1);

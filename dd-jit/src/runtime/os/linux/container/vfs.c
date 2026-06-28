@@ -291,17 +291,24 @@ struct vol {
     char hcanon[1024];
     size_t hlen;
     int fd;
+    int ro; // 1 = read-only bind (`-v …:ro`): write-intent syscalls under `guest` fail EROFS
 };
 static struct vol g_vols[32];
 static int g_nvols;
-static void add_vol(const char *spec) { // "guestpath:hostdir" -> a confined bind-mount volume
+static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confined bind-mount volume
     if (g_nvols >= 32) return;
+    // Optional read-only marker. A guest path always begins with '/', so a leading "ro:"/"rw:" token is
+    // unambiguous; absent (the legacy `guest:host` form) it defaults to read-write -> byte-identical.
+    int ro = 0;
+    if (!strncmp(spec, "ro:", 3)) { ro = 1; spec += 3; }
+    else if (!strncmp(spec, "rw:", 3)) { spec += 3; }
     char tmp[4096];
     snprintf(tmp, sizeof tmp, "%s", spec);
     char *col = strchr(tmp, ':');
     if (!col || tmp[0] != '/') return;
     *col = 0;
     struct vol *v = &g_vols[g_nvols];
+    v->ro = ro;
     snprintf(v->guest, sizeof v->guest, "%s", tmp);
     v->glen = strlen(v->guest);
     while (v->glen > 1 && v->guest[v->glen - 1] == '/') v->guest[--v->glen] = 0;
