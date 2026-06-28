@@ -99,6 +99,15 @@ static void container_init(const char *rootfs) {
         if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
         g_rootfs_canon_len = strlen(g_rootfs_canon);
         g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
+        // Container identity = root (0) by default, matching linux_aarch64.c; DD_UID/DD_GID (or --uid/--gid)
+        // override. Without this g_uid stayed -1 and cuid() fell back to the HOST uid -> the guest saw
+        // getuid()/geteuid() == the host's 501 ("I have no name!", non-root shell) on x86-64 only.
+        const char *eu = getenv("DD_UID");
+        if (eu && g_uid < 0) g_uid = atoi(eu);
+        const char *eg = getenv("DD_GID");
+        if (eg && g_gid < 0) g_gid = atoi(eg);
+        if (g_uid < 0) g_uid = 0;
+        if (g_gid < 0) g_gid = 0;
     }
     if (!getenv("JIT86_NONETNS")) { // opt-out: leave g_netns empty -> 127/8 uses the REAL host TCP stack
         const char *ns = getenv("JIT86_NETNS"); // private-loopback dir: inherit across exec, else create one
@@ -341,7 +350,13 @@ int main(int argc, char **argv) {
             add_lower(argv[ai + 1]);
             ai += 2;
         } // overlay read-only layer
-        else
+        else if (strcmp(argv[ai], "--uid") == 0) { // docker --user uid (USER-ns uid); else container default 0
+            g_uid = atoi(argv[ai + 1]);
+            ai += 2;
+        } else if (strcmp(argv[ai], "--gid") == 0) {
+            g_gid = atoi(argv[ai + 1]);
+            ai += 2;
+        } else
             break;
     }
     if (ai >= argc) {
