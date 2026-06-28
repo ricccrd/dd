@@ -152,6 +152,12 @@ static void service_local(struct cpu *c) {
         // Linux SEEK_DATA=3,SEEK_HOLE=4 ; macOS SEEK_HOLE=3,SEEK_DATA=4. Translate so sparse-file
         // probing finds holes/data correctly.
         int whence = (int)a2;
+        struct memf *mm = memf_get((int)a0);
+        if (mm) {
+            off_t mr = memf_lseek(mm, (off_t)a1, whence);
+            if (mr != -2) { G_RET(c) = mr < 0 ? (uint64_t)(-EINVAL) : (uint64_t)mr; break; }
+            memf_materialize((int)a0); // SEEK_DATA/HOLE: fall through to the now-materialized host fd
+        }
         if (whence == 3) whence = 4;      // Linux SEEK_DATA -> macOS SEEK_DATA
         else if (whence == 4) whence = 3; // Linux SEEK_HOLE -> macOS SEEK_HOLE
         off_t r = lseek((int)a0, (off_t)a1, whence);
@@ -160,6 +166,12 @@ static void service_local(struct cpu *c) {
     }
     case 63: {
         int rfd = (int)a0;
+        // RAM-backed scratch file: serve the read from memory
+        if (memf_get(rfd)) {
+            ssize_t r = memf_read_pos(g_memf[rfd], (void *)a1, (size_t)a2);
+            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+            break;
+        }
         // signalfd read -> struct signalfd_siginfo
         if (rfd >= 0 && rfd == g_sigfd_read) {
             char b;
@@ -283,6 +295,12 @@ static void service_local(struct cpu *c) {
     }
     case 64: {
         int wfd = (int)a0;
+        // RAM-backed scratch file: serve the write from memory (spill to the host file past the cap)
+        if (memf_get(wfd) && memf_room_or_spill(wfd, (off_t)g_memf[wfd]->pos + (off_t)a2)) {
+            ssize_t r = memf_write_pos(g_memf[wfd], (void *)a1, (size_t)a2);
+            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+            break;
+        }
         // eventfd write: ADD to the counter (not a raw pipe write); signal the pipe readable on 0->positive.
         if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) {
             if (a2 < 8) { G_RET(c) = (uint64_t)(-EINVAL); break; }
@@ -300,12 +318,27 @@ static void service_local(struct cpu *c) {
         break;
     }
     case 65: {
+        if (memf_get((int)a0)) {
+            ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, -1, 1);
+            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+            break;
+        }
         ssize_t r = readv((int)a0, (void *)a1, (int)a2);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     // readv
     }
     case 66: {
+        if (memf_get((int)a0)) {
+            const struct iovec *iv = (const struct iovec *)a1;
+            off_t end = g_memf[(int)a0]->pos;
+            for (int i = 0; i < (int)a2; i++) end += iv[i].iov_len;
+            if (memf_room_or_spill((int)a0, end)) {
+                ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, -1, 1);
+                G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+                break;
+            }
+        }
         fd_evict((int)a0);
         ssize_t r = writev((int)a0, (void *)a1, (int)a2);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -314,13 +347,23 @@ static void service_local(struct cpu *c) {
     }
     case 67: {
         // pread64
+        if (memf_get((int)a0)) {
+            ssize_t r = memf_pread(g_memf[(int)a0], (void *)a1, (size_t)a2, (off_t)a3);
+            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+            break;
+        }
         ssize_t r = pread((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 68: {
-        fd_evict((int)a0);
         // pwrite64
+        if (memf_get((int)a0) && memf_room_or_spill((int)a0, (off_t)a3 + (off_t)a2)) {
+            ssize_t r = memf_pwrite(g_memf[(int)a0], (void *)a1, (size_t)a2, (off_t)a3);
+            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+            break;
+        }
+        fd_evict((int)a0);
         ssize_t r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -328,6 +371,8 @@ static void service_local(struct cpu *c) {
     // sendfile(out,in,off*,count)
     case 71: {
         int outfd = (int)a0, infd = (int)a1;
+        memf_materialize(outfd); // sendfile reads/writes via the real fds -> flush RAM cache first
+        memf_materialize(infd);
         off_t *po = (off_t *)a2;
         size_t cnt = (size_t)a3;
         if (po) lseek(infd, *po, SEEK_SET);
@@ -350,6 +395,8 @@ static void service_local(struct cpu *c) {
     // splice(fd_in,off_in,fd_out,off_out,len,fl) / tee -> emulate
     case 77: {
         int fin = (int)a0, fout = (int)a2;
+        memf_materialize(fin); // splice/tee move bytes via the real fds -> flush RAM cache first
+        memf_materialize(fout);
         size_t len = (size_t)a4;
         if (len > 65536) len = 65536;
         static __thread char sb[65536];
@@ -411,7 +458,8 @@ static void service_local(struct cpu *c) {
         break;
     }
     case 23: {
-        // dup
+        // dup -- a 2nd fd would share the description; flush the RAM cache so both see the real file
+        memf_materialize((int)a0);
         int r = dup((int)a0);
         // carry path + socket-emulation metadata to the new fd
         if (r >= 0 && r < 1024 && (int)a0 >= 0 && (int)a0 < 1024) { strcpy(g_fdpath[r], g_fdpath[(int)a0]); fd_carry_sock(r, (int)a0); }
@@ -424,6 +472,8 @@ static void service_local(struct cpu *c) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
+        memf_materialize((int)a0); // source: a 2nd fd shares the description -> flush RAM cache
+        memf_close((int)a1);       // target fd is about to be reused; drop any cache it held
         int r = dup2((int)a0, (int)a1);
         if (r >= 0) {
             if ((int)a2 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC); // O_CLOEXEC
@@ -438,6 +488,9 @@ static void service_local(struct cpu *c) {
     case 25: {
         // fcntl -- Linux cmd# -> macOS (they diverge!)
         int lcmd = (int)a1;
+        // F_DUPFD(_CLOEXEC) makes a 2nd fd sharing the description; F_SETFL O_APPEND changes write-offset
+        // semantics. Either way, flush a RAM-backed fd so the real host fd takes over with correct bytes.
+        if (lcmd == 0 || lcmd == 1030 || (lcmd == 4 && ((int)a2 & 0x400))) memf_materialize((int)a0);
         // F_GETFL: macOS O_* -> Linux O_*
         if (lcmd == 3) {
             int r = fcntl((int)a0, F_GETFL, 0);
@@ -690,6 +743,19 @@ static void service_local(struct cpu *c) {
     }
     // unlinkat(dirfd, path, flags) -- confined
     case 35: {
+        // RAM-backed scratch adoption: SQLite et al. open a temp file O_CREAT|O_EXCL then unlink it while
+        // still open (delete-on-close). After this unlink drops its last link the file is anonymous, so we
+        // may adopt it into RAM. Cheap pre-filter (avoid the fd scan on ordinary unlinks): a temp-dir path
+        // or the sqlite "etilqs_" prefix, and not a directory removal. dev/ino is captured (per branch,
+        // through the same resolution the unlink uses) right before the unlink and matched after.
+        int try_adopt = 0;
+        if (!memf_disabled() && !(a2 & 0x200)) {
+            char gp[4200];
+            abs_guest((int)a0, (const char *)a1, gp, sizeof gp);
+            const char *base = strrchr(gp, '/');
+            base = base ? base + 1 : gp;
+            try_adopt = !strncmp(gp, "/tmp/", 5) || !strncmp(gp, "/var/tmp/", 9) || strstr(base, "etilqs_") != 0;
+        }
         // OVERLAY: whiteout (hides lower) + drop the upper copy
         if (g_rootfs && g_nlower) {
             char gp[4200];
@@ -711,6 +777,14 @@ static void service_local(struct cpu *c) {
                 G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
+            uint64_t adev = 0, aino = 0;
+            if (try_adopt) {
+                struct stat ps;
+                if (fstatat(pfd, fin, &ps, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(ps.st_mode)) {
+                    adev = (uint64_t)ps.st_dev;
+                    aino = (uint64_t)ps.st_ino;
+                }
+            }
             // AT_REMOVEDIR: linux 0x200
             int r = unlinkat(pfd, fin, (a2 & 0x200) ? AT_REMOVEDIR : 0), e = errno;
             char dp[4200];
@@ -722,15 +796,25 @@ static void service_local(struct cpu *c) {
                 rl_evict(hp);
             }
             close(pfd);
+            if (r >= 0 && aino) memf_try_adopt(adev, aino);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        uint64_t adev = 0, aino = 0;
+        if (try_adopt) {
+            struct stat ps;
+            if (fstatat(ATFD(a0), p, &ps, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(ps.st_mode)) {
+                adev = (uint64_t)ps.st_dev;
+                aino = (uint64_t)ps.st_ino;
+            }
+        }
         int r = unlinkat(ATFD(a0), p, (a2 & 0x200) ? AT_REMOVEDIR : 0);
         mc_evict(p);
         ac_evict(p);
         rl_evict(p);
+        if (r >= 0 && aino) memf_try_adopt(adev, aino);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -867,6 +951,22 @@ static void service_local(struct cpu *c) {
         break;
     }
     case 46: {
+        // ftruncate on a RAM-backed scratch file (spill past the cap)
+        if (memf_get((int)a0) && memf_room_or_spill((int)a0, (off_t)a1)) {
+            struct memf *m = g_memf[(int)a0];
+            off_t len = (off_t)a1;
+            if (len < 0) { G_RET(c) = (uint64_t)(-EINVAL); break; }
+            if ((size_t)len > m->size) {
+                if (memf_reserve(m, (size_t)len)) { G_RET(c) = (uint64_t)(-ENOMEM); break; }
+                atomic_fetch_add(&g_memf_total, (uint64_t)len - m->size);
+            } else {
+                atomic_fetch_sub(&g_memf_total, m->size - (uint64_t)len);
+                if ((size_t)len < m->cap) memset(m->buf + len, 0, m->size - (size_t)len); // re-zero shrunk tail
+            }
+            m->size = (size_t)len;
+            G_RET(c) = 0;
+            break;
+        }
         int r = ftruncate((int)a0, (off_t)a1);
         fd_evict((int)a0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -876,6 +976,7 @@ static void service_local(struct cpu *c) {
     case 47: {
         // fallocate(fd,mode,offset,len). FALLOC_FL_PUNCH_HOLE(2)|KEEP_SIZE(1): deallocate+zero a range
         // via macOS F_PUNCHHOLE (file stays the same size, the range reads as zeros).
+        memf_materialize((int)a0); // rare on scratch: flush RAM cache, then use the host fallocate path
         int mode = (int)a1;
         off_t off = (off_t)a2, len = (off_t)a3;
         if (mode & 2) {
@@ -1013,7 +1114,10 @@ static void service_local(struct cpu *c) {
                 if (e != EEXIST) break;
             }
             close(dfd);
-            if (fd >= 0 && fd < 1024) g_fdpath[fd][0] = 0; // anonymous: no tracked path
+            if (fd >= 0 && fd < 1024) {
+                g_fdpath[fd][0] = 0;   // anonymous: no tracked path
+                memf_attach(fd, 0, 0); // O_TMPFILE is unambiguously private scratch -> back it with RAM
+            }
             G_RET(c) = fd < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)fd;
             break;
         }
@@ -1078,6 +1182,7 @@ static void service_local(struct cpu *c) {
             // dup(N), which at least hands back a working, equivalent fd.
             int pfn = procfd_num((const char *)a1);
             if (pfn >= 0) {
+                memf_materialize(pfn); // reopen-by-fd would expose the real file -> flush RAM cache first
                 char gp[4200];
                 int r = -1;
                 if (fcntl(pfn, F_GETPATH, gp) == 0 && gp[0])
@@ -1247,6 +1352,7 @@ static void service_local(struct cpu *c) {
             ep_fd_reset(cf); // w3e: drop epoll armed-state (kqueue auto-removes a closed fd)
         // reap eventfd peer / timerfd / overlay dir / loopback
         }
+        memf_close(cf); // release any RAM-backed scratch buffer
         dirs_drop(cf); // invalidate the getdents DIR* cache so a reused fd re-opendir's
         int r = close(cf);
         fd_clear(cf);
@@ -1435,8 +1541,10 @@ static void service_local(struct cpu *c) {
             break;
         }
         // AT_EMPTY_PATH -> fstat(dfd)
-        int r = (raw && !raw[0] && (a3 & 0x1000)) ? fstat((int)a0, &s)
-                                                  : fstatat(ATFD(a0), p, &s, AT_SYMLINK_NOFOLLOW);
+        int empty_self = (raw && !raw[0] && (a3 & 0x1000));
+        int r = (empty_self && memf_get((int)a0)) ? memf_fstat((int)a0, &s)
+                : empty_self                       ? fstat((int)a0, &s)
+                                                   : fstatat(ATFD(a0), p, &s, AT_SYMLINK_NOFOLLOW);
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
@@ -1448,7 +1556,8 @@ static void service_local(struct cpu *c) {
     case 80: {
         // fstat(fd, buf)
         struct stat s;
-        if (fstat((int)a0, &s) < 0) {
+        int sr = memf_get((int)a0) ? memf_fstat((int)a0, &s) : fstat((int)a0, &s);
+        if (sr < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
@@ -1462,9 +1571,10 @@ static void service_local(struct cpu *c) {
         // sync
         break;
     // fsync -- durability policy (S3DB_DURABILITY): default/fast == plain fsync() (legacy path)
-    case 82: G_RET(c) = s3db_sync_fd((int)a0); break;
+    // A RAM-backed scratch file is anonymous/private: fsync has no observable effect -> 0.
+    case 82: G_RET(c) = memf_get((int)a0) ? 0 : s3db_sync_fd((int)a0); break;
     // fdatasync -> fsync (no macOS fdatasync); same durability policy
-    case 83: G_RET(c) = s3db_sync_fd((int)a0); break;
+    case 83: G_RET(c) = memf_get((int)a0) ? 0 : s3db_sync_fd((int)a0); break;
     // utimensat(dirfd, path, times, flags)
     case 88: {
         struct timespec *ts = (struct timespec *)a2;
@@ -1506,6 +1616,8 @@ static void service_local(struct cpu *c) {
     // copy_file_range(fdin,offin*,fdout,offout*,len,flags)
     case 285: {
         int fdin = (int)a0, fdout = (int)a2;
+        memf_materialize(fdin); // copy_file_range moves bytes via the real fds -> flush RAM caches first
+        memf_materialize(fdout);
         size_t len = (size_t)a4, done = 0;
         int err = 0;
         off_t *poi = (off_t *)a1, *poo = (off_t *)a3;
@@ -1554,7 +1666,9 @@ static void service_local(struct cpu *c) {
                 mc_store(p, rc, &s);
             }
         } else {
-            int rr = empty ? fstat((int)a0, &s) : fstatat(ATFD(a0), p, &s, 0);
+            int rr = (empty && memf_get((int)a0)) ? memf_fstat((int)a0, &s)
+                     : empty                       ? fstat((int)a0, &s)
+                                                   : fstatat(ATFD(a0), p, &s, 0);
             rc = rr < 0 ? -errno : 0;
         }
         if (rc < 0) {
@@ -1816,7 +1930,10 @@ static void service_local(struct cpu *c) {
             G_RET(c) = (uint64_t)spawn_thread(c, a0, a1, a3, a2, a4);
             break;
         }
-        // fork/vfork: COW copy; child continues
+        // fork/vfork: COW copy; child continues. Flush RAM-backed scratch into the real (shared) fds so
+        // parent and child see one coherent file via the inherited description, exactly as POSIX requires
+        // (the heap-resident buffers would otherwise COW-diverge while the fd stays shared).
+        memf_materialize_all();
         pid_t pid = fork();
         if (pid == 0) {
             // clone(CLONE_VM, child_stack): glibc posix_spawn/popen/vfork pass a separate child stack in a1
@@ -1849,6 +1966,7 @@ static void service_local(struct cpu *c) {
     }
     // execve(path, argv, envp)
     case 221: {
+        memf_materialize_all(); // non-CLOEXEC scratch fds survive exec -> flush RAM into the real files
         char pb[4200];
         const char *p =
             // follow symlink rootfs-relative (busybox applets), through the overlay (upper then lowers)
@@ -2455,6 +2573,9 @@ static void service_local(struct cpu *c) {
         size_t gcl = *(uint64_t *)(g + 40);
         uint8_t hctl[4096]; // host-layout scratch (macOS hdr is smaller, so this is ample)
         if (nr == 211) {    // sendmsg: translate guest -> host before the call
+            // Ancillary data may carry SCM_RIGHTS fds to another process; flush all RAM-backed scratch so a
+            // passed fd (and any other) is a coherent host file on the receiving side.
+            if (gc && gcl) memf_materialize_all();
             ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, sizeof hctl) : 0;
             mh.msg_control = hn > 0 ? hctl : NULL;
             mh.msg_controllen = hn > 0 ? (socklen_t)hn : 0;
@@ -2897,11 +3018,26 @@ static void service_local(struct cpu *c) {
     case 32: G_RET(c) = flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     // preadv/pwritev: struct iovec layout is identical Linux<->macOS
     case 69: {
+        if (memf_get((int)a0)) {
+            ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, (off_t)a3, 0);
+            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+            break;
+        }
         ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 70: {
+        if (memf_get((int)a0)) {
+            const struct iovec *iv = (const struct iovec *)a1;
+            off_t end = (off_t)a3;
+            for (int i = 0; i < (int)a2; i++) end += iv[i].iov_len;
+            if (memf_room_or_spill((int)a0, end)) {
+                ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
+                G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+                break;
+            }
+        }
         ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -2927,7 +3063,7 @@ static void service_local(struct cpu *c) {
         G_RET(c) = setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0
                        ? (uint64_t)(-errno) : 0;
         break;
-    case 84: G_RET(c) = s3db_sync_fd((int)a0); break; // sync_file_range -> fsync, durability policy
+    case 84: G_RET(c) = memf_get((int)a0) ? 0 : s3db_sync_fd((int)a0); break; // sync_file_range -> fsync (no-op for RAM scratch)
     case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
     case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
     case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
@@ -2940,11 +3076,26 @@ static void service_local(struct cpu *c) {
     case 274: G_RET(c) = 0; break; // sched_setattr -> ok (ignored)
     // preadv2/pwritev2: flags (a5) ignored; offset in a3 (pos_high a4 is 0 on LP64)
     case 286: {
+        if (memf_get((int)a0)) {
+            ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, (off_t)a3, 0);
+            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+            break;
+        }
         ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 287: {
+        if (memf_get((int)a0)) {
+            const struct iovec *iv = (const struct iovec *)a1;
+            off_t end = (off_t)a3;
+            for (int i = 0; i < (int)a2; i++) end += iv[i].iov_len;
+            if (memf_room_or_spill((int)a0, end)) {
+                ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
+                G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+                break;
+            }
+        }
         ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;

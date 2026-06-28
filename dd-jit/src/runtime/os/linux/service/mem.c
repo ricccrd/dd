@@ -88,6 +88,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     // mmap
     case 222: {
+        // File-backed mmap of a RAM-backed scratch fd: flush the cache so the mapping sees the real bytes.
+        if (!(a3 & 0x20)) memf_materialize((int)a4);
         // charge anon, but NOT MAP_NORESERVE
         int charge = g_mem_max && (a3 & 0x20) && !(a3 & 0x4000);
         //   (libc reserves huge virtual arenas it never commits;

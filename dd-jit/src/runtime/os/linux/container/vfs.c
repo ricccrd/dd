@@ -58,6 +58,216 @@ static int g_eventfd_peer[1024];
 static uint64_t g_eventfd_count[1024];
 static uint8_t g_eventfd_sema[1024]; // EFD_SEMAPHORE: read() returns 1 and decrements by 1, not the whole counter
 
+// ===================== in-memory temp-file backing (sqlite sorter/index spill) =====================
+// A genuinely-PRIVATE scratch file is served from a host RAM buffer instead of issuing pread/pwrite to
+// a host temp file. SQLite's sorter/index spill ("etilqs_*") opens O_RDWR|O_CREAT|O_EXCL under the temp
+// dir and unlink()s it IMMEDIATELY while still open (delete-on-close), and glibc/rustix also use
+// O_TMPFILE. Once a regular file has been unlinked while open with link count 0 it has NO name and CANNOT
+// be reached by any other path -> it is private scratch, exactly equivalent to an anonymous memfd, so it
+// is safe to back with RAM (this is the same anonymity O_TMPFILE has from birth).
+//
+// PLUMBING: the guest fd stays a REAL host fd (a created-then-unlinked regular file), so the fd NUMBER,
+// poll/select/epoll readiness, fcntl, and fork inheritance all behave exactly like a normal file. The RAM
+// buffer is a transparent write-back cache: read/write/pread/pwrite/lseek/ftruncate/fstat/fsync on the fd
+// hit RAM (memcpy), turning the per-block host I/O syscalls into memory copies. On ANY operation that
+// could let another observer see the bytes through the real fd -- dup/sendfile/splice/copy_file_range,
+// mmap, an SCM_RIGHTS send, a /proc/self/fd reopen, fork, or execve -- we first "materialize" (flush the
+// RAM buffer back into the real fd, restore its size+offset) and drop the cache, after which the fd is an
+// ordinary host file and behaves identically to the unoptimized path. This materialize-on-escape rule is
+// the bit-exact safety argument: backing a file changes only WHERE the bytes live, never any observable
+// byte/size/seek/stat result.
+//
+// KILL SWITCH: NOTMPFS=1 disables all backing (pure host-file behaviour). BOUND: a file larger than
+// MEMF_CAP, or once the process-wide RAM total would exceed MEMF_TOTAL_CAP, is materialized and spills to
+// the real host file (host I/O resumes) -- RAM use is bounded, never unbounded.
+#define MEMF_CAP (256ull * 1024 * 1024)        // per-file RAM cap; beyond this, spill to the host file
+#define MEMF_TOTAL_CAP (1024ull * 1024 * 1024) // process-wide RAM cap for all backed files
+struct memf {
+    uint8_t *buf;
+    size_t size; // logical file size (bytes)
+    size_t cap;  // allocated bytes of buf
+    off_t pos;   // current file offset (for read/write/lseek SEEK_CUR)
+};
+static struct memf *g_memf[1024];
+static _Atomic uint64_t g_memf_total; // sum of logical sizes of all backed files
+
+static int memf_disabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("NOTMPFS") ? 1 : 0;
+    return v;
+}
+static inline struct memf *memf_get(int fd) { return (fd >= 0 && fd < 1024) ? g_memf[fd] : NULL; }
+
+// grow buf to >= need bytes, zero-filling the new tail (so a sparse write reads back as zeros).
+static int memf_reserve(struct memf *m, size_t need) {
+    if (need <= m->cap) return 0;
+    size_t nc = m->cap ? m->cap : 65536;
+    while (nc < need) nc = nc < (16u << 20) ? nc << 1 : nc + (16u << 20); // double, then +16MiB chunks
+    uint8_t *nb = realloc(m->buf, nc);
+    if (!nb) return -1;
+    memset(nb + m->cap, 0, nc - m->cap);
+    m->buf = nb;
+    m->cap = nc;
+    return 0;
+}
+// Attach a RAM cache to real host fd `fd`, slurping `init` bytes already present in the fd. Returns 1 if
+// backed, 0 if left as a plain host fd (kill switch / over cap / OOM). The fd becomes anonymous.
+static int memf_attach(int fd, off_t init, off_t pos) {
+    if (memf_disabled() || fd < 0 || fd >= 1024 || g_memf[fd]) return 0;
+    if (init < 0 || (uint64_t)init > MEMF_CAP) return 0;
+    if (atomic_load(&g_memf_total) + (uint64_t)init > MEMF_TOTAL_CAP) return 0;
+    struct memf *m = calloc(1, sizeof *m);
+    if (!m) return 0;
+    if (init > 0) {
+        if (memf_reserve(m, (size_t)init)) { free(m); return 0; }
+        for (off_t o = 0; o < init;) { // slurp existing bytes from the real fd into RAM
+            ssize_t r = pread(fd, m->buf + o, (size_t)(init - o), o);
+            if (r <= 0) break;
+            o += r;
+        }
+        m->size = (size_t)init;
+    }
+    m->pos = pos < 0 ? 0 : pos;
+    g_memf[fd] = m;
+    atomic_fetch_add(&g_memf_total, (uint64_t)m->size);
+    g_fdpath[fd][0] = 0; // anonymous: no tracked host path
+    return 1;
+}
+// Flush the RAM buffer back into the real fd (size + offset restored) and drop the cache: the fd reverts
+// to a plain host file behaving exactly as if it had never been backed.
+static void memf_materialize(int fd) {
+    struct memf *m = memf_get(fd);
+    if (!m) return;
+    g_memf[fd] = NULL;
+    for (size_t o = 0; o < m->size;) {
+        ssize_t w = pwrite(fd, m->buf + o, m->size - o, (off_t)o);
+        if (w <= 0) break;
+        o += (size_t)w;
+    }
+    if (ftruncate(fd, (off_t)m->size) < 0) {}
+    lseek(fd, m->pos, SEEK_SET);
+    atomic_fetch_sub(&g_memf_total, (uint64_t)m->size);
+    free(m->buf);
+    free(m);
+}
+static void memf_materialize_all(void) {
+    for (int fd = 0; fd < 1024; fd++)
+        if (g_memf[fd]) memf_materialize(fd);
+}
+static void memf_close(int fd) { // fd is being closed: just discard the RAM buffer
+    struct memf *m = memf_get(fd);
+    if (!m) return;
+    g_memf[fd] = NULL;
+    atomic_fetch_sub(&g_memf_total, (uint64_t)m->size);
+    free(m->buf);
+    free(m);
+}
+// I/O served from RAM. pread/pwrite are positional; read/write advance m->pos.
+static ssize_t memf_pread(struct memf *m, void *buf, size_t n, off_t off) {
+    if (off < 0) return -EINVAL;
+    size_t avail = (size_t)off < m->size ? m->size - (size_t)off : 0;
+    size_t k = n < avail ? n : avail;
+    if (k) memcpy(buf, m->buf + off, k);
+    return (ssize_t)k;
+}
+static ssize_t memf_pwrite(struct memf *m, const void *buf, size_t n, off_t off) {
+    if (off < 0) return -EINVAL;
+    size_t end = (size_t)off + n;
+    if (memf_reserve(m, end)) return -ENOMEM;
+    memcpy(m->buf + off, buf, n);
+    if (end > m->size) {
+        atomic_fetch_add(&g_memf_total, end - m->size);
+        m->size = end;
+    }
+    return (ssize_t)n;
+}
+static ssize_t memf_read_pos(struct memf *m, void *buf, size_t n) {
+    ssize_t k = memf_pread(m, buf, n, m->pos);
+    if (k > 0) m->pos += k;
+    return k;
+}
+static ssize_t memf_write_pos(struct memf *m, const void *buf, size_t n) {
+    ssize_t k = memf_pwrite(m, buf, n, m->pos);
+    if (k > 0) m->pos += k;
+    return k;
+}
+static ssize_t memf_preadv(struct memf *m, const struct iovec *iov, int cnt, off_t off, int advance) {
+    off_t p = advance ? m->pos : off;
+    ssize_t tot = 0;
+    for (int i = 0; i < cnt; i++) {
+        ssize_t k = memf_pread(m, iov[i].iov_base, iov[i].iov_len, p);
+        if (k < 0) return tot ? tot : k;
+        tot += k;
+        p += k;
+        if ((size_t)k < iov[i].iov_len) break; // short read -> EOF
+    }
+    if (advance) m->pos = p;
+    return tot;
+}
+static ssize_t memf_pwritev(struct memf *m, const struct iovec *iov, int cnt, off_t off, int advance) {
+    off_t p = advance ? m->pos : off;
+    ssize_t tot = 0;
+    for (int i = 0; i < cnt; i++) {
+        ssize_t k = memf_pwrite(m, iov[i].iov_base, iov[i].iov_len, p);
+        if (k < 0) return tot ? tot : k;
+        tot += k;
+        p += k;
+    }
+    if (advance) m->pos = p;
+    return tot;
+}
+// lseek on RAM. Returns the new offset, -1 for EINVAL, or -2 to mean "unsupported whence -> materialize".
+static off_t memf_lseek(struct memf *m, off_t off, int whence) {
+    off_t np;
+    if (whence == 0) np = off;                  // SEEK_SET
+    else if (whence == 1) np = m->pos + off;    // SEEK_CUR
+    else if (whence == 2) np = (off_t)m->size + off; // SEEK_END
+    else return -2;                             // SEEK_DATA/SEEK_HOLE: let the host fd handle it
+    if (np < 0) return -1;
+    m->pos = np;
+    return np;
+}
+static int memf_fstat(int fd, struct stat *s) { // real-file metadata, RAM size/blocks
+    if (fstat(fd, s) != 0) return -1;
+    struct memf *m = g_memf[fd];
+    s->st_size = (off_t)m->size;
+    s->st_blocks = (blkcnt_t)((m->size + 511) / 512);
+    return 0;
+}
+// Returns 1 if writing up to byte `end` stays within the caps; otherwise materializes fd (spills to the
+// host file) and returns 0 so the caller falls through to the real host write.
+static int memf_room_or_spill(int fd, off_t end) {
+    struct memf *m = g_memf[fd];
+    if (end < 0 || (uint64_t)end <= m->size) return 1;
+    uint64_t grow = (uint64_t)end - m->size;
+    if ((uint64_t)end > MEMF_CAP || atomic_load(&g_memf_total) + grow > MEMF_TOTAL_CAP) {
+        memf_materialize(fd);
+        return 0;
+    }
+    return 1;
+}
+// After the guest unlinked a temp file (dev/ino captured before the unlink), adopt it as RAM-backed iff
+// EXACTLY ONE open fd now holds the last (zero) link to that regular file -- i.e. it is now anonymous and
+// privately owned by this one description. More than one matching fd (a dup) shares an offset we don't
+// model, so we leave those as a plain host file.
+static void memf_try_adopt(uint64_t dev, uint64_t ino) {
+    if (memf_disabled() || !ino) return;
+    int found = -1;
+    for (int fd = 0; fd < 1024; fd++) {
+        if (g_memf[fd]) continue;
+        struct stat s;
+        if (fstat(fd, &s) != 0) continue;
+        if ((uint64_t)s.st_dev == dev && (uint64_t)s.st_ino == ino) {
+            if (found >= 0) return; // duped: shared description -> don't risk it
+            found = fd;
+        }
+    }
+    if (found < 0) return;
+    struct stat s;
+    if (fstat(found, &s) != 0 || !S_ISREG(s.st_mode) || s.st_nlink != 0) return;
+    memf_attach(found, s.st_size, lseek(found, 0, SEEK_CUR));
+}
+
 #include "vfs/gmap.c"
 // A non-PIE ET_EXEC is linked at a fixed low vaddr but __PAGEZERO forbids mapping there, so load_elf biases
 // it high. Its un-relocated absolute refs still point at the low link range; when the guest takes an
