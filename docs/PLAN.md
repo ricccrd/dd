@@ -15,9 +15,9 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
    per-block `g_trace` dump). Gate: matrix green both engines.
 2. **Networking Phase-2b — netstack** → `docs/design/netstack.md`. External egress already works; the gap is
    L3 identity + reachability. **PR1 ✅** (daemon IPAM `172.18/12`, per-container IP, `--network` join →
-   docker-net 5/7). PR2 (per-network AF_UNIX virtual switch) landed but **unverified** vs docker-net 7/7.
-   **Remaining:** name→IP embedded DNS (`reach-by-name`), confirm 7/7, then the optional in-process
-   `smoltcp` stack behind `DD_NETSTACK`.
+   docker-net 5/7). PR2 (per-network AF_UNIX virtual switch + `/etc/hosts` reach-by-name DNS) landed but
+   **unverified** vs docker-net 7/7. **Remaining:** confirm 7/7, then the optional in-process `smoltcp`
+   stack behind `DD_NETSTACK`.
 3. **Untrusted-guest isolation — sentry process-split** → `docs/design/sentry-split.md`. **No PR yet.** The
    trust boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on
    `g_untrusted`, split `service()` by authority (compute/mem local, fs/net/proc → sentry over an SPSC
@@ -58,10 +58,8 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
 ## Coverage gaps — syscalls
 
 *Source: `make coverage`. Static **178/323 handled** at last snapshot (many since landed).*
-- **Signals:** `rt_sigtimedwait`(137), `rt_sigsuspend`(133) — need guest-mask-aware signal waiting.
-- **Edge corners** (`edge` group; xfail-tracked): `madvise(MADV_DONTNEED)` doesn't zero anon pages (stale
-  reread), `mprotect` PROT_NONE is a no-op (no fault → RELRO/guard pages unenforced), `pipe2(O_DIRECT)`
-  packet mode (host-limited — macOS pipes can't frame writes), `/proc/self/fd` not synthesized.
+- **Edge corners** (`edge` group; xfail-tracked): `mprotect` PROT_NONE is a no-op (no fault → RELRO/guard
+  pages unenforced), `pipe2(O_DIRECT)` packet mode (host-limited — macOS pipes can't frame writes).
 - **Host-limited (emulate or leave ENOSYS):** POSIX mqueue `mq_*`(180-185), `timer_create`/`timer_*`(107-111)
   *(could ride kqueue)*; `pidfd`/`io_uring`/NUMA/keyring/module/`ptrace` out of scope.
 
@@ -69,12 +67,10 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
 
 | Area | What's left | Pri |
 |------|-------------|:---:|
-| `docker logs` | `-f`/follow, `--since` (tail/timestamps/raw done) | P1 |
-| `docker ps` | `--size`, remaining `--filter` keys (status/name/label done) | P1 |
+| `docker ps` | remaining `--filter` keys (status/name/label/`--size` done) | P1 |
 | `docker exec` | `-u` (needs a `SpawnConfig` uid field), `--privileged` (`-e`/`-w`/`-d` done) | P1 |
 | `docker run` opts | `--user` (uid not applied), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` (`--label` done) | P2 |
 | `docker build` | BuildKit/layer cache (every build re-runs from base) — args/target/nocache/labels/digest-IDs done | P2 |
-| image inspect | surface `Config.Labels` (stored at build; inspect still emits `{}`) | P2 |
 | `docker cp` | non-default-driver named volumes (default `<volumes_dir>/<name>` handled) | P3 |
 | IPC | `*ctl(IPC_STAT/IPC_SET)` introspection (macOS `*_ds` layout differs; ENOSYS today) | P3 |
 
