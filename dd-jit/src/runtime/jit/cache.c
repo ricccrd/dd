@@ -74,6 +74,58 @@ static uint64_t g_prof_cross, g_prof_miss, g_prof_xlate, g_prof_sys, g_lse_n;
 // PROF=1: dispatcher crossings / IBTC misses / translations
 static int g_prof;
 
+// ---------------- W4E adaptive tier-2 ----------------
+// W4E tier-2: a hot self-loop's in-cache back-edge counter reached threshold -> the dispatcher
+// recompiles (promotes) the block with the optimized codegen, then resumes (pc already = block start).
+// (The reason code normally lives next to R_BRANCH/R_SYSCALL in include/cpu_aarch64.h; it is defined here
+// because this engine integration is confined to the jit/ + frontend/aarch64/ translate units.)
+#define R_TIER2 2
+//
+// A same-ISA aarch64->aarch64 transliterator already keeps every guest GPR in its host reg and flags
+// native, so tier-1 hot loops are near-native EXCEPT the conditional back-edge: a self-loop `b.cond` is
+// laid as `b.cond Ltaken; b body` -- TWO taken host branches per iteration. Tier-2 recompiles a hot
+// self-loop folding that into a single `b.cond body` (native-equivalent).
+//
+// Hotness must be measured IN-CACHE: a chained hot loop never returns to the dispatcher, so a
+// dispatcher-side counter is blind to it. Each translated single-block self-loop therefore carries a
+// cheap, flag-free, decrementing back-edge counter (initialized to the threshold). When it hits zero the
+// back-edge exits R_TIER2; the dispatcher promotes the block (recompile + swap the map entry + repoint
+// pending chains/IBTC) and resumes -- the remaining iterations run folded in-cache. The counter is
+// removed by the recompile, so the promoted steady state has ZERO tier-2 overhead.
+#define T2_MAX 8192
+// per self-loop iteration counter (plain RW data -- NOT in the W^X cache, which is RX while executing;
+// emitted code stores to it via an adrp+add absolute address)
+static uint64_t g_t2cnt[T2_MAX];
+static uint64_t g_t2gpc[T2_MAX]; // the loop-start gpc owning each slot (dedup on re-translate)
+static int g_t2n;                // slots allocated
+static int g_notier2;            // NOTIER2=1 kill switch (pure tier-1 baseline)
+static uint64_t g_t2thresh = 1000; // back-edge iterations before promotion (TIER2_THRESHOLD env)
+static uint64_t g_prof_t2;       // PROF: blocks promoted to tier-2
+static int g_tier2_build;        // set while recompiling a block as tier-2 (fold, no counter, no map_put)
+static void *g_last_body;        // body pointer of the most recent translate_block (for the promoter)
+// Kill-switch + threshold env, read ONCE (idempotent static guard; the W4E diff read these in the target
+// main(), relocated here to keep the integration inside the allowed jit/ + frontend/aarch64/ units).
+static int g_t2_envdone;
+static void tier2_env_init(void) {
+    if (g_t2_envdone) return;
+    g_t2_envdone = 1;
+    g_notier2 = getenv("NOTIER2") != NULL;
+    const char *t = getenv("TIER2_THRESHOLD");
+    if (t && atoll(t) > 0) g_t2thresh = (uint64_t)atoll(t);
+}
+// Find (or allocate) the counter slot for a self-loop whose body starts at gpc. Re-translation of the
+// same loop reuses its slot so the count is not reset (and a re-translated promoted loop won't re-arm a
+// fresh counter). Returns -1 if the table is full (-> emit plain tier-1, no counter).
+static int t2_slot(uint64_t gpc) {
+    for (int i = 0; i < g_t2n; i++)
+        if (g_t2gpc[i] == gpc) return i;
+    if (g_t2n >= T2_MAX) return -1;
+    int i = g_t2n++;
+    g_t2gpc[i] = gpc;
+    g_t2cnt[i] = g_t2thresh;
+    return i;
+}
+
 // Direct-branch edges whose target wasn't translated yet: remembered so the branch
 // can be back-patched into a direct `b target.body` once the target is translated.
 static struct {

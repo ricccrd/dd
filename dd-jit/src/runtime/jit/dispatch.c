@@ -101,6 +101,12 @@ static void run_guest(struct cpu *c) {
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
         // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
         G_DISPATCH_REASON(c);
+        // W4E tier-2: a hot self-loop's back-edge counter fired -> recompile+swap it in. pc is already =
+        // loop start, so the next iteration of this dispatcher loop runs the folded block. R_TIER2 is
+        // disjoint from R_SYSCALL (handled in the hook above) so this never double-fires. tier2_promote is a
+        // no-op under threads / NOTIER2. (This TU is the aarch64 dispatcher only -- the x86 engine includes
+        // frontend/x86_64/dispatch.c instead -- so R_TIER2/tier2_promote are aarch64-scoped here.)
+        if (c->reason == R_TIER2) tier2_promote(c->pc);
         // async signal -> guest handler
         if (g_pending) maybe_deliver_signal(c);
     }

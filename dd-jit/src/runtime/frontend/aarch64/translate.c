@@ -385,6 +385,90 @@ static uint32_t recode_cond(uint32_t in, int64_t d) {
     return (in & 0xFFF8001Fu) | ((uint32_t)(d & 0x3FFF) << 5);
 }
 
+// W4E tier-2: emit the in-cache back-edge hotness counter for a hot-candidate self-loop. Runs on the
+// TAKEN (loop) edge in tier-1. Flag-free (sub-imm + cbnz never touch NZCV, so the guest's condition
+// flags are preserved across the back-edge -- mandatory for bit-exactness when the loop body does not
+// itself re-set the tested flags). x9/x10 are spilled to the [sp,#-16/-24] red zone (never live across a
+// block boundary, same convention as emit_spill/IBTC). Counts DOWN from g_t2thresh; on reaching zero it
+// exits R_TIER2 so the dispatcher promotes the block, after which this stub is dead.
+static void emit_t2_counter(int slot, uint64_t start, void *body) {
+    e_stur(9, 31, -16);
+    e_stur(10, 31, -24);
+    // x9 = &g_t2cnt[slot] (plain RW data; adrp+add reaches it)
+    e_adrp_add(9, (uint64_t)&g_t2cnt[slot]);
+    e_ldr(10, 9, 0);
+    // --count (sub immediate: flag-free)
+    e_subi(10, 10, 1);
+    e_str(10, 9, 0);
+    uint32_t *p_cbnz = (uint32_t *)g_cp;
+    // cbnz x10, Lcont (still counting -> keep looping; flag-free)
+    emit32(0);
+    // reached 0 -> restore scratch + exit to the dispatcher to promote (pc = loop start)
+    e_ldur(9, 31, -16);
+    e_ldur(10, 31, -24);
+    emit_exit_const(start, R_TIER2);
+    uint8_t *Lcont = g_cp;
+    *p_cbnz = 0xB5000000u | (((uint32_t)(((uint8_t *)Lcont - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 10;
+    e_ldur(9, 31, -16);
+    e_ldur(10, 31, -24);
+    // b body  (the loop back-edge, in-cache)
+    int64_t d = ((uint8_t *)body - (uint8_t *)g_cp) / 4;
+    emit32(0x14000000u | ((uint32_t)d & 0x3FFFFFFu));
+}
+// W4E tier-2: store-to-load-forwarding hazard guard. Folding the back-edge tightens the loop enough that
+// a store immediately followed by a load of the SAME address (e.g. a volatile / aliased RMW of one stack
+// slot every iteration) starts hitting an Apple-Silicon store-forwarding replay -- measured as a ~3.7x
+// slowdown on a `volatile` counter loop, while the extra tier-1 trampoline branch happened to mask it. So
+// if the loop body contains a store whose (size,base,offset) a later load reuses, leave the loop on tier-1
+// (no counter, no fold). Pure-store, load-only, and distinct-address load+store loops are NOT flagged and
+// still tier up (measured wins). Scans the guest body [start, endpc).
+static int loop_has_rmw_hazard(uint64_t start, uint64_t endpc) {
+    uint64_t stores[32];
+    int ns = 0;
+    for (uint64_t p = start; p < endpc; p += 4) {
+        uint32_t in = *(uint32_t *)p;
+        uint64_t key = 0;
+        int opc = -1;
+        // load/store unsigned imm12
+        if ((in & 0x3B000000u) == 0x39000000u) {
+            opc = (in >> 22) & 3;
+            key = ((uint64_t)((in >> 30) & 3) << 24) | (((in >> 5) & 31) << 12) | ((in >> 10) & 0xFFF);
+        }
+        // STUR/LDUR unscaled imm9
+        else if ((in & 0x3B200C00u) == 0x38000000u) {
+            opc = (in >> 22) & 3;
+            key = (1ull << 40) | ((uint64_t)((in >> 30) & 3) << 24) | (((in >> 5) & 31) << 12) | ((in >> 12) & 0x1FF);
+        }
+        if (opc == 0) {
+            if (ns < 32) stores[ns++] = key; // a store
+        } else if (opc > 0) {
+            for (int i = 0; i < ns; i++)
+                if (stores[i] == key) return 1; // a load reusing a stored address -> hazard
+        }
+    }
+    return 0;
+}
+
+// W4E tier-2: emit a single-block self-loop's terminating conditional (taken target == block start).
+//   tier-1 build: cond -> Lcnt (counter) ; fall-through = loop exit. The counter promotes when hot.
+//   tier-2 build: cond -> body DIRECTLY (the fold) ; fall-through = loop exit. One taken branch/iter
+//                 instead of tier-1's `b.cond Ltaken; b body` -- native-equivalent. Bit-identical control
+//                 flow (same condition, same taken target = loop top). `body` is always a few insns above,
+//                 well inside the conditional's imm19/imm14 reach.
+static void emit_selfloop(uint32_t in, uint64_t start, uint64_t fall, void *body, int slot) {
+    uint32_t *patch = (uint32_t *)g_cp;
+    emit32(0);
+    emit_chain_exit(fall);
+    if (g_tier2_build) {
+        int64_t d = ((uint8_t *)body - (uint8_t *)patch) / 4;
+        *patch = recode_cond(in, d);
+        return;
+    }
+    int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
+    *patch = recode_cond(in, d);
+    emit_t2_counter(slot, start, body);
+}
+
 // ---- LSE atomics idiom upgrade ----
 // Distro binaries are built ARMv8.0-baseline, so every atomic is an ldxr/stxr retry
 // loop. Apple Silicon has FEAT_LSE: recognize the loop and emit a single atomic op
@@ -623,6 +707,8 @@ static void stitch_cond(uint32_t inv, uint64_t taken) {
 }
 
 static void *translate_block(uint64_t gpc) {
+    // W4E tier-2: read NOTIER2 / TIER2_THRESHOLD once (idempotent) before any self-loop detection.
+    tier2_env_init();
     // gpc is mutated by the decode loop; key the cache by START
     uint64_t start = gpc;
     void *host = g_cp;
@@ -733,6 +819,16 @@ static void *translate_block(uint64_t gpc) {
                 gpc += 4;
                 continue;
             }
+            // W4E tier-2: single-block self-loop (taken back-edge == block start). Intercept BEFORE the
+            // opt4 stitch so the redundant back-edge trampoline can be folded; non-self-loops (taken !=
+            // start) fall through to opt4 unchanged. NOTIER2 -> skipped (exact committed-opt4 baseline).
+            if (taken == start && !g_notier2 && !loop_has_rmw_hazard(start, gpc)) {
+                int slot = g_tier2_build ? 0 : t2_slot(start);
+                if (g_tier2_build || slot >= 0) {
+                    emit_selfloop(in, start, fall, body, slot);
+                    break;
+                }
+            }
             // opt4: lay the fall-through inline; invert the condition so TAKEN is the exit
             if (STITCH_OK && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall)) {
                 stitch_cond(in ^ 1u, taken);
@@ -763,6 +859,14 @@ static void *translate_block(uint64_t gpc) {
                 emit32(0);
                 gpc += 4;
                 continue;
+            }
+            // W4E tier-2: single-block self-loop (non-stolen tested reg). Before opt4; NOTIER2 -> skipped.
+            if (taken == start && !g_notier2 && !is_stolen(rt) && !loop_has_rmw_hazard(start, gpc)) {
+                int slot = g_tier2_build ? 0 : t2_slot(start);
+                if (g_tier2_build || slot >= 0) {
+                    emit_selfloop(in, start, fall, body, slot);
+                    break;
+                }
             }
             // opt4: lay the fall-through inline (non-stolen test reg only); invert op (cbz<->cbnz)
             if (STITCH_OK && !is_stolen(rt) && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall)) {
@@ -813,6 +917,14 @@ static void *translate_block(uint64_t gpc) {
                 emit32(0);
                 gpc += 4;
                 continue;
+            }
+            // W4E tier-2: single-block self-loop (non-stolen tested reg). Before opt4; NOTIER2 -> skipped.
+            if (taken == start && !g_notier2 && !is_stolen(rt) && !loop_has_rmw_hazard(start, gpc)) {
+                int slot = g_tier2_build ? 0 : t2_slot(start);
+                if (g_tier2_build || slot >= 0) {
+                    emit_selfloop(in, start, fall, body, slot);
+                    break;
+                }
             }
             // opt4: lay the fall-through inline (non-stolen test reg only); invert op (tbz<->tbnz)
             if (STITCH_OK && !is_stolen(rt) && fall != start && !seen_has(seen, nseen, fall) && !map_body(fall)) {
@@ -967,10 +1079,61 @@ static void *translate_block(uint64_t gpc) {
     }
     // Only the REGION HEAD (start) is registered; intermediate inlined block-starts are left
     // unregistered so a later mid-region entry self-heals via re-translate + back-patch.
-    map_put(start, host, body);
+    // W4E tier-2: the promoter (g_tier2_build) recompiles in place and updates the EXISTING map entry
+    // itself, so don't insert a duplicate. Expose the body for it.
+    g_last_body = body;
+    if (!g_tier2_build) map_put(start, host, body);
     // patch_links_to is MOVED to the dispatcher, AFTER the new block's icache is invalidated:
     // chaining an existing block X -> this new block before its code is icache-coherent on a peer
     // core lets that core fetch stale instructions. Only chain to it once it's visible everywhere.
     return host;
 }
 #undef STITCH_OK
+
+// W4E tier-2: promote a hot self-loop (its in-cache counter hit the threshold and exited R_TIER2 with
+// pc == gpc). Recompile the block with the folded back-edge (no counter), then SWAP it in under live
+// execution: emit+icache-flush the tier-2 code, repoint the live map entry, repoint any still-pending
+// chains, and drop a stale IBTC entry so the indirect path refills to tier-2. The old tier-1 code is left
+// in place (harmless dead bytes). Single-threaded only -- promotion mutates the cache outside the threaded
+// translate-lock discipline, so it's skipped once a guest thread exists (loop keeps running tier-1, still
+// correct). Caller is the dispatcher between block runs, so guest state is settled.
+static void tier2_promote(uint64_t gpc) {
+    if (g_threaded || g_notier2) return;
+    int mi = map_idx(gpc);
+    if (mi < 0) return;
+    pthread_jit_write_protect_np(0);
+    g_emit_start = g_cp;
+    g_tier2_build = 1;
+    void *nh = translate_block(gpc); // folded recompile; no counter, no map_put
+    void *nb = g_last_body;
+    g_tier2_build = 0;
+    if (getenv("T2DUMP")) {
+        fprintf(stderr, "[t2dump] gpc=%llx body+%ld:", (unsigned long long)gpc, (long)((uint8_t *)nb - (uint8_t *)nh));
+        for (uint32_t *p = (uint32_t *)nb; (uint8_t *)p < g_cp; p++)
+            fprintf(stderr, " %08x", *p);
+        fprintf(stderr, "\n");
+    }
+    // make the tier-2 code coherent on all cores BEFORE anything can branch into it
+    sys_icache_invalidate(g_emit_start, (size_t)(g_cp - g_emit_start));
+    // Redirect the OLD tier-1 body to tier-2: overwrite its first instruction with `b nb`. Chains from
+    // predecessors were resolved to the old body when they were translated (patch_links_to only fixes
+    // still-PENDING ones), so without this an outer loop re-entering this inner loop would keep hitting
+    // the spent counter stub. The bounce costs one branch per loop ENTRY (negligible vs the loop body).
+    void *old_body = g_map[mi].body;
+    int64_t bd = ((uint8_t *)nb - (uint8_t *)old_body) / 4;
+    *(uint32_t *)old_body = 0x14000000u | ((uint32_t)bd & 0x3FFFFFFu);
+    sys_icache_invalidate(old_body, 4);
+    // swap the live map entry: future dispatcher lookups + IBTC fills resolve to tier-2 directly
+    g_map[mi].host = nh;
+    g_map[mi].body = nb;
+    // repoint any still-unresolved chains to this gpc straight at the tier-2 body
+    patch_links_to(gpc, nb);
+    // drop a stale IBTC entry (if this block is an indirect-branch target) so it refills to tier-2
+    uint32_t h = (uint32_t)((gpc >> 2) & (IBTC_N - 1));
+    if (g_ibtc[h].target == gpc) {
+        g_ibtc[h].target = 0;
+        g_ibtc[h].body = NULL;
+    }
+    pthread_jit_write_protect_np(1);
+    g_prof_t2++;
+}
