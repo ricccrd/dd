@@ -38,7 +38,7 @@ pub(crate) async fn images_json(State(a): State<App>) -> Json<Value> {
         // object if any are absent). `VirtualSize` is a required i64 in API <=1.43 models (no serde
         // default), so it must be present; dd has no parent/registry-digest/shared-size accounting yet,
         // so the rest take the Docker "not calculated" sentinels (-1) or empties.
-        "VirtualSize": size, "ParentId": "", "RepoDigests": [], "SharedSize": -1, "Labels": {}, "Containers": -1})
+        "VirtualSize": size, "ParentId": "", "RepoDigests": [], "SharedSize": -1, "Labels": i.labels, "Containers": -1})
     }).collect();
     Json(json!(imgs))
 }
@@ -105,7 +105,7 @@ pub(crate) async fn image_inspect(State(a): State<App>, Path(name): Path<String>
                     "Entrypoint": entrypoint,
                     "Env": env,
                     "WorkingDir": i.workdir,
-                    "Labels": {},
+                    "Labels": i.labels,
                 },
                 "RootFS": {"Type": "layers", "Layers": []}})).into_response()
         }

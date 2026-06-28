@@ -637,15 +637,26 @@ pub(crate) struct LogsQ {
     tail: Option<String>,
     /// `--timestamps`: prefix each line with an RFC3339 timestamp.
     timestamps: Option<String>,
-    /// `--follow`: best-effort no-op here (dd containers run to completion; we return the buffer).
+    /// `--follow`: after replaying the buffer, keep the body open and stream new output until the
+    /// container exits (or the client disconnects). A non-live/exited container just returns the buffer.
     follow: Option<String>,
     /// Stream selection. Docker requests at least one; default to both when neither is given.
     stdout: Option<String>,
     stderr: Option<String>,
+    /// `--since` / `--until`: unix-timestamp filters (seconds; an optional `.nanos` suffix is dropped).
+    since: Option<String>,
+    until: Option<String>,
 }
 
 fn q_truthy(s: &Option<String>) -> bool {
     matches!(s.as_deref(), Some("1") | Some("true") | Some("True"))
+}
+
+/// Parse a docker `since`/`until` value into unix seconds. Docker may send `"<secs>"` or
+/// `"<secs>.<nanos>"`; we keep the integer seconds. Returns None for absent/0/unparsable.
+fn parse_unix_ts(s: &Option<String>) -> Option<i64> {
+    let v = s.as_deref().filter(|x| !x.is_empty())?;
+    v.split('.').next().unwrap_or(v).parse::<i64>().ok().filter(|n| *n > 0)
 }
 
 /// Split a log buffer into newline-terminated lines, keeping the trailing `\n` on each line and any
@@ -660,13 +671,29 @@ fn split_log_lines(buf: &[u8]) -> Vec<Vec<u8>> {
     lines
 }
 
+/// Frame a chunk of guest output for the docker logs wire. TTY containers stream raw bytes (no demux
+/// header); non-TTY uses Docker's multiplexed framing (8-byte header, stream id 1=stdout / 2=stderr).
+/// With `--timestamps` the chunk is split into lines and each gets an RFC3339 prefix (dd stores no
+/// per-line emit time, so the CURRENT time is used -- best-effort) so the stamp survives demuxing
+/// exactly as dockerd writes it.
+fn frame_chunk(stream: u8, data: &[u8], tty: bool, timestamps: bool) -> Vec<u8> {
+    if !timestamps {
+        return if tty { data.to_vec() } else { log_frame(stream, data) };
+    }
+    let ts = fmt_rfc3339(now_secs());
+    let mut out = Vec::new();
+    for line in split_log_lines(data) {
+        let mut p = Vec::with_capacity(ts.len() + 1 + line.len());
+        p.extend_from_slice(ts.as_bytes());
+        p.push(b' ');
+        p.extend_from_slice(&line);
+        if tty { out.extend_from_slice(&p); } else { out.extend(log_frame(stream, &p)); }
+    }
+    out
+}
+
 pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>, Query(q): Query<LogsQ>) -> Response {
-    let g = a.inner.lock().await;
-    let c = match resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) {
-        Some(c) => c,
-        None => return no_such(&id),
-    };
-    let _follow = q_truthy(&q.follow); // accepted; dd containers run to completion, so we serve the buffer
+    let follow = q_truthy(&q.follow);
     let timestamps = q_truthy(&q.timestamps);
     // Stream selection: honor explicit stdout/stderr flags, defaulting to both when neither is given.
     let (mut want_out, mut want_err) = (q_truthy(&q.stdout), q_truthy(&q.stderr));
@@ -676,28 +703,107 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
         None | Some("") | Some("all") => None,
         Some(s) => s.parse::<usize>().ok(),
     };
-    // Collect lines as (stream_id, bytes); stdout first then stderr, mirroring the previous ordering.
-    let mut entries: Vec<(u8, Vec<u8>)> = Vec::new();
-    if want_out { for line in split_log_lines(&c.stdout) { entries.push((1, line)); } }
-    if want_err { for line in split_log_lines(&c.stderr) { entries.push((2, line)); } }
-    if let Some(n) = tail { if entries.len() > n { entries.drain(0..entries.len() - n); } }
-    // dd doesn't record per-line emit times; use the current time as a best-effort timestamp.
-    let ts = fmt_rfc3339(now_secs());
-    // TTY containers stream raw bytes (no demux header); non-TTY uses Docker's multiplexed framing
-    // (8-byte header per chunk, stream id 1=stdout / 2=stderr). The timestamp, when requested, is part
-    // of the stream payload so it survives demuxing -- exactly how dockerd writes it.
-    let mut b = Vec::new();
-    for (stream, line) in entries {
-        let payload = if timestamps {
-            let mut p = Vec::with_capacity(ts.len() + 1 + line.len());
-            p.extend_from_slice(ts.as_bytes());
-            p.push(b' ');
-            p.extend_from_slice(&line);
-            p
-        } else { line };
-        if c.tty { b.extend_from_slice(&payload); } else { b.extend(log_frame(stream, &payload)); }
+    let since = parse_unix_ts(&q.since);
+    let until = parse_unix_ts(&q.until);
+
+    // Snapshot the container + its live IO under the daemon lock; clone the Arc<Live> so we can read its
+    // buffers / subscribe to its broadcast after releasing the lock.
+    let (tty, running, live, persisted_out, persisted_err, start_t, end_t) = {
+        let g = a.inner.lock().await;
+        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+        let Some(c) = g.containers.get(&full) else { return no_such(&id) };
+        let running = c.status == "running" || c.status == "paused";
+        let start_t = if c.started_at > 0 { c.started_at } else { c.created };
+        let end_t = if c.finished_at > 0 { c.finished_at } else { now_secs() };
+        (c.tty, running, g.live.get(&full).cloned(), c.stdout.clone(), c.stderr.clone(), start_t, end_t)
+    };
+
+    // For follow we stream new output from the container's `Live.out` broadcast (the same channel
+    // attach/exec fan out from). Subscribe BEFORE snapshotting the buffer so output produced between the
+    // snapshot and the stream start isn't lost -- a chunk straddling that boundary may appear once in
+    // the replay and once live, i.e. dd favors never dropping output over a rare duplicate.
+    let follow_live = follow && running && live.is_some();
+    let out_sub = if follow_live { live.as_ref().map(|l| l.out.subscribe()) } else { None };
+    let exit_sub = live.as_ref().map(|l| l.exit_rx.clone());
+
+    // Buffered output: the live buffers while running; once exited those are emptied into c.stdout/stderr.
+    let (sout, serr) = match &live {
+        Some(l) => {
+            let so = l.stdout_buf.lock().await.clone();
+            let se = l.stderr_buf.lock().await.clone();
+            (if so.is_empty() { persisted_out } else { so },
+             if se.is_empty() { persisted_err } else { se })
+        }
+        None => (persisted_out, persisted_err),
+    };
+
+    // `--since`/`--until`: dd stores no per-line timestamps, so the buffered block is filtered as a
+    // WHOLE against the container's run window [start_t, end_t]. The buffer is kept unless that entire
+    // window lies outside [since, until]; finer per-line filtering isn't possible without stored times.
+    let include_buffer = since.map_or(true, |s| end_t >= s) && until.map_or(true, |u| start_t <= u);
+
+    // Replay: collect lines as (stream_id, bytes), stdout first then stderr, apply `--tail` across the
+    // combined set, then per-line timestamp + framing.
+    let mut replay = Vec::new();
+    if include_buffer {
+        let mut entries: Vec<(u8, Vec<u8>)> = Vec::new();
+        if want_out { for line in split_log_lines(&sout) { entries.push((1, line)); } }
+        if want_err { for line in split_log_lines(&serr) { entries.push((2, line)); } }
+        if let Some(n) = tail { if entries.len() > n { entries.drain(0..entries.len() - n); } }
+        for (stream, line) in entries { replay.extend(frame_chunk(stream, &line, tty, timestamps)); }
     }
-    b.into_response()
+
+    // Non-follow (or nothing live to follow): serve the buffer and end, as before.
+    if !follow_live {
+        return replay.into_response();
+    }
+
+    // Follow: a task emits the replay, then streams each new broadcast chunk until the container exits
+    // (draining any final buffered chunks first) or the client disconnects (the channel send fails).
+    // `until`, when given, also ends the stream once wall-clock passes it.
+    let mut out_rx = out_sub.unwrap();
+    let mut exit_rx = exit_sub.unwrap();
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        if !replay.is_empty() && tx.send(replay).await.is_err() { return; }
+        let want = |kind: u8| (kind == 1 && want_out) || (kind == 2 && want_err);
+        // If the guest finished between the snapshot and here, the exit watch already holds Some(code).
+        let mut exited = exit_rx.borrow().is_some();
+        loop {
+            if exited {
+                // The broadcast Sender stays alive in the live map, so recv() would block forever after
+                // exit; flush whatever is still buffered with try_recv, then end the stream.
+                while let Ok((kind, chunk)) = out_rx.try_recv() {
+                    if want(kind) {
+                        let f = frame_chunk(kind, &chunk, tty, timestamps);
+                        if tx.send(f).await.is_err() { return; }
+                    }
+                }
+                break;
+            }
+            if let Some(u) = until { if now_secs() > u { break; } }
+            tokio::select! {
+                biased;
+                msg = out_rx.recv() => match msg {
+                    Ok((kind, chunk)) => {
+                        if want(kind) {
+                            let f = frame_chunk(kind, &chunk, tty, timestamps);
+                            if tx.send(f).await.is_err() { return; }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = exit_rx.changed() => { exited = true; }
+            }
+        }
+    });
+    let body = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|b| (Ok::<Vec<u8>, std::io::Error>(b), rx))
+    });
+    Response::builder().status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .body(Body::from_stream(body)).unwrap()
 }
 
 pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<String>) -> Response {
@@ -736,7 +842,17 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
 }
 
 #[derive(Deserialize)]
-pub(crate) struct PsQ { all: Option<String>, filters: Option<String> }
+pub(crate) struct PsQ { all: Option<String>, filters: Option<String>, size: Option<String> }
+
+/// `docker ps --size` -> (SizeRw, SizeRootFs). dd runs a container directly in the (shared) image
+/// rootfs with NO copy-on-write upper layer, so there is no isolated writable diff to measure: like
+/// `docker diff` (see `containers_changes`, which reports no rootfs changes), SizeRw is 0. SizeRootFs is
+/// the full rootfs `du`-style walk. The host-fs `macos` image (rootfs "/") is skipped -- walking it
+/// would be catastrophic, exactly as `image_size` guards against.
+fn container_sizes(c: &Container) -> (i64, i64) {
+    if c.image == "macos" || c.rootfs.is_empty() || c.rootfs == "/" { return (0, 0); }
+    (0, dir_size(std::path::Path::new(&c.rootfs)))
+}
 
 /// Apply `docker ps --filter`. `f` is the decoded `filters` map (`{"status":[..],"name":[..],"label":[..]}`).
 /// Within a filter type the values are OR'd; `label` entries are AND'd (each must match). `name` is a
@@ -790,18 +906,35 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
         .unwrap_or_default();
     // A `status` filter implies "show all matching" (like `docker ps --filter status=exited`).
     let status_filter = filters.contains_key("status");
-    let v: Vec<Value> = a.inner.lock().await.containers.values()
-        .filter(|c| all || status_filter || c.status == "running")
-        .filter(|c| {
-            let name = if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() };
-            ps_match(c, &name, &filters)
-        })
-        .map(|c| json!({
+    // `--size`: docker only computes SizeRw/SizeRootFs on demand (a per-container rootfs walk is
+    // expensive). Gather the matching containers, release the lock, THEN walk the disk so the daemon
+    // lock isn't held across the (synchronous) `du`.
+    let want_size = q_truthy(&q.size);
+    let matched: Vec<Container> = {
+        let g = a.inner.lock().await;
+        g.containers.values()
+            .filter(|c| all || status_filter || c.status == "running")
+            .filter(|c| {
+                let name = if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() };
+                ps_match(c, &name, &filters)
+            })
+            .cloned().collect()
+    };
+    let v: Vec<Value> = matched.iter().map(|c| {
+        let mut entry = json!({
         "Id": c.id, "Image": c.image, "Command": c.cmd.join(" "), "Created": c.created,
         "State": c.status, "Status": human_status(c), "ExitCode": c.exit_code, "Ports": ports_json(&c.publish),
         "Labels": c.labels,
         "Mounts": c.binds.iter().filter_map(|b| b.split_once(':').map(|(s, d)| json!({"Source": s, "Destination": d, "Type": "bind"}))).collect::<Vec<_>>(),
-        "Names": [format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() })]})).collect();
+        "Names": [format!("/{}", if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() })]});
+        // Only emit the size keys when requested -- docker omits them otherwise.
+        if want_size {
+            let (rw, rootfs) = container_sizes(c);
+            entry["SizeRw"] = json!(rw);
+            entry["SizeRootFs"] = json!(rootfs);
+        }
+        entry
+    }).collect();
     Json(json!(v))
 }
 

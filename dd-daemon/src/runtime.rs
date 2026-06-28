@@ -102,11 +102,40 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
     if live.started.swap(true, Ordering::SeqCst) {
         return true; // already started
     }
-    // netstack PR2: this container's (network-id, assigned-ip) from PR1's per-network endpoints map.
-    let bridge = {
+    // netstack PR2: this container's (network-id, assigned-ip) from PR1's per-network endpoints map,
+    // plus the /etc/hosts reach-by-name table (this container + same-network peers, name -> ip).
+    let (bridge, hosts) = {
         let g = app.inner.lock().await;
-        g.networks.iter().find_map(|n| n.endpoints.get(&c.id).map(|e| (n.id.clone(), e.ip.clone())))
+        let bridge = g.networks.iter().find_map(|n| n.endpoints.get(&c.id).map(|e| (n.id.clone(), e.ip.clone())));
+        // netstack reach-by-name: a guest's getaddrinfo("peer") must resolve to the peer's network IP so
+        // the per-network br_* switch (PR2) can carry the connect. Docker drives this via embedded DNS;
+        // the equivalent here is to seed /etc/hosts with every endpoint on the network(s) this container
+        // is attached to. musl/glibc read /etc/hosts before any nameserver, so the resolve is local.
+        let mut hosts = String::from("127.0.0.1\tlocalhost\n");
+        // own entry (once): own-ip  own-name [hostname]. Absent for --network host/none (no endpoint).
+        if let Some(own) = g.networks.iter().find_map(|n| n.endpoints.get(&c.id)) {
+            let mut names = own.name.clone();
+            if !c.hostname.is_empty() && c.hostname != own.name { names.push(' '); names.push_str(&c.hostname); }
+            hosts.push_str(&format!("{}\t{}\n", own.ip, names));
+        }
+        // peers: every OTHER endpoint on any network this container is a member of.
+        for n in &g.networks {
+            if !n.endpoints.contains_key(&c.id) { continue; }
+            for (cid, e) in &n.endpoints {
+                if cid != &c.id { hosts.push_str(&format!("{}\t{}\n", e.ip, e.name)); }
+            }
+        }
+        (bridge, hosts)
     };
+    // Write the table best-effort — Docker manages /etc/hosts, so overwriting with the generated
+    // reach-by-name content is correct; never fail the spawn on an I/O error.
+    {
+        let etc = format!("{}/etc", c.rootfs);
+        let _ = std::fs::create_dir_all(&etc);
+        if let Err(e) = std::fs::write(format!("{etc}/hosts"), &hosts) {
+            if std::env::var("DD_DEBUG").is_ok() { eprintln!("[live] {} write /etc/hosts failed: {e}", &c.id[..c.id.len().min(12)]); }
+        }
+    }
     let Some((prog, args)) = spawn_cfg(c, &app.volumes_dir, vols, bridge) else { return false };
     let mut cmd = tokio::process::Command::new(prog);
     cmd.args(args);
