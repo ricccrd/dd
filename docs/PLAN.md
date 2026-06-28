@@ -230,15 +230,15 @@ Remaining — what still needs to be figured out / built (priority):
 | `docker logs` | ~~`--tail`/`--timestamps`, **raw** stream for `-t`~~ **done**; still `-f`/follow, `--since` | P1 |
 | `docker ps` | ~~human `Status`, `--filter` (status/name/label), `Labels`~~ **done**; still `--size`, `--filter` (other keys) | P1 |
 | `docker exec` | ~~`-e`/`-w`, `exec -d` → 200~~ **done**; still `-u` (needs a `SpawnConfig` uid field), `--privileged` | P1 |
-| `docker events` | ~~real lifecycle event bus (container create/start/stop/die/destroy; type/event/container filters)~~ **done** (verified live); still image/network/volume emits (one-liners, hooks ready) | P1 |
+| `docker events` | ~~lifecycle event bus — container + image + network + volume create/start/stop/die/destroy~~ **done** (verified live) | P1 |
 | `docker inspect` State | ~~`State.{Pid,StartedAt,FinishedAt}`~~ **done** (RFC3339; Pid from live) | P1 |
 | `docker stats` | real CPU/mem accounting from the JIT runtime + streaming *(design: runtime has no cgroup metrics)* | P1 |
 | networks | ~~per-container IP/IPAM + `network inspect` member IPs~~ **PR1 done** (172.18/12, verified `172.18.0.2`); still **container-to-container reachability** (`docker-net.sh` `reach-by-name`/`-ip`): the data path — a per-network AF_UNIX virtual switch + embedded name→IP DNS — see netstack #2 next PR. Cross-network isolation trivially holds. | P2 |
-| `docker build` | ~~`buildargs`/`target`/`nocache`~~ **done**; still `labels`, real content-digest image IDs; (BuildKit cache, above) | P2 |
+| `docker build` | ~~`buildargs`/`target`/`nocache`, `LABEL`+`--label`, real sha256 content-digest IDs~~ **done**; still (BuildKit cache, above) | P2 |
 | `docker run` opts | ~~`--label` (stored → `Config.Labels`)~~ **done**; still `--user` (uid not applied — needs a `SpawnConfig` uid field), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` | P2 |
-| volumes | ~~`409` when in use, RFC3339 `CreatedAt`~~ **done**; still persist `--driver`/`--opt`/`--label` | P2 |
+| volumes | ~~`409` in use, RFC3339 `CreatedAt`, `--driver`/`--opt`/`--label`~~ **done** | P2 |
 | `docker pull`/`push` | per-layer progress bars; push returns final `aux{Digest}` | P2 |
-| image inspect/history | ~~real `Size`/`Entrypoint`/`Env`/`Cmd`/`WorkingDir`~~ **done** (from the Image struct); still real `Created` (needs an `Image.created` field) + `Labels` | P2 |
+| image inspect/history | ~~real `Size`/`Entrypoint`/`Env`/`Cmd`/`WorkingDir`/`Created`~~ **done**; `Labels` stored (build), inspect-surface pending | P2 |
 | `docker cp` | ~~redirect a `cp` into a bind-mount path~~ **done** (longest-prefix bind match); still named-volume paths (handlers lack the volume list) | P2 |
 | `save`/`load`/`import` | ~~`images/get` + `images/load` + `fromSrc`~~ **done** (dd-native rootfs tar + manifest) | P3 |
 | stop/kill/restart | honor `signal`/`t` + real signal delivery (containers run synchronously today) | P3 |
@@ -261,7 +261,7 @@ Real, syscall/fork/thread/mmap-heavy production binaries run with deterministic 
   initial loader parses it as a bogus ELF. **Fix in progress** (reuse execve's shebang logic in `jit_run`).
   setuid/setgid drop already works; daemonize/initdb is the *next* gap, downstream of this. (Also: the local
   `postgres` image's `dd-image.json` lacks `entrypoint`/`env` — a daemon-side metadata gap.)
-- **nats:latest** ❌ — won't even **pull**: `dd-daemon` reports "could not detect the image architecture"
+- **nats:latest** — ~~arch-detect~~ **fixed**: distroless pulls now fall back to the manifest `architecture` (then native aarch64) instead of failing
   on a distroless/scratch image (the arch sniffer in `containers_create`/`detect_arch` scans for an ELF
   where there is none — needs a manifest-`platform` fallback). A `dd-daemon` image-arch-detection gap.
 
