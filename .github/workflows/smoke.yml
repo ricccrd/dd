@@ -31,5 +31,8 @@ jobs:
       - name: Build ddcli + daemon + JIT engines
         run: cargo build --release -p dd-cli -p dd-daemon
 
-      - name: Real-image smoke (fresh pull + run; ubuntu & debian; arm64 & amd64)
+      - name: Install docker CLI (the scenarios drive dd-daemon through it)
+        run: brew install docker
+
+      - name: Real-image smoke (fresh pull + run via dd-daemon; arm64 ubuntu/debian + amd64 debian)
         run: bash dd-tests/scenarios/smoke-realimage.sh
