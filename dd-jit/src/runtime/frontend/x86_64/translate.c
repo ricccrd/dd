@@ -76,14 +76,67 @@ static void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already
             e_bfi(I->rm_reg, val, 0, 8 * w, 1);
     }
 }
-// Lazy flags (x86-perf PR1): pending PF_SUB record. Translate-time only -- no guest state,
-// never exists at runtime. Set true by a width-4/8 sub/cmp producer that *deferred* its
-// e_nzcv_save (§3.1/§7 Phase 1); means the LIVE ARM NZCV currently holds that op's flags in
-// the canonical borrow convention (== exactly what e_nzcv_save would have spilled to cpu->nzcv,
-// and what x86cc_to_arm() already assumes). Consumed live only by an *immediately following*
-// Jcc; any other instruction or block boundary materializes it to membank (identical bytes to
-// today) and clears it -- so the cross-block nzcv ABI is byte-identical. Reset per block.
-static int g_pf_sub_live;
+// Lazy flags (x86-perf PR1 + opt3): pending-finalizer record. Translate-time only -- no guest
+// state, never exists at runtime. A width-4/8 do_alu producer *defers* its NZCV materialization:
+// the LIVE ARM NZCV currently holds that op's result flags, and g_fl_pending names which finalizer
+// would spill them to cpu->nzcv in the canonical borrow convention (== exactly the bytes the inline
+// finalizer would have emitted, and what x86cc_to_arm() assumes). Consumed live only by an
+// *immediately following* Jcc; any other instruction or block boundary materializes it to membank
+// and clears it -- so the cross-block cpu->nzcv ABI is byte-identical. Reset per block.
+//   FL_SUB   -> e_nzcv_save     (sub/cmp: ARM SUBS already canonical; PR1 baseline path)
+//   FL_ADD   -> e_nzcv_save_ci  (x86 add: invert ARM add-carry)
+//   FL_LOGIC -> e_nzcv_save_c1  (and/or/xor/test: x86 CF=0,OF=0)
+enum { FL_NONE, FL_SUB, FL_ADD, FL_LOGIC };
+static int g_fl_pending;
+
+// opt3 kill-switch: NOLAZY=1 (any non-"0") reverts to the PR1 partial scheme (only sub/cmp defers;
+// add/logical materialize inline; no dead-flag elimination). Read once, cached.
+static int lazyflags_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("NOLAZY");
+        v = (s && *s && *s != '0') ? 0 : 1;
+    }
+    return v;
+}
+
+// Spill the deferred flags to cpu->nzcv with the producer-correct finalizer (byte-identical to the
+// old inline finalizer) and clear the pending state. Every finalizer also msr's the corrected value
+// back, so the live ARM NZCV is left canonical for an immediately-following Jcc to branch off.
+static void flags_materialize(void) {
+    switch (g_fl_pending) {
+    case FL_SUB:   e_nzcv_save();    break;
+    case FL_ADD:   e_nzcv_save_ci(); break;
+    case FL_LOGIC: e_nzcv_save_c1(); break;
+    default: break;
+    }
+    g_fl_pending = FL_NONE;
+}
+
+// opt3 dead-flag elimination: 1 iff I's handler provably writes the FULL NZCV while reading no
+// flags -- so a pending producer's flags are dead (overwritten before any read) and need not be
+// materialized at all. Conservative whitelist: add/or/and/sub/xor/cmp/test/neg only. EXCLUDES
+// adc/sbb (read CF), inc/dec (preserve CF), shifts, mul/div, not (flags untouched) -> default 0.
+static int insn_is_flagkill(const struct insn *I) {
+    if (I->two) return 0;
+    uint8_t op = I->op;
+    // primary ALU 00..3D (reg/rm + AL/imm forms): kinds add/or/and/sub/xor/cmp, not adc(2)/sbb(3)
+    if (op < 0x40 && alu_kind_primary(op) >= 0) {
+        int k = alu_kind_primary(op);
+        return (k != 2 && k != 3);
+    }
+    // group1 (80/81/83): ALU r/m, imm
+    if (op == 0x80 || op == 0x81 || op == 0x83) {
+        int k = I->reg & 7;
+        return (k != 2 && k != 3);
+    }
+    if (op == 0x84 || op == 0x85 || op == 0xA8 || op == 0xA9) return 1; // test
+    if (op == 0xF6 || op == 0xF7) {                                     // group3
+        int k = I->reg & 7;
+        return (k == 0 || k == 3); // /0 test, /3 neg (full NZCV overwrite, read nothing)
+    }
+    return 0;
+}
 
 // Width-correct ALU: dst = a <kind> b, set cpu->nzcv.  dst<0 => cmp/test (no write).
 // 4/8-byte: direct ARM op. 1/2-byte: operate in the HIGH bits (<<sh) so ARM NZCV matches
@@ -107,15 +160,19 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
     int logical = (kind == 1 || kind == 4 || kind == 6); // or/and/xor (and test): x86 clears CF
     if (w >= 4) {
         alu_core(ak, out, a, b, sf);
-        if (kind == 0)
-            e_nzcv_save_ci(); // x86 add -> invert ARM add-carry
-        else if (logical)
-            e_nzcv_save_c1(); // x86 CF=0 -> stored C=1
-        else
-            // PF_SUB (sub/cmp, width 4/8): defer e_nzcv_save. ARM SUBS already left the live
-            // NZCV in borrow convention; an immediately-following Jcc reads it directly, and
-            // any other consumer/boundary materializes it via e_nzcv_save (same bytes as here).
-            g_pf_sub_live = 1;
+        // opt3: defer the NZCV materialization (record which finalizer would spill it). The live ARM
+        // NZCV holds the result flags; an immediately-following Jcc branches off them directly and any
+        // other consumer/boundary calls flags_materialize() -- emitting the exact same finalizer bytes.
+        // Sub/cmp always defers (the PR1 baseline path). Under NOLAZY, add/logical materialize inline
+        // (exactly the pre-opt3 behavior) so only sub/cmp stays deferred.
+        int lazy = lazyflags_on();
+        if (kind == 0) {
+            if (lazy) g_fl_pending = FL_ADD; else e_nzcv_save_ci();
+        } else if (logical) {
+            if (lazy) g_fl_pending = FL_LOGIC; else e_nzcv_save_c1();
+        } else {
+            g_fl_pending = FL_SUB;
+        }
         return;
     }
     int sh = 8 * (4 - w);                       // 24 for byte, 16 for word
@@ -294,10 +351,10 @@ static void *translate_block(uint64_t gpc) {
     void *host = g_cp;
     emit_prologue();
     void *body = g_cp;
-    g_pf_sub_live = 0; // lazy flags: no pending sub/cmp at block entry
+    g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
     for (;;) {
         if (g_itrace && gpc != start) {
-            if (g_pf_sub_live) { e_nzcv_save(); g_pf_sub_live = 0; } // materialize before boundary
+            if (g_fl_pending) flags_materialize(); // materialize before boundary
             emit_chain_exit(gpc);
             break;
         } // 1 insn/block: per-instruction register dump
@@ -311,16 +368,21 @@ static void *translate_block(uint64_t gpc) {
                     (unsigned long long)gpc, I.two ? "0F " : "", op, I.len, I.mod, I.rm_reg, I.reg, I.is_mem,
                     I.m_hasbase ? I.m_base : -1, I.m_hasindex ? I.m_index : -1, (long long)I.disp, (long long)I.imm);
 
-        // Lazy flags: a pending width-4/8 sub/cmp left its flags live in NZCV instead of spilling
-        // to cpu->nzcv. The ONLY consumer allowed to read them live is an immediately-following Jcc
-        // (rel8 70-7F / rel32 0F 80-8F). For every other instruction -- another flag op, a non-Jcc
-        // consumer (setcc/cmovcc/adc/...), or a block-ender -- materialize to membank NOW, before it
-        // emits anything, with the exact e_nzcv_save the producer would have emitted. This keeps the
-        // cross-block nzcv ABI byte-identical and makes the fast path strictly producer-then-Jcc.
+        // Lazy flags: a pending width-4/8 producer left its result flags live in NZCV instead of
+        // spilling to cpu->nzcv. The ONLY consumer allowed to read them live is an immediately-
+        // following Jcc (rel8 70-7F / rel32 0F 80-8F). For every other instruction:
+        //   - opt3 dead-flag elimination: if this instruction fully overwrites NZCV and reads no
+        //     flags (insn_is_flagkill), the pending flags are dead -- drop them, emitting nothing;
+        //   - otherwise (a non-Jcc flag reader/consumer or a block-ender): materialize to membank
+        //     NOW, before it emits anything, with the exact finalizer the producer would have used.
+        // Both keep the cross-block cpu->nzcv ABI byte-identical (intra-block only). NOLAZY disables
+        // dead-flag elimination, so the pending sub/cmp always materializes (PR1 behavior).
         int is_jcc = (!I.two && op >= 0x70 && op <= 0x7F) || (I.two && (op & 0xF0) == 0x80);
-        if (g_pf_sub_live && !is_jcc) {
-            e_nzcv_save();
-            g_pf_sub_live = 0;
+        if (g_fl_pending && !is_jcc) {
+            if (lazyflags_on() && insn_is_flagkill(&I))
+                g_fl_pending = FL_NONE; // dead: next op fully overwrites the flags before any read
+            else
+                flags_materialize();
         }
 
         if (!I.two) {
@@ -863,19 +925,18 @@ static void *translate_block(uint64_t gpc) {
             if (op >= 0x70 && op <= 0x7F) {
                 int cc = x86cc_to_arm(op & 0xF);
                 if (cc < 0) {
-                    if (g_pf_sub_live) { e_nzcv_save(); g_pf_sub_live = 0; } // materialize before boundary
+                    if (g_fl_pending) flags_materialize(); // materialize before boundary
                     report_unimpl(gpc, &I);
                     break;
                 }
                 uint64_t taken = next + (uint64_t)I.imm;
-                if (g_pf_sub_live) {
-                    // Fast path: live NZCV still holds the immediately-preceding width-4/8 sub/cmp
-                    // flags (borrow-convention C, exactly what x86cc_to_arm assumes). Spill them to
-                    // membank for the successor blocks (boundary materialize -- mrs;str, identical
-                    // bytes to today's producer save, and preserves NZCV), then branch straight off
-                    // the live flags -- dropping the redundant e_nzcv_load (ldr;msr) round-trip.
-                    e_nzcv_save();
-                    g_pf_sub_live = 0;
+                if (g_fl_pending) {
+                    // Fast path: live NZCV still holds the immediately-preceding width-4/8 producer's
+                    // flags. flags_materialize() spills them to membank for the successor blocks (the
+                    // exact finalizer bytes the producer deferred) AND leaves the live ARM NZCV
+                    // canonical (each finalizer msr's the corrected value back) -- so we branch
+                    // straight off the live flags, dropping the redundant e_nzcv_load (ldr;msr).
+                    flags_materialize();
                 } else {
                     e_nzcv_load();
                 }
@@ -2036,16 +2097,15 @@ static void *translate_block(uint64_t gpc) {
             if ((op & 0xF0) == 0x80) {
                 int cc = x86cc_to_arm(op & 0xF);
                 if (cc < 0) {
-                    if (g_pf_sub_live) { e_nzcv_save(); g_pf_sub_live = 0; } // materialize before boundary
+                    if (g_fl_pending) flags_materialize(); // materialize before boundary
                     report_unimpl(gpc, &I);
                     break;
                 }
                 uint64_t taken = next + (uint64_t)I.imm;
-                if (g_pf_sub_live) {
-                    // Fast path (see jcc rel8): membank-spill the live sub/cmp flags for successors,
-                    // then branch off live NZCV; drop the redundant e_nzcv_load.
-                    e_nzcv_save();
-                    g_pf_sub_live = 0;
+                if (g_fl_pending) {
+                    // Fast path (see jcc rel8): spill the deferred flags for successors AND leave
+                    // the live NZCV canonical, then branch off it; drop the redundant e_nzcv_load.
+                    flags_materialize();
                 } else {
                     e_nzcv_load();
                 }
