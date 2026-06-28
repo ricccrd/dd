@@ -43,6 +43,10 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
   fork). First mitigation applied (re-assert execute in the child) — insufficient. **Robust fix (PR-ready):**
   the **dual-mapped RX/RW code cache** (`mach_vm_remap` a RW alias, route cache stores through `cw()`,
   execute stays RX in the page tables → survives fork). Also closes the `soak/smc` RWX gap below.
+- **x86 busybox `sort` SIGSEGV on large input** (jit86 frontend; baseline bug, 3 independent confirmations,
+  tracked separately from the fork+exec crashes). Small input works, large faults → a mistranslated
+  instruction on the bulk path (suspect: `rep movs/cmps`, SSE memcpy/`pmovmskb` strlen, or address sign-ext).
+  Under differential-trace + static-audit research → `docs/design/{fix-x86-busybox-sort,audit-x86-largeinput}.md`.
 - **`soak/smc` / RWX guest-JIT pages.** `mmap(PROT_READ|WRITE|EXEC)` returns EPERM (W^X). Any guest that JITs
   its own code (JVM/V8/LuaJIT/.NET/PyPy) needs executable pages — fixed by the same dual-map cache (intercept
   RWX/`PROT_EXEC` maps, back with MAP_JIT, re-translate on writes). *(Endurance otherwise holds:
