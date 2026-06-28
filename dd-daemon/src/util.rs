@@ -193,7 +193,9 @@ pub(crate) fn discover_images(images_dir: &str) -> Vec<Image> {
         let arr = |k: &str| meta.as_ref().and_then(|m| m[k].as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
         let workdir = meta.as_ref().and_then(|m| m["workdir"].as_str()).unwrap_or("").to_string();
-        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env: arr("env"), entrypoint: arr("entrypoint"), workdir });
+        let created = std::fs::metadata(&rootfs).and_then(|m| m.modified()).ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
+        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env: arr("env"), entrypoint: arr("entrypoint"), workdir, created, ..Default::default() });
     }
     out
 }

@@ -118,8 +118,11 @@ pub(crate) async fn networks_create(State(a): State<App>, Json(body): Json<NetCr
     let n = Net { id: fake_id(&format!("net-{name}")), name, driver: body.driver.unwrap_or_else(|| "bridge".into()),
         scope: "local".into(), containers: vec![], created: now_secs(), subnet, gateway, endpoints: HashMap::new() };
     let id = n.id.clone();
+    let ev_name = n.name.clone();
+    let ev_driver = n.driver.clone();
     g.networks.push(n);
     save_state(&g, &a.state_path);
+    crate::events::emit_event(&a.events, "network", "create", &id, json!({"name": ev_name, "type": ev_driver}));
     (StatusCode::CREATED, Json(json!({"Id": id, "Warning": ""}))).into_response()
 }
 
@@ -135,9 +138,16 @@ pub(crate) async fn network_delete(State(a): State<App>, Path(id): Path<String>)
     if g.networks.iter().any(|n| net_matches(n, &id) && is_predefined(&n.name)) {
         return (StatusCode::FORBIDDEN, Json(json!({"message": "predefined network cannot be removed"}))).into_response();
     }
+    let removed = g.networks.iter().find(|n| net_matches(n, &id)).map(|n| (n.id.clone(), n.name.clone(), n.driver.clone()));
     let before = g.networks.len();
     g.networks.retain(|n| !net_matches(n, &id));
-    if g.networks.len() != before { save_state(&g, &a.state_path); StatusCode::NO_CONTENT.into_response() } else { network_404(&id) }
+    if g.networks.len() != before {
+        save_state(&g, &a.state_path);
+        if let Some((rid, rname, rdriver)) = removed {
+            crate::events::emit_event(&a.events, "network", "destroy", &rid, json!({"name": rname, "type": rdriver}));
+        }
+        StatusCode::NO_CONTENT.into_response()
+    } else { network_404(&id) }
 }
 
 #[derive(Deserialize)]

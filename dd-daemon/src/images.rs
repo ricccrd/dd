@@ -33,7 +33,7 @@ pub(crate) async fn images_json(State(a): State<App>) -> Json<Value> {
         let size = image_size(&i.rootfs, &i.name);
         json!({
         "Id": format!("sha256:{}", fake_id(&i.name)), "RepoTags": [repo_tag(&i.name)],
-        "Created": 0, "Size": size,
+        "Created": i.created, "Size": size,
         // Fields required by the Docker `ImageSummary` schema (strict clients like bollard reject the
         // object if any are absent). `VirtualSize` is a required i64 in API <=1.43 models (no serde
         // default), so it must be present; dd has no parent/registry-digest/shared-size accounting yet,
@@ -49,7 +49,7 @@ pub(crate) async fn image_history(State(a): State<App>, Path(name): Path<String>
     let g = a.inner.lock().await;
     match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
         Some(i) => Json(json!([{
-            "Id": format!("sha256:{}", fake_id(&i.name)), "Created": 0,
+            "Id": format!("sha256:{}", fake_id(&i.name)), "Created": i.created,
             "CreatedBy": "dd import", "Tags": [repo_tag(&i.name)],
             "Size": image_size(&i.rootfs, &i.name), "Comment": ""}])).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response(),
@@ -97,9 +97,8 @@ pub(crate) async fn image_inspect(State(a): State<App>, Path(name): Path<String>
                 "RepoTags": [tag.clone()], "RepoDigests": [],
                 "Architecture": docker_arch(i.arch),
                 "Os": i.arch.os(),
-                // dd has no image-creation timestamp yet (see report); the epoch keeps the RFC3339
-                // shape strict clients expect.
-                "Size": size, "VirtualSize": size, "Created": "1970-01-01T00:00:00Z",
+                // RFC3339 string shape strict clients (bollard) expect; `created` is unix secs.
+                "Size": size, "VirtualSize": size, "Created": fmt_rfc3339(i.created),
                 "Config": {
                     "Image": tag,
                     "Cmd": i.cmd,
@@ -155,6 +154,7 @@ pub(crate) async fn images_create(State(a): State<App>, Query(q): Query<ImageCre
             let mut g = a.inner.lock().await;
             g.images.retain(|i| repo_tag(&i.name) != want); // a re-pull (e.g. a new platform) replaces the old
             g.images.push(img);
+            crate::events::emit_event(&a.events, "image", "pull", &want, json!({"name": want}));
             pull_progress(&name, &tag, Ok(false))
         }
         Err(e) => pull_progress(&name, &tag, Err(e)),
@@ -200,7 +200,12 @@ pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: C
     let iref = image_ref(from_image, tag);
     let rootfs = std::path::PathBuf::from(format!("{images_dir}/{}/rootfs", safe_name(&iref)));
     let pulled = Client::new(iref.clone(), creds).pull(&rootfs, archs)?;
-    let arch = detect_arch(&rootfs).ok_or("could not detect the image architecture")?;
+    // Distroless/scratch images carry no ELF/Mach-O to sniff, so the rootfs scan comes up empty.
+    // Fall back to the manifest config's `architecture`+`os`, then to native arm64 — never fail the
+    // pull just because the arch couldn't be detected.
+    let arch = detect_arch(&rootfs)
+        .or_else(|| manifest_arch(&pulled.config))
+        .unwrap_or(Guest::LinuxAarch64);
     let darwin = arch.os() == "darwin";
     // A pulled macOS image's `dd-image.json` sidecar doesn't survive the registry round-trip and its
     // userland shell lives on the in-jail PATH (`/profile/bin/bash`), not `/bin/sh` — so default a
@@ -213,7 +218,21 @@ pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: C
     let mut meta = json!({ "name": name.clone(), "cmd": cmd.clone() });
     if darwin { meta["os"] = json!("darwin"); }
     let _ = std::fs::write(format!("{images_dir}/{}/dd-image.json", safe_name(&iref)), meta.to_string());
-    Ok(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, ..Default::default() })
+    Ok(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, created: now_secs(), ..Default::default() })
+}
+
+
+/// Derive a [`Guest`] from an OCI/Docker image config's top-level `architecture`+`os`
+/// (e.g. `{"architecture":"amd64","os":"linux"}`). Used as a fallback when the rootfs has no
+/// ELF/Mach-O to sniff (distroless/scratch). Returns `None` when the fields are absent/unrecognized.
+fn manifest_arch(config: &Value) -> Option<Guest> {
+    let os = config["os"].as_str().unwrap_or("linux");
+    match (os, config["architecture"].as_str()?) {
+        ("darwin", "arm64" | "aarch64") => Some(Guest::DarwinAarch64),
+        (_, "amd64" | "x86_64") => Some(Guest::LinuxX86_64),
+        (_, "arm64" | "aarch64") => Some(Guest::LinuxAarch64),
+        _ => None,
+    }
 }
 
 
@@ -265,8 +284,9 @@ pub(crate) async fn image_tag(State(a): State<App>, Path(name): Path<String>, Qu
     if repo.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"message": "repo required"}))).into_response(); }
     let full = match q.tag.filter(|t| !t.is_empty()) { Some(t) => format!("{repo}:{t}"), None => repo };
     if !g.images.iter().any(|i| i.name == full) {
-        g.images.push(Image { name: full, ..src });
+        g.images.push(Image { name: full.clone(), ..src });
     }
+    crate::events::emit_event(&a.events, "image", "tag", &full, json!({"name": full}));
     StatusCode::CREATED.into_response()
 }
 
@@ -280,6 +300,7 @@ pub(crate) async fn image_delete(State(a): State<App>, Path(name): Path<String>)
     if g.images.len() == before {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
     }
+    crate::events::emit_event(&a.events, "image", "delete", &bare, json!({"name": bare}));
     let untagged = untagged.unwrap_or_else(|| format!("{bare}:latest"));
     Json(json!([{ "Untagged": untagged }, { "Deleted": format!("sha256:{}", fake_id(&bare)) }])).into_response()
 }
@@ -447,12 +468,14 @@ pub(crate) async fn image_load(State(a): State<App>, body: axum::body::Bytes) ->
     let img = Image {
         name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch,
         cmd: cmd.clone(), env: env.clone(), entrypoint: entrypoint.clone(), workdir: workdir.clone(),
+        created: now_secs(), ..Default::default()
     };
     // Persist a dd-image.json so the image round-trips through `discover_images` after a daemon restart.
     let mut dd = json!({ "name": name, "cmd": cmd, "env": env, "entrypoint": entrypoint, "workdir": workdir });
     if darwin { dd["os"] = json!("darwin"); }
     let _ = std::fs::write(target.join("dd-image.json"), dd.to_string());
     register_image(&a, img).await;
+    crate::events::emit_event(&a.events, "image", "load", &name, json!({"name": name}));
     Json(json!({ "stream": format!("Loaded image: {}", repo_tag(&name)) })).into_response()
 }
 
@@ -479,7 +502,7 @@ pub(crate) async fn image_import(a: App, repo: String, tag: String, src: &str, b
     }
     let arch = detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64);
     let cmd = default_shell(&rootfs);
-    let img = Image { name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd: cmd.clone(), ..Default::default() };
+    let img = Image { name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd: cmd.clone(), created: now_secs(), ..Default::default() };
     let _ = std::fs::write(target.join("dd-image.json"), json!({ "name": name, "cmd": cmd }).to_string());
     register_image(&a, img).await;
     import_progress(Ok(format!("sha256:{}", fake_id(&name))))

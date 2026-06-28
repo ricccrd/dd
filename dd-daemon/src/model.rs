@@ -39,6 +39,8 @@ pub(crate) struct Image {
     pub(crate) env: Vec<String>,        // "K=V" entries (ENV)
     pub(crate) entrypoint: Vec<String>, // ENTRYPOINT (prepended to the command)
     pub(crate) workdir: String,         // WORKDIR / Config.WorkingDir
+    pub(crate) created: i64,            // unix secs; image creation/discovery time
+    pub(crate) labels: std::collections::HashMap<String, String>, // LABEL + build --label
 }
 
 
@@ -119,6 +121,12 @@ pub(crate) struct Vol {
     pub(crate) name: String,
     pub(crate) mountpoint: String,
     pub(crate) created_at: i64,
+    #[serde(default)]
+    pub(crate) driver: String, // `docker volume create --driver` (default "local")
+    #[serde(default)]
+    pub(crate) options: std::collections::HashMap<String, String>, // --opt
+    #[serde(default)]
+    pub(crate) labels: std::collections::HashMap<String, String>, // --label
 }
 
 

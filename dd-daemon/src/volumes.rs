@@ -32,8 +32,9 @@ use ddjit::{Guest, PortMap, SpawnConfig, Volume};
 // ---- volumes ---------------------------------------------------------------
 
 pub(crate) fn vol_json(v: &Vol) -> Value {
-    json!({"Name": v.name, "Driver": "local", "Mountpoint": v.mountpoint,
-        "CreatedAt": fmt_rfc3339(v.created_at), "Scope": "local", "Labels": {}, "Options": {}})
+    let driver = if v.driver.is_empty() { "local".to_string() } else { v.driver.clone() };
+    json!({"Name": v.name, "Driver": driver, "Mountpoint": v.mountpoint,
+        "CreatedAt": fmt_rfc3339(v.created_at), "Scope": "local", "Labels": v.labels, "Options": v.options})
 }
 
 pub(crate) async fn volumes_list(State(a): State<App>) -> Json<Value> {
@@ -42,22 +43,32 @@ pub(crate) async fn volumes_list(State(a): State<App>) -> Json<Value> {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct VolumeCreateBody { #[serde(rename = "Name")] name: Option<String> }
+pub(crate) struct VolumeCreateBody {
+    #[serde(rename = "Name")] name: Option<String>,
+    #[serde(rename = "Driver")] driver: Option<String>,
+    #[serde(rename = "DriverOpts")] driver_opts: Option<HashMap<String, String>>,
+    #[serde(rename = "Labels")] labels: Option<HashMap<String, String>>,
+}
 
 pub(crate) async fn volumes_create(State(a): State<App>, Json(body): Json<VolumeCreateBody>) -> Response {
     let name = body.name.filter(|n| !n.is_empty()).unwrap_or_else(|| format!("vol_{}", fake_id("v")[..12].to_string()));
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
         return (StatusCode::BAD_REQUEST, Json(json!({"message": "invalid volume name"}))).into_response();
     }
+    let driver = body.driver.filter(|d| !d.is_empty()).unwrap_or_else(|| "local".into());
+    let options = body.driver_opts.unwrap_or_default();
+    let labels = body.labels.unwrap_or_default();
     let mountpoint = PathBuf::from(&a.volumes_dir).join(&name);
     let _ = std::fs::create_dir_all(&mountpoint);
     let mut g = a.inner.lock().await;
     let v = if let Some(existing) = g.volumes.iter().find(|v| v.name == name).cloned() {
         existing
     } else {
-        let v = Vol { name: name.clone(), mountpoint: mountpoint.to_string_lossy().into_owned(), created_at: now_secs() };
+        let v = Vol { name: name.clone(), mountpoint: mountpoint.to_string_lossy().into_owned(), created_at: now_secs(),
+            driver, options, labels };
         g.volumes.push(v.clone());
         save_state(&g, &a.state_path);
+        crate::events::emit_event(&a.events, "volume", "create", &name, json!({"driver": "local"}));
         v
     };
     (StatusCode::CREATED, Json(vol_json(&v))).into_response()
@@ -84,6 +95,7 @@ pub(crate) async fn volume_delete(State(a): State<App>, Path(name): Path<String>
     if g.volumes.len() != before {
         let _ = std::fs::remove_dir_all(PathBuf::from(&a.volumes_dir).join(&name));
         save_state(&g, &a.state_path);
+        crate::events::emit_event(&a.events, "volume", "destroy", &name, json!({"driver": "local"}));
         StatusCode::NO_CONTENT.into_response()
     } else {
         (StatusCode::NOT_FOUND, Json(json!({"message": format!("no such volume: {name}")}))).into_response()
