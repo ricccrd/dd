@@ -23,6 +23,43 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 // Emulated pipe-buffer sizes for F_SETPIPE_SZ/F_GETPIPE_SZ (macOS has no pipe-size fcntl): we record
 // the requested (page-rounded) size per-fd and report it back, so size-probing programs see it stick.
 static int g_pipesz[1024];
+// Configurable fsync durability policy (S3DB_DURABILITY=none|fast|strict), read once and cached.
+//   0 = fast   (DEFAULT, and when env unset): plain fsync() -- the macOS fast path, unchanged legacy
+//               behavior. NOTE: a plain fsync() only reaches the drive's write cache on macOS; this is
+//               survives-process-crash, NOT survives-host-power-loss. We deliberately do NOT map
+//               fsync->F_FULLFSYNC by default: a single F_FULLFSYNC is ~3 ms (160x a plain fsync) and
+//               collapses sqlite commit throughput ~35-100x. Default must stay `fast`.
+//   1 = none   no-op barrier (return success without syncing) -- for ephemeral/CI containers, which are
+//               page-cache-coherent for any reader but NOT host-crash-durable. ~2.9x sqlite insert tps.
+//   2 = strict fcntl(fd, F_FULLFSYNC) for real on-platter durability (falls back to fsync on non-reg fds).
+static int s3db_durability(void) {
+    static int mode = -1;
+    if (__builtin_expect(mode < 0, 0)) {
+        const char *e = getenv("S3DB_DURABILITY");
+        int m = 0; // default == fast == legacy
+        if (e) {
+            if (!strcmp(e, "none")) m = 1;
+            else if (!strcmp(e, "strict")) m = 2;
+            else m = 0; // "fast" or anything unrecognized -> fast (safe default)
+        }
+        mode = m;
+    }
+    return mode;
+}
+// Route fsync/fdatasync/sync_file_range (82/83/84) through the durability policy. Returns 0 on success
+// or -errno (Linux ABI convention used by the caller's G_RET). `fast`/default is byte-identical to the
+// legacy `fsync((int)fd) < 0 ? -errno : 0` path.
+static uint64_t s3db_sync_fd(int fd) {
+    switch (s3db_durability()) {
+        case 1: return 0; // none: no-op barrier
+        case 2: // strict: real host-crash durability; fall back to fsync if F_FULLFSYNC unsupported
+            if (fcntl(fd, F_FULLFSYNC, 0) == 0) return 0;
+            // EINVAL/ENOTSUP on non-regular fds (pipes, sockets, etc.) -> plain fsync
+            return fsync(fd) < 0 ? (uint64_t)(-errno) : 0;
+        default: // 0 fast (== legacy default)
+            return fsync(fd) < 0 ? (uint64_t)(-errno) : 0;
+    }
+}
 // Map a Linux `semctl` cmd to the macOS one: the GET*/SET* values differ (Linux GETVAL=12/SETVAL=16,
 // macOS GETVAL=5/SETVAL=8); IPC_RMID/SET/STAT (0/1/2) are the same.
 static int sem_cmd_l2m(int c) {
@@ -1564,10 +1601,10 @@ static void service(struct cpu *c) {
         G_RET(c) = 0;
         // sync
         break;
-    // fsync
-    case 82: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
-    // fdatasync -> fsync (no macOS fdatasync)
-    case 83: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break;
+    // fsync -- durability policy (S3DB_DURABILITY): default/fast == plain fsync() (legacy path)
+    case 82: G_RET(c) = s3db_sync_fd((int)a0); break;
+    // fdatasync -> fsync (no macOS fdatasync); same durability policy
+    case 83: G_RET(c) = s3db_sync_fd((int)a0); break;
     // utimensat(dirfd, path, times, flags)
     case 88: {
         struct timespec *ts = (struct timespec *)a2;
@@ -1840,7 +1877,20 @@ static void service(struct cpu *c) {
         break;
     case 227: // msync: stores through a MAP_SHARED mapping are already in the unified page cache, so the
         // file is coherent without an explicit flush; treat as success (avoids a spurious -ENOSYS).
-        G_RET(c) = 0;
+        // Default/fast/none keep the no-op (page-cache coherent). Only `strict` issues a real host
+        // msync for on-platter writeback durability, translating Linux MS_* flags to macOS (macOS
+        // MS_SYNC=16 != Linux 4; MS_ASYNC=1/MS_INVALIDATE=2 match), tolerating EINVAL.
+        if (s3db_durability() == 2) {
+            int lf = (int)a2, mf = 0;
+            if (lf & 0x1) mf |= MS_ASYNC;       // Linux MS_ASYNC=1
+            if (lf & 0x2) mf |= MS_INVALIDATE;  // Linux MS_INVALIDATE=2
+            if (lf & 0x4) mf |= MS_SYNC;        // Linux MS_SYNC=4 -> macOS MS_SYNC(16)
+            if (!(mf & (MS_ASYNC | MS_SYNC))) mf |= MS_SYNC; // default to a sync flush
+            int r = msync((void *)a0, (size_t)a1, mf);
+            G_RET(c) = (r < 0 && errno != EINVAL) ? (uint64_t)(-errno) : 0;
+        } else {
+            G_RET(c) = 0;
+        }
         break;
     case 228:
     case 229:
@@ -3502,7 +3552,7 @@ static void service(struct cpu *c) {
         G_RET(c) = setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0
                        ? (uint64_t)(-errno) : 0;
         break;
-    case 84: G_RET(c) = fsync((int)a0) < 0 ? (uint64_t)(-errno) : 0; break; // sync_file_range -> fsync
+    case 84: G_RET(c) = s3db_sync_fd((int)a0); break; // sync_file_range -> fsync, durability policy
     case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
     case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
     case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
