@@ -39,6 +39,9 @@ pub(crate) struct CreateBody {
     #[serde(rename = "Tty")] tty: Option<bool>,
     #[serde(rename = "WorkingDir")] working_dir: Option<String>,
     #[serde(rename = "Labels")] labels: Option<HashMap<String, String>>,
+    // `docker run --user U[:G]` — docker puts the "uid:gid" / "name" string in Config.User (top-level
+    // of the create body, alongside Image/Cmd/Env). Stored on the Container and turned into DD_UID/DD_GID.
+    #[serde(rename = "User")] user: Option<String>,
     #[serde(rename = "HostConfig")] host_config: Option<HostConfig>,
 }
 
@@ -107,6 +110,7 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         created: now_secs(), tty,
         name: cq.name.unwrap_or_default().trim_start_matches('/').to_string(),
         working_dir, env,
+        user: body.user.unwrap_or_default(),
         labels: body.labels.unwrap_or_default(),
         network_mode: hc.as_ref().and_then(|h| h.network_mode.clone()).unwrap_or_default(),
         status: "created".into(), ..Default::default()
@@ -362,11 +366,12 @@ pub(crate) async fn exec_start(State(a): State<App>, Path(id): Path<String>, req
         temp.id = id.clone();
         temp.cmd = exec.cmd.clone();
         temp.tty = exec.tty;
-        // `docker exec -e/-w`: the exec inherits the container's env and adds `-e` overrides (later wins),
-        // and `-w` overrides the working dir. spawn_cfg reads temp.env / temp.working_dir, so set them here.
-        // (`-u`/User is captured on the Exec but not applied: SpawnConfig has no user/uid field yet.)
+        // `docker exec -e/-w/-u`: the exec inherits the container's env and adds `-e` overrides (later
+        // wins), `-w` overrides the working dir, and `-u U[:G]` overrides the run user. spawn_cfg reads
+        // temp.env / temp.working_dir / temp.user (-> DD_UID/DD_GID), so set them on the temp here.
         temp.env.extend(exec.env.iter().cloned());
         if !exec.working_dir.is_empty() { temp.working_dir = exec.working_dir.clone(); }
+        if !exec.user.is_empty() { temp.user = exec.user.clone(); }
         let live = Live::new(exec.tty);
         g.live.insert(id.clone(), live.clone());
         if let Some(e) = g.execs.get_mut(&id) { e.started = true; }
@@ -857,7 +862,9 @@ fn container_sizes(c: &Container) -> (i64, i64) {
 /// Apply `docker ps --filter`. `f` is the decoded `filters` map (`{"status":[..],"name":[..],"label":[..]}`).
 /// Within a filter type the values are OR'd; `label` entries are AND'd (each must match). `name` is a
 /// substring match against the container's effective name; `label` matches `key` or `key=value`.
-fn ps_match(c: &Container, name: &str, f: &HashMap<String, Vec<String>>) -> bool {
+/// `before_ts`/`since_ts` are the `created` timestamps of the containers named by `before=`/`since=`
+/// (resolved by the caller, which holds the full container map); `None` => that key is absent/unresolved.
+fn ps_match(c: &Container, name: &str, f: &HashMap<String, Vec<String>>, before_ts: Option<i64>, since_ts: Option<i64>) -> bool {
     if let Some(vals) = f.get("status") { if !vals.iter().any(|v| v == &c.status) { return false; } }
     if let Some(vals) = f.get("name") { if !vals.iter().any(|v| name.contains(v.as_str())) { return false; } }
     if let Some(vals) = f.get("label") {
@@ -869,6 +876,22 @@ fn ps_match(c: &Container, name: &str, f: &HashMap<String, Vec<String>>) -> bool
             if !ok { return false; }
         }
     }
+    // `id=`: full-or-prefix match on the container id (docker accepts a leading prefix).
+    if let Some(vals) = f.get("id") { if !vals.iter().any(|v| c.id.starts_with(v.as_str())) { return false; } }
+    // `ancestor=`: the image the container was created from (repo[:tag] or a raw image ref).
+    if let Some(vals) = f.get("ancestor") {
+        if !vals.iter().any(|v| c.image == *v || ref_name(&c.image) == ref_name(v)) { return false; }
+    }
+    // `exited=N`: containers that exited with code N (only meaningful for the exited state).
+    if let Some(vals) = f.get("exited") {
+        if !vals.iter().any(|v| v.parse::<i64>().map_or(false, |n| c.status == "exited" && c.exit_code == n)) { return false; }
+    }
+    // `health=`: dd models no healthcheck, so every container is effectively `none`; any other value
+    // (starting/healthy/unhealthy) matches nothing.
+    if let Some(vals) = f.get("health") { if !vals.iter().any(|v| v == "none") { return false; } }
+    // `before=`/`since=`: created strictly before / after the referenced container (by create time).
+    if let Some(ts) = before_ts { if c.created >= ts { return false; } }
+    if let Some(ts) = since_ts { if c.created <= ts { return false; } }
     true
 }
 
@@ -912,11 +935,24 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
     let want_size = q_truthy(&q.size);
     let matched: Vec<Container> = {
         let g = a.inner.lock().await;
+        // `before=`/`since=` name a reference container (by id-prefix or name); resolve each to that
+        // container's `created` time so ps_match can compare create-order against it.
+        let resolve = |key: &str| -> Option<i64> {
+            filters.get(key).and_then(|vals| vals.first()).and_then(|r| {
+                g.containers.values()
+                    .find(|c| c.id.starts_with(r.as_str()) || &c.name == r)
+                    .map(|c| c.created)
+            })
+        };
+        let before_ts = resolve("before");
+        let since_ts = resolve("since");
+        // A before/since (like status) filter implies "show all matching", not just running.
+        let order_filter = filters.contains_key("before") || filters.contains_key("since");
         g.containers.values()
-            .filter(|c| all || status_filter || c.status == "running")
+            .filter(|c| all || status_filter || order_filter || c.status == "running")
             .filter(|c| {
                 let name = if c.name.is_empty() { c.id[..12.min(c.id.len())].to_string() } else { c.name.clone() };
-                ps_match(c, &name, &filters)
+                ps_match(c, &name, &filters, before_ts, since_ts)
             })
             .cloned().collect()
     };

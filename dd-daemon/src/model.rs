@@ -71,6 +71,8 @@ pub(crate) struct Container {
     #[serde(default)]
     pub(crate) network_mode: String,
     #[serde(default)]
+    pub(crate) user: String, // `docker run --user` / `docker exec -u` -> DD_UID/DD_GID
+    #[serde(default)]
     pub(crate) started_at: i64, // unix secs, set on start (inspect State.StartedAt)
     #[serde(default)]
     pub(crate) finished_at: i64, // unix secs, set on stop/natural exit (inspect State.FinishedAt)

@@ -51,6 +51,18 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
     if c.network_mode == "none" { cfg.env.push(("DD_NET_ISOLATE".into(), "1".into())); }
     // netstack PR2 — per-network AF_UNIX virtual switch: container<->container TCP for in-subnet peers.
     if let Some((netid, ip)) = bridge { cfg.env.push(("DD_NETBR".into(), netid)); cfg.env.push(("DD_IP".into(), ip)); }
+    // `docker run --user U[:G]` / `docker exec -u U[:G]`: surface the requested uid/gid to the JIT, which
+    // makes the guest observe them via getuid/getgid/setuid. Only numeric ids are honored; a `name` we
+    // can't resolve (no passwd lookup here) is skipped (the guest then keeps its default identity). When
+    // no group is given, the gid mirrors the uid (the common rootless case for this DBT).
+    if !c.user.is_empty() {
+        let (us, gs) = c.user.split_once(':').map_or((c.user.as_str(), None), |(u, g)| (u, Some(g)));
+        if let Ok(uid) = us.parse::<u32>() {
+            let gid = gs.and_then(|g| g.parse::<u32>().ok()).unwrap_or(uid);
+            cfg.env.push(("DD_UID".into(), uid.to_string()));
+            cfg.env.push(("DD_GID".into(), gid.to_string()));
+        }
+    }
     cfg.volumes = c.binds.iter().filter_map(|b| b.split_once(':').map(|(host, dst)| {
         // A bind whose source isn't an absolute path is a named volume.
         let host = if host.starts_with('/') {
