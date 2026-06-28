@@ -355,6 +355,12 @@ fn sandbox() -> Group {
         // socket family: socket/bind/getsockname/sendto/recvfrom on a sentry-owned UDP loopback socket.
         src("sentry-net", "sentry_net.c").out("sentry_net echo=datagram-echo-42 len=16\n"),
         src("sentry-net-untrusted", "sentry_net.c").out("sentry_net echo=datagram-echo-42 len=16\n").untrusted(),
+        // clone-FORK lane: a single fork() whose CHILD writes a /tmp file on a freshly CAS-claimed lane
+        // (sentry_fork_child drops the inherited lane) while the PARENT reaps via wait4 then reads it back
+        // on its own lane. Exercises lane-reclaim + the 8-ring pool under two live workers + owner-gated
+        // reap -- the riskiest forwarding path. Same golden under the split as trusted (sum == sentry_fs).
+        src("sentry-fork", "sentry_fork.c").out("sentry_fork child_exit=7 readback=ok sum=32640\n"),
+        src("sentry-fork-untrusted", "sentry_fork.c").out("sentry_fork child_exit=7 readback=ok sum=32640\n").untrusted(),
     ])
 }
 
