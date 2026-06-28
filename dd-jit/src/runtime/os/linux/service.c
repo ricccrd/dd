@@ -196,6 +196,35 @@ static void service(struct cpu *c) {
     if (g_trace)
         fprintf(stderr, "[sys] %llu (%llx,%llx,%llx)\n", (unsigned long long)nr, (unsigned long long)a0,
                 (unsigned long long)a1, (unsigned long long)a2);
+    // S2 path-resolution-cache invalidation: bump the epoch BEFORE dispatch on any syscall that mutates
+    // the FS namespace, so no cached guest->host string mapping can survive a create/unlink/rename/mkdir/
+    // symlink (over-invalidates, never under -- when in doubt, the next lookup MISSES and re-resolves).
+    // Legacy x86 forms (open/mkdir/rename/...) were already normalized to these *at numbers by G_NORMALIZE.
+    switch (nr) {
+    case 33:  // mknodat
+    case 34:  // mkdirat
+    case 35:  // unlinkat (covers rmdir via AT_REMOVEDIR)
+    case 36:  // symlinkat
+    case 37:  // linkat
+    case 38:  // renameat
+    case 39:  // umount2
+    case 40:  // mount
+    case 276: // renameat2
+        res_bump();
+        break;
+    case 56: // openat: a2 = Linux flags. O_CREAT (0x40) adds a name. In OVERLAY mode a write-open
+             // (O_WRONLY/O_RDWR, a2&3) copies the file lower->upper, RELOCATING its resolved host path
+             // -- so it must invalidate too, or a cached lower path goes stale (flat rootfs: no copy-up).
+        if ((a2 & 0x40) || (g_nlower && (a2 & 3))) res_bump();
+        break;
+    case 437: { // openat2: flags live in open_how.flags (a2 -> struct open_how *), before its case rewrites a2
+        uint64_t *how = (uint64_t *)a2;
+        if (how && ((how[0] & 0x40) || (g_nlower && (how[0] & 3)))) res_bump();
+        break;
+    }
+    default:
+        break;
+    }
     switch (nr) {
     // ===================== I/O — read/write/seek (+ eventfd/timerfd/signalfd fd redirection) =====================
     case 62: {
@@ -1992,6 +2021,8 @@ static void service(struct cpu *c) {
             // cache -> the intermittent fork+exec SIGBUS. pthread_jit_write_protect_np(1) = RX (executable).
             pthread_jit_write_protect_np(1);
             G_SHADOW_RESET(c); // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
+            rc_reset();        // S2: drop the inherited (COW) path-resolution cache so the child can never
+                               // serve a guest->host mapping that the parent populated before the FS diverged
             g_ndirs = 0;       // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
                                // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
 #ifdef DD_HAS_MACH_EXC
@@ -2137,8 +2168,11 @@ static void service(struct cpu *c) {
             break;
         }
         pid_t pid = fork();
-        // §B: same -- child drops the inherited shadow
-        if (pid == 0) G_SHADOW_RESET(c);
+        // §B: same -- child drops the inherited shadow; S2: and the inherited path-resolution cache
+        if (pid == 0) {
+            G_SHADOW_RESET(c);
+            rc_reset();
+        }
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }

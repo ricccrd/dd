@@ -6,16 +6,34 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 
 // Linux AT_FDCWD(-100) -> macOS AT_FDCWD; real dir-fds pass through unchanged.
 #define ATFD(a) (((int)(a) == -100) ? AT_FDCWD : (int)(a))
+// ---- S2 path-resolution cache (forward decls; impl after mc_hash, which it reuses) ----
+// Memoizes the absolute guest-path -> resolved host-path STRING only (the real syscall still
+// runs on the result, so existence/contents are never cached). A global epoch -- bumped by
+// service.c on every FS-namespace mutation -- invalidates the whole cache; rc_reset() hard-clears
+// it in the fork child so a child never serves the parent's stale mappings. Kill: DD_NOPATHCACHE=1.
+static int rc_lookup(const char *g, char *out, size_t n);
+static void rc_store(const char *g, const char *host);
+static void res_bump(void);
+static void rc_reset(void);
 // Rewrite ABSOLUTE guest paths into the rootfs; relative paths pass through (resolved
 // against the dir-fd by the *at syscall, e.g. ls stat-ing entries relative to a dir).
 static const char *atpath(int dirfd, const char *raw, char *buf, size_t n) {
     if (!raw) return raw;
     // absolute -> follow symlinks rootfs-relative + confine
     if (raw[0] == '/') {
+        // S2: serve the memoized host path (only when a rootfs is configured -- without one the
+        // resolvers below return `raw` untouched and leave `buf` garbage, so there's nothing to cache).
+        if (g_rootfs && rc_lookup(raw, buf, n)) return buf;
         if (g_nlower) {
             overlay_resolve(raw, buf, n, 0);
+            if (g_rootfs) rc_store(raw, buf);
             return buf;
         // overlay: search upper+lowers
+        }
+        if (g_rootfs) {
+            xresolve_exec(raw, buf, n);
+            rc_store(raw, buf);
+            return buf;
         }
         return xresolve_exec(raw, buf, n);
     }
@@ -193,6 +211,86 @@ static void ac_evict(const char *p) {
     if (e->hash == mc_hash(p) && !strcmp(e->path, p)) e->hash = 0;
     CUL;
 }
+
+// ---- S2 path-resolution cache (impl) ----
+// The metadata caches above (mc_/rl_/ac_) memoize the *result* of a syscall, keyed on the resolved
+// HOST path -- so the caller must FIRST pay the full atpath()/realpath()+lstat() walk to obtain that
+// key. This cache fills that gap: it memoizes the walk itself (guest abs path -> host path string),
+// which is a pure function of the FS namespace (dirs + symlinks). The real syscall ALWAYS still runs
+// on the returned string, so a stale entry can never fabricate existence or contents -- the only
+// failure mode is returning the wrong host *path*, which the epoch guard below prevents:
+//   * Whole-cache invalidation by epoch: service.c bumps g_res_epoch on EVERY namespace mutation
+//     (mknod/mkdir/unlink/rmdir/symlink/link/rename/(u)mount, open/openat2 w/ O_CREAT). A lookup
+//     compares epochs, so every entry stamped before the mutation instantly misses. This covers all
+//     stale-entry hazards conservatively (over-invalidates, never under): create-after-negative,
+//     delete-after-positive, rename, mkdir/rmdir -- when in doubt we MISS and re-resolve.
+//   * Hard reset on fork (rc_reset, called in the clone/clone3 child) so a child never serves a
+//     mapping the parent populated before the FS diverged.
+#define RCACHE_N 8192
+static struct rcent {
+    uint64_t hash;
+    uint32_t epoch;
+    char guest[200];
+    char host[256];
+} g_rc[RCACHE_N];
+static uint32_t g_res_epoch = 1; // 0 is reserved as "never matches"
+// PROF
+static uint64_t g_rc_hits, g_rc_miss;
+// kill switch (read once): DD_NOPATHCACHE=1 -> exact baseline resolution, no memoization.
+static int res_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DD_NOPATHCACHE");
+        on = (e && e[0] == '1') ? 0 : 1;
+    }
+    return on;
+}
+// Bump the epoch -> the whole cache misses. Skip 0 (the reserved "never matches" stamp).
+// Locked under threads (same model as mc_*) so a bump can't race a concurrent lookup's epoch read.
+static void res_bump(void) {
+    CLK;
+    g_res_epoch++;
+    if (!g_res_epoch) g_res_epoch = 1;
+    CUL;
+}
+// fork child: drop every inherited (COW) entry so it cannot outlive a parent-side mutation.
+static void rc_reset(void) {
+    CLK;
+    memset(g_rc, 0, sizeof g_rc);
+    g_res_epoch = 1;
+    g_rc_hits = g_rc_miss = 0;
+    CUL;
+}
+static int rc_lookup(const char *g, char *out, size_t n) {
+    if (!res_enabled() || !g || g[0] != '/' || strlen(g) >= sizeof(((struct rcent *)0)->guest)) return 0;
+    CLK;
+    int hit = 0;
+    uint64_t h = mc_hash(g);
+    struct rcent *e = &g_rc[h & (RCACHE_N - 1)];
+    if (e->hash == h && e->epoch == g_res_epoch && !strcmp(e->guest, g)) {
+        snprintf(out, n, "%s", e->host);
+        g_rc_hits++;
+        hit = 1;
+    }
+    CUL;
+    return hit;
+}
+static void rc_store(const char *g, const char *host) {
+    if (!res_enabled() || !g || g[0] != '/' || !host) return;
+    // over-length paths simply bypass the cache (fixed-size slot) -> re-resolved every time, safely.
+    if (strlen(g) >= sizeof(((struct rcent *)0)->guest) || strlen(host) >= sizeof(((struct rcent *)0)->host))
+        return;
+    CLK;
+    uint64_t h = mc_hash(g);
+    struct rcent *e = &g_rc[h & (RCACHE_N - 1)];
+    e->hash = h;
+    e->epoch = g_res_epoch; // stamp with the CURRENT epoch; a later mutation invalidates it
+    strcpy(e->guest, g);
+    strcpy(e->host, host);
+    g_rc_miss++;
+    CUL;
+}
+
 static void fd_setpath(int fd, const char *p) {
     if (fd >= 0 && fd < 1024 && p && strlen(p) < 192) strcpy(g_fdpath[fd], p);
 }
