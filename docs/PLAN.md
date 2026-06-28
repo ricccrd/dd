@@ -2,7 +2,7 @@
 
 `dd` is a Cargo workspace: `dd-jit` (JIT runtime + bindings), `dd-daemon` (Docker Engine API), and the desktop
 surface. **This is the only plan — a work list of what is NOT yet implemented.** Subplans in
-[`docs/design/`](design/). Validate: `make test` (**249-green** / 3 engines), `make test-docker[-full|-net|-fn]`,
+[`docs/design/`](design/). Validate: `make test` (**257-green** / 3 engines), `make test-docker[-full|-net|-fn]`,
 `make test-macos`, `make test-realsw`, `make coverage`.
 
 > **The clearable JIT + daemon work is DONE (see git history):** the wave-1–6 opt sweep, wave-5 server bugs, the
@@ -11,15 +11,22 @@ surface. **This is the only plan — a work list of what is NOT yet implemented.
 > (fs + socket family + N-ring pool + fork/exec/wait + sendmsg/SCM_RIGHTS + poll/epoll + daemon `--security-opt`
 > wiring), the **sqlite RAM temp-file backing**, **`-v :ro` enforcement**, postgres B3/B4, the munmap guard-tail
 > leak, the **vfs.c / translate.c / daemon containers.rs refactor splits**, and the full **Docker-API** fidelity
-> (HostConfig / build-cache / `commit` / `--name`·rm·exec·`--rm`·events·logs-interleave·`:ro`).
+> (HostConfig / build-cache / `commit` / `--name`·rm·exec·`--rm`·events·logs-interleave·`:ro`), plus per-scenario DD_STATE/DD_VOLUMES test isolation.
 
-## In flight (critical) — validating the landed sentry
+## Sentry: VALIDATED ✓
 
-The sentry code is fully landed and proven **inert when gated off**, but it had **zero `DDJIT_UNTRUSTED` test
-coverage** — it was never actually executed, so "run untrusted images" is code-complete but **unproven**. An
-agent is adding harness `.untrusted()` support + golden tests (fs read/write/stat, socket echo, getdents —
-sandbox-forwarded output compared against the trusted baseline) and statically shaking out the ring/forwarding
-path. Until these pass, treat the sentry as unvalidated.
+The sentry now has live `DDJIT_UNTRUSTED` coverage — golden guests (`sentry_fs`: open/write/read/pread/lseek/
+fstat/getdents64; `sentry_net`: AF_INET UDP bind/getsockname/sendto/recvfrom) run sandbox-forwarded and match
+the trusted baseline on **both** linux engines (matrix 257). "Run untrusted images" is now **proven**, not just
+code-complete. Remaining sentry items are edge/perf only: futex wakeup, per-process fd tables, eventfd/timerfd
+forwarding, sendmmsg — the sandbox is sound for the common path.
+
+## Now in flight
+
+- **service.c io-category split** (refactoring) — extract the fd-I/O syscalls into `service/io.c`; gate-verified,
+  reverted if threads/mutex/tls/contention regress.
+- **sentry threat-model / security review** → `docs/design/sentry-security.md` (adversarial worker→ring +
+  Seatbelt analysis).
 
 ## Residual — NOT clearable by a mechanical agent pass
 
