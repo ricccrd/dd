@@ -15,8 +15,9 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
    per-block `g_trace` dump). Gate: matrix green both engines.
 2. **Networking Phase-2b — netstack** → `docs/design/netstack.md`. External egress already works; the gap is
    L3 identity + reachability. **PR1 ✅** (daemon IPAM `172.18/12`, per-container IP, `--network` join →
-   docker-net 5/7). **Remaining: PR2** (per-network AF_UNIX virtual switch + name→IP DNS → 7/7) *(in
-   flight)*; then the optional in-process `smoltcp` stack behind `DD_NETSTACK`.
+   docker-net 5/7). PR2 (per-network AF_UNIX virtual switch) landed but **unverified** vs docker-net 7/7.
+   **Remaining:** name→IP embedded DNS (`reach-by-name`), confirm 7/7, then the optional in-process
+   `smoltcp` stack behind `DD_NETSTACK`.
 3. **Untrusted-guest isolation — sentry process-split** → `docs/design/sentry-split.md`. **No PR yet.** The
    trust boundary is one line (`run_guest`→`service(c)`); route it through `syscall_route(c)` on
    `g_untrusted`, split `service()` by authority (compute/mem local, fs/net/proc → sentry over an SPSC
@@ -31,7 +32,7 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
 
 ## Deep bugs (root-caused; fixes scoped)
 
-- **fork()+execve() non-PIE crash (gcc toolchain).** `execve` biases a non-PIE `ET_EXEC` off its fixed
+- **fork()+execve() non-PIE crash (victims: gcc toolchain; postgres' `gosu`).** `execve` biases a non-PIE `ET_EXEC` off its fixed
   vaddr (`__PAGEZERO` forces it); post-`fork` the dense layout makes its un-relocated absolute refs fault.
   Landed: execve address-space teardown + the dispatcher PC-redirect (advances code-jump fault → data-ref
   fault). `-pagezero_size 0x1000` + pinning the non-PIE low **fully fixes it** but broke the PIE common case
@@ -47,30 +48,20 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
   execute stays RX in the page tables → survives fork). Also closes the `soak/smc` RWX gap below. **Spine
   designed; activation deferred** — needs ~20 frontend emit sites routed through `cw()` first (else the live
   alias APRR-faults every block); the inert spine was reverted from the safe batch.
-- **x86 busybox `sort` SIGSEGV** — ✅ **FIXED** (committed, matrix 240 green): the `0x90` NOP
-  handler ignored `REX.B`, so `49 90` (`xchg rax,r8`, the `call malloc; xchg %rax,%r8` allocator idiom) was
-  dropped → stale `r8` → wild memset → SIGSEGV. Differential-proven (qemu 66 vs jit 153); data-INDEPENDENT
-  (the "large input" framing was an empty-piped-stdin artifact). See `docs/design/fix-x86-busybox-sort.md`.
-  *Secondary (tracked, unconfirmed):* the global monotonic `g_lazymaps<4096` over-read/stack-grow budget
-  never resets — could bite huge workloads; see `dd-jit/docs/design/audit-x86-largeinput.md`.
+- **x86 large-input lazy-fault budget** (unconfirmed): the global monotonic `g_lazymaps<4096` over-read/
+  stack-grow budget never resets — could bite huge workloads. `dd-jit/docs/design/audit-x86-largeinput.md`.
 - **`soak/smc` / RWX guest-JIT pages.** `mmap(PROT_READ|WRITE|EXEC)` returns EPERM (W^X). Any guest that JITs
   its own code (JVM/V8/LuaJIT/.NET/PyPy) needs executable pages — fixed by the same dual-map cache (intercept
   RWX/`PROT_EXEC` maps, back with MAP_JIT, re-translate on writes). *(Endurance otherwise holds:
   `soak/{codecache,indirect,threadchurn,forkchurn,allocchurn}` pass.)*
-- **postgres:alpine** — root-caused: the initial loader `load_elf` had no `#!` check (entry is a shebang
-  script). **Fix landed** (shared `parse_shebang` in `jit_run`); next gap downstream is daemonize/initdb.
-  Daemon-side: the local `postgres` image's `dd-image.json` lacks `entrypoint`/`env`.
 
 ## Coverage gaps — syscalls
 
 *Source: `make coverage`. Static **178/323 handled** at last snapshot (many since landed).*
 - **Signals:** `rt_sigtimedwait`(137), `rt_sigsuspend`(133) — need guest-mask-aware signal waiting.
-- **Edge corners** (`edge` group; xfail-tracked, fix → XPASS) *(batch in flight: renameat2 flags, fallocate
-  PUNCH_HOLE, lseek SEEK_HOLE/DATA, O_TMPFILE, statfs/fstatfs layout, times, madvise MADV_DONTNEED, mprotect
-  PROT_NONE)*. Likely still after: **SCM_RIGHTS fd-passing** over AF_UNIX (cmsg translation — breaks
-  systemd/Docker/D-Bus), **abstract-namespace AF_UNIX** (`sun_path[0]==0` — X11/D-Bus/systemd),
-  `clock_nanosleep(TIMER_ABSTIME)` treated as relative (hangs), `MSG_NOSIGNAL` ignored (SIGPIPE instead of
-  EPIPE), `pipe2(O_DIRECT)` packet mode, `F_SETPIPE_SZ`, `/proc/self/fd` synth.
+- **Edge corners** (`edge` group; xfail-tracked): `madvise(MADV_DONTNEED)` doesn't zero anon pages (stale
+  reread), `mprotect` PROT_NONE is a no-op (no fault → RELRO/guard pages unenforced), `pipe2(O_DIRECT)`
+  packet mode (host-limited — macOS pipes can't frame writes), `/proc/self/fd` not synthesized.
 - **Host-limited (emulate or leave ENOSYS):** POSIX mqueue `mq_*`(180-185), `timer_create`/`timer_*`(107-111)
   *(could ride kqueue)*; `pidfd`/`io_uring`/NUMA/keyring/module/`ptrace` out of scope.
 
@@ -78,14 +69,13 @@ green** / 3 engines), `make test-docker[-full|-net]`, `make test-macos` (23/23),
 
 | Area | What's left | Pri |
 |------|-------------|:---:|
-| `docker stats` | real-ish CPU/mem + streaming *(in flight; runtime has no cgroup metrics → best-effort)* | P1 |
 | `docker logs` | `-f`/follow, `--since` (tail/timestamps/raw done) | P1 |
 | `docker ps` | `--size`, remaining `--filter` keys (status/name/label done) | P1 |
 | `docker exec` | `-u` (needs a `SpawnConfig` uid field), `--privileged` (`-e`/`-w`/`-d` done) | P1 |
 | `docker run` opts | `--user` (uid not applied), wider `HostConfig`: restart policy, `--cap-add`, `--device`, `--mount`, `--privileged` (`--label` done) | P2 |
 | `docker build` | BuildKit/layer cache (every build re-runs from base) — args/target/nocache/labels/digest-IDs done | P2 |
 | image inspect | surface `Config.Labels` (stored at build; inspect still emits `{}`) | P2 |
-| `docker cp` | non-default-driver named volumes (default `<volumes_dir>/<name>` *in flight*) | P3 |
+| `docker cp` | non-default-driver named volumes (default `<volumes_dir>/<name>` handled) | P3 |
 | IPC | `*ctl(IPC_STAT/IPC_SET)` introspection (macOS `*_ds` layout differs; ENOSYS today) | P3 |
 
 ## Platform limitations (macOS host — can't provide the Linux primitive; off the work-list)
