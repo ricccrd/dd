@@ -45,6 +45,21 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
     cfg.hostname = (!c.hostname.is_empty()).then(|| c.hostname.clone());
     cfg.mem_max = c.memory.max(0) as u64;
     cfg.pids_max = c.pids_limit.max(0) as u32;
+    // ---- JIT performance: developer-optimal defaults (see dd-daemon/PERFORMANCE.md) ----
+    // The transparent codegen/syscall speedups (addressing, lazy flags, traces, tier-up, inline
+    // clock_gettime/sigprocmask, epoll batching, path/openat caches, SSE->NEON, rep-string) are ON by
+    // default inside the JIT itself -- every container gets them, zero config, byte-identical output.
+    // Here the daemon enables the one CONTAINER-managed win: the persistent translated-code cache, so the
+    // 2nd+ run of an image skips translation (~-40% cold start). It is self-invalidating (keyed by image
+    // hash + engine version) and graceful-miss safe -> it can NEVER serve stale/wrong code, so the
+    // everyday developer needs no knowledge of it. Operators can disable it daemon-wide with DD_PCACHE=0;
+    // the cache lives under the dd home and is reported by `docker system df` / cleared by `system prune`.
+    if std::env::var("DD_PCACHE").as_deref() != Ok("0") {
+        let pdir = crate::util::dd_home().join("pcache");
+        let _ = std::fs::create_dir_all(&pdir);
+        cfg.env.push(("DDJIT_PCACHE".into(), "1".into()));
+        cfg.env.push(("DDJIT_PCACHE_DIR".into(), pdir.to_string_lossy().into_owned()));
+    }
     // `--network host` shares the host network (no per-container netns); otherwise isolate in one.
     cfg.netns = (c.network_mode != "host").then(|| c.id[..c.id.len().min(40)].to_string());
     // `--network none`: no external egress -- the JIT refuses non-loopback connects (DD_NET_ISOLATE).

@@ -319,7 +319,7 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
                 if parts.len() < 2 { cleanup(&ctx); return build_err(log, format!("{inst} needs a source and destination")); }
                 let dst = parts[parts.len() - 1];
                 let dst_guest = if dst.starts_with('/') { dst.to_string() } else { format!("{}/{}", workdir.trim_end_matches('/'), dst) };
-                let dst_host = archive_host_path(&rootfs.to_string_lossy(), &[], &dst_guest);
+                let dst_host = archive_host_path(&rootfs.to_string_lossy(), &[], "", &dst_guest);
                 let into_dir = dst.ends_with('/') || parts.len() > 2;
                 if into_dir { std::fs::create_dir_all(&dst_host).ok(); } else if let Some(p) = dst_host.parent() { std::fs::create_dir_all(p).ok(); }
                 // COPY --from=<stage>: source is a path inside that stage's rootfs; else the build context.
@@ -329,7 +329,7 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
                     None => ctx.clone(),
                 };
                 for src in &parts[..parts.len() - 1] {
-                    let src_host = if from_stage.is_some() { archive_host_path(&src_root.to_string_lossy(), &[], src) } else { src_root.join(src) };
+                    let src_host = if from_stage.is_some() { archive_host_path(&src_root.to_string_lossy(), &[], "", src) } else { src_root.join(src) };
                     if !matches!(std::process::Command::new("cp").arg("-a").arg(&src_host).arg(&dst_host).status(), Ok(s) if s.success()) {
                         cleanup(&ctx); return build_err(log, format!("{inst} {src}: not found")); }
                 }
@@ -345,7 +345,7 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
             }
             "WORKDIR" => {
                 workdir = if args.starts_with('/') { args.clone() } else { format!("{}/{}", workdir.trim_end_matches('/'), args) };
-                let wh = archive_host_path(&rootfs.to_string_lossy(), &[], &workdir);
+                let wh = archive_host_path(&rootfs.to_string_lossy(), &[], "", &workdir);
                 std::fs::create_dir_all(&wh).ok();
             }
             "CMD" => cmd = parse_exec_form(&args),
@@ -407,5 +407,22 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
 
 /// `POST /build/prune` — `docker builder prune`. dd has no build cache; report nothing reclaimed.
 pub(crate) async fn build_prune() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({"CachesDeleted": [], "SpaceReclaimed": 0}))
+    // `docker builder prune` / the build-cache portion of `docker system prune`. dd has no layer build
+    // cache, but the persistent JIT translated-code cache (~/.dd/pcache) lives in this slot (see
+    // system_df) — reclaim it here. It's safe to drop wholesale: every entry rebuilds on demand, keyed by
+    // binary hash, so this only forces a one-time re-translation on the next run of each image.
+    let dir = crate::util::dd_home().join("pcache");
+    let (mut deleted, mut reclaimed) = (Vec::new(), 0i64);
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let sz = e.metadata().ok().filter(|m| m.is_file()).map(|m| m.len() as i64);
+            if let Some(sz) = sz {
+                if std::fs::remove_file(e.path()).is_ok() {
+                    reclaimed += sz;
+                    deleted.push(e.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    axum::Json(serde_json::json!({"CachesDeleted": deleted, "SpaceReclaimed": reclaimed}))
 }

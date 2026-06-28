@@ -82,8 +82,24 @@ pub(crate) async fn system_df(State(a): State<App>) -> Json<Value> {
     let volumes: Vec<Value> = g.volumes.iter().map(|v| json!({
         "Name": v.name, "Driver": "local", "Mountpoint": v.mountpoint,
         "UsageData": {"Size": -1, "RefCount": -1}})).collect();
-    Json(json!({"LayersSize": layers, "Images": images, "Containers": containers,
-        "Volumes": volumes, "BuildCache": [], "BuilderSize": 0}))
+    // Emit BOTH shapes: the classic flat lists (older clients) AND the newer nested *Usage objects
+    // current clients (docker CLI / bollard) read — so `docker system df` and the GUI both populate.
+    let running = g.containers.values().filter(|c| c.status == "running").count() as i64;
+    let (nimg, nctr, nvol) = (images.len() as i64, containers.len() as i64, volumes.len() as i64);
+    // Persistent JIT translated-code cache (~/.dd/pcache, one <binid>.pcache per guest binary). It's the
+    // closest analogue to Docker's build cache, so we surface it in that slot: shown by `system df`,
+    // reclaimed by `system prune` / `builder prune` (see build_prune). Fully reclaimable (rebuilds on demand).
+    let (pc_size, pc_count) = std::fs::read_dir(crate::util::dd_home().join("pcache")).map(|rd|
+        rd.filter_map(|e| e.ok().and_then(|e| e.metadata().ok())).filter(|m| m.is_file())
+            .fold((0i64, 0i64), |(s, c), m| (s + m.len() as i64, c + 1))).unwrap_or((0, 0));
+    Json(json!({
+        "LayersSize": layers, "Images": images, "Containers": containers,
+        "Volumes": volumes, "BuildCache": [], "BuilderSize": pc_size,
+        "ImageUsage":      {"ActiveCount": nctr, "TotalCount": nimg, "Reclaimable": 0, "TotalSize": layers, "Items": images},
+        "ContainerUsage":  {"ActiveCount": running, "TotalCount": nctr, "Reclaimable": 0, "TotalSize": 0, "Items": containers},
+        "VolumeUsage":     {"ActiveCount": 0, "TotalCount": nvol, "Reclaimable": 0, "TotalSize": 0, "Items": volumes},
+        "BuildCacheUsage": {"ActiveCount": 0, "TotalCount": pc_count, "Reclaimable": pc_size, "TotalSize": pc_size, "Items": []}
+    }))
 }
 
 // `GET /events` — `docker events`. The handler now lives in `crate::events` (the lifecycle bus):
