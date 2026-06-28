@@ -1,5 +1,10 @@
 // brk arena
 static uint64_t brk_lo, brk_cur, brk_hi;
+// W3D fork-server prewarm/worker: when set, the guest's exit_group UNWINDS run_guest (sets c->exited
+// + c->exit_code) instead of _exit()ing, so the resident ddjitd parent survives pre-translating a
+// binary into the COW arena and a worker can report its exit code before dying. 0 on every normal
+// (standalone) run -> exit_group behaves exactly as before.
+int g_noexit;
 // dd/runtime/os/linux -- service(): the Linux syscall layer (the "kernel" the guest talks to).
 // Dispatches the guest syscall number to the host, translating the ABI (errno, struct layouts, flags,
 // fd semantics); every path argument is resolved through the container VFS jail. One sorted switch,
@@ -1984,6 +1989,11 @@ static void service(struct cpu *c) {
                     (unsigned long long)(g_prof_cross - g_prof_sys - g_prof_miss), (unsigned long long)g_prof_xlate,
                     (unsigned long long)g_lse_n);
         ep_prof_dump(); // w3e: flush epoll kevent-syscall counter (atexit is bypassed by _exit)
+        if (g_noexit) { // W3D fork-server prewarm: don't kill the resident parent; unwind run_guest instead
+            c->exited = 1;
+            c->exit_code = (int)a0;
+            break;
+        }
         _exit((int)a0);
     case 96:
         G_RET(c) = (uint64_t)getpid();

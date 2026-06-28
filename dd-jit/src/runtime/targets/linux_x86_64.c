@@ -80,8 +80,16 @@
 
 // ---- entry + main ----
 // ---------------- entry ----------------
-int jit86_run(const char *rootfs, int argc, char *const argv[]) {
-    if (argc < 1 || !argv || !argv[0]) return 2;
+// W3D fork-server refactor: the original jit86_run inlined (1) container init, (2) engine init
+// (pthread key + MAP_JIT arena + signal handlers + trace env), and (3) per-launch load+run. The
+// resident ddjitd parent must pay (1)+(2) ONCE and share them COW with every forked worker, so
+// those two phases are factored into container_init()/engine_global_init(). engine_global_init()
+// is idempotent (g_engine_inited) so the standalone path is byte-for-byte unchanged: standalone
+// jit86_run() composes container_init -> engine_global_init -> load_program -> run_loaded in the
+// exact original order, with the identical operations in each phase.
+static int g_engine_inited;
+
+static void container_init(const char *rootfs) {
     if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
         g_rootfs = (char *)rootfs;
         if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
@@ -131,8 +139,13 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.
     const char *icwd = getenv("DD_CWD");
     if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
-    const char *prog = argv[0];
+}
 
+// W3D: idempotent engine init (pthread key + MAP_JIT arena + trace env + fault handlers). Returns 0
+// on success, nonzero exit code on failure. First call wins; later calls are no-ops (g_engine_inited),
+// so the resident parent pays this once and the standalone path runs it exactly as before.
+static int engine_global_init(void) {
+    if (g_engine_inited) return 0;
     if (pthread_key_create(&g_cpu_key, NULL) != 0) {
         perror("pthread_key_create");
         return 1;
@@ -192,35 +205,53 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGBUS, &sa, NULL);
     }
-    char gb[1024];
+    g_engine_inited = 1;
+    return 0;
+}
+
+// W3D: load main program + (optional) interp, recording the load base/entry/at_base into *lm/*li.
+// Used both by the standalone path and by the fork-server's parent preload (so the COW-inherited
+// image is byte-identical and the warm worker re-runs from the same entry at the same base). The
+// gb/pb/ib buffers are static because g_exe_path = prog points into gb and must outlive this call.
+static const char *load_program(const char *prog, struct loaded *lm, struct loaded *li, uint64_t *jump,
+                                uint64_t *at_base, int *have_interp) {
+    static char gb[1024];
     prog = find_in_path(prog, gb, sizeof gb); // bare "sh" (docker) -> "/bin/sh" via the container PATH
     g_exe_path = prog;
 
-    char pb[4200];
+    static char pb[4200];
     const char *prog_host = xresolve_overlay(prog, pb, sizeof pb); // upper, then lowers (pure --lower image)
-    struct loaded lm;
-    load_elf(prog_host, &lm);
-    g_loadbase = lm.base;
-
-    uint64_t jump = lm.entry, at_base = 0;
+    load_elf(prog_host, lm);
+    g_loadbase = lm->base;
+    *jump = lm->entry;
+    *at_base = 0;
+    *have_interp = 0;
     char interp[256];
     if (elf_interp(prog_host, interp, sizeof interp) == 0) {
-        char ib[4200];
+        static char ib[4200];
         const char *ihost = xresolve_overlay(interp, ib, sizeof ib);
-        struct loaded li;
-        load_elf(ihost, &li);
-        jump = li.entry;
-        at_base = li.base;
+        load_elf(ihost, li);
+        *jump = li->entry;
+        *at_base = li->base;
+        *have_interp = 1;
     }
+    return prog;
+}
 
+// W3D: fresh per-launch guest run from a loaded image. Allocates a private heap + stack + cpu and
+// runs from `jump`. Shared by jit86_run (standalone/cold) and the warm worker (which restores a
+// pristine COW image first, then calls this against the parent-preloaded base). Body is the original
+// jit86_run tail verbatim (incl. the committed s1_calibrate + the fastsys/prof prints), so standalone
+// behavior is byte-identical.
+static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t jump, uint64_t at_base) {
     uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     brk_lo = brk_cur = (uint64_t)heap;
     brk_hi = brk_lo + (256u << 20);
 
     struct cpu c;
     memset(&c, 0, sizeof c);
-    c.r[RSP] = build_stack(argc, (char **)argv, &lm, at_base); // rsp -> argc
-    c.r[RDX] = 0;                                              // rtld_fini = 0
+    c.r[RSP] = build_stack(argc, (char **)argv, lm, at_base); // rsp -> argc
+    c.r[RDX] = 0;                                             // rtld_fini = 0
     c.rip = jump;
 
     s1_calibrate(); // S1: anchor CNTVCT vs host REALTIME/MONOTONIC for the inline time fast path
@@ -234,6 +265,20 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     return c.exit_code;
 }
 
+int jit86_run(const char *rootfs, int argc, char *const argv[]) {
+    if (argc < 1 || !argv || !argv[0]) return 2;
+    container_init(rootfs);
+    int rc = engine_global_init();
+    if (rc) return rc;
+    struct loaded lm, li;
+    uint64_t jump, at_base;
+    int have_interp;
+    load_program(argv[0], &lm, &li, &jump, &at_base, &have_interp);
+    return run_loaded(argc, argv, &lm, jump, at_base);
+}
+
+#include "../frontend/x86_64/forkserver.c" // W3D: resident ddjitd fork-server (server/client/worker)
+
 #ifndef JIT86_LIB
 int main(int argc, char **argv) {
     int ai = 1;
@@ -243,6 +288,13 @@ int main(int argc, char **argv) {
         g_self_path = self;
     else
         g_self_path = argv[0];
+    // W3D fork-server dispatch (gated; standalone path untouched when neither flag is present):
+    //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run resident ddjitd, listen on SOCK
+    //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to a ddjitd
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--server") == 0) return ddjitd_server_main(argc, argv);
+        if (strcmp(argv[i], "--client") == 0) return ddjitd_client_main(argc, argv);
+    }
     while (ai + 1 < argc) { // --rootfs DIR / --vol guest:host (repeatable)
         if (strcmp(argv[ai], "--rootfs") == 0) {
             rootfs = argv[ai + 1];
