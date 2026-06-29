@@ -60,8 +60,11 @@ static inline uint64_t nonpie_p(uint64_t a) {
     return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
 }
 static void service(struct cpu *c) {
-    if (__builtin_expect(g_untrusted, 0)) { syscall_route(c); return; } // untrusted: route via sentry
-    service_local(c);                                                    // trusted: byte-identical path
+    if (__builtin_expect(g_untrusted, 0)) {
+        syscall_route(c);
+        return;
+    } // untrusted: route via sentry
+    service_local(c); // trusted: byte-identical path
 }
 static void service_local(struct cpu *c) {
     // Frontends whose guest has legacy syscalls without a canonical (aarch64) equivalent rewrite them
@@ -81,47 +84,69 @@ static void service_local(struct cpu *c) {
     // res_bump switch below, which itself dereferences a2 (open_how*) for openat2.
     if (g_nonpie_lo) {
         switch (nr) {
-        case 56:                                                  // openat(dfd, PATH, flags, mode)
-        case 33:                                                  // mknodat(dfd, PATH, ...)
-        case 34:                                                  // mkdirat(dfd, PATH, mode)
-        case 35:                                                  // unlinkat(dfd, PATH, flags)
-        case 48:                                                  // faccessat(dfd, PATH, mode)
-        case 439:                                                 // faccessat2(dfd, PATH, mode, flags)
-        case 53:                                                  // fchmodat(dfd, PATH, mode, flags)
-        case 54:                                                  // fchownat(dfd, PATH, uid, gid, flags)
-            a1 = nonpie_p(a1); break;                             //   path is a1 for the whole *at family
-        case 437: a1 = nonpie_p(a1); a2 = nonpie_p(a2); break;    // openat2(dfd, PATH, open_how*, size)
-        case 79:                                                  // newfstatat(dfd, PATH, STATBUF, flags)
-        case 78: a1 = nonpie_p(a1); a2 = nonpie_p(a2); break;     // readlinkat(dfd, PATH, BUF, sz)
-        case 291: a1 = nonpie_p(a1); a4 = nonpie_p(a4); break;    // statx(dfd, PATH, flags, mask, STATXBUF)
-        case 36: a0 = nonpie_p(a0); a2 = nonpie_p(a2); break;     // symlinkat(TARGET, newdfd, LINKPATH)
-        case 37:                                                  // linkat(odfd, OLD, ndfd, NEW, flags)
-        case 38:                                                  // renameat(odfd, OLD, ndfd, NEW)
-        case 276: a1 = nonpie_p(a1); a3 = nonpie_p(a3); break;    // renameat2(odfd, OLD, ndfd, NEW, flags)
-        case 80:                                                  // fstat(fd, STATBUF)
-        case 63:                                                  // read(fd, BUF, count)
-        case 64:                                                  // write(fd, BUF, count)
-        case 67:                                                  // pread64(fd, BUF, count, off)
-        case 68:                                                  // pwrite64(fd, BUF, count, off)
-        case 65:                                                  // readv(fd, IOVEC, n)  -- array base only
-        case 200:                                                 // bind(fd, SOCKADDR, alen)
-        case 203:                                                 // connect(fd, SOCKADDR, alen)
-        case 204:                                                 // getsockname(fd, ADDR, alen)
-        case 205:                                                 // getpeername(fd, ADDR, alen)
-        case 202:                                                 // accept(fd, ADDR, alen)
-        case 242:                                                 // accept4(fd, ADDR, alen, flags)
-        case 61:                                                  // getdents64(fd, DIRENT_BUF, count)
-        case 113:                                                 // clock_gettime(clkid, TIMESPEC)
-        case 66: a1 = nonpie_p(a1); break;                        // writev(fd, IOVEC, n) -- array base only
-        case 17:                                                  // getcwd(BUF, size)
-        case 160:                                                 // uname(UTSBUF)
-        case 73: a0 = nonpie_p(a0); break;                        // ppoll(FDS, n, tmo, sigmask, sz)
-        case 207:                                                 // recvfrom(fd, BUF, len, fl, SRCADDR, alen)
-        case 206: a1 = nonpie_p(a1); a4 = nonpie_p(a4); break;    // sendto(fd, BUF, len, fl, SOCKADDR, alen)
-        case 211:                                                 // sendmsg(fd, MSGHDR, flags) -- top only
-        case 212: a1 = nonpie_p(a1); break;                       // recvmsg(fd, MSGHDR, flags) -- top only
-        case 221: a0 = nonpie_p(a0); a1 = nonpie_p(a1); break;    // execve(PATH, ARGV, envp); argv base here,
-                                                                  //   each argv[] element rebased at case 221
+        case 56:  // openat(dfd, PATH, flags, mode)
+        case 33:  // mknodat(dfd, PATH, ...)
+        case 34:  // mkdirat(dfd, PATH, mode)
+        case 35:  // unlinkat(dfd, PATH, flags)
+        case 48:  // faccessat(dfd, PATH, mode)
+        case 439: // faccessat2(dfd, PATH, mode, flags)
+        case 53:  // fchmodat(dfd, PATH, mode, flags)
+        case 54:  // fchownat(dfd, PATH, uid, gid, flags)
+            a1 = nonpie_p(a1);
+            break; //   path is a1 for the whole *at family
+        case 437:
+            a1 = nonpie_p(a1);
+            a2 = nonpie_p(a2);
+            break; // openat2(dfd, PATH, open_how*, size)
+        case 79:   // newfstatat(dfd, PATH, STATBUF, flags)
+        case 78:
+            a1 = nonpie_p(a1);
+            a2 = nonpie_p(a2);
+            break; // readlinkat(dfd, PATH, BUF, sz)
+        case 291:
+            a1 = nonpie_p(a1);
+            a4 = nonpie_p(a4);
+            break; // statx(dfd, PATH, flags, mask, STATXBUF)
+        case 36:
+            a0 = nonpie_p(a0);
+            a2 = nonpie_p(a2);
+            break; // symlinkat(TARGET, newdfd, LINKPATH)
+        case 37:   // linkat(odfd, OLD, ndfd, NEW, flags)
+        case 38:   // renameat(odfd, OLD, ndfd, NEW)
+        case 276:
+            a1 = nonpie_p(a1);
+            a3 = nonpie_p(a3);
+            break;                         // renameat2(odfd, OLD, ndfd, NEW, flags)
+        case 80:                           // fstat(fd, STATBUF)
+        case 63:                           // read(fd, BUF, count)
+        case 64:                           // write(fd, BUF, count)
+        case 67:                           // pread64(fd, BUF, count, off)
+        case 68:                           // pwrite64(fd, BUF, count, off)
+        case 65:                           // readv(fd, IOVEC, n)  -- array base only
+        case 200:                          // bind(fd, SOCKADDR, alen)
+        case 203:                          // connect(fd, SOCKADDR, alen)
+        case 204:                          // getsockname(fd, ADDR, alen)
+        case 205:                          // getpeername(fd, ADDR, alen)
+        case 202:                          // accept(fd, ADDR, alen)
+        case 242:                          // accept4(fd, ADDR, alen, flags)
+        case 61:                           // getdents64(fd, DIRENT_BUF, count)
+        case 113:                          // clock_gettime(clkid, TIMESPEC)
+        case 66: a1 = nonpie_p(a1); break; // writev(fd, IOVEC, n) -- array base only
+        case 17:                           // getcwd(BUF, size)
+        case 160:                          // uname(UTSBUF)
+        case 73: a0 = nonpie_p(a0); break; // ppoll(FDS, n, tmo, sigmask, sz)
+        case 207:                          // recvfrom(fd, BUF, len, fl, SRCADDR, alen)
+        case 206:
+            a1 = nonpie_p(a1);
+            a4 = nonpie_p(a4);
+            break;                          // sendto(fd, BUF, len, fl, SOCKADDR, alen)
+        case 211:                           // sendmsg(fd, MSGHDR, flags) -- top only
+        case 212: a1 = nonpie_p(a1); break; // recvmsg(fd, MSGHDR, flags) -- top only
+        case 221:
+            a0 = nonpie_p(a0);
+            a1 = nonpie_p(a1);
+            break; // execve(PATH, ARGV, envp); argv base here,
+                   //   each argv[] element rebased at case 221
         default: break;
         }
     }
@@ -151,8 +176,7 @@ static void service_local(struct cpu *c) {
         if (how && ((how[0] & 0x40) || (g_nlower && (how[0] & 3)))) res_bump();
         break;
     }
-    default:
-        break;
+    default: break;
     }
     if (svc_sysv(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_mem(c, nr, a0, a1, a2, a3, a4, a5)) return;
@@ -207,7 +231,7 @@ static void service_local(struct cpu *c) {
             if (tcgetattr(fd, &t) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
                 break;
-            // TCGETS
+                // TCGETS
             }
             termios_m2l(&t, (uint8_t *)arg);
             G_RET(c) = 0;
@@ -228,7 +252,7 @@ static void service_local(struct cpu *c) {
             if (tcgetattr(fd, &t) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
                 break;
-            // TCGETS2 (glibc aarch64 uses this)
+                // TCGETS2 (glibc aarch64 uses this)
             }
             termios_m2l(&t, (uint8_t *)arg);
             *(uint32_t *)((uint8_t *)arg + 36) = (uint32_t)cfgetispeed(&t);
@@ -276,7 +300,7 @@ static void service_local(struct cpu *c) {
             int fl = fcntl(fd, F_GETFD);
             G_RET(c) = fcntl(fd, F_SETFD, fl & ~FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0;
             break;
-        // FIONCLEX
+            // FIONCLEX
         }
         // TIOCGPGRP/TIOCSPGRP -- REAL job control. The guest's children are real host processes (clone = host
         // fork) in the engine's session (the daemon's login_tty made the engine the pty's session leader), so
@@ -296,9 +320,9 @@ static void service_local(struct cpu *c) {
         }
         case 0x5410: { // tcsetpgrp
             pid_t pg = arg ? *(int *)arg : 0;
-            if (pg == 1 && g_init_hostpid) pg = g_init_hostpid;   // guest pgid 1 -> init's real host group
-            if (isatty(fd) && pg > 0) (void)tcsetpgrp(fd, pg);    // really install the fg group (kernel routes ^C)
-            G_RET(c) = 0;                                         // never surface an error -> bash never warns
+            if (pg == 1 && g_init_hostpid) pg = g_init_hostpid; // guest pgid 1 -> init's real host group
+            if (isatty(fd) && pg > 0) (void)tcsetpgrp(fd, pg);  // really install the fg group (kernel routes ^C)
+            G_RET(c) = 0;                                       // never surface an error -> bash never warns
             break;
         }
         // TIOCSCTTY -- acquire the controlling terminal for real when `fd` is a tty (best effort; the
@@ -315,7 +339,10 @@ static void service_local(struct cpu *c) {
     }
     // mknodat(dirfd, path, mode, dev)
     case 33: {
-        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at((int)a0, (const char *)a1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
@@ -336,7 +363,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = mknodat(ATFD(a0), p, (mode_t)a2, (dev_t)a3);
         if (r >= 0) {
             mc_evict(p);
@@ -347,7 +374,10 @@ static void service_local(struct cpu *c) {
     }
     // mkdirat(dirfd, path, mode) -- confined
     case 34: {
-        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at((int)a0, (const char *)a1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
@@ -368,7 +398,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = mkdirat(ATFD(a0), p, (mode_t)a2);
         mc_evict(p);
         // namespace change -> evict
@@ -378,7 +408,10 @@ static void service_local(struct cpu *c) {
     }
     // unlinkat(dirfd, path, flags) -- confined
     case 35: {
-        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at((int)a0, (const char *)a1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         // RAM-backed scratch adoption: SQLite et al. open a temp file O_CREAT|O_EXCL then unlink it while
         // still open (delete-on-close). After this unlink drops its last link the file is anonymous, so we
         // may adopt it into RAM. Cheap pre-filter (avoid the fd scan on ordinary unlinks): a temp-dir path
@@ -400,7 +433,7 @@ static void service_local(struct cpu *c) {
             if (!overlay_resolve(gp, host, sizeof host, 1)) {
                 G_RET(c) = (uint64_t)(-2);
                 break;
-            // ENOENT
+                // ENOENT
             }
             overlay_whiteout(gp);
             G_RET(c) = 0;
@@ -437,7 +470,8 @@ static void service_local(struct cpu *c) {
             break;
         }
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        // unlink: never follow the final symlink (remove the link itself, not its target).
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 1);
         uint64_t adev = 0, aino = 0;
         if (try_adopt) {
             struct stat ps;
@@ -456,7 +490,10 @@ static void service_local(struct cpu *c) {
     }
     // symlinkat(target, newdirfd, linkpath) -- the link is CREATED at (newdirfd, linkpath)
     case 36: {
-        if (jail_ro_at((int)a1, (const char *)a2)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at((int)a1, (const char *)a2)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         const char *target =
             // target is the link CONTENT (unresolved); follow-time confinement guards it
             (const char *)a0;
@@ -473,7 +510,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         char pb[4200];
-        const char *p = atpath((int)a1, (const char *)a2, pb, sizeof pb);
+        const char *p = atpath((int)a1, (const char *)a2, pb, sizeof pb, 0);
         G_RET(c) = symlinkat(target, ATFD(a1), p) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -505,8 +542,8 @@ static void service_local(struct cpu *c) {
             break;
         }
         char ob[4200], nb[4200];
-        const char *op = atpath((int)a0, (const char *)a1, ob, sizeof ob);
-        const char *np = atpath((int)a2, (const char *)a3, nb, sizeof nb);
+        const char *op = atpath((int)a0, (const char *)a1, ob, sizeof ob, 0);
+        const char *np = atpath((int)a2, (const char *)a3, nb, sizeof nb, 0);
         G_RET(c) = linkat(ATFD(a0), op, ATFD(a2), np, fl) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -552,8 +589,8 @@ static void service_local(struct cpu *c) {
             break;
         }
         char ob[4200], nb[4200];
-        const char *op = atpath((int)a0, (const char *)a1, ob, sizeof ob);
-        const char *np = atpath((int)a2, (const char *)a3, nb, sizeof nb);
+        const char *op = atpath((int)a0, (const char *)a1, ob, sizeof ob, 0);
+        const char *np = atpath((int)a2, (const char *)a3, nb, sizeof nb, 0);
         G_RET(c) = renameatx_np(ATFD(a0), op, ATFD(a2), np, rxflags) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -569,7 +606,7 @@ static void service_local(struct cpu *c) {
         int r;
         if (nr == 43) {
             char pb[4200];
-            const char *p = atpath(-100, (const char *)a0, pb, sizeof pb);
+            const char *p = atpath(-100, (const char *)a0, pb, sizeof pb, 0);
             r = statfs(p, &hs);
         } else {
             r = fstatfs((int)a0, &hs);
@@ -580,18 +617,18 @@ static void service_local(struct cpu *c) {
         }
         uint8_t *b = (uint8_t *)a1;
         memset(b, 0, 120);
-        *(int64_t *)(b + 0) = 0x01021994;                // f_type (TMPFS_MAGIC; geometry is what matters)
-        *(int64_t *)(b + 8) = (int64_t)hs.f_bsize;       // f_bsize
-        *(uint64_t *)(b + 16) = (uint64_t)hs.f_blocks;   // f_blocks
-        *(uint64_t *)(b + 24) = (uint64_t)hs.f_bfree;    // f_bfree
-        *(uint64_t *)(b + 32) = (uint64_t)hs.f_bavail;   // f_bavail
-        *(uint64_t *)(b + 40) = (uint64_t)hs.f_files;    // f_files
-        *(uint64_t *)(b + 48) = (uint64_t)hs.f_ffree;    // f_ffree
-        *(int32_t *)(b + 56) = hs.f_fsid.val[0];         // f_fsid[0]
-        *(int32_t *)(b + 60) = hs.f_fsid.val[1];         // f_fsid[1]
-        *(int64_t *)(b + 64) = 255;                      // f_namelen (NAME_MAX)
-        *(int64_t *)(b + 72) = (int64_t)hs.f_bsize;      // f_frsize
-        *(int64_t *)(b + 80) = 0;                        // f_flags
+        *(int64_t *)(b + 0) = 0x01021994;              // f_type (TMPFS_MAGIC; geometry is what matters)
+        *(int64_t *)(b + 8) = (int64_t)hs.f_bsize;     // f_bsize
+        *(uint64_t *)(b + 16) = (uint64_t)hs.f_blocks; // f_blocks
+        *(uint64_t *)(b + 24) = (uint64_t)hs.f_bfree;  // f_bfree
+        *(uint64_t *)(b + 32) = (uint64_t)hs.f_bavail; // f_bavail
+        *(uint64_t *)(b + 40) = (uint64_t)hs.f_files;  // f_files
+        *(uint64_t *)(b + 48) = (uint64_t)hs.f_ffree;  // f_ffree
+        *(int32_t *)(b + 56) = hs.f_fsid.val[0];       // f_fsid[0]
+        *(int32_t *)(b + 60) = hs.f_fsid.val[1];       // f_fsid[1]
+        *(int64_t *)(b + 64) = 255;                    // f_namelen (NAME_MAX)
+        *(int64_t *)(b + 72) = (int64_t)hs.f_bsize;    // f_frsize
+        *(int64_t *)(b + 80) = 0;                      // f_flags
         G_RET(c) = 0;
         break;
     }
@@ -600,9 +637,15 @@ static void service_local(struct cpu *c) {
         if (memf_get((int)a0) && memf_room_or_spill((int)a0, (off_t)a1)) {
             struct memf *m = g_memf[(int)a0];
             off_t len = (off_t)a1;
-            if (len < 0) { G_RET(c) = (uint64_t)(-EINVAL); break; }
+            if (len < 0) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
             if ((size_t)len > m->size) {
-                if (memf_reserve(m, (size_t)len)) { G_RET(c) = (uint64_t)(-ENOMEM); break; }
+                if (memf_reserve(m, (size_t)len)) {
+                    G_RET(c) = (uint64_t)(-ENOMEM);
+                    break;
+                }
                 atomic_fetch_add(&g_memf_total, (uint64_t)len - m->size);
             } else {
                 atomic_fetch_sub(&g_memf_total, m->size - (uint64_t)len);
@@ -616,7 +659,7 @@ static void service_local(struct cpu *c) {
         fd_evict((int)a0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
-    // ftruncate
+        // ftruncate
     }
     case 47: {
         // fallocate(fd,mode,offset,len). FALLOC_FL_PUNCH_HOLE(2)|KEEP_SIZE(1): deallocate+zero a range
@@ -649,7 +692,7 @@ static void service_local(struct cpu *c) {
     case 49: {
         char pb[4200];
         // chdir (confined; tracks guest cwd)
-        const char *p = atpath(-100, (const char *)a0, pb, sizeof pb);
+        const char *p = atpath(-100, (const char *)a0, pb, sizeof pb, 0);
         if (chdir(p) < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
@@ -665,7 +708,7 @@ static void service_local(struct cpu *c) {
         if (fchdir((int)a0) < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
-        // fchdir (tracks guest cwd)
+            // fchdir (tracks guest cwd)
         }
         if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0]) {
             const char *g = g_fdpath[(int)a0];
@@ -680,7 +723,10 @@ static void service_local(struct cpu *c) {
     case 53:
     // fchmodat(dirfd,path,mode,flags) / fchmodat2
     case 452: {
-        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at((int)a0, (const char *)a1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 0);
@@ -700,7 +746,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = fchmodat(ATFD(a0), p, (mode_t)a2, 0);
         if (r >= 0) mc_evict(p);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -708,7 +754,10 @@ static void service_local(struct cpu *c) {
     }
     // fchownat(dirfd,path,uid,gid,flags) -- best-effort (rootless)
     case 54: {
-        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at((int)a0, (const char *)a1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a4 & 0x100) ? 1 : 0);
@@ -720,10 +769,10 @@ static void service_local(struct cpu *c) {
             close(pfd);
             G_RET(c) = 0;
             break;
-        // EPERM on the host -> faked OK
+            // EPERM on the host -> faked OK
         }
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         fchownat(ATFD(a0), p, (uid_t)a2, (gid_t)a3, 0);
         G_RET(c) = 0;
         break;
@@ -732,7 +781,7 @@ static void service_local(struct cpu *c) {
         fchown((int)a0, (uid_t)a1, (gid_t)a2);
         G_RET(c) = 0;
         break;
-    // fchown(fd,uid,gid) -- best-effort
+        // fchown(fd,uid,gid) -- best-effort
     }
     case 56: {
         // openat -- Linux O_* -> macOS O_* (they differ!)
@@ -741,8 +790,7 @@ static void service_local(struct cpu *c) {
         // O_TMPFILE which carries O_RDWR) under an `-v …:ro` volume fails EROFS -- exactly as the kernel
         // rejects a write-open on a read-only mount. A pure O_RDONLY open still succeeds. Checked up front
         // so neither O_TMPFILE nor the memoized open-cache walk below can slip a write through.
-        if (((lf & 3) || (lf & 0x40) || (lf & 0x200) || (lf & 0x400)) &&
-            jail_ro_at((int)a0, (const char *)a1)) {
+        if (((lf & 3) || (lf & 0x40) || (lf & 0x200) || (lf & 0x400)) && jail_ro_at((int)a0, (const char *)a1)) {
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }
@@ -751,7 +799,7 @@ static void service_local(struct cpu *c) {
         // O_TMPFILE). The fd is a normal RW file with link count 0.
         if (lf & 0x400000) {
             char pb[4200];
-            const char *dir = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+            const char *dir = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
             int dfd = open(dir, O_RDONLY | O_DIRECTORY);
             if (dfd < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -841,8 +889,7 @@ static void service_local(struct cpu *c) {
                 memf_materialize(pfn); // reopen-by-fd would expose the real file -> flush RAM cache first
                 char gp[4200];
                 int r = -1;
-                if (fcntl(pfn, F_GETPATH, gp) == 0 && gp[0])
-                    r = open(gp, mf & ~(O_EXCL | O_CREAT), (mode_t)a3);
+                if (fcntl(pfn, F_GETPATH, gp) == 0 && gp[0]) r = open(gp, mf & ~(O_EXCL | O_CREAT), (mode_t)a3);
                 if (r < 0) r = dup(pfn); // anonymous/pipe/socket fd -> share the description
                 if (r >= 0) {
                     char tp[4200];
@@ -859,7 +906,8 @@ static void service_local(struct cpu *c) {
             if (rp && !strncmp(rp, "/dev/shm/", 9)) {
                 char hp[300];
                 int n = snprintf(hp, sizeof hp, "/tmp/.ddshm-%s", rp + 9);
-                for (int i = 12; i < n; i++) if (hp[i] == '/') hp[i] = '_';
+                for (int i = 12; i < n; i++)
+                    if (hp[i] == '/') hp[i] = '_';
                 int d = open(hp, mf, (mode_t)a3);
                 G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
                 break;
@@ -882,7 +930,7 @@ static void service_local(struct cpu *c) {
                 if (!sn) {
                     G_RET(c) = (uint64_t)(int64_t)(-2);
                     break;
-                // ENOENT
+                    // ENOENT
                 }
                 int s = open(sn, mf);
                 G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s;
@@ -913,7 +961,7 @@ static void service_local(struct cpu *c) {
                     }
                 }
                 if (r < 1024) snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gp);
-            // remember guest path for merged getdents
+                // remember guest path for merged getdents
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
             break;
@@ -976,7 +1024,7 @@ static void service_local(struct cpu *c) {
         }
         char pb[4200];
         // no jail
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = openat(ATFD(a0), p, mf, (mode_t)a3);
         if (r >= 0) {
             fd_setpath(r, p);
@@ -1006,15 +1054,15 @@ static void service_local(struct cpu *c) {
             g_eventfd_count[cf] = 0;
             g_eventfd_sema[cf] = 0;
             ep_fd_reset(cf); // w3e: drop epoll armed-state (kqueue auto-removes a closed fd)
-        // reap eventfd peer / timerfd / overlay dir / loopback
+            // reap eventfd peer / timerfd / overlay dir / loopback
         }
         memf_close(cf); // release any RAM-backed scratch buffer
-        dirs_drop(cf); // invalidate the getdents DIR* cache so a reused fd re-opendir's
+        dirs_drop(cf);  // invalidate the getdents DIR* cache so a reused fd re-opendir's
         int r = close(cf);
         fd_clear(cf);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
-    // close: -errno on fail
+        // close: -errno on fail
     }
     // getdents64
     case 61: {
@@ -1120,8 +1168,8 @@ static void service_local(struct cpu *c) {
                 break;
             }
             // map the host path back into the guest's view (strip the rootfs prefix if jailed)
-            const char *gpath = (g_rootfs && !strncmp(gp, g_rootfs_canon, g_rootfs_canon_len)) ? gp + g_rootfs_canon_len
-                                                                                                : gp;
+            const char *gpath =
+                (g_rootfs && !strncmp(gp, g_rootfs_canon, g_rootfs_canon_len)) ? gp + g_rootfs_canon_len : gp;
             if (!gpath[0]) gpath = "/";
             size_t l = strlen(gpath);
             if (l > bs) l = bs;
@@ -1154,14 +1202,15 @@ static void service_local(struct cpu *c) {
         struct stat s;
         // newfstatat(dfd, path, buf, flags)
         char pb[4200];
-        const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb);
+        // AT_SYMLINK_NOFOLLOW (0x100): lstat -- resolve the final component WITHOUT following it.
+        const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
         {
             const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
             if (synth_stat(gp, (uint8_t *)a2)) {
                 G_RET(c) = 0;
                 break;
             }
-        // synthesized /proc or /sys file
+            // synthesized /proc or /sys file
         }
         // cacheable: named path, follow
         if (raw && raw[0] && !(a3 & 0x100)) {
@@ -1178,8 +1227,8 @@ static void service_local(struct cpu *c) {
         // AT_EMPTY_PATH -> fstat(dfd)
         int empty_self = (raw && !raw[0] && (a3 & 0x1000));
         int r = (empty_self && memf_get((int)a0)) ? memf_fstat((int)a0, &s)
-                : empty_self                       ? fstat((int)a0, &s)
-                                                   : fstatat(ATFD(a0), p, &s, AT_SYMLINK_NOFOLLOW);
+                : empty_self                      ? fstat((int)a0, &s)
+                                                  : fstatat(ATFD(a0), p, &s, AT_SYMLINK_NOFOLLOW);
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
@@ -1211,9 +1260,12 @@ static void service_local(struct cpu *c) {
         if (!a1) {
             G_RET(c) = futimens((int)a0, ts) < 0 ? (uint64_t)(-errno) : 0;
             break;
-        // path NULL -> futimens(fd)
+            // path NULL -> futimens(fd)
         }
-        if (jail_ro_at((int)a0, (const char *)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at((int)a0, (const char *)a1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         if (g_rootfs) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a3 & 0x100) ? 1 : 0);
@@ -1227,14 +1279,14 @@ static void service_local(struct cpu *c) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
-            // mtime changed
+                // mtime changed
             }
             close(pfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
         char pb[4200];
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = utimensat(ATFD(a0), p, ts, (a3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
         if (r >= 0) mc_evict(p);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -1248,12 +1300,12 @@ static void service_local(struct cpu *c) {
         struct stat s;
         // statx(dfd, path, flags, mask, buf)
         char pb[4200];
-        const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb);
+        const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, 0);
         int rc, empty = (raw && !raw[0] && (a2 & 0x1000));
         const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
         if (synth_stat_raw(gp, &s)) {
             rc = 0;
-        // synth /proc or /sys -> fill from s below
+            // synth /proc or /sys -> fill from s below
         }
         // cacheable
         else if (raw && raw[0] && !empty) {
@@ -1264,8 +1316,8 @@ static void service_local(struct cpu *c) {
             }
         } else {
             int rr = (empty && memf_get((int)a0)) ? memf_fstat((int)a0, &s)
-                     : empty                       ? fstat((int)a0, &s)
-                                                   : fstatat(ATFD(a0), p, &s, 0);
+                     : empty                      ? fstat((int)a0, &s)
+                                                  : fstatat(ATFD(a0), p, &s, 0);
             rc = rr < 0 ? -errno : 0;
         }
         if (rc < 0) {
@@ -1312,7 +1364,7 @@ static void service_local(struct cpu *c) {
     case 48: {
         char pb[4200];
         // faccessat
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         // F_OK existence check: cacheable
         if (a2 == 0 && p) {
             int rc;
@@ -1334,7 +1386,7 @@ static void service_local(struct cpu *c) {
         if (a1) memset((void *)a1, 0xff, 12);
         G_RET(c) = 0;
         break;
-    // capget -> all caps present
+        // capget -> all caps present
     }
     // capset -> ok
     case 91: G_RET(c) = 0; break;
@@ -1360,14 +1412,16 @@ static void service_local(struct cpu *c) {
         if (getenv("PROF")) {
             unsigned long long h = (unsigned long long)g_prof_shret_hit, f = (unsigned long long)g_prof_shret_fb;
             double hr = (h + f) ? 100.0 * (double)h / (double)(h + f) : 0.0;
-            fprintf(stderr,
-                    "[prof] shadow_push=%llu shret_hit=%llu shret_fb=%llu hit_rate=%.1f%% bl_shadow=%llu bl_leaf=%llu\n",
-                    (unsigned long long)g_prof_shpush, h, f, hr, (unsigned long long)g_prof_bl_shadow,
-                    (unsigned long long)g_prof_bl_leaf);
+            fprintf(
+                stderr,
+                "[prof] shadow_push=%llu shret_hit=%llu shret_fb=%llu hit_rate=%.1f%% bl_shadow=%llu bl_leaf=%llu\n",
+                (unsigned long long)g_prof_shpush, h, f, hr, (unsigned long long)g_prof_bl_shadow,
+                (unsigned long long)g_prof_bl_leaf);
         }
 #ifdef R_REPSTR // W4-C: x86-only rep cmps/scas idiom firing counts
-        if (getenv("PROF")) fprintf(stderr, "[prof] repstr=%llu repstr_elems=%llu\n",
-                                    (unsigned long long)g_repstr_n, (unsigned long long)g_repstr_elems);
+        if (getenv("PROF"))
+            fprintf(stderr, "[prof] repstr=%llu repstr_elems=%llu\n", (unsigned long long)g_repstr_n,
+                    (unsigned long long)g_repstr_elems);
 #endif
 #ifdef G_PROF_EXTRA
         G_PROF_EXTRA; // W5B: x86 tier-2 promotion counters
@@ -1406,7 +1460,7 @@ static void service_local(struct cpu *c) {
         if (a2 && n) {
             memset((void *)a2, 0, n);
             *(uint8_t *)a2 = 1;
-        // cpu 0 set; mask is a2 not a1
+            // cpu 0 set; mask is a2 not a1
         }
         G_RET(c) = n < 8 ? (uint64_t)n : 8;
         break;
@@ -1456,7 +1510,7 @@ static void service_local(struct cpu *c) {
         // Map the guest's view of the init (pid/pgid 1) to its real host pid/group, then do the REAL setpgid.
         // Children already carry real host pids, so they pass straight through and get real process groups.
         // EPERM is benign (the init is a session leader, already its own group leader) -> report success.
-        pid_t pid  = ((pid_t)a0 == 1 && g_init_hostpid) ? g_init_hostpid : (pid_t)a0;
+        pid_t pid = ((pid_t)a0 == 1 && g_init_hostpid) ? g_init_hostpid : (pid_t)a0;
         pid_t pgid = ((pid_t)a1 == 1 && g_init_hostpid) ? g_init_hostpid : (pid_t)a1;
         int r = setpgid(pid, pgid);
         G_RET(c) = (r < 0 && errno != EPERM) ? (uint64_t)(-errno) : 0;
@@ -1467,14 +1521,24 @@ static void service_local(struct cpu *c) {
     // leader and initializes job control WITHOUT the setpgid EPERM / "cannot set terminal process group"
     // warning -- it enables job control cleanly, and the real terminal handoff works (see TIOCSPGRP above +
     // the rt_sigprocmask stop-signal mirroring).
-    case 155: { pid_t r = getpgid((pid_t)a0); if (g_init_hostpid && r == g_init_hostpid) r = 1; G_RET(c) = (uint64_t)r; break; }
-    case 156: { pid_t r = getsid((pid_t)a0);  if (g_init_hostpid && r == g_init_hostpid) r = 1; G_RET(c) = (uint64_t)r; break; }
+    case 155: {
+        pid_t r = getpgid((pid_t)a0);
+        if (g_init_hostpid && r == g_init_hostpid) r = 1;
+        G_RET(c) = (uint64_t)r;
+        break;
+    }
+    case 156: {
+        pid_t r = getsid((pid_t)a0);
+        if (g_init_hostpid && r == g_init_hostpid) r = 1;
+        G_RET(c) = (uint64_t)r;
+        break;
+    }
     case 158: {
         if (g_gid >= 0) {
             if ((int)a0 >= 1 && a1) *(gid_t *)a1 = (gid_t)cgid();
             G_RET(c) = 1;
             break;
-        // getgroups -> [container gid]
+            // getgroups -> [container gid]
         }
         int r = getgroups((int)a0, (gid_t *)a1);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -1512,8 +1576,16 @@ static void service_local(struct cpu *c) {
     }
     // prctl(option,...)
     case 167: {
-        if ((int)a0 == 15) { snprintf(g_procname, sizeof g_procname, "%.15s", (const char *)a1); G_RET(c) = 0; break; } // PR_SET_NAME
-        if ((int)a0 == 16) { snprintf((char *)a1, 16, "%s", g_procname); G_RET(c) = 0; break; }                          // PR_GET_NAME
+        if ((int)a0 == 15) {
+            snprintf(g_procname, sizeof g_procname, "%.15s", (const char *)a1);
+            G_RET(c) = 0;
+            break;
+        } // PR_SET_NAME
+        if ((int)a0 == 16) {
+            snprintf((char *)a1, 16, "%s", g_procname);
+            G_RET(c) = 0;
+            break;
+        } // PR_GET_NAME
         // 0 for known no-ops; EINVAL for unknown (kernel does)
         switch ((int)a0) {
         case 1:
@@ -1569,7 +1641,7 @@ static void service_local(struct cpu *c) {
             // so the child's first run_block can instruction-abort fetching from the (non-executable) code
             // cache -> the intermittent fork+exec SIGBUS. pthread_jit_write_protect_np(1) = RX (executable).
             pthread_jit_write_protect_np(1);
-            jit_after_fork(); // dual map: COW split the RW/RX aliases -> rebuild a fresh aliased cache
+            jit_after_fork();  // dual map: COW split the RW/RX aliases -> rebuild a fresh aliased cache
             G_SHADOW_RESET(c); // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
             rc_reset();        // S2: drop the inherited (COW) path-resolution cache so the child can never
                                // serve a guest->host mapping that the parent populated before the FS diverged
@@ -1598,7 +1670,7 @@ static void service_local(struct cpu *c) {
         if (access(p, F_OK) != 0) {
             G_RET(c) = (uint64_t)(-2);
             break;
-        // ENOENT
+            // ENOENT
         }
         char *argv[256];
         int ac = 0;
@@ -1637,12 +1709,14 @@ static void service_local(struct cpu *c) {
         // argv + path live in guest memory we're about to munmap, so copy them to the host heap first.
         char *xpath = strdup(p);
         char *xargv[256];
-        for (int i = 0; i < ac && i < 255; i++) xargv[i] = strdup(argv[i]);
+        for (int i = 0; i < ac && i < 255; i++)
+            xargv[i] = strdup(argv[i]);
         xargv[ac < 255 ? ac : 255] = NULL;
         gmap_reset_all();
         g_nonpie_lo = g_nonpie_hi = 0; // reset; load_elf re-sets it iff the new main image is non-PIE
         p = xpath;
-        for (int i = 0; i < ac && i < 255; i++) argv[i] = xargv[i];
+        for (int i = 0; i < ac && i < 255; i++)
+            argv[i] = xargv[i];
         argv[ac < 255 ? ac : 255] = NULL;
         struct loaded lm;
         load_elf(p, &lm);
@@ -1670,7 +1744,8 @@ static void service_local(struct cpu *c) {
         brk_hi = brk_lo + (256u << 20);
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
         free(xpath);
-        for (int i = 0; i < ac && i < 255; i++) free(xargv[i]);
+        for (int i = 0; i < ac && i < 255; i++)
+            free(xargv[i]);
         G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;
@@ -1689,8 +1764,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         // WIFSIGNALED: macOS termsig -> Linux
-        if ((st & 0x7f) != 0 && (st & 0x7f) != 0x7f)
-            st = (st & ~0x7f) | (sig_m2l(st & 0x7f) & 0x7f);
+        if ((st & 0x7f) != 0 && (st & 0x7f) != 0x7f) st = (st & ~0x7f) | (sig_m2l(st & 0x7f) & 0x7f);
         // WIFSTOPPED: macOS stopsig -> Linux
         else if ((st & 0xff) == 0x7f)
             st = (st & ~0xff00) | ((sig_m2l((st >> 8) & 0xff) & 0xff) << 8);
@@ -1741,7 +1815,10 @@ static void service_local(struct cpu *c) {
             // socket -- write(2), writev(2), send(2) without MSG_NOSIGNAL -- returns -1/EPIPE instead
             // of raising SIGPIPE. Benign on healthy sockets; only sockets get it, so real pipes/FIFOs
             // keep Linux's default SIGPIPE-on-write semantics.
-            { int on = 1; setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
+            {
+                int on = 1;
+                setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+            }
             if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
             if (r < 1024) {
@@ -1797,8 +1874,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         // NET bridge: bind(0.0.0.0 / own-ip / in-subnet :port) -> LISTEN on /tmp/.ddbr-<netid>/<ownip>:<port>
-        if (br_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
-            br_bind_is(sa, (socklen_t)a2)) {
+        if (br_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] && br_bind_is(sa, (socklen_t)a2)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = br_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
             char up[200];
@@ -1894,13 +1970,16 @@ static void service_local(struct cpu *c) {
         struct sockaddr_storage hss;
         socklen_t hsl = sizeof hss;
         int want_peer = (!pl && !pbr && a1);
-        int r = (pl || pbr) ? accept(lfd, NULL, NULL)
-                            : accept(lfd, want_peer ? (struct sockaddr *)&hss : NULL,
-                                     want_peer ? &hsl : (socklen_t *)a2);
+        int r = (pl || pbr)
+                    ? accept(lfd, NULL, NULL)
+                    : accept(lfd, want_peer ? (struct sockaddr *)&hss : NULL, want_peer ? &hsl : (socklen_t *)a2);
         if (r >= 0) {
             // Accepted connections are sockets too: make SIGPIPE suppression sticky on the new fd so a
             // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
-            { int on = 1; setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
+            {
+                int on = 1;
+                setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+            }
             if (nr == 242) {
                 if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
                 if ((int)a3 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
@@ -1930,7 +2009,7 @@ static void service_local(struct cpu *c) {
                 // peer reported as our virtual listen addr (cf. lo_* simplification)
                 fill_inet_br((uint8_t *)a1, (socklen_t *)a2, pbrip, pbr);
             }
-        // peer = 127.0.0.1:lport
+            // peer = 127.0.0.1:lport
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -1967,8 +2046,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         // NET bridge: connect(peer-ip:port in our subnet) -> dial /tmp/.ddbr-<netid>/<peerip>:<port>
-        if (br_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
-            br_connect_is(sa, (socklen_t)a2)) {
+        if (br_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] && br_connect_is(sa, (socklen_t)a2)) {
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
@@ -2080,7 +2158,10 @@ static void service_local(struct cpu *c) {
     case 206: {
         // MSG_NOSIGNAL(0x4000) has no per-call equivalent on macOS; emulate it with the SO_NOSIGPIPE
         // socket option so the send returns EPIPE instead of raising a fatal SIGPIPE.
-        if ((int)a3 & 0x4000) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
+        if ((int)a3 & 0x4000) {
+            int on = 1;
+            setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+        }
         // dest addr (UDP): translate Linux AF_INET/INET6 sockaddr -> macOS; NULL/non-inet pass through.
         struct sockaddr_storage dss;
         socklen_t dhl = a4 ? sa_l2m((uint8_t *)a4, (socklen_t)a5, &dss) : (socklen_t)-1;
@@ -2120,7 +2201,7 @@ static void service_local(struct cpu *c) {
                 G_RET(c) = 0;
                 break;
             }
-        // translate SOL_SOCKET; ignore unknown
+            // translate SOL_SOCKET; ignore unknown
         } else if (lvl == 6) { // IPPROTO_TCP: optnames diverge — translate, ignore unknown (never cork by accident)
             opt = tcp_opt_l2m((int)a2);
             if (opt < 0) {
@@ -2147,7 +2228,7 @@ static void service_local(struct cpu *c) {
                 G_RET(c) = 0;
                 break;
             }
-        // unknown -> report 0
+            // unknown -> report 0
         } else if (lvl == 6) { // IPPROTO_TCP: translate optname, report 0 for unknown
             opt = tcp_opt_l2m((int)a2);
             if (opt < 0) {
@@ -2208,7 +2289,10 @@ static void service_local(struct cpu *c) {
             mh.msg_controllen = (gc && gcl) ? (socklen_t)sizeof hctl : 0;
         }
         // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE (macOS has no per-call flag); EPIPE instead of SIGPIPE.
-        if (nr == 211 && ((int)a2 & 0x4000)) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
+        if (nr == 211 && ((int)a2 & 0x4000)) {
+            int on = 1;
+            setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+        }
         ssize_t r =
             (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         if (nr == 212 && r >= 0) {
@@ -2235,7 +2319,10 @@ static void service_local(struct cpu *c) {
         // mmsghdr = msghdr(56) + msg_len(4) + pad
         int done = 0, err = 0;
         // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE once before the fan-out (macOS has no per-call flag).
-        if (nr == 269 && ((int)a3 & 0x4000)) { int on = 1; setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on); }
+        if (nr == 269 && ((int)a3 & 0x4000)) {
+            int on = 1;
+            setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+        }
         for (unsigned i = 0; i < vlen; i++) {
             uint8_t *g = vec + (size_t)i * 64;
             struct msghdr mh;
@@ -2310,19 +2397,22 @@ static void service_local(struct cpu *c) {
         if (a1 & 0x80000) {
             fcntl(fds[0], F_SETFD, FD_CLOEXEC);
             fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-        // EFD_CLOEXEC
+            // EFD_CLOEXEC
         }
         if (a1 & 0x800) {
             fcntl(fds[0], F_SETFL, O_NONBLOCK);
             fcntl(fds[1], F_SETFL, O_NONBLOCK);
-        // EFD_NONBLOCK
+            // EFD_NONBLOCK
         }
         // writes to the eventfd go to fds[1]; the counter + sema-flag live alongside.
         if (fds[0] < 1024 && fds[1] < 1024) {
             g_eventfd_peer[fds[0]] = fds[1] + 1;
-            g_eventfd_sema[fds[0]] = (a1 & 1) != 0;   // EFD_SEMAPHORE
-            g_eventfd_count[fds[0]] = a0;             // initval
-            if (a0 > 0) { char b = 1; if (write(fds[1], &b, 1) < 0) {} } // make it readable
+            g_eventfd_sema[fds[0]] = (a1 & 1) != 0; // EFD_SEMAPHORE
+            g_eventfd_count[fds[0]] = a0;           // initval
+            if (a0 > 0) {
+                char b = 1;
+                if (write(fds[1], &b, 1) < 0) {}
+            } // make it readable
         }
         G_RET(c) = (uint64_t)fds[0];
         break;
@@ -2343,19 +2433,29 @@ static void service_local(struct cpu *c) {
         if (a3) {
             ev = *(uint32_t *)a3;
             memcpy(&data, (void *)(a3 + 4), 8);
-        // struct epoll_event {u32 events; u64 data} packed
+            // struct epoll_event {u32 events; u64 data} packed
         }
         // op: 1=ADD 2=DEL 3=MOD ; EPOLLET=0x80000000 -> EV_CLEAR ; EPOLLONESHOT=0x40000000 -> EV_ONESHOT
         uint16_t xf = (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0));
-        int want_rd = (op != 2) && (ev & 0x1);   // EPOLLIN
-        int want_wr = (op != 2) && (ev & 0x4);   // EPOLLOUT
+        int want_rd = (op != 2) && (ev & 0x1); // EPOLLIN
+        int want_wr = (op != 2) && (ev & 0x4); // EPOLLOUT
         if (epopt_on() && (int)a0 >= 0 && (int)a0 < 1024 && fd >= 0 && fd < 1024) {
             // W3E fast path: track armed filters, defer the change to the next epoll_wait kevent().
             int ep = (int)a0;
-            if (want_rd) { ep_push(ep, fd, EVFILT_READ, EV_ADD | xf, (void *)data); g_ep_rd[fd] = 1; }
-            else if (g_ep_rd[fd]) { ep_push(ep, fd, EVFILT_READ, EV_DELETE, (void *)data); g_ep_rd[fd] = 0; }
-            if (want_wr) { ep_push(ep, fd, EVFILT_WRITE, EV_ADD | xf, (void *)data); g_ep_wr[fd] = 1; }
-            else if (g_ep_wr[fd]) { ep_push(ep, fd, EVFILT_WRITE, EV_DELETE, (void *)data); g_ep_wr[fd] = 0; }
+            if (want_rd) {
+                ep_push(ep, fd, EVFILT_READ, EV_ADD | xf, (void *)data);
+                g_ep_rd[fd] = 1;
+            } else if (g_ep_rd[fd]) {
+                ep_push(ep, fd, EVFILT_READ, EV_DELETE, (void *)data);
+                g_ep_rd[fd] = 0;
+            }
+            if (want_wr) {
+                ep_push(ep, fd, EVFILT_WRITE, EV_ADD | xf, (void *)data);
+                g_ep_wr[fd] = 1;
+            } else if (g_ep_wr[fd]) {
+                ep_push(ep, fd, EVFILT_WRITE, EV_DELETE, (void *)data);
+                g_ep_wr[fd] = 0;
+            }
             g_ep_os[fd] = (op != 2 && (ev & 0x40000000u)) ? 1 : 0;
             G_RET(c) = 0;
             break;
@@ -2367,12 +2467,12 @@ static void service_local(struct cpu *c) {
         if (op == 2 || (ev & 0x1)) {
             EV_SET(&kv[n], fd, EVFILT_READ, base | xf, 0, 0, (void *)data);
             n++;
-        // EPOLLIN
+            // EPOLLIN
         }
         if (op == 2 || (ev & 0x4)) {
             EV_SET(&kv[n], fd, EVFILT_WRITE, base | xf, 0, 0, (void *)data);
             n++;
-        // EPOLLOUT
+            // EPOLLOUT
         }
         for (int i = 0; i < n; i++) {
             // per-filter so DEL of an absent one is ignored
@@ -2421,8 +2521,10 @@ static void service_local(struct cpu *c) {
             memcpy(out + oi * 12 + 4, &kv[i].udata, 8);
             // EPOLLONESHOT: the kernel auto-removed this registration; keep our armed map in sync.
             if (opt && kv[i].ident < 1024 && g_ep_os[kv[i].ident]) {
-                if (kv[i].filter == EVFILT_READ) g_ep_rd[kv[i].ident] = 0;
-                else if (kv[i].filter == EVFILT_WRITE) g_ep_wr[kv[i].ident] = 0;
+                if (kv[i].filter == EVFILT_READ)
+                    g_ep_rd[kv[i].ident] = 0;
+                else if (kv[i].filter == EVFILT_WRITE)
+                    g_ep_wr[kv[i].ident] = 0;
             }
             oi++;
         }
@@ -2431,7 +2533,10 @@ static void service_local(struct cpu *c) {
         if (opt && oi == 0 && r > 0 && nchg > 0 && (int)a3 != 0) {
             int r2 = kevent(ep, NULL, 0, kv, maxev, tp);
             ep_count();
-            if (r2 < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+            if (r2 < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             for (int i = 0; i < r2 && oi < maxev; i++) {
                 if (kv[i].flags & EV_ERROR) continue;
                 uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
@@ -2439,8 +2544,10 @@ static void service_local(struct cpu *c) {
                 *(uint32_t *)(out + oi * 12) = ev;
                 memcpy(out + oi * 12 + 4, &kv[i].udata, 8);
                 if (kv[i].ident < 1024 && g_ep_os[kv[i].ident]) {
-                    if (kv[i].filter == EVFILT_READ) g_ep_rd[kv[i].ident] = 0;
-                    else if (kv[i].filter == EVFILT_WRITE) g_ep_wr[kv[i].ident] = 0;
+                    if (kv[i].filter == EVFILT_READ)
+                        g_ep_rd[kv[i].ident] = 0;
+                    else if (kv[i].filter == EVFILT_WRITE)
+                        g_ep_wr[kv[i].ident] = 0;
                 }
                 oi++;
             }
@@ -2463,7 +2570,7 @@ static void service_local(struct cpu *c) {
     case 27: {
         char pb[4200];
         // confined (realpath gate)
-        const char *p = atpath(-100, (const char *)a1, pb, sizeof pb);
+        const char *p = atpath(-100, (const char *)a1, pb, sizeof pb, 0);
         int wfd = open(p, O_EVTONLY);
         if (wfd < 0) {
             G_RET(c) = (uint64_t)(-errno);
@@ -2487,7 +2594,7 @@ static void service_local(struct cpu *c) {
         }
         G_RET(c) = (uint64_t)wfd;
         break;
-    // watch descriptor = the watched fd
+        // watch descriptor = the watched fd
     }
     case 28: {
         struct kevent kv;
@@ -2501,7 +2608,10 @@ static void service_local(struct cpu *c) {
     case 72: { // pselect6(nfds, readfds, writefds, exceptfds, timeout(timespec), sigmask) -> pselect.
         // The Linux/macOS fd_set byte-layout is identical (bit N at byte N/8), so pass the sets through.
         struct timespec ts, *tsp = NULL;
-        if (a4) { ts = *(struct timespec *)a4; tsp = &ts; }
+        if (a4) {
+            ts = *(struct timespec *)a4;
+            tsp = &ts;
+        }
         int r = pselect((int)a0, (fd_set *)a1, (fd_set *)a2, (fd_set *)a3, tsp, NULL);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -2548,7 +2658,7 @@ static void service_local(struct cpu *c) {
         if (r >= 0) {
             if (r < 1024) g_timerfd[r] = 1;
             if (a1 & 1) fcntl(r, F_SETFL, O_NONBLOCK);
-        // TFD_NONBLOCK=1
+            // TFD_NONBLOCK=1
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -2572,7 +2682,7 @@ static void service_local(struct cpu *c) {
             kevent((int)a0, &kv, 1, NULL, 0, NULL);
             G_RET(c) = 0;
             break;
-        // disarm
+            // disarm
         }
         // no interval -> one-shot
         uint16_t fl = EV_ADD | ((iv_s || iv_n) ? 0 : EV_ONESHOT);
@@ -2584,7 +2694,7 @@ static void service_local(struct cpu *c) {
         if (a1) memset((void *)a1, 0, 32);
         G_RET(c) = 0;
         break;
-    // timerfd_gettime -> best-effort 0
+        // timerfd_gettime -> best-effort 0
     }
 
     // ===================== Misc — uname/sysinfo/getrandom/hostname =====================
@@ -2606,7 +2716,7 @@ static void service_local(struct cpu *c) {
         if (n > 0) {
             memcpy(g_hostname, (void *)a0, n);
             g_hostname[n] = 0;
-        // sethostname (UTS ns)
+            // sethostname (UTS ns)
         }
         G_RET(c) = 0;
         break;
@@ -2641,36 +2751,50 @@ static void service_local(struct cpu *c) {
     // flock(fd, op): macOS flock(2); Linux LOCK_SH/EX/UN/NB op values match the host
     case 32: G_RET(c) = flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     // setsid(): new session / process-group leader
-    case 157: { pid_t s = setsid(); G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s; break; }
+    case 157: {
+        pid_t s = setsid();
+        G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s;
+        break;
+    }
     // scheduling: stub with sane SCHED_OTHER values (real-time priorities aren't offered)
-    case 118: // sched_setparam
-    case 119: G_RET(c) = 0; break;                            // sched_setscheduler -> ok (ignored)
-    case 120: G_RET(c) = 0; break;                            // sched_getscheduler -> SCHED_OTHER(0)
-    case 121: if (a1) *(int *)a1 = 0; G_RET(c) = 0; break;    // sched_getparam -> priority 0
+    case 118:                      // sched_setparam
+    case 119: G_RET(c) = 0; break; // sched_setscheduler -> ok (ignored)
+    case 120: G_RET(c) = 0; break; // sched_getscheduler -> SCHED_OTHER(0)
+    case 121:
+        if (a1) *(int *)a1 = 0;
+        G_RET(c) = 0;
+        break;                                                 // sched_getparam -> priority 0
     case 125: G_RET(c) = (a0 == 1 || a0 == 2) ? 99 : 0; break; // sched_get_priority_max: FIFO/RR=99 else 0
-    case 126: G_RET(c) = 0; break;                            // sched_get_priority_min -> 0
-    case 127: // sched_rr_get_interval -> a nominal 100ms slice
-        if (a1) { ((struct timespec *)a1)->tv_sec = 0; ((struct timespec *)a1)->tv_nsec = 100000000L; }
-        G_RET(c) = 0; break;
+    case 126: G_RET(c) = 0; break;                             // sched_get_priority_min -> 0
+    case 127:                                                  // sched_rr_get_interval -> a nominal 100ms slice
+        if (a1) {
+            ((struct timespec *)a1)->tv_sec = 0;
+            ((struct timespec *)a1)->tv_nsec = 100000000L;
+        }
+        G_RET(c) = 0;
+        break;
     // mlockall/munlockall: no macOS equivalent; the guest's "don't swap" intent is a safe no-op
     case 230:
     case 231: G_RET(c) = 0; break;
     // getitimer/setitimer: wrap the host (ITIMER_* + struct itimerval layouts match Linux<->macOS)
     case 102: G_RET(c) = getitimer((int)a0, (struct itimerval *)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     case 103:
-        G_RET(c) = setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0
-                       ? (uint64_t)(-errno) : 0;
+        G_RET(c) =
+            setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
     case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
     case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
     case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
     case 152: G_RET(c) = (uint64_t)cgid(); break; // setfsgid -> previous fsgid
-    case 168: // getcpu(cpu, node, tcache) -> cpu 0 / node 0
+    case 168:                                     // getcpu(cpu, node, tcache) -> cpu 0 / node 0
         if (a0) *(unsigned *)a0 = 0;
         if (a1) *(unsigned *)a1 = 0;
-        G_RET(c) = 0; break;
+        G_RET(c) = 0;
+        break;
     case 213: G_RET(c) = 0; break; // readahead: advisory, no-op
-    case 274: G_RET(c) = 0; break; // sched_setattr -> ok (ignored)
+    case 274:
+        G_RET(c) = 0;
+        break; // sched_setattr -> ok (ignored)
     // preadv2/pwritev2: flags (a5) ignored; offset in a3 (pos_high a4 is 0 on LP64)
     case 286: {
         if (memf_get((int)a0)) {
@@ -2686,7 +2810,8 @@ static void service_local(struct cpu *c) {
         if (memf_get((int)a0)) {
             const struct iovec *iv = (const struct iovec *)a1;
             off_t end = (off_t)a3;
-            for (int i = 0; i < (int)a2; i++) end += iv[i].iov_len;
+            for (int i = 0; i < (int)a2; i++)
+                end += iv[i].iov_len;
             if (memf_room_or_spill((int)a0, end)) {
                 ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
@@ -2723,12 +2848,12 @@ static void service_local(struct cpu *c) {
                 // si_status carries a signal number for kill/dump/stop/cont -> translate macOS->Linux
                 if (code == CLD_KILLED || code == CLD_DUMPED || code == CLD_STOPPED || code == CLD_CONTINUED)
                     status = sig_m2l(status);
-                *(int *)(gi + 0) = 17;            // si_signo = Linux SIGCHLD
-                *(int *)(gi + 4) = 0;             // si_errno
-                *(int *)(gi + 8) = code;          // si_code (CLD_* values match Linux<->macOS)
+                *(int *)(gi + 0) = 17;   // si_signo = Linux SIGCHLD
+                *(int *)(gi + 4) = 0;    // si_errno
+                *(int *)(gi + 8) = code; // si_code (CLD_* values match Linux<->macOS)
                 *(int *)(gi + 16) = (int)si.si_pid;
                 *(int *)(gi + 20) = (int)si.si_uid;
-                *(int *)(gi + 24) = status;       // si_status
+                *(int *)(gi + 24) = status; // si_status
             }
         }
         G_RET(c) = 0;
@@ -2737,7 +2862,10 @@ static void service_local(struct cpu *c) {
     // truncate(path, length): resolve the guest path through the overlay (same helper execve uses), then
     // truncate by host path. Evict the stat cache so the new size is observed.
     case 45: {
-        if (jail_ro_at(-100, (const char *)a0)) { G_RET(c) = (uint64_t)(int64_t)(-EROFS); break; }
+        if (jail_ro_at(-100, (const char *)a0)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+            break;
+        }
         char pb[4200];
         const char *p = xresolve_overlay((const char *)a0, pb, sizeof pb);
         int r = truncate(p, (off_t)a1);
@@ -2756,7 +2884,9 @@ static void service_local(struct cpu *c) {
         G_RET(c) = 0;
         break;
     }
-    case 164: G_RET(c) = 0; break; // setrlimit -> accepted
+    case 164:
+        G_RET(c) = 0;
+        break; // setrlimit -> accepted
 
     // clock_adjtime(clk_id, timex): container has no CAP_SYS_TIME -> EPERM (mirrors clock_settime case 112)
     case 266: G_RET(c) = (uint64_t)(-1); break;
@@ -2780,7 +2910,7 @@ static void service_local(struct cpu *c) {
     case 240: {
         int sig = (int)a2;
         if (sig >= 1 && sig <= 64 && a3) {
-            g_sigcode[sig] = *(int *)(a3 + 8);     // siginfo.si_code
+            g_sigcode[sig] = *(int *)(a3 + 8);      // siginfo.si_code
             g_sigval[sig] = *(uint64_t *)(a3 + 24); // siginfo.si_value (sival_int/ptr)
         }
         raise_guest_signal(c, sig);

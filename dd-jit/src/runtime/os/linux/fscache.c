@@ -24,25 +24,32 @@ static void oc_store(const char *g, const char *host);
 static void oc_reset(void);
 // Rewrite ABSOLUTE guest paths into the rootfs; relative paths pass through (resolved
 // against the dir-fd by the *at syscall, e.g. ls stat-ing entries relative to a dir).
-static const char *atpath(int dirfd, const char *raw, char *buf, size_t n) {
+// nofollow=1 leaves the FINAL component unresolved (lstat/AT_SYMLINK_NOFOLLOW unlink), so a
+// symlink is stat'd/removed as the link itself rather than its target.
+static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int nofollow) {
     if (!raw) return raw;
-    // absolute -> follow symlinks rootfs-relative + confine
+    // absolute -> rootfs-relative + confine (final component followed unless nofollow)
     if (raw[0] == '/') {
         // S2: serve the memoized host path (only when a rootfs is configured -- without one the
         // resolvers below return `raw` untouched and leave `buf` garbage, so there's nothing to cache).
-        if (g_rootfs && rc_lookup(raw, buf, n)) return buf;
+        // Follow-path only: the rc_* cache memoizes followed results, so a nofollow lookup must bypass it.
+        if (!nofollow && g_rootfs && rc_lookup(raw, buf, n)) return buf;
         if (g_nlower) {
-            overlay_resolve(raw, buf, n, 0);
-            if (g_rootfs) rc_store(raw, buf);
+            overlay_resolve(raw, buf, n, nofollow);
+            if (!nofollow && g_rootfs) rc_store(raw, buf);
             return buf;
-        // overlay: search upper+lowers
+            // overlay: search upper+lowers
         }
         if (g_rootfs) {
-            xresolve_exec(raw, buf, n);
-            rc_store(raw, buf);
+            if (nofollow)
+                xlate(raw, buf, n);
+            else {
+                xresolve_exec(raw, buf, n);
+                rc_store(raw, buf);
+            }
             return buf;
         }
-        return xresolve_exec(raw, buf, n);
+        return nofollow ? xlate(raw, buf, n) : xresolve_exec(raw, buf, n);
     }
     if (!g_rootfs) return raw;
     // relative via a real dir-fd
@@ -62,26 +69,26 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n) {
                 if (strncmp(gdir, g_lower[i].canon, g_lower[i].clen) == 0) {
                     gdir += g_lower[i].clen;
                     break;
-                // a lower -> guest dir
+                    // a lower -> guest dir
                 }
         char combined[8400];
         snprintf(combined, sizeof combined, "/%s/%s", gdir, raw);
         if (g_nlower) {
-            overlay_resolve(combined, buf, n, 0);
+            overlay_resolve(combined, buf, n, nofollow);
             return buf;
         }
         // openat then ignores dirfd (path absolute)
-        return xresolve(combined, buf, n);
+        return nofollow ? xlate(combined, buf, n) : xresolve(combined, buf, n);
     }
     {
         char j[8400];
         // AT_FDCWD-relative -> join the guest cwd, then confine
         snprintf(j, sizeof j, "%s/%s", g_cwd, raw);
         if (g_nlower) {
-            overlay_resolve(j, buf, n, 0);
+            overlay_resolve(j, buf, n, nofollow);
             return buf;
         }
-        return xresolve_exec(j, buf, n);
+        return nofollow ? xlate(j, buf, n) : xresolve_exec(j, buf, n);
     }
 }
 
@@ -286,8 +293,7 @@ static int rc_lookup(const char *g, char *out, size_t n) {
 static void rc_store(const char *g, const char *host) {
     if (!res_enabled() || !g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-resolved every time, safely.
-    if (strlen(g) >= sizeof(((struct rcent *)0)->guest) || strlen(host) >= sizeof(((struct rcent *)0)->host))
-        return;
+    if (strlen(g) >= sizeof(((struct rcent *)0)->guest) || strlen(host) >= sizeof(((struct rcent *)0)->host)) return;
     CLK;
     uint64_t h = mc_hash(g);
     struct rcent *e = &g_rc[h & (RCACHE_N - 1)];
@@ -349,8 +355,7 @@ static int oc_lookup(const char *g, char *out, size_t n) {
 static void oc_store(const char *g, const char *host) {
     if (!oc_enabled() || !g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-walked every time, safely.
-    if (strlen(g) >= sizeof(((struct ocent *)0)->guest) || strlen(host) >= sizeof(((struct ocent *)0)->host))
-        return;
+    if (strlen(g) >= sizeof(((struct ocent *)0)->guest) || strlen(host) >= sizeof(((struct ocent *)0)->host)) return;
     // defensive: never cache a host path that resolved OUTSIDE the rootfs jail (item-9-style confinement).
     if (g_rootfs_canon_len && strncmp(host, g_rootfs_canon, g_rootfs_canon_len)) return;
     CLK;
