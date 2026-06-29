@@ -174,6 +174,49 @@
     <li><strong class="text-txt"><code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli</code> for the terminal</strong> — install the CLI for scripts and CI; <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli mac</code> even drops you into a real isolated macOS shell — the kernel is just userspace code, not only a <em>Linux</em> one, so JVM / Node / .NET that JIT at runtime work too.</li>
   </ul>
 
+  <!-- click-to-play demo carousel -->
+  <div class="mt-6" id="dd-demos">
+    <div class="relative overflow-hidden rounded-xl border border-edge bg-code">
+      <div class="ddc-track">
+        <figure class="ddc-slide" data-gif="../assets/dd-run.gif" data-poster="../assets/dd-run-poster.png"><img src="../assets/dd-run-poster.png" alt="dd: run a Linux container, no VM" loading="lazy" /><button class="ddc-play" type="button" aria-label="Play demo">&#9654;</button></figure>
+        <figure class="ddc-slide" data-gif="../assets/dd-inside.gif" data-poster="../assets/dd-inside-poster.png"><img src="../assets/dd-inside-poster.png" alt="dd: a real Alpine Linux userland" loading="lazy" /><button class="ddc-play" type="button" aria-label="Play demo">&#9654;</button></figure>
+        <figure class="ddc-slide" data-gif="../assets/dd-docker.gif" data-poster="../assets/dd-docker-poster.png"><img src="../assets/dd-docker-poster.png" alt="dd: the Docker CLI, unchanged" loading="lazy" /><button class="ddc-play" type="button" aria-label="Play demo">&#9654;</button></figure>
+      </div>
+      <button class="ddc-nav ddc-prev" type="button" aria-label="Previous">&#8249;</button>
+      <button class="ddc-nav ddc-next" type="button" aria-label="Next">&#8250;</button>
+    </div>
+    <div class="ddc-cap mt-2 text-center text-sm text-muted2"></div>
+    <div class="ddc-dots mt-3 flex justify-center gap-2"></div>
+  </div>
+  <style>
+    #dd-demos .ddc-track{display:flex;transition:transform .35s ease}
+    #dd-demos .ddc-slide{position:relative;min-width:100%;cursor:pointer;margin:0}
+    #dd-demos .ddc-slide img{display:block;width:100%}
+    #dd-demos .ddc-play{position:absolute;inset:0;margin:auto;width:64px;height:64px;border-radius:9999px;background:rgba(33,95,231,.85);color:#fff;font-size:22px;border:0;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 24px rgba(0,0,0,.45);transition:transform .15s}
+    #dd-demos .ddc-play:hover{transform:scale(1.08)}
+    #dd-demos .ddc-slide.playing .ddc-play{display:none}
+    #dd-demos .ddc-nav{position:absolute;top:50%;transform:translateY(-50%);width:36px;height:36px;border-radius:9999px;background:rgba(12,19,34,.6);color:#fff;border:1px solid #25324d;font-size:20px;line-height:1;cursor:pointer}
+    #dd-demos .ddc-prev{left:10px}#dd-demos .ddc-next{right:10px}
+    #dd-demos .ddc-dot{width:8px;height:8px;border-radius:9999px;background:#25324d;border:0;cursor:pointer;padding:0}
+    #dd-demos .ddc-dot.active{background:#4f88ff}
+  </style>
+  <script>
+  (function(){
+    var root=document.getElementById('dd-demos'); if(!root) return;
+    var track=root.querySelector('.ddc-track'),
+        slides=[].slice.call(root.querySelectorAll('.ddc-slide')),
+        dots=root.querySelector('.ddc-dots'), capEl=root.querySelector('.ddc-cap'),
+        caps=['Run a Linux container — no VM','A real Alpine Linux userland','The Docker CLI, unchanged'], i=0;
+    function reset(s){var img=s.querySelector('img');img.src=s.dataset.poster;s.classList.remove('playing');}
+    function play(s){var img=s.querySelector('img');img.src=s.dataset.gif+'?t='+Date.now();s.classList.add('playing');}
+    function go(n){slides.forEach(reset);i=(n+slides.length)%slides.length;track.style.transform='translateX('+(-i*100)+'%)';capEl.textContent=caps[i];[].slice.call(dots.children).forEach(function(d,idx){d.classList.toggle('active',idx===i);});}
+    slides.forEach(function(s,idx){var d=document.createElement('button');d.className='ddc-dot';d.type='button';d.addEventListener('click',function(){go(idx);});dots.appendChild(d);s.addEventListener('click',function(){play(s);});});
+    root.querySelector('.ddc-prev').addEventListener('click',function(){go(i-1);});
+    root.querySelector('.ddc-next').addEventListener('click',function(){go(i+1);});
+    go(0);
+  })();
+  </script>
+
   <!-- HONEST TRADE-OFF -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">The honest trade-off</h2>
   <p class="mt-4 leading-relaxed text-muted">A userspace kernel is only as complete as the syscalls it implements, and by default dd runs the guest in one process — a great fit for code you <strong class="text-txt">trust</strong> (your dev environment, CI, your own tools). For <strong class="text-txt">untrusted</strong> code there's now an opt-in <strong class="text-txt">sentry split</strong> (<code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">DDJIT_UNTRUSTED</code>): the guest runs in a deny-default Seatbelt sandbox with no host fs/net authority, while a trusted <em>sentry</em> process owns the real resources and serves its syscalls across a shared-memory ring — the gVisor shape, on the desktop. It's early — the core file syscalls (read/write/open/close/lseek) forward today; sockets/exec/fork are landing — so I won't pretend it matches a VM yet: for fully hostile code a VM still exposes a narrower attack surface. (Default path is unchanged: gate off, byte-identical to before.) And it's all still alpha — some images are flaky run-to-run.</p>
