@@ -337,7 +337,22 @@ static void ea_add_disp(int64_t d) {
 // Address-gen fast path: fold base, index<<scale and disp into the fewest host insns --
 // base+index in one shifted add, disp in an add/sub-immediate (no per-access constant build).
 // NOEAOPT=1 reverts to the exact baseline lowering (movconst-built disp + base+0 add).
-static void emit_ea(struct insn *I, uint64_t next_rip) {
+// guest_base bias-fold: x17 holds the guest effective address; if it is a LOW image address (< 4GiB) add
+// g_nonpie_bias so the access hits the high mapping. Flag-free (lsr/cbnz/add only) so the x86 lazy-flags
+// state is untouched; x16 is the EA scratch (already clobbered by emit_ea), free to reuse here. Inert for
+// PIE (guestfold_on() == 0). Only the dereference path uses it -- `lea` returns the LOW address unbiased.
+static void ea_bias17(void) {
+    if (!guestfold_on()) return;
+    e_lsr_i(16, 17, 32, 1); // x16 = EA >> 32   (x16 == 0 <=> EA < 4GiB == image)
+    uint32_t *cb = (uint32_t *)g_cp;
+    emit32(0); // cbnz x16, Lskip   (high address -> no bias)
+    e_movconst(16, g_nonpie_bias);
+    e_rrr(A_ADD, 17, 17, 16, 1, 0); // x17 += bias
+    *cb = 0xB5000000u | (((uint32_t)(((uint8_t *)g_cp - (uint8_t *)cb) / 4) & 0x7FFFF) << 5) | 16; // cbnz x16
+}
+static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias);
+static void emit_ea(struct insn *I, uint64_t next_rip) { emit_ea_core(I, next_rip, 1); }
+static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias) {
     if (noeaopt()) { // exact baseline lowering
         if (I->rip_rel) {
             e_movconst(17, next_rip + (uint64_t)I->disp);
@@ -376,6 +391,7 @@ static void emit_ea(struct insn *I, uint64_t next_rip) {
         e_ldr(16, 28, I->seg == 1 ? OFF_FS : OFF_GS);
         e_rrr(A_ADD, 17, 17, 16, 1, 0);
     }
+    if (do_bias) ea_bias17(); // non-PIE: x17 = host address (+bias for a low image EA); no-op for PIE / lea
 }
 
 // Decide whether a [base+disp] (no index/seg/rip) memory operand can be folded directly
@@ -384,6 +400,9 @@ static void emit_ea(struct insn *I, uint64_t next_rip) {
 // NOEAOPT=1 forces 0 (no fold) -> the caller uses the baseline emit_ea + e_load/e_store.
 static int ea_imm_fold(struct insn *I, int w, int *rn, int *off) {
     if (noeaopt()) return 0;
+    // guest_base bias-fold: the direct [base+disp] fold uses the guest base register unbiased -> route
+    // through emit_ea (which biases x17) instead, so a low image access is redirected to the high mapping.
+    if (guestfold_on()) return 0;
     if (!(I->m_hasbase && !I->m_hasindex && !I->seg && !I->rip_rel)) return 0;
     int64_t d = I->disp;
     *rn = I->m_base;

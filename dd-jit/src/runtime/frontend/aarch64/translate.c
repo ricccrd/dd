@@ -157,6 +157,161 @@ static void emit_mangled_x18(uint32_t in, int mask) {
         // restore scratch
         e_ldr(sc[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
 }
+// ---- guest_base bias-fold (non-PIE ET_EXEC; see docs/design/nonpie-pagezero.md) ----
+// A non-PIE image maps HIGH (+g_nonpie_bias) but its baked absolute pointers stay LOW (link vaddr); a
+// guest load/store through such a pointer would hit the unmapped low address and trap (one SIGSEGV per
+// access -> cc1 ~400s). Instead, fold the bias into the effective address at translate time: if the access
+// targets a LOW image address, add g_nonpie_bias so it lands directly in the high mapping. Stack/heap/mmap
+// pointers are real HIGH addresses (>= 4GiB, above the engine's 4GiB __PAGEZERO), so the discriminator is
+// "EA < 4GiB" <=> image. The common single-base + register-offset + writeback forms are folded; the
+// monitor-exclusive pair, AdvSIMD load/store structures, DC-ZVA, and the LSE-upgraded atomic loops fall
+// through to nonpie_fixup, the safety net (still correct, just a per-access fault). Inert for PIE.
+
+// Is `in` a base-register memory op whose effective address we fold? We fold ONLY the forms with a single
+// base register Xn[9:5] + a (possibly absent) immediate, so the "is this a LOW image address" test on Xn
+// is sound: a LOW Xn means an image access, regardless of the small immediate. Excluded (left to the
+// nonpie_fixup safety net -- still correct, just a per-access fault):
+//   - ldr-literal (PC-relative; already materialized HIGH)
+//   - writeback (pre/post-index)
+//   - the exclusive-MONITOR pair (a scratch spill between ldxr/stxr clears the monitor)
+//   - AdvSIMD load/store structures, DC ZVA.
+// The register-offset form [Xn,Xm{,ext}] HAS two address registers (EA = Xn + extend(Xm)); it is folded
+// too, but by computing the full EA first and testing THAT (biasing Xn alone is wrong when the pointer is
+// the high Xm and Xn a small index -- that corrupted glibc/ld.so). See emit_fold_mem.
+static int is_foldable_mem(uint32_t in) {
+    if ((in & 0x0A000000u) != 0x08000000u) return 0; // not in the loads/stores major group
+    if ((in & 0x3B000000u) == 0x18000000u) return 0; // ldr (literal): handled separately, maps HIGH
+    if ((in & 0x3B000000u) == 0x39000000u) return 1; // LDR/STR unsigned-offset (int + SIMD): no WB
+    if ((in & 0x3B200000u) == 0x38000000u) return 1; // unscaled / unpriv / post / pre (single base Xn; WB
+                                                     // handled by emit_fold_mem -- post/pre are the hot form)
+    if ((in & 0x3B200C00u) == 0x38200800u) return 1; // register-offset [Xn,Xm{,ext}]: full-EA fold below
+    if ((in & 0x3A000000u) == 0x28000000u) {         // LDP/STP family
+        int o = (in >> 23) & 3;
+        return o == 0 || o == 2; // 00 no-alloc, 10 offset; reject 01/11 (writeback)
+    }
+    if ((in & 0x3F000000u) == 0x08000000u)            // exclusive / ordered / CAS group ([Xn] base)
+        return (in & 0x00800000u) != 0;               // bit23: 1=LDAR/STLR/CAS (single) -> fold; 0=monitor pair
+    if ((in & 0x3B200C00u) == 0x38200000u) return 1; // LSE atomic memory ops (LDADD/SWP/...): [Xn]
+    return 0;
+}
+
+// Emit a folded memory op: compute the guest effective address into a scratch Sb, add g_nonpie_bias iff
+// that address is a LOW image address (< 4GiB; everything else -- stack/heap/mmap/libs -- is >= the
+// engine's 4GiB __PAGEZERO), then the access re-pointed at Sb. Flag-free (loads/stores must not disturb the
+// guest NZCV): only mov/ldr/add/lsr/cbnz. Scratch originals are spilled to cpu->mscratch (NOT the stack:
+// the fold runs on every memory op, where an async host signal would clobber a red-zone slot). For the
+// register-offset form the full EA (Xn + extend(Xm)) is materialized and the access is de-indexed to a
+// plain [Sb] (unscaled, #0) so the single < 4GiB test is on the real target. Pre/post-index writeback is
+// de-indexed too: the access runs against the biased Sb, then the writeback updates the LOW guest base. Any
+// stolen Rt/Rt2/Rs is handled by reusing emit_mangled_x18 on the re-based instruction (base field -> Sb).
+static void emit_fold_mem(uint32_t in) {
+    int mask = gpr_field_mask(in), base = (in >> 5) & 31;
+    // LSE atomic memory ops (LDADD/SWP/...) carry an operand register Rs at [20:16] that gpr_field_mask
+    // does not flag; mark it (bit2) so the scratch picker never aliases Rs and a stolen Rs is mangled.
+    if ((in & 0x3B200C00u) == 0x38200000u) mask |= 4;
+    int regoff = (in & 0x3B200C00u) == 0x38200800u;
+    int wb = 0; // single-register writeback: 1 = pre-index, 2 = post-index
+    int64_t wbimm = 0;
+    if (((in >> 27) & 7) == 7 && !((in >> 24) & 1)) {
+        int o = (in >> 10) & 3;
+        wb = (o == 3) ? 1 : (o == 1) ? 2 : 0;
+        if (wb) wbimm = sext((uint64_t)((in >> 12) & 0x1FF), 9);
+    }
+    int used = 0;
+    static const int shifts[4] = {0, 5, 16, 10}, mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; k++)
+        if (mask & mbits[k]) used |= 1u << ((in >> shifts[k]) & 31);
+    int need = regoff ? 4 : 3, sc[4], n = 0;
+    for (int r = 0; r <= 30 && n < need; r++)
+        if (!(used & (1u << r)) && !is_stolen(r)) sc[n++] = r;
+    int Sb = sc[0], T = sc[1], T2 = sc[2], Tm = regoff ? sc[3] : -1;
+    // Spill scratch originals to cpu->mscratch[4..7], NOT the stack: the fold runs on EVERY guest memory op,
+    // and an async host signal (e.g. Go's SIGURG preemption) would clobber a [sp,#-N] red-zone slot. This
+    // mirrors emit_mangled_x18 (it uses mscratch[0..3]); the slots are disjoint so the nested call is safe.
+    int M = (int)OFF_MSCRATCH;
+    e_str(Sb, CPUREG, M + 32);
+    e_str(T, CPUREG, M + 40);
+    e_str(T2, CPUREG, M + 48);
+    if (regoff) e_str(Tm, CPUREG, M + 56);
+    if (is_stolen(base))
+        e_ldr(Sb, CPUREG, base * 8); // guest base from cpu->x[base]
+    else
+        e_movr(Sb, base); // guest base from the live host reg
+    if (regoff) {
+        int rm = (in >> 16) & 31, opt = (in >> 13) & 7, S = (in >> 12) & 1, v = (in >> 26) & 1;
+        int sz = v ? ((((in >> 22) & 3) >> 1) << 2) | ((in >> 30) & 3) : (in >> 30) & 3;
+        int amt = S ? sz : 0, mreg = rm;
+        if (is_stolen(rm)) {
+            e_ldr(Tm, CPUREG, rm * 8); // index from cpu->x[rm]
+            mreg = Tm;
+        }
+        // Sb = Xn + extend(Xm)  (extended-register add; option/amount mirror the load's index extend)
+        emit32(0x8B200000u | (mreg << 16) | (opt << 13) | ((unsigned)(amt & 7) << 10) | (Sb << 5) | Sb);
+    }
+    // Bias iff the EA falls in THIS image's span [g_nonpie_lo, g_nonpie_hi). Fast path: a >= 4GiB address is
+    // never the low non-PIE image (stack/heap/mmap/ld.so/libc all live above the 4GiB __PAGEZERO) -> skip
+    // with no flag traffic (the common case). For a < 4GiB EA, do the exact two-sided range test; biasing
+    // ANY low address outside the image's own span (Go's small sentinel pointers in [0,lo), or a PIE peer's
+    // mapping) would corrupt it. The compares set NZCV, so save/restore the guest flags around them.
+    emit32(0xD360FC00u | (Sb << 5) | T); // lsr T, Sb, #32
+    uint32_t *p_hi = (uint32_t *)g_cp;
+    emit32(0);                              // cbnz T, Lhi   (>= 4GiB -> skip, flags untouched)
+    emit32(0xD53B4200u | T2);               // mrs T2, nzcv  (save guest flags)
+    e_movconst(T, g_nonpie_lo);
+    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, lo
+    uint32_t *p_lo1 = (uint32_t *)g_cp;
+    emit32(0);                              // b.lo Llo   (Sb < lo -> not image)
+    e_movconst(T, g_nonpie_hi);
+    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, hi
+    uint32_t *p_lo2 = (uint32_t *)g_cp;
+    emit32(0);                              // b.hs Llo   (Sb >= hi -> not image)
+    e_movconst(T, g_nonpie_bias);
+    emit32(0x8B000000u | (T << 16) | (Sb << 5) | Sb); // add Sb, Sb, bias
+    uint8_t *Llo = g_cp;
+    emit32(0xD51B4200u | T2);               // msr nzcv, T2  (restore guest flags)
+    uint8_t *Lhi = g_cp;
+    *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
+    *p_lo1 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3; // b.lo
+    *p_lo2 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2; // b.hs
+    uint32_t m;
+    int emask = mask;
+    if (regoff) {
+        // de-index: register-offset -> unscaled [Sb,#0]; keep size/V/opc/Rt, clear bits[21:10] + base->Sb
+        m = (in & ~0x003FFC00u & ~(0x1Fu << 5)) | ((unsigned)Sb << 5);
+        emask &= ~4; // Rm now folded into Sb -> drop it from the mangle set
+    } else if (wb) {
+        // de-index pre/post -> unscaled [Sb,#imm9]: mode bits[11:10] -> 00; post accesses at the base, so
+        // also zero imm9 (pre keeps imm9 == the offset). The writeback is applied to the LOW base below.
+        m = in & ~(0x3u << 10);
+        if (wb == 2) m &= ~(0x1FFu << 12);
+        m = (m & ~(0x1Fu << 5)) | ((unsigned)Sb << 5);
+    } else {
+        m = (in & ~(0x1Fu << 5)) | ((unsigned)Sb << 5); // re-base the access onto Sb
+    }
+    if (uses_x18(m, emask))
+        emit_mangled_x18(m, emask); // stolen Rt/Rt2/Rs (base now names non-stolen Sb)
+    else
+        emit32(m);
+    if (wb) { // writeback updates the LOW guest base (Rt != base for loads -> safe to do after the access)
+        unsigned a = (unsigned)(wbimm < 0 ? -wbimm : wbimm);
+        if (is_stolen(base)) {
+            e_ldr(T, CPUREG, base * 8);
+            if (wbimm < 0)
+                e_subi(T, T, a);
+            else
+                e_addi(T, T, a);
+            e_str(T, CPUREG, base * 8);
+        } else if (wbimm < 0)
+            e_subi(base, base, a);
+        else
+            e_addi(base, base, a);
+    }
+    if (regoff) e_ldr(Tm, CPUREG, M + 56); // restore scratch originals
+    e_ldr(Sb, CPUREG, M + 32);
+    e_ldr(T, CPUREG, M + 40);
+    e_ldr(T2, CPUREG, M + 48);
+}
+
 // For instructions that WRITE x18 via a special path (adr/ldr-literal/mrs): save x0,x1 to
 // the red zone, x1 := cpu. The case then computes a value into x0 and stores it to
 // cpu->x[18]; x18_epilog restores x0,x1.
@@ -1274,6 +1429,14 @@ static void *translate_block(uint64_t gpc) {
         // retaa/retab -> shadow ret (x30)
         if ((in & 0xFFFFFBFFu) == 0xD65F0BFFu) { emit_shadow_ret(); break; }
 
+        // guest_base bias-fold: a non-PIE image's LOW absolute load/store -> +bias (the high mapping), no
+        // fault. Only outside an exclusive monitor region (the fold spills scratch to memory, which would
+        // clear the monitor) and only for a non-SP base (the stack is always high). Inert for PIE.
+        if (guestbase_on() && !in_excl && ((in >> 5) & 31) != 31 && is_foldable_mem(in)) {
+            emit_fold_mem(in);
+            gpc += 4;
+            continue;
+        }
         // everything else: verbatim,
         int mask = gpr_field_mask(in);
         if (uses_x18(in, mask))

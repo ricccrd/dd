@@ -743,7 +743,7 @@ static void *translate_block(uint64_t gpc) {
                         continue;
                     }
                 }
-                emit_ea(&I, next);
+                emit_ea_core(&I, next, 0); // lea returns the guest (low) effective ADDRESS -> no bias-fold
                 e_mov_rr(I.reg, 17, sf);
                 gpc = next;
                 continue;

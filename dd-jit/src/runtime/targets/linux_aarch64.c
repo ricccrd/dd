@@ -167,6 +167,47 @@ static void install_mach_exc(void) {
     pthread_t t;
     pthread_create(&t, NULL, exc_thread, NULL);
 }
+// DD_FAULTCOUNT=1: measurement-only wrapper around nonpie_guard that tallies served low-address faults
+// (the guest_base bias-fold's whole point is to drive this to ~0). Per-process; printed at jit_run exit.
+static volatile uint64_t g_nonpie_faults;
+static volatile uint64_t g_fhist[16];
+static const char *g_fhname[16] = {"uoff", "unscaled", "wb",    "regoff", "ldp",   "ldp_wb", "excl", "lse",
+                                   "cas",  "advmult",  "advsi", "dczva",  "ldlit", "ldar",   "other", "x"};
+static int fault_class(uint32_t in) {
+    if ((in & 0xFFFFFFE0u) == 0xD50B7420u) return 11;                            // dc zva
+    if ((in & 0x3B000000u) == 0x18000000u) return 12;                           // ldr literal
+    if ((in & 0x3A000000u) == 0x28000000u) return ((in >> 23) & 1) ? 5 : 4;     // ldp (wb if op2 odd)
+    if ((in & 0x3F200C00u) == 0x38200000u) return 7;                            // lse atomic
+    if ((in & 0x3FA07C00u) == 0x08A07C00u) return 8;                            // cas
+    if ((in & 0x3F200000u) == 0x08000000u) return (in & 0x00800000u) ? 13 : 6;  // ordered(ldar)/exclusive
+    if ((in & 0xBFBF0000u) == 0x0C000000u || (in & 0xBFA00000u) == 0x0C800000u) return 9; // advsimd mult
+    if ((in & 0xBF000000u) == 0x0D000000u) return 10;                           // advsimd single
+    if ((in & 0x3B000000u) == 0x39000000u) return 0;                            // uoff
+    if ((in & 0x3B200C00u) == 0x38200800u) return 3;                            // regoff
+    if (((in >> 27) & 7) == 7) {
+        int m = (in >> 10) & 3;
+        return (!((in >> 24) & 1) && (m == 1 || m == 3)) ? 2 : 1; // wb (pre/post) else unscaled/unpriv
+    }
+    return 14;
+}
+static void nonpie_guard_count(int sig, siginfo_t *si, void *uc) {
+    uint64_t va = (uint64_t)si->si_addr;
+    if (g_nonpie_lo && va >= g_nonpie_lo && va < g_nonpie_hi) {
+        ucontext_t *u = (ucontext_t *)uc;
+        g_fhist[fault_class(*(uint32_t *)(u->uc_mcontext->__ss.__pc))]++;
+        uint64_t n = __atomic_add_fetch(&g_nonpie_faults, 1, __ATOMIC_RELAXED);
+        if (n % 50000 == 0) {
+            char b[256];
+            int o = snprintf(b, sizeof b, "[fhist pid=%d n=%llu]", getpid(), (unsigned long long)n);
+            for (int i = 0; i < 15; i++)
+                if (g_fhist[i])
+                    o += snprintf(b + o, sizeof b - o, " %s=%llu", g_fhname[i], (unsigned long long)g_fhist[i]);
+            b[o++] = '\n';
+            if (write(2, b, o) < 0) {}
+        }
+    }
+    nonpie_guard(sig, si, uc);
+}
 int jit_run(const char *rootfs, int argc, char *const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return 2;
     // PID ns: only containers (rootfs) get PID 1
@@ -221,7 +262,7 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         // load_elf below); a fault it doesn't own re-raises with the default action.
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
-        sa.sa_sigaction = nonpie_guard;
+        sa.sa_sigaction = getenv("DD_FAULTCOUNT") ? nonpie_guard_count : nonpie_guard;
         sa.sa_flags = SA_SIGINFO;
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGBUS, &sa, NULL);
@@ -325,6 +366,10 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     // A1: steal host x16/x17 for the engine (default on). NOSTEAL1617=1 -> legacy 3-reg stolen set
     // (guest x16/x17 in host regs, per-branch red-zone stash/restore). Read once before any translation.
     if (getenv("NOSTEAL1617")) g_steal1617 = 0;
+    // guest_base bias-fold (non-PIE ET_EXEC): default on; NOGUESTFOLD=1 reverts to the SIGSEGV-per-low-
+    // access fault path (A/B kill-switch). Read once before any translation; inert for PIE (gated on the
+    // non-PIE marker g_nonpie_lo, set only for ET_EXEC by load_elf).
+    if (getenv("NOGUESTFOLD")) g_guestfold = 0;
     if (getenv("NOMTIBTC")) g_mtibtc = 0; // W5C: disable race-free threaded IBTC fill (A/B kill-switch)
     if (getenv("NOFUTEXQ")) g_futexq = 0; // W5C: disable per-address futex wait queues (A/B kill-switch)
     // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.
@@ -391,6 +436,9 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
     if (g_untrusted) sentry_init(); // fork the host-authority sentry + (optionally) confine the worker
     run_guest(&c);
     if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
+    if (getenv("DD_FAULTCOUNT"))
+        fprintf(stderr, "[faultcount] pid=%d nonpie_served=%llu\n", getpid(),
+                (unsigned long long)g_nonpie_faults);
     return c.exit_code;
 }
 

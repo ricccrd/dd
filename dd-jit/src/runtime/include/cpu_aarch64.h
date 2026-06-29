@@ -66,6 +66,18 @@ struct cpu {
 #define OFF_GSP offsetof(struct cpu, gsp)
 // §B: real x28 reserved = cpu pointer
 #define CPUREG 28
+// guest_base bias-fold (non-PIE ET_EXEC only): re-target a guest load/store of a LOW image pointer to the
+// HIGH mapping (+g_nonpie_bias) at translate time instead of faulting. The bias is materialized INLINE per
+// folded access (no stolen host register) -- stealing a 5th GPR was unsafe: a Linux/Go guest uses every
+// GPR (Go reserves R27/R28 on ARM64), so any instruction form not flagged by gpr_field_mask would read the
+// stolen reg's engine value instead of the guest's. g_nonpie_lo/g_nonpie_bias are defined (and set by
+// load_elf) in os/linux/elf.c + container/vfs.c (compiled LATER in the same unity TU); forward-declared
+// static here (tentative -> merges with the single later def). Both 0 for PIE/static-PIE -> guestbase_on()
+// is 0 -> the fold is inert and codegen stays byte-identical (the test matrix never sees a non-PIE image).
+static uint64_t g_nonpie_lo, g_nonpie_bias;
+// master enable (default on); cleared at startup by NOGUESTFOLD=1 for an A/B kill-switch.
+static int g_guestfold = 1;
+static int guestbase_on(void) { return g_guestfold && g_nonpie_lo != 0; }
 // A1: x16/x17 engine-private (IBTC scratch); guest x16/x17 mangled like x18 so they never live in
 // the host reg -> the per-indirect-branch red-zone stash/restore of x16/x17 disappears.
 // x18 volatile, x28=cpu, x30=host link (§B). NOSTEAL1617=1 reverts to the 3-reg stolen set at startup.

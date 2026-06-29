@@ -107,6 +107,20 @@ static int noeaopt(void) {
     return g_noeaopt;
 }
 
+// ---- guest_base bias-fold (non-PIE ET_EXEC; see docs/design/nonpie-pagezero.md) ----
+// A non-PIE x86_64 image maps HIGH (+g_nonpie_bias) but its baked absolute pointers stay LOW (link vaddr);
+// a guest load/store through one would hit the unmapped low address and trap (one SIGSEGV per access).
+// Instead fold +bias into the effective host address at emit time when the EA is a LOW image address
+// (< 4GiB; stack/heap/mmap/libs are all >= the engine's 4GiB __PAGEZERO). g_nonpie_lo/g_nonpie_bias are
+// forward-declared here (tentative; merge with the real defs set by load_elf in elf.c / translate.c). 0
+// for PIE/static-PIE -> guestfold_on() is 0 -> codegen byte-identical to baseline.
+static uint64_t g_nonpie_lo, g_nonpie_bias;
+static int g_x86fold = -1; // cached: NOGUESTFOLD=1 disables (A/B kill-switch); default on for non-PIE
+static int guestfold_on(void) {
+    if (g_x86fold < 0) g_x86fold = (getenv("NOGUESTFOLD") == NULL);
+    return g_x86fold && g_nonpie_lo != 0;
+}
+
 // ---- W5B adaptive tier-2 (x86 engine) — x86-only glue over the SHARED W4E substrate ----
 // The hotness counter table (g_t2cnt/g_t2gpc/g_t2n), the dedup slot allocator (t2_slot), the promotion
 // threshold (g_t2thresh, default 1000), the tier-2-build flag (g_tier2_build), the last-body handoff
