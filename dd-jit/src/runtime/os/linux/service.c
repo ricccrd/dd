@@ -59,6 +59,36 @@ static void service_local(struct cpu *c); // fwd: the canonical syscall switch (
 static inline uint64_t nonpie_p(uint64_t a) {
     return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
 }
+// Overlay: a metadata/rename syscall (chmod/chown/utimensat/rename) confines to the writable upper via
+// jail_at, but a target that still lives only in a read-only lower (the image) is absent from the upper
+// -> the op ENOENTs. Copy the target up first (same write-path pattern openat uses) so jail_at finds it.
+// No-op when not in overlay mode (g_nlower==0) or when the file is already in the upper. (dirfd,raw) is
+// the syscall's AT_FDCWD/dir-fd-relative path; overlay_copyup leaves a genuinely missing path untouched
+// so a real bad path still ENOENTs in the upper as before.
+static void overlay_copyup_at(int dirfd, const char *raw) {
+    if (!g_nlower || !raw) return;
+    char gp[4200], host[4300];
+    abs_guest(dirfd, raw, gp, sizeof gp);
+    overlay_copyup(gp, host, sizeof host);
+}
+// Overlay: does a read-only lower still provide `guest` (so it would re-surface once the upper copy is moved
+// away)? Mirrors overlay_copyup's lower scan; rootfs-routed paths only (a volume has its own backing dir).
+// Used by rename to decide whether the source needs a whiteout. False outside overlay mode (g_nlower==0).
+static int overlay_lower_has(const char *guest) {
+    if (!g_nlower || !guest || guest[0] != '/') return 0;
+    const char *canon;
+    size_t clen;
+    const char *rel;
+    if (jail_pick(guest, &canon, &clen, &rel) != g_root_fd) return 0;
+    for (int i = 0; i < g_nlower; i++) {
+        char lp[4300];
+        struct stat st;
+        layer_follow(g_lower[i].canon, g_lower[i].clen, guest, lp, sizeof lp, 1);
+        if (lstat(lp, &st) == 0) return 1;
+        if (wh_exists(g_lower[i].canon, g_lower[i].clen, guest)) return 0; // hidden below this layer
+    }
+    return 0;
+}
 // adjtimex/clock_adjtime read-only query: macOS has no adjtimex, so report an OK-but-unsynchronised
 // kernel clock and fill the Linux struct timex the caller passed. Setting the clock (modes != 0) needs
 // CAP_SYS_TIME, which the container lacks -> EPERM (mirrors clock_settime). Returns the clock state
@@ -705,7 +735,9 @@ static void service_local(struct cpu *c) {
             if (lf & 2) rxflags |= RENAME_SWAP;
         }
         if (g_rootfs) {
-            // both ends confined (TOCTOU-free)
+            // both ends confined (TOCTOU-free). Copy a lower-only SOURCE up first so renameatx_np finds it
+            // in the writable upper (jail_at already materializes the dest's upper parent via overlay_mkparents).
+            overlay_copyup_at((int)a0, (const char *)a1);
             char ofin[512], nfin[512];
             int opfd = jail_at((int)a0, (const char *)a1, ofin, sizeof ofin, 1);
             if (opfd < 0) {
@@ -728,6 +760,14 @@ static void service_local(struct cpu *c) {
             int r = renameatx_np(opfd, ofin, npfd, nfin, rxflags), e = errno;
             close(opfd);
             close(npfd);
+            // Overlay: a plain move (not RENAME_EXCHANGE) of a file the image lower still provides leaves the
+            // copied-up upper source moved away but the lower copy exposed -> the source would re-appear. Drop
+            // a whiteout at the source so it stays gone (real overlayfs rename semantics). No-op outside overlay.
+            if (r == 0 && !(rxflags & RENAME_SWAP)) {
+                char sgp[4200];
+                abs_guest((int)a0, (const char *)a1, sgp, sizeof sgp);
+                if (overlay_lower_has(sgp)) overlay_whiteout(sgp);
+            }
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
@@ -871,6 +911,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         if (g_rootfs) {
+            overlay_copyup_at((int)a0, (const char *)a1); // bring a lower-only target up so jail_at finds it
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 0);
             if (pfd < 0) {
@@ -902,6 +943,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         if (g_rootfs) {
+            overlay_copyup_at((int)a0, (const char *)a1); // bring a lower-only target up so jail_at finds it
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a4 & 0x100) ? 1 : 0);
             if (pfd < 0) {
@@ -1438,6 +1480,7 @@ static void service_local(struct cpu *c) {
             break;
         }
         if (g_rootfs) {
+            overlay_copyup_at((int)a0, (const char *)a1); // bring a lower-only target up so jail_at finds it
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a3 & 0x100) ? 1 : 0);
             if (pfd < 0) {
@@ -1918,8 +1961,9 @@ static void service_local(struct cpu *c) {
             for (int i = 1; i < ac && ni < 256; i++)
                 na[ni++] = argv[i];
             na[ni] = NULL;
-            // load the interpreter, not the script
-            p = xresolve_exec(sh_interp, shpb, sizeof shpb);
+            // load the interpreter, not the script -- through the overlay (the #! interp, e.g. /bin/sh, may
+            // live only in a read-only lower in a fresh container; xresolve_exec sees the upper alone -> ENOENT)
+            p = xresolve_overlay(sh_interp, shpb, sizeof shpb);
             if (access(p, F_OK) != 0) {
                 G_RET(c) = (uint64_t)(-2);
                 break;
