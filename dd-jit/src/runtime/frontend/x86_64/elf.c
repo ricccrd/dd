@@ -607,6 +607,37 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
     signal(sig, SIG_DFL);
     raise(sig); // out of budget / mmap failed -> real crash
 }
+// Synchronous CPU faults other than SIGSEGV/SIGBUS (which the run path wires to jit86_lazyguard above): a
+// guest may install a handler for SIGILL/SIGFPE/SIGTRAP and DELIBERATELY trigger it -- e.g. a CPU-feature
+// probe that executes an optional instruction guarded by a SIGILL handler (ud2 / 0F 0B once the feature is
+// declared absent), an integer div-by-zero relying on a SIGFPE handler, or an int3 caught via SIGTRAP. The
+// x86 frontend emits/raises these as real host signals, but rt_sigaction only records the guest handler --
+// it does not install a host handler for synchronous signals (they are served by the guards installed here)
+// -- so without this the trap is fatal (exit 255) instead of reaching the guest's handler.
+//
+// This is the analogue of os/linux/elf.c's install_sync_fault_guards() (aarch64). We do NOT reuse
+// jit86_lazyguard: its lazy zero-page path keys off si_addr, which for these signals is the faulting PC (in
+// a mapped, executable JIT page) -- lazy_neighbor_mapped() would judge it "legitimate growth", skip
+// deliver_guest_fault, and mprotect/retry the PC page in a loop. Instead route straight to nonpie_fixup
+// (which self-declines: si_addr is the high faulting PC, never in the low non-PIE link range) and then
+// deliver_guest_fault (delivers the guest signal when the guest has a handler, else re-raises the default).
+// CRASHDBG handles these via its mach exception port + diagnostics instead, so leave that path untouched.
+static void jit86_syncguard(int sig, siginfo_t *si, void *uc) {
+    if (nonpie_fixup(si, uc)) return;
+    if (deliver_guest_fault(sig, si, uc)) return;
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+__attribute__((constructor)) static void jit86_install_sync_fault_guards(void) {
+    if (getenv("CRASHDBG")) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = jit86_syncguard;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+}
 void jit86_faulth(int sig, siginfo_t *si, void *uc) {
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     static const char *nm[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
