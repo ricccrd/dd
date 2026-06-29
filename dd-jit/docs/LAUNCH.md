@@ -101,6 +101,42 @@ The `os()` branch in `script()` disappears; the only remaining difference is the
 **prefix** (which binary, or the jail's DYLD_INSERT) — pick it from one small match, build the
 `DD_*` block once for all. The binding becomes data-driven and obviously uniform.
 
+## Input validation (the trust boundary)
+
+Yes — and today it barely exists. The C trusts whatever string arrives and **fails silently**:
+
+| current gap | example | consequence |
+|---|---|---|
+| `atoi` everywhere (0 on garbage, no range) | `DD_UID=oops` → `atoi` → **0 = root** | silent privilege/mis-config, no error |
+| ports via `atoi`, not range-checked | `DD_PUBLISH=99999:80` | wraps to a wrong `u16` port |
+| fixed caps, silent truncation | darwin `add_vol`: `g_nvol<16` drops the rest; `g_netns[64]` | volumes/paths quietly vanish |
+| no failure path | any bad value | container launches mis-configured instead of refusing |
+
+### The rule: the C is the security boundary — parse, validate, fail loud
+
+The engine is the actual container runtime executing **untrusted guest images**, and it is also
+invoked **directly** (human/docker `main()` CLI), not only via the typed Rust binding. So it
+**must not trust its input**, even if the binding is correct. Every config input:
+
+1. **Parse with `strtol`+`errno`** (not `atoi`) → reject non-numeric / overflow.
+2. **Range-check** (port ≤ 65535, uid/gid in range, sizes within sane bounds).
+3. **Bound-check collections** → on cap overflow, **error out**, never silently drop.
+4. **Fail fast**: print `dd: invalid DD_<X>=<v>` to stderr and exit nonzero — never coerce a
+   bad value to a privileged default (the uid=root footgun).
+
+### Two gates, one shared validator
+
+| gate | role | rigor |
+|---|---|---|
+| **binding** (`SpawnConfig`) | typed fields (`u16`/`u32`) already make many bad values *unrepresentable*; validate paths/ranges early for a friendly error | convenience / early-fail |
+| **C engine** | the real boundary — re-validate everything; the binding may be bypassed | mandatory / authoritative |
+
+Put the `DD_*` parsing in **one shared validating parser** (the container code is already
+shared) so the rules and error messages are identical across all targets — today darwin caps
+at 16 while linux differs, which is exactly the drift centralization removes. Classes:
+`DD_*` (validate strictly), `DDJIT_*` (dev knobs — lax is fine), `DD_GUEST_ENV` (opaque
+pass-through, never parsed). This rides with migration step 1 (the shared parser).
+
 ## Why this is dead-obvious afterward
 
 - One channel (env), one namespace (`DD_*`), one parser, one entry symbol, one binding template.
