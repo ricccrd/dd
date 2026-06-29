@@ -53,7 +53,17 @@ __attribute__((constructor)) static void init(void){
         for(int i=0;i<g_nvol && n<3000;i++) n+=snprintf(prof+n,sizeof prof-n,"(allow file-write* (subpath \"%s\"))",g_vol[i].host);
         if(getenv("DD_NET_ISOLATE")) n+=snprintf(prof+n,sizeof prof-n,
             "(deny network-outbound (remote ip \"*:*\"))(allow network-outbound (remote ip \"localhost:*\"))");
-        char *err=0; if(sandbox_init(prof,0,&err)) fprintf(stderr,"[darwinjail] sandbox: %s\n",err?err:"?");
+        // The macOS Seatbelt doesn't nest. On a mac that already confines this process (e.g. Sequoia
+        // sandboxes a notarized app's spawned children) sandbox_init fails "Operation not permitted" and
+        // libsandbox prints its own "sandbox initialization failed" line to stderr. The container's real
+        // jail is the libc path-interposition above, not Seatbelt -- so mute libsandbox's stderr across the
+        // call, still apply Seatbelt where it works, and surface only an UNEXPECTED error.
+        char *err=0; int sb;
+        { int sv=dup(2), dn=open("/dev/null",O_WRONLY); if(dn>=0){ dup2(dn,2); close(dn); }
+          sb=sandbox_init(prof,0,&err);
+          if(sv>=0){ dup2(sv,2); close(sv); } }
+        if(sb && (!err || !strstr(err,"Operation not permitted")))
+            fprintf(stderr,"[darwinjail] sandbox: %s\n",err?err:"?");
     }
 }
 // container path -> host path: bind volumes, then overlay (upper wins, else a lower, else upper for creates).

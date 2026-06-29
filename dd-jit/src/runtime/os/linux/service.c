@@ -1427,8 +1427,16 @@ static void service_local(struct cpu *c) {
         G_RET(c) = 0;
         break;
     }
-    // setpgid
-    case 154: G_RET(c) = setpgid((pid_t)a0, (pid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    // setpgid -- bash job control. The container init has getpid()==1 (container_pid), so bash issues
+    // setpgid(0, 1); forwarded verbatim that names launchd (host pid 1) -> EPERM ("initialize_job_control:
+    // setpgid: Operation not permitted"). Map the faked PID1 self-reference to the host's own process, and
+    // treat a residual EPERM as success -- a container is its own session, so guest process groups are virtual.
+    case 154: {
+        pid_t pid = (pid_t)a0 == 1 ? 0 : (pid_t)a0, pgid = (pid_t)a1 == 1 ? 0 : (pid_t)a1;
+        int r = setpgid(pid, pgid);
+        G_RET(c) = (r < 0 && errno != EPERM) ? (uint64_t)(-errno) : 0;
+        break;
+    }
     // getpgid (bash job control)
     case 155: G_RET(c) = (uint64_t)getpgid((pid_t)a0); break;
     // getsid
