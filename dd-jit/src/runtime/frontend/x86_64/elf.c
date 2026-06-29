@@ -20,6 +20,7 @@ static uint64_t rd64(const uint8_t *p) {
     memcpy(&v, p, 8);
     return v;
 }
+static void wr64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 
 // struct loaded is defined by the shared os/linux (container/netns.c).
 
@@ -48,6 +49,89 @@ static int elf_interp(const char *path, char *out, size_t n) {
     munmap(f, st.st_size);
     return r;
 }
+// W6A item 1 (Go non-PIE): a Go ET_EXEC's runtime keeps its OWN code/data addresses in the
+// firstmoduledata struct (and the pclntab it points at) as LINK-TIME absolute values: text/etext,
+// minpc/maxpc, the pclntab slice pointers, findfunctab, the type/gc/gofunc bases, the init-task
+// list, etc. After we bias the image HIGH (macOS reserves the low 4GB), the runtime's live code PCs
+// -- return addresses pushed by `call`, function pointers materialized by rip-relative `lea` -- are
+// all BIASED, but findfunc() still compares them against the un-biased moduledata: findmoduledatap()
+// rejects the pc (pc >= maxpc), findfunc() returns a nil funcInfo, and runtime.pcdatavalue derefs
+// it -> SIGSEGV at offset 0x1c. Fix: at load time, add g_nonpie_bias to every ABSOLUTE pointer word
+// of firstmoduledata so the comparisons line up with the biased PCs. The pclntab's own tables are
+// pc-DELTAS and text-RELATIVE offsets (and pcHeader.textStart no longer exists in Go 1.20+, it is a
+// reserved zero), so only the moduledata pointer words and the textsect baseaddr are rebased; slice
+// len/cap, relative offsets and flags are left untouched. Each rebase is guarded to the link range
+// [lo,hi) so a zero/small/already-mapped field is never disturbed. The module is located via the
+// runtime.firstmoduledata symbol and validated by the pclntab magic -> a no-op for a stripped image
+// or a non-Go ET_EXEC. Layout per Go runtime/symtab.go (verified against the go1.26 nats-server).
+static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64_t lo, uint64_t hi) {
+    uint64_t shoff = rd64(f + 0x28);
+    int shnum = rd16(f + 0x3C), shent = rd16(f + 0x3A);
+    if (!shoff || !shent || (uint64_t)shoff + (uint64_t)shnum * shent > fsz) return;
+    // Find runtime.firstmoduledata in the symbol table (.symtab + its linked string table).
+    uint64_t md_va = 0;
+    for (int i = 0; i < shnum && !md_va; i++) {
+        const uint8_t *sh = f + shoff + (uint64_t)i * shent;
+        if (rd32(sh + 4) != 2) continue; // SHT_SYMTAB
+        uint64_t symoff = rd64(sh + 0x18), symsz = rd64(sh + 0x20), syment = rd64(sh + 0x38);
+        uint32_t strndx = rd32(sh + 0x28); // sh_link -> string table section
+        if (!syment || strndx >= (uint32_t)shnum) continue;
+        const uint8_t *strsh = f + shoff + (uint64_t)strndx * shent;
+        uint64_t stroff = rd64(strsh + 0x18), strsz = rd64(strsh + 0x20);
+        if (symoff + symsz > fsz || stroff + strsz > fsz) continue;
+        for (uint64_t o = 0; o + syment <= symsz; o += syment) {
+            const uint8_t *sym = f + symoff + o;
+            uint32_t nameoff = rd32(sym);
+            if (nameoff >= strsz) continue;
+            if (strcmp((const char *)(f + stroff + nameoff), "runtime.firstmoduledata") == 0) {
+                md_va = rd64(sym + 8); // st_value
+                break;
+            }
+        }
+    }
+    if (!md_va || md_va < lo || md_va >= hi) return;
+    uint8_t *md = (uint8_t *)(md_va + bias); // the mapped (biased) copy of firstmoduledata
+    // Validate: field 0 is &pclntab, whose first u32 is the Go pclntab magic. Bail if not Go.
+    uint64_t pch = rd64(md);
+    if (pch < lo || pch >= hi) return;
+    uint32_t magic = rd32((const uint8_t *)(pch + bias));
+    if (magic != 0xfffffff0u && magic != 0xfffffff1u && magic != 0xfffffffau && magic != 0xfffffffbu) return;
+    // Absolute pointer words of moduledata, in 8-byte units (Go 1.26 runtime/symtab.go). Slice headers
+    // contribute only their .ptr word; len/cap follow and are skipped. The guard below also skips any
+    // word that is zero or outside the link range, so unused fields cost nothing.
+    static const int ptr_words[] = {
+        0,                                  // pcHeader
+        1, 4, 7, 10, 13, 16,                // funcnametab/cutab/filetab/pctab/pclntable/ftab slice ptrs
+        19, 20, 21,                         // findfunctab, minpc, maxpc
+        22, 23, 24, 25, 26, 27, 28, 29,     // text,etext,noptrdata,enoptrdata,data,edata,bss,ebss
+        30, 31, 32, 33, 34, 35, 36,         // noptrbss,enoptrbss,covctrs,ecovctrs,end,gcdata,gcbss
+        37, 38, 39, 40, 41,                 // types,etypes,rodata,gofunc,epclntab
+        42, 45, 48, 51,                     // textsectmap,typelinks,itablinks,ptab slice ptrs
+        54, 56, 59, 62, 64,                 // pluginpath,pkghashes,inittasks,modulename,modulehashes ptrs
+        69, 71, 72, 73,                     // gcdatamask.bytedata, gcbssmask.bytedata, typemap, next
+    };
+    for (size_t k = 0; k < sizeof ptr_words / sizeof *ptr_words; k++) {
+        uint8_t *slot = md + (size_t)ptr_words[k] * 8;
+        uint64_t cur = rd64(slot);
+        if (cur >= lo && cur < hi) wr64(slot, cur + bias);
+    }
+    // textsectmap is []textsect{vaddr, end, baseaddr}; only baseaddr is an absolute (relocated) address
+    // -- vaddr/end are text-relative -- so rebase each entry's baseaddr explicitly. (With a single text
+    // section the runtime ignores baseaddr, but keep it consistent for the multi-section case.)
+    uint64_t ts_ptr = rd64(md + 42 * 8), ts_len = rd64(md + 43 * 8); // ts_ptr already rebased above
+    if (ts_ptr >= lo + bias && ts_ptr < hi + bias) {
+        for (uint64_t i = 0; i < ts_len && i < 64; i++) {
+            uint8_t *ba = (uint8_t *)(ts_ptr + i * 24 + 16);
+            uint64_t cur = rd64(ba);
+            if (cur >= lo && cur < hi) wr64(ba, cur + bias);
+        }
+    }
+    extern int g_diag;
+    if (g_trace || g_diag || getenv("JT"))
+        fprintf(stderr, "[go-rebase] firstmoduledata@%llx +bias=%llx (magic=%x)\n", (unsigned long long)md_va,
+                (unsigned long long)bias, magic);
+}
+
 static void load_elf(const char *path, struct loaded *out) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -112,6 +196,10 @@ static void load_elf(const char *path, struct loaded *out) {
         uint64_t off = rd64(ph + 8), v = rd64(ph + 16), fsz = rd64(ph + 32);
         memcpy((void *)(v + bias), f + off, fsz);
     }
+    // W6A item 1: for a biased non-PIE Go image, rebase firstmoduledata so the runtime's findfunc()
+    // resolves the biased code PCs (otherwise runtime.pcdatavalue nil-derefs). Gated on g_nonpie_lo
+    // (ET_EXEC only); NOGOREBASE=1 disables for A/B testing.
+    if (g_nonpie_lo && !getenv("NOGOREBASE")) go_rebase_nonpie(f, st.st_size, bias, g_nonpie_lo, g_nonpie_hi);
     mprotect(base, span, PROT_READ | PROT_WRITE | PROT_EXEC);
     out->entry = e_entry + bias;
     out->base = (uint64_t)base;
