@@ -57,14 +57,10 @@
 
 <article class="mx-auto max-w-read px-5 py-12 md:py-16">
 
-  <!-- grand idea -->
-  <p class="text-xl font-semibold leading-relaxed text-txt md:text-2xl">Software is increasingly written by agents, and the <em>environment</em> is the bottleneck: an agent — and you — needs a reproducible, isolated sandbox it can&rsquo;t break out of, every tool one command away, and dozens of projects spun up and switched between with near-zero overhead. Heavyweight VMs, threadbare terminal integration, and minutes-long setup hold that back. dd is building a <strong class="text-blue1">universal interpreter for every architecture</strong> — isolation by default, plus the freedom to run anything, on any OS or chip, instantly.</p>
-  <p class="mt-3 mb-8 text-sm"><a href="../roadmap.html" class="font-semibold text-blue2 hover:underline">Where this is going &rarr; the roadmap</a></p>
-
   <!-- tldr -->
   <div class="rounded-2xl border border-blue4/40 bg-panel2 p-5 md:p-6">
     <p class="text-xs font-bold uppercase tracking-widest text-blue3">TL;DR</p>
-    <p class="mt-2 leading-relaxed text-muted"><strong class="text-txt">dd runs Docker containers on an Apple-Silicon Mac with no Linux VM.</strong> A container runs as a normal macOS process and a userspace kernel answers its syscalls. One engine, three runtimes: <strong class="text-txt">Linux arm64</strong> (native), <strong class="text-txt">Linux x86-64</strong> (through a JIT), and <strong class="text-txt">macOS arm64</strong>. So: no idle RAM, near-instant start, bind mounts straight to the real filesystem. It's a drop-in <code class="rounded bg-code px-1 py-0.5 font-mono text-[12px] text-blue1">docker context</code>, free and open source (MIT). It's alpha, and honest about it: syscall-heavy workloads are slower today.</p>
+  <p class="mt-2 leading-relaxed text-muted"><strong class="text-txt">In the agent era, development needs reproducible, isolated environments &mdash; every tool at hand, near-zero overhead, no VM.</strong> dd&rsquo;s goal is a universal interpreter for every architecture: isolated by default, run anything on any OS or chip, fast (<a href="../roadmap.html" class="text-blue2 hover:underline">roadmap</a>). Today: <strong class="text-txt">Docker containers on Apple-Silicon macOS, no Linux VM</strong> &mdash; a container is a normal macOS process, a userspace kernel serves its syscalls; one engine, three runtimes (Linux arm64 native, x86-64 via JIT, macOS arm64). Drop-in <code class="rounded bg-code px-1 py-0.5 font-mono text-[12px] text-blue1">docker context</code>, MIT, alpha.</p>
   </div>
 
   <!-- lede -->
