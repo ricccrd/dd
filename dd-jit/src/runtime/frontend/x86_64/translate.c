@@ -556,22 +556,47 @@ static void e_sse_var_shift(int vd, int vn, int vs, int esize, int left, int ari
     emit32(shl | (17 << 16) | (vn << 5) | vd);                       // [s|u]shl vd, vn, v17
 }
 
-// 0F 0B (UD2): an explicitly-undefined opcode that real software (e.g. ruby's unreachable/trap paths)
-// uses as a deliberate trap. On Linux it raises SIGILL; with no handler the process dies with shell
-// status 128+SIGILL = 132. We can't run a guest SIGILL handler from a block exit (that needs the
-// dispatcher), so terminate the guest cleanly with the Linux status -- the run_guest loop breaks on
-// c->exited. This is distinct from report_unimpl's "engine aborted" path (status 70), which would
+// Emit a REAL host trap (UDF -> SIGILL, BRK -> SIGTRAP) for an x86 fault/trap the guest may handle.
+// It is emitted INLINE with the 16 guest GPRs still live in host x0..x15 and xmm in v0..v15, so the
+// synchronous-fault guard (jit86_syncguard -> deliver_guest_fault -> sigframe_capture_fault, frontend/
+// x86_64/sigframe.c) reconstructs guest state from the host fault context and either delivers the signal
+// to the guest's handler or default-terminates when there is none. cpu->rip is set to the architectural
+// PC the handler observes and sigreturn resumes at -- the faulting insn for a #UD/#DE fault, the
+// following insn for an int3 (#BP) trap. Lazy flags and the x87 shadow top are spilled first so the
+// rt_sigframe (built from cpu->nzcv / cpu->st[]) is current.
+static void emit_guest_trap(uint64_t rip, uint32_t trap) {
+    if (g_fl_pending) flags_materialize();
+    if (g_fp_known) fp_drop();
+    e_movconst(16, rip);   // scratch x16 (not a guest GPR) -> cpu->rip
+    e_str(16, 28, OFF_RIP);
+    emit32(trap); // guest GPRs x0..x15 + xmm v0..v15 are still live at the trap
+}
+
+// Integer DIV/IDIV by zero raises #DE (SIGFPE) on x86, but ARM sdiv/udiv quietly return 0 -- a guest
+// #DE would be silently swallowed. Guard the inline (8/16/32-bit) divides: when the (width-extended)
+// divisor in divreg is zero, route to the C div path (R_DIV/R_IDIV in dispatch.c), which reports the
+// #DE -- the same exit the 64-bit DIV already uses. The non-zero path falls straight through to the
+// inline divide, so normal division is unaffected.
+static void emit_div_zero_check(int divreg, uint64_t next, int idiv) {
+    uint32_t *patch = (uint32_t *)g_cp;
+    emit32(0);                    // cbnz divreg, ok  (divisor != 0): offset patched below
+    e_str(divreg, 28, OFF_DIVOP); // divisor (== 0) -> cpu->divop for the C #DE path
+    emit_exit_const(next, idiv ? R_IDIV : R_DIV);
+    int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
+    *patch = 0xB5000000u | (((uint32_t)d & 0x7FFFF) << 5) | (uint32_t)divreg; // cbnz x[divreg], ok
+}
+
+// 0F 0B (UD2): an explicitly-undefined opcode that real software (e.g. ruby's unreachable/trap paths,
+// libc CPU-feature probes) uses as a deliberate trap. On x86 it raises #UD -> SIGILL; with a guest
+// handler that runs, otherwise the process dies with status 128+SIGILL = 132. Emit a host UDF so the
+// SIGILL guard delivers it to the guest handler (or default-terminates), instead of the old always-
+// terminate hack. This is distinct from report_unimpl's "engine aborted" path (status 70), which would
 // mislabel a legitimate guest fault as an unimplemented-opcode bug of ours.
 static void emit_sigill(uint64_t pc) {
     // Quiet by default: UD2 frequently sits on never-taken paths (compiler trap/unreachable slots) that get
     // translated as block fall-through but never run; an unconditional message would falsely imply delivery.
     if (getenv("CRASHDBG")) fprintf(stderr, "[jit86] #UD ud2 at rip=%llx -> SIGILL\n", (unsigned long long)pc);
-    emit_spill();
-    // one 64-bit store covers the two adjacent ints: exited (low word) = 1, exit_code (high word) = 132.
-    e_movconst(16, ((uint64_t)132 << 32) | 1u);
-    e_str(16, 28, OFF_EXITED);
-    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
-    e_br(16);
+    emit_guest_trap(pc, 0x00000000u); // udf #0 -> host SIGILL
 }
 
 // Translate the basic block at guest address gpc; returns host entry pointer.
@@ -1055,11 +1080,13 @@ static void *translate_block(uint64_t gpc) {
                         if (k == 6) {
                             e_uxt(19, RAX, 2);
                             e_uxt(20, rmv, 1);
+                            emit_div_zero_check(20, gpc, 0); // #DE on /0 (rip = the div insn)
                             e_udiv(21, 19, 20, 0);
                         } // AX uxth, src uxtb
                         else {
                             e_sxt(19, RAX, 2);
                             e_sxt(20, rmv, 1);
+                            emit_div_zero_check(20, gpc, 1);
                             e_sdiv(21, 19, 20, 0);
                         } // AX sxth, src sxtb
                         e_msub(22, 21, 20, 19, 0); // rem = dividend - quot*divisor
@@ -1089,10 +1116,12 @@ static void *translate_block(uint64_t gpc) {
                         e_bfi(19, RDX, 16, 16, 0); // x19 = (DX<<16)|AX -- the 32-bit dividend
                         if (k == 6) {
                             e_uxt(20, rmv, 2);
+                            emit_div_zero_check(20, gpc, 0); // #DE on /0
                             e_udiv(21, 19, 20, 0);
                         } // unsigned: divisor uxth
                         else {
                             e_sxt(20, rmv, 2);
+                            emit_div_zero_check(20, gpc, 1);
                             e_sdiv(21, 19, 20, 0);
                         } // signed: x19 already the 32-bit pattern
                         e_msub(22, 21, 20, 19, 0); // rem = dividend - quot*divisor
@@ -1155,10 +1184,12 @@ static void *translate_block(uint64_t gpc) {
                         e_bfi(19, RAX, 0, 32, 1); // x19 = (edx<<32)|eax
                         if (k == 6) {
                             e_uxt(22, rmv, 4);
+                            emit_div_zero_check(22, gpc, 0); // #DE on /0
                             e_udiv(20, 19, 22, 1);
                         } // unsigned: zero-extend divisor
                         else {
                             e_sxt(22, rmv, 4);
+                            emit_div_zero_check(22, gpc, 1);
                             e_sdiv(20, 19, 22, 1);
                         } // signed: sign-extend divisor (edx:eax already 64-bit signed)
                         e_msub(21, 20, 22, 19, 1); // rem = x19 - q*divisor
@@ -1932,6 +1963,13 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
+            // ---- int3 (CC): software breakpoint -> #BP, a TRAP delivered as SIGTRAP. rip points PAST
+            // the int3 (trap semantics). Emit a host BRK so the SIGTRAP guard runs the guest handler (or
+            // default-terminates); previously this fell through to report_unimpl -> engine abort (70).
+            if (op == 0xCC) {
+                emit_guest_trap(next, 0xD4200000u); // brk #0 -> host SIGTRAP
+                break;
+            }
             if (op >= 0x91 && op <= 0x97) {
                 int r = (op - 0x90) | (I.rexB << 3);
                 e_mov_rr(19, RAX, sf);
@@ -2048,9 +2086,9 @@ static void *translate_block(uint64_t gpc) {
                             e_ldr_s(vd, 17);
                     } else {
                         if (st)
-                            emit32(0x6E040420u | (vd << 5) | vm);
+                            emit32(0x6E040400u | (vd << 5) | vm);
                         else
-                            emit32(0x6E040420u | (vm << 5) | vd);
+                            emit32(0x6E040400u | (vm << 5) | vd);
                     } // ins .s[0]
                 } else if ((op == 0x10 || op == 0x11) && I.repne) { // movsd (64-bit)
                     int st = (op == 0x11);
@@ -2062,9 +2100,9 @@ static void *translate_block(uint64_t gpc) {
                             e_ldr_d(vd, 17);
                     } else {
                         if (st)
-                            emit32(0x6E080420u | (vd << 5) | vm);
+                            emit32(0x6E080400u | (vd << 5) | vm);
                         else
-                            emit32(0x6E080420u | (vm << 5) | vd);
+                            emit32(0x6E080400u | (vm << 5) | vd);
                     } // ins .d[0]
                 } else if (op == 0x12 || op == 0x16) { // movlps/movhps (load) or movhlps/movlhps (reg)
                     int lane = (op == 0x16) ? 1 : 0;   // 12->low lane(d[0]), 16->high lane(d[1])
