@@ -288,6 +288,16 @@ static void load_elf(const char *path, struct loaded *out) {
         perror("mmap elf");
         exit(1);
     }
+    // Refuse a foreign-arch ELF up front: this engine only translates aarch64 (e_machine==EM_AARCH64).
+    // Without this guard an x86-64 image's bytes are decoded as aarch64 instructions -- the translator
+    // runs off into a zero/garbage region and dies deep inside translate_block with a cryptic SIGSEGV.
+    // (The x86-64 image is the x86_64 engine's job; the daemon/test harness route by the rootfs's arch.)
+    uint16_t e_machine = rd16(f + 18);
+    if (e_machine != 0xB7) { // EM_AARCH64
+        fprintf(stderr, "dd: %s: ELF e_machine=0x%x is not aarch64 (EM_AARCH64=0xb7) -- wrong engine for this image\n",
+                path, e_machine);
+        exit(1);
+    }
     uint64_t e_entry = rd64(f + 24), phoff = rd64(f + 32);
     int phnum = rd16(f + 56), phentsize = rd16(f + 54);
     uint64_t minv = ~0ull, maxv = 0;
