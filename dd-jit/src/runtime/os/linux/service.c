@@ -232,6 +232,33 @@ static void cpu_range_str(char *buf, size_t n) {
     else
         snprintf(buf, n, "0-%d\n", nc - 1);
 }
+// /proc/self/exe and /proc/<pid>/exe (where <pid> is the guest's own pid) are magic kernel symlinks
+// to the running executable. macOS has no /proc, so synthesize them: the link target is the guest
+// path that was exec'd (g_exe_path). Many programs (Go, the JVM, boost::filesystem, mongod) readlink
+// or stat this to locate their own binary. Returns 1 and fills tgt[] with the guest-visible target
+// path when `p` names this link, else 0.
+static int proc_self_exe(const char *p, char *tgt, size_t cap) {
+    if (!p || strncmp(p, "/proc/", 6)) return 0;
+    const char *rest = p + 6;
+    if (!strncmp(rest, "self/", 5)) {
+        rest += 5;
+    } else {
+        char *end;
+        long pid = strtol(rest, &end, 10);
+        if (end == rest || *end != '/' || (int)pid != container_pid()) return 0;
+        rest = end + 1;
+    }
+    if (strcmp(rest, "exe")) return 0;
+    const char *src = (g_exe_path && g_exe_path[0]) ? g_exe_path : "/";
+    // g_exe_path is already a guest-absolute path; strip any rootfs prefix that may have leaked in.
+    if (g_rootfs && !strncmp(src, g_rootfs_canon, g_rootfs_canon_len)) src += g_rootfs_canon_len;
+    if (!src[0]) src = "/";
+    size_t l = strlen(src);
+    if (l >= cap) l = cap - 1;
+    memcpy(tgt, src, l);
+    tgt[l] = 0;
+    return 1;
+}
 static void service(struct cpu *c) {
     if (__builtin_expect(g_untrusted, 0)) {
         syscall_route(c);
@@ -1022,6 +1049,16 @@ static void service_local(struct cpu *c) {
             // synthesize /proc/* (macOS has no /proc)
             const char *rp = (const char *)a1;
             if (rp && !strncmp(rp, "/proc/", 6)) {
+                // /proc/[self|pid]/exe -> open the actual guest executable (the magic symlink target)
+                char ep[1024];
+                if (proc_self_exe(rp, ep, sizeof ep)) {
+                    char hb[4200];
+                    const char *hp = xresolve(ep, hb, sizeof hb);
+                    int ef = open(hp, O_RDONLY);
+                    if (ef >= 0 && (lf & 0x80000)) fcntl(ef, F_SETFD, FD_CLOEXEC); // honor O_CLOEXEC
+                    G_RET(c) = ef < 0 ? (uint64_t)(-errno) : (uint64_t)ef;
+                    break;
+                }
                 // /proc/[self|pid]/auxv (rustix/libc read it)
                 if (strstr(rp, "/auxv")) {
                     char tn[] = "/tmp/.ddauxvXXXXXX";
@@ -1382,12 +1419,11 @@ static void service_local(struct cpu *c) {
             G_RET(c) = l;
             break;
         }
-        if (p && strstr(p, "/proc/self/exe")) {
-            char rp[1024];
-            if (!realpath(g_exe_path, rp)) strncpy(rp, g_exe_path, sizeof rp - 1);
-            size_t l = strlen(rp);
+        char ep[1024];
+        if (proc_self_exe(p, ep, sizeof ep)) {
+            size_t l = strlen(ep);
             if (l > bs) l = bs;
-            memcpy(buf, rp, l);
+            memcpy(buf, ep, l);
             G_RET(c) = l;
         } else {
             char pb[4200];
@@ -1411,6 +1447,28 @@ static void service_local(struct cpu *c) {
         const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
         {
             const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
+            char ep[1024];
+            if (proc_self_exe(gp, ep, sizeof ep)) {
+                struct stat es;
+                if (a3 & 0x100) { // lstat: report the magic symlink itself
+                    memset(&es, 0, sizeof es);
+                    es.st_mode = S_IFLNK | 0777;
+                    es.st_size = (off_t)strlen(ep);
+                    es.st_nlink = 1;
+                    fill_linux_stat((uint8_t *)a2, &es);
+                    G_RET(c) = 0;
+                    break;
+                }
+                // stat (follow): stat the actual executable file through the jail
+                char hb[4200];
+                const char *hp = xresolve(ep, hb, sizeof hb);
+                if (stat(hp, &es) == 0) {
+                    fill_linux_stat((uint8_t *)a2, &es);
+                    G_RET(c) = 0;
+                    break;
+                }
+                // file unexpectedly missing -> fall through to the generic ENOENT path
+            }
             if (synth_stat(gp, (uint8_t *)a2)) {
                 G_RET(c) = 0;
                 break;
@@ -1518,7 +1576,21 @@ static void service_local(struct cpu *c) {
         const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, nofollow);
         int rc, empty = (raw && !raw[0] && (a2 & 0x1000));
         const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
-        if (synth_stat_raw(gp, &s)) {
+        char ep[1024];
+        if (proc_self_exe(gp, ep, sizeof ep)) {
+            // /proc/[self|pid]/exe magic symlink -> the running executable
+            if (nofollow) {
+                memset(&s, 0, sizeof s);
+                s.st_mode = S_IFLNK | 0777;
+                s.st_size = (off_t)strlen(ep);
+                s.st_nlink = 1;
+                rc = 0;
+            } else {
+                char hb[4200];
+                const char *hp = xresolve(ep, hb, sizeof hb);
+                rc = stat(hp, &s) == 0 ? 0 : -errno;
+            }
+        } else if (synth_stat_raw(gp, &s)) {
             rc = 0;
             // synth /proc or /sys -> fill from s below
         }
@@ -1610,6 +1682,15 @@ static void service_local(struct cpu *c) {
     case 439:
     case 48: {
         char pb[4200];
+        // /proc/[self|pid]/exe magic symlink -> access the actual executable
+        char ep[1024];
+        if (proc_self_exe((const char *)a1, ep, sizeof ep)) {
+            char hb[4200];
+            const char *hp = xresolve(ep, hb, sizeof hb);
+            int r = access(hp, (int)a2);
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
         // faccessat
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         // F_OK existence check: cacheable
