@@ -120,13 +120,15 @@ pub struct Image {
     pub repo_tags: Vec<String>,
     pub architecture: String,
     pub size: i64,
+    /// Unix creation time (seconds) — for newest-first sorting.
+    pub created: i64,
 }
 
 impl From<ImageSummary> for Image {
     fn from(i: ImageSummary) -> Self {
         // bollard's ImageSummary has no Architecture field (the dd daemon emits it as an extra,
         // which bollard drops). The UI only displays it, so leave it blank.
-        Image { id: i.id, repo_tags: i.repo_tags, architecture: String::new(), size: i.size }
+        Image { id: i.id, repo_tags: i.repo_tags, architecture: String::new(), size: i.size, created: i.created }
     }
 }
 
@@ -146,6 +148,8 @@ pub struct Volume {
     pub scope: String,
     pub labels: Vec<(String, String)>,
     pub options: Vec<(String, String)>,
+    /// ISO-8601 creation time (sorts chronologically as a string) — for newest-first sorting.
+    pub created_at: String,
 }
 
 impl From<bollard::models::Volume> for Volume {
@@ -157,6 +161,7 @@ impl From<bollard::models::Volume> for Volume {
             scope: v.scope.map(|s| s.to_string()).unwrap_or_default(),
             labels: sorted_pairs(v.labels),
             options: sorted_pairs(v.options),
+            created_at: v.created_at.unwrap_or_default(),
         }
     }
 }
@@ -177,6 +182,8 @@ pub struct Network {
     pub options: Vec<(String, String)>,
     /// IDs of the containers attached to this network (from the inspect `Containers` map).
     pub containers: Vec<String>,
+    /// ISO-8601 creation time (sorts chronologically as a string) — for newest-first sorting.
+    pub created_at: String,
 }
 
 impl From<bollard::models::Network> for Network {
@@ -201,6 +208,7 @@ impl From<bollard::models::Network> for Network {
             options: sorted_pairs(n.options.unwrap_or_default()),
             // bollard's list `Network` model carries no container map (only on inspect).
             containers: Vec::new(),
+            created_at: n.created.unwrap_or_default(),
         }
     }
 }

@@ -147,24 +147,17 @@ fn context_section(m: &AppModel, sender: &ComponentSender<AppModel>) -> gtk::Box
             hint.add_css_class("dd-sub");
             card.append(&hint);
         }
-        // docker CLI absent -> friendly note + install action, never a crash
+        // docker CLI absent (or not found on the app's PATH) -> just a small warning. Note: installing
+        // the dd CLI does NOT help here — it doesn't provide `docker`. Context switching needs docker.
         None => {
             let note = gtk::Label::new(Some(
-                "Docker CLI not detected. Install the dd CLI to add the 'dd' context and switch here \
-                 — dd keeps running either way.",
+                "Docker CLI not found — context switching is unavailable. Install Docker \
+                 (e.g. `brew install docker`) and reopen. dd keeps running either way.",
             ));
             note.set_xalign(0.0);
             note.set_wrap(true);
             note.add_css_class("dd-sub");
             card.append(&note);
-            card.append(&action_row(
-                "Install the dd CLI",
-                "Sets up the `dd`/`docker` context so you can select it here.",
-                "Install CLI",
-                false,
-                sender,
-                || Msg::InstallCli,
-            ));
         }
     }
 

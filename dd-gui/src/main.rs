@@ -603,12 +603,22 @@ async fn fetch(c: &Client) -> Snapshot {
     if c.ping().await.is_err() {
         return Snapshot { docker_context, docker_contexts, ..Snapshot::default() };
     }
+    // Sort every list newest-first (descending). Containers/images carry a unix `created`; networks
+    // and volumes carry an ISO-8601 `created_at` (lexicographic order == chronological).
+    let mut containers = c.list_containers().await.unwrap_or_default();
+    containers.sort_by(|a, b| b.created.cmp(&a.created));
+    let mut images = c.list_images().await.unwrap_or_default();
+    images.sort_by(|a, b| b.created.cmp(&a.created));
+    let mut networks = c.list_networks().await.unwrap_or_default();
+    networks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let mut volumes = c.list_volumes().await.unwrap_or_default();
+    volumes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Snapshot {
         connected: true,
-        containers: c.list_containers().await.unwrap_or_default(),
-        images: c.list_images().await.unwrap_or_default(),
-        networks: c.list_networks().await.unwrap_or_default(),
-        volumes: c.list_volumes().await.unwrap_or_default(),
+        containers,
+        images,
+        networks,
+        volumes,
         sys: c.system().await.ok(),
         df: c.disk_usage().await.ok(),
         daemon_log: read_daemon_log(),
@@ -630,9 +640,31 @@ fn read_daemon_log() -> String {
     }
 }
 
+/// Absolute path to the `docker` CLI. A macOS app launched from Finder/Dock/launchd inherits a
+/// minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) that excludes Homebrew (`/opt/homebrew/bin`),
+/// `/usr/local/bin`, and Docker Desktop (`~/.docker/bin`) — so a bare `Command::new("docker")` fails
+/// even when docker is installed and on the user's *shell* PATH (which is why it works in a terminal
+/// but the app "can't see it"). Search the well-known install locations; fall back to the bare name
+/// (PATH) for terminal/dev launches.
+fn docker_bin() -> std::ffi::OsString {
+    let home = std::env::var("HOME").unwrap_or_default();
+    for c in [
+        "/opt/homebrew/bin/docker".to_string(),
+        "/usr/local/bin/docker".to_string(),
+        format!("{home}/.docker/bin/docker"),
+        "/Applications/Docker.app/Contents/Resources/bin/docker".to_string(),
+        "/usr/bin/docker".to_string(),
+    ] {
+        if std::path::Path::new(&c).exists() {
+            return c.into();
+        }
+    }
+    "docker".into()
+}
+
 /// The active `docker` context name, or `None` if the docker CLI isn't installed / errored.
 async fn docker_context() -> Option<String> {
-    let out = tokio::process::Command::new("docker").args(["context", "show"]).output().await.ok()?;
+    let out = tokio::process::Command::new(docker_bin()).args(["context", "show"]).output().await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -643,7 +675,7 @@ async fn docker_context() -> Option<String> {
 /// All selectable docker contexts (`docker context ls`), always including `dd` so the user can
 /// pick our daemon even before the context exists.
 async fn docker_contexts() -> Vec<String> {
-    let out = tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new(docker_bin())
         .args(["context", "ls", "--format", "{{.Name}}"])
         .output()
         .await;
@@ -666,9 +698,9 @@ async fn set_context(name: &str, socket: &std::path::Path) {
     use tokio::process::Command;
     if name == "dd" {
         let host = format!("host=unix://{}", socket.display());
-        let _ = Command::new("docker").args(["context", "create", "dd", "--docker", &host]).output().await;
+        let _ = Command::new(docker_bin()).args(["context", "create", "dd", "--docker", &host]).output().await;
     }
-    let _ = Command::new("docker").args(["context", "use", name]).output().await;
+    let _ = Command::new(docker_bin()).args(["context", "use", name]).output().await;
 }
 
 /// Spawn the dd-daemon binary detached, with the canonical socket/images/JIT env, and return the
