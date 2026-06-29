@@ -268,6 +268,9 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
 // +bias (nonpie_fixup); anything else re-raises with the default action (a real crash). Inert for PIE.
 static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     if (nonpie_fixup(si, uc)) return;
+    // A genuine guest fault (wild pointer / null deref) with a registered guest handler is the guest's
+    // to handle: synthesize+deliver the guest signal. nonpie_fixup (absolute-data) already won above.
+    if (deliver_guest_fault(sig, si, uc)) return;
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -402,11 +405,18 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     arc4random_buf(top, 16);
     uint64_t rnd = (uint64_t)top;
     top = (uint8_t *)((uint64_t)top & ~15ull);
+    // AT_PAGESZ must be the HOST mmap granularity (16 KB on Apple Silicon), not the guest's nominal 4 KB.
+    // ld.so rounds every PT_LOAD segment map to AT_PAGESZ; aarch64 .so segments use a 64 KB p_align, so a
+    // 16 KB page keeps each segment's MAP_FIXED address host-page-aligned and the kernel maps it directly.
+    // A 4 KB AT_PAGESZ instead yields 4 KB- but not 16 KB-aligned fixed maps that macOS rejects (EINVAL),
+    // forcing the syscall layer's fallback to copy from the reserved-but-past-EOF tail of the file map ->
+    // SIGBUS in the host's memmove. (64 KB-aligned segments stay congruent under a 16 KB page, so ld.so's
+    // p_vaddr/p_offset page-alignment check still passes.)
     uint64_t aux[][2] = {
         {3, lm->phdr},
         {4, (uint64_t)lm->phent},
         {5, (uint64_t)lm->phnum},
-        {6, 4096},
+        {6, (uint64_t)getpagesize()},
         {7, at_base},
         {8, 0},
         {9, lm->entry},
