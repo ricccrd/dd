@@ -70,6 +70,42 @@ static void avx_put_rm(struct cpu *c, struct insn *I, uint64_t rip_after, int wb
     }
 }
 
+// ---- scalar FP helpers used by the VEX arithmetic/FMA lowerings ----
+// map-1 0x58..0x5F packed/scalar arithmetic, by opcode.
+static float avx_fp_arith_f32(int op, float x, float y) {
+    switch (op) {
+    case 0x58: return x + y;
+    case 0x59: return x * y;
+    case 0x5C: return x - y;
+    case 0x5E: return x / y;
+    case 0x5D: return x < y ? x : y; // min (x86: NaN/equal -> second operand; tests don't probe that)
+    default: return x > y ? x : y;   // 0x5F max
+    }
+}
+static double avx_fp_arith_f64(int op, double x, double y) {
+    switch (op) {
+    case 0x58: return x + y;
+    case 0x59: return x * y;
+    case 0x5C: return x - y;
+    case 0x5E: return x / y;
+    case 0x5D: return x < y ? x : y;
+    default: return x > y ? x : y;
+    }
+}
+
+// F16C uses the host's native fp16 so the half<->single conversion (and round-to-nearest-even) matches x86.
+static uint16_t avx_f32_to_f16(float f) {
+    _Float16 h = (_Float16)f;
+    uint16_t o;
+    memcpy(&o, &h, 2);
+    return o;
+}
+static float avx_f16_to_f32(uint16_t bits) {
+    _Float16 h;
+    memcpy(&h, &bits, 2);
+    return (float)h;
+}
+
 static void do_avx(struct cpu *c) {
     struct insn I;
     decode(c->rip, &I);
@@ -209,6 +245,174 @@ static void do_avx(struct cpu *c) {
             avx_put_rm(c, &I, next, 8, d);
             goto done;
         }
+        case 0x12: { // F2: vmovddup (dup low 64 per 128-lane); F3: vmovsldup (dup even dwords)
+            if (pp == 3) {     // vmovddup
+                uint8_t src[64]; // 128-bit reads m64; 256-bit reads m256
+                if (I.is_mem) {
+                    uint64_t ea = avx_ea(c, &I, next, L == 0 ? 8 : W);
+                    memcpy(src, (void *)ea, L == 0 ? 8 : W);
+                } else
+                    avx_get(c, I.rm_reg, src);
+                for (int lane = 0; lane < W; lane += 16) {
+                    int so = (I.is_mem && L == 0) ? 0 : lane; // 128-bit mem source is a single m64
+                    memcpy(d + lane, src + so, 8);
+                    memcpy(d + lane + 8, src + so, 8);
+                }
+                avx_put(c, rd, d, W);
+                goto done;
+            } else if (pp == 2) { // vmovsldup
+                avx_get_rm(c, &I, next, W, b);
+                for (int i = 0; i < W; i += 8) {
+                    memcpy(d + i, b + i, 4);
+                    memcpy(d + i + 4, b + i, 4);
+                }
+                avx_put(c, rd, d, W);
+                goto done;
+            }
+            goto avx_unimpl;
+        }
+        case 0x16: { // F3: vmovshdup (dup odd dwords)
+            if (pp == 2) {
+                avx_get_rm(c, &I, next, W, b);
+                for (int i = 0; i < W; i += 8) {
+                    memcpy(d + i, b + i + 4, 4);
+                    memcpy(d + i + 4, b + i + 4, 4);
+                }
+                avx_put(c, rd, d, W);
+                goto done;
+            }
+            goto avx_unimpl;
+        }
+        case 0x2A: { // vcvtsi2ss/sd: GPR/mem int -> scalar float; rest of low-128 from src1(vvvv)
+            int dbl = (pp == 3), wi = I.vex_w ? 8 : 4;
+            avx_get(c, vv, a);
+            int64_t iv;
+            if (I.is_mem) {
+                uint64_t ea = avx_ea(c, &I, next, wi);
+                iv = 0;
+                memcpy(&iv, (void *)ea, wi);
+                if (!I.vex_w) iv = (int32_t)iv;
+            } else
+                iv = I.vex_w ? (int64_t)c->r[I.rm_reg] : (int64_t)(int32_t)c->r[I.rm_reg];
+            memcpy(d, a, 16);
+            if (dbl) {
+                double f = (double)iv;
+                memcpy(d, &f, 8);
+            } else {
+                float f = (float)iv;
+                memcpy(d, &f, 4);
+            }
+            avx_put(c, rd, d, 16);
+            goto done;
+        }
+        case 0x2C: // vcvttss2si/sd2si (truncate) -> GPR
+        case 0x2D: // vcvtss2si/sd2si (round)    -> GPR
+        {
+            int dbl = (pp == 3), es = dbl ? 8 : 4, trunc = (op == 0x2C);
+            avx_get_rm(c, &I, next, es, b);
+            int64_t res;
+            if (dbl) {
+                double x;
+                memcpy(&x, b, 8);
+                res = trunc ? (int64_t)x : (int64_t)__builtin_llrint(x);
+            } else {
+                float x;
+                memcpy(&x, b, 4);
+                res = trunc ? (int64_t)x : (int64_t)__builtin_llrintf(x);
+            }
+            c->r[rd] = I.vex_w ? (uint64_t)res : (uint32_t)res; // 32-bit dst zero-extends
+            goto done;
+        }
+        case 0x5A: { // vcvtss2sd/sd2ss (scalar) or vcvtps2pd/pd2ps (packed) per pp
+            if (pp == 2) { // F3: ss->sd scalar, rest of low-128 from src1
+                avx_get(c, vv, a);
+                avx_get_rm(c, &I, next, 4, b);
+                memcpy(d, a, 16);
+                float x;
+                memcpy(&x, b, 4);
+                double y = (double)x;
+                memcpy(d, &y, 8);
+                avx_put(c, rd, d, 16);
+            } else if (pp == 3) { // F2: sd->ss scalar
+                avx_get(c, vv, a);
+                avx_get_rm(c, &I, next, 8, b);
+                memcpy(d, a, 16);
+                double x;
+                memcpy(&x, b, 8);
+                float y = (float)x;
+                memcpy(d, &y, 4);
+                avx_put(c, rd, d, 16);
+            } else if (pp == 0) { // np: ps->pd, src is W/2 bytes of floats -> W bytes doubles
+                avx_get_rm(c, &I, next, W / 2, b);
+                int n = W / 8;
+                for (int i = 0; i < n; i++) {
+                    float x;
+                    memcpy(&x, b + 4 * i, 4);
+                    double y = (double)x;
+                    memcpy(d + 8 * i, &y, 8);
+                }
+                avx_put(c, rd, d, W);
+            } else { // 66: pd->ps, src W bytes doubles -> W/2 bytes floats
+                avx_get_rm(c, &I, next, W, b);
+                int n = W / 8;
+                for (int i = 0; i < n; i++) {
+                    double x;
+                    memcpy(&x, b + 8 * i, 8);
+                    float y = (float)x;
+                    memcpy(d + 4 * i, &y, 4);
+                }
+                avx_put(c, rd, d, W / 2);
+            }
+            goto done;
+        }
+        // packed/scalar FP arithmetic: dst = src1 OP src2 (src1=vvvv, src2=rm). pp: 0=ps,1=pd,2=ss,3=sd.
+        case 0x58: // vadd
+        case 0x59: // vmul
+        case 0x5C: // vsub
+        case 0x5D: // vmin
+        case 0x5E: // vdiv
+        case 0x5F: // vmax
+        {
+            int dbl = (pp == 1 || pp == 3), scalar = (pp == 2 || pp == 3);
+            int es = dbl ? 8 : 4;
+            avx_get(c, vv, a);
+            avx_get_rm(c, &I, next, scalar ? es : W, b);
+            if (scalar) {       // low element computed, rest of low-128 from src1
+                memcpy(d, a, 16);
+                if (dbl) {
+                    double x, y;
+                    memcpy(&x, a, 8);
+                    memcpy(&y, b, 8);
+                    double z = avx_fp_arith_f64(op, x, y);
+                    memcpy(d, &z, 8);
+                } else {
+                    float x, y;
+                    memcpy(&x, a, 4);
+                    memcpy(&y, b, 4);
+                    float z = avx_fp_arith_f32(op, x, y);
+                    memcpy(d, &z, 4);
+                }
+                avx_put(c, rd, d, 16);
+            } else {
+                for (int i = 0; i < W; i += es) {
+                    if (dbl) {
+                        double x, y;
+                        memcpy(&x, a + i, 8);
+                        memcpy(&y, b + i, 8);
+                        double z = avx_fp_arith_f64(op, x, y);
+                        memcpy(d + i, &z, 8);
+                    } else {
+                        float x, y;
+                        memcpy(&x, a + i, 4);
+                        memcpy(&y, b + i, 4);
+                        float z = avx_fp_arith_f32(op, x, y);
+                        memcpy(d + i, &z, 4);
+                    }
+                }
+                avx_put(c, rd, d, W);
+            }
+            goto done;
+        }
         // logical: dst = src1 OP src2  (src1=vvvv, src2=rm). byte-wise over W.
         case 0xEF: // vpxor
         case 0xEB: // vpor
@@ -315,6 +519,40 @@ static void do_avx(struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
+        case 0x71: // shift-by-imm8 group: dst=vvvv, src=rm(reg), ModRM.reg=opcode extension.
+        case 0x72: // 0x71 word /2 psrlw /4 psraw /6 psllw; 0x72 dword /2 psrld /4 psrad /6 pslld;
+        case 0x73: // 0x73 qword /2 psrlq /6 psllq; /3 psrldq /7 pslldq (per-128-lane byte shift).
+        {
+            int ext = rd, imm = (uint8_t)I.imm;
+            int es = (op == 0x71) ? 2 : (op == 0x72) ? 4 : 8;
+            avx_get(c, I.rm_reg, a); // source
+            if (op == 0x73 && (ext == 3 || ext == 7)) {
+                for (int lane = 0; lane < W; lane += 16)
+                    for (int i = 0; i < 16; i++) {
+                        if (ext == 3) // psrldq
+                            d[lane + i] = (i + imm < 16) ? a[lane + i + imm] : 0;
+                        else // pslldq
+                            d[lane + i] = (i - imm >= 0) ? a[lane + i - imm] : 0;
+                    }
+            } else {
+                int left = (ext == 6), arith = (ext == 4), bits = es * 8;
+                for (int i = 0; i < W; i += es) {
+                    uint64_t v = 0, z;
+                    memcpy(&v, a + i, es);
+                    if (left)
+                        z = (imm >= bits) ? 0 : (v << imm);
+                    else if (arith) {
+                        int sh = 64 - bits;
+                        int64_t sv = ((int64_t)v << sh) >> sh;
+                        z = (uint64_t)(sv >> (imm >= bits ? bits - 1 : imm));
+                    } else
+                        z = (imm >= bits) ? 0 : (v >> imm);
+                    memcpy(d + i, &z, es);
+                }
+            }
+            avx_put(c, vv, d, W); // dst = VEX.vvvv
+            goto done;
+        }
         case 0x77: { // vzeroupper (L=0): zero bits[128:256) of ymm0..15. vzeroall (L=1): zero all of 0..15.
             uint8_t z[64];
             memset(z, 0, 64);
@@ -363,11 +601,168 @@ static void do_avx(struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
+        case 0x20: // vpmovsxbw   vpmov{s,z}x{b,w,d}{w,d,q}: widen a smaller source element with
+        case 0x21: // vpmovsxbd   sign(2x)/zero(3x) extension. dst holds W/dst_es elements.
+        case 0x22: // vpmovsxbq
+        case 0x23: // vpmovsxwd
+        case 0x24: // vpmovsxwq
+        case 0x25: // vpmovsxdq
+        case 0x30: // vpmovzxbw
+        case 0x31: // vpmovzxbd
+        case 0x32: // vpmovzxbq
+        case 0x33: // vpmovzxwd
+        case 0x34: // vpmovzxwq
+        case 0x35: // vpmovzxdq
+        {
+            int sx = (op < 0x30), idx = op - (sx ? 0x20 : 0x30);
+            static const int k_src_es[6] = {1, 1, 1, 2, 2, 4};
+            static const int k_dst_es[6] = {2, 4, 8, 4, 8, 8};
+            int src_es = k_src_es[idx], dst_es = k_dst_es[idx];
+            int n = W / dst_es;
+            avx_get_rm(c, &I, next, n * src_es, b);
+            for (int i = 0; i < n; i++) {
+                int64_t v = 0;
+                memcpy(&v, b + i * src_es, src_es);
+                if (sx) { // sign-extend from src_es bytes
+                    int sh = 64 - src_es * 8;
+                    v = (v << sh) >> sh;
+                }
+                memcpy(d + i * dst_es, &v, dst_es);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x13: { // vcvtph2ps: rm holds W/2 bytes of packed fp16 -> W/4 fp32 in dst
+            int nf = W / 4;
+            avx_get_rm(c, &I, next, W / 2, b);
+            for (int i = 0; i < nf; i++) {
+                uint16_t h;
+                memcpy(&h, b + 2 * i, 2);
+                float f = avx_f16_to_f32(h);
+                memcpy(d + 4 * i, &f, 4);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x36: { // vpermd: dst.dword[i] = rm.dword[ vvvv.dword[i] & 7 ] (across full 256)
+            avx_get(c, vv, a); // control indices
+            avx_get_rm(c, &I, next, W, b);
+            for (int i = 0; i < W; i += 4) {
+                uint32_t idx;
+                memcpy(&idx, a + i, 4);
+                memcpy(d + i, b + 4 * (idx & 7), 4);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x40: { // vpmulld: 32-bit low product, dst = src1(vvvv) * rm
+            avx_get(c, vv, a);
+            avx_get_rm(c, &I, next, W, b);
+            for (int i = 0; i < W; i += 4) {
+                int32_t x, y;
+                memcpy(&x, a + i, 4);
+                memcpy(&y, b + i, 4);
+                int32_t z = x * y;
+                memcpy(d + i, &z, 4);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x45: // vpsrlvd/q: variable logical right shift
+        case 0x46: // vpsravd:   variable arithmetic right shift (dword only)
+        case 0x47: // vpsllvd/q: variable logical left shift
+        {
+            int es = I.vex_w ? 8 : 4; // W selects dword(0) / qword(1); 0x46 is dword-only
+            avx_get(c, vv, a);        // values to shift
+            avx_get_rm(c, &I, next, W, b);
+            for (int i = 0; i < W; i += es) {
+                uint64_t v = 0, cnt = 0;
+                memcpy(&v, a + i, es);
+                memcpy(&cnt, b + i, es);
+                uint64_t z;
+                int bits = es * 8;
+                if (op == 0x46) { // arithmetic right (sign-extend), dword
+                    int32_t sv;
+                    memcpy(&sv, a + i, 4);
+                    z = (uint32_t)((cnt >= 32) ? (sv >> 31) : (sv >> cnt));
+                } else if (op == 0x45) { // logical right
+                    z = (cnt >= (uint64_t)bits) ? 0 : (v >> cnt);
+                } else { // 0x47 logical left
+                    z = (cnt >= (uint64_t)bits) ? 0 : (v << cnt);
+                }
+                memcpy(d + i, &z, es);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        // ---- FMA (VEX 0F38 0x98..0xBF): fused multiply-add. reg=dst, vvvv, rm. W=0 ps, W=1 pd; odd op=scalar.
+        case 0x98:
+        case 0x99:
+        case 0x9A:
+        case 0x9B:
+        case 0x9C:
+        case 0x9D:
+        case 0x9E:
+        case 0x9F:
+        case 0xA8:
+        case 0xA9:
+        case 0xAA:
+        case 0xAB:
+        case 0xAC:
+        case 0xAD:
+        case 0xAE:
+        case 0xAF:
+        case 0xB8:
+        case 0xB9:
+        case 0xBA:
+        case 0xBB:
+        case 0xBC:
+        case 0xBD:
+        case 0xBE:
+        case 0xBF: {
+            int form = (op >> 4) - 9;     // 0=132, 1=213, 2=231
+            int base = op & 0x0E;         // 8=madd,A=msub,C=nmadd,E=nmsub
+            int scalar = op & 1;
+            int dbl = I.vex_w;
+            int es = dbl ? 8 : 4;
+            int sneg_mul = (base == 0x0C || base == 0x0E) ? -1 : 1;
+            int sneg_add = (base == 0x0A || base == 0x0E) ? -1 : 1;
+            uint8_t dst[64];
+            avx_get(c, rd, dst);
+            avx_get(c, vv, a);
+            avx_get_rm(c, &I, next, W, b);
+            // per form pick (mul1, mul2, add) from {dst, vvvv=a, rm=b}
+            uint8_t *m1 = (form == 0) ? dst : a;
+            uint8_t *m2 = (form == 0) ? b : (form == 1) ? dst : b;
+            uint8_t *ad = (form == 0) ? a : (form == 1) ? b : dst;
+            int n = scalar ? es : W;
+            memcpy(d, dst, 64); // scalar keeps dst's upper bits; packed overwrites fully
+            for (int i = 0; i < n; i += es) {
+                if (dbl) {
+                    double x, y, z;
+                    memcpy(&x, m1 + i, 8);
+                    memcpy(&y, m2 + i, 8);
+                    memcpy(&z, ad + i, 8);
+                    double res = __builtin_fma(sneg_mul * x, y, sneg_add * z);
+                    memcpy(d + i, &res, 8);
+                } else {
+                    float x, y, z;
+                    memcpy(&x, m1 + i, 4);
+                    memcpy(&y, m2 + i, 4);
+                    memcpy(&z, ad + i, 4);
+                    float res = __builtin_fmaf(sneg_mul * x, y, sneg_add * z);
+                    memcpy(d + i, &res, 4);
+                }
+            }
+            avx_put(c, rd, d, scalar ? 16 : W);
+            goto done;
+        }
         }
     }
     // ---- map 3 (0F3A) ----
     if (map == 3) {
         switch (op) {
+        case 0x18: // vinsertf128 (same as vinserti128)
         case 0x38: { // vinserti128: dst = src1; dst[imm&1 *16] = rm(128)
             avx_get(c, vv, d);
             avx_get_rm(c, &I, next, 16, b);
@@ -375,10 +770,39 @@ static void do_avx(struct cpu *c) {
             avx_put(c, rd, d, 32);
             goto done;
         }
+        case 0x19: // vextractf128 (same as vextracti128)
         case 0x39: { // vextracti128: rm(128) = src.reg[imm&1]
             avx_get(c, rd, a);
             memcpy(d, a + ((I.imm & 1) ? 16 : 0), 16);
             avx_put_rm(c, &I, next, 16, d);
+            goto done;
+        }
+        case 0x06: { // vperm2f128: select a 128-bit lane into each half (imm[3]/[7] zero the lane)
+            avx_get(c, vv, a);
+            avx_get_rm(c, &I, next, 32, b);
+            uint8_t src[64];
+            memcpy(src, a, 32);      // [0:16)=a.lo, [16:32)=a.hi
+            memcpy(src + 32, b, 32); // [32:48)=b.lo, [48:64)=b.hi
+            for (int half = 0; half < 2; half++) {
+                int ctl = (I.imm >> (half * 4)) & 0xF;
+                if (ctl & 0x8)
+                    memset(d + half * 16, 0, 16);
+                else
+                    memcpy(d + half * 16, src + (ctl & 3) * 16, 16);
+            }
+            avx_put(c, rd, d, 32);
+            goto done;
+        }
+        case 0x1D: { // vcvtps2ph: reg holds W/4 fp32 -> W/2 bytes of fp16 in rm (imm[1:0] rounding; RNE only)
+            int nf = W / 4;
+            avx_get(c, rd, a);
+            for (int i = 0; i < nf; i++) {
+                float f;
+                memcpy(&f, a + 4 * i, 4);
+                uint16_t h = avx_f32_to_f16(f);
+                memcpy(d + 2 * i, &h, 2);
+            }
+            avx_put_rm(c, &I, next, W / 2, d);
             goto done;
         }
         case 0x0F: { // vpalignr imm8: per-128-lane byte concat(src1:src2) >> imm
