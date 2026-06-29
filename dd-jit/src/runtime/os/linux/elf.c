@@ -394,6 +394,26 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     signal(sig, SIG_DFL);
     raise(sig);
 }
+// Synchronous CPU faults other than SIGSEGV/SIGBUS (which jit_run wires to nonpie_guard above): a guest
+// may install a handler for SIGILL/SIGFPE/SIGTRAP and DELIBERATELY trigger it -- the canonical case is a
+// CPU-feature probe (ring/OpenSSL/musl) that executes an optional instruction guarded by a SIGILL handler
+// and falls back when it traps. The aarch64 frontend emits such instructions verbatim, so on a host CPU
+// missing the extension (e.g. Apple Silicon has no SM3/SM4) they raise a real host SIGILL. rt_sigaction
+// records the guest handler but does not install a host handler for synchronous signals (they are served by
+// the guards installed here), so without this the trap is fatal instead of reaching the guest's handler.
+// nonpie_guard already routes any signal to deliver_guest_fault (nonpie_fixup self-declines: its si_addr is
+// the high faulting PC, never in the low link range), so reuse it. CRASHDBG handles these via its mach
+// exception port + diag_crash instead, so leave its diagnostics untouched.
+__attribute__((constructor)) static void install_sync_fault_guards(void) {
+    if (getenv("CRASHDBG")) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = nonpie_guard;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+}
 
 static void load_elf(const char *path, struct loaded *out) {
     int fd = open(path, O_RDONLY);

@@ -237,6 +237,10 @@ static void cpu_range_str(char *buf, size_t n) {
 // path that was exec'd (g_exe_path). Many programs (Go, the JVM, boost::filesystem, mongod) readlink
 // or stat this to locate their own binary. Returns 1 and fills tgt[] with the guest-visible target
 // path when `p` names this link, else 0.
+// Backing storage for g_exe_path after an execve (case 221) updates it: the initial g_exe_path points at
+// the launcher's argv buffer, but a post-exec /proc/self/exe must name the NEWLY exec'd image. We copy the
+// guest-absolute exec path here and repoint g_exe_path at it (the prior image's address space is torn down).
+static char g_exe_path_store[4200];
 static int proc_self_exe(const char *p, char *tgt, size_t cap) {
     if (!p || strncmp(p, "/proc/", 6)) return 0;
     const char *rest = p + 6;
@@ -2029,9 +2033,16 @@ static void service_local(struct cpu *c) {
             ac++;
         }
         argv[ac] = NULL;
+        // Capture the guest-absolute exec path NOW (a0 is still mapped) so /proc/self/exe can name the new
+        // image after the teardown below. ld.so resolves a binary's $ORIGIN (DT_RUNPATH) via readlink of
+        // /proc/self/exe; a stale value makes an exec'd dynamic binary fail to find its own libraries (e.g.
+        // rustup's proxy execs the real rustc, whose RUNPATH $ORIGIN/../lib must point into the toolchain).
+        char gexe[4200];
+        abs_guest(-100, (const char *)a0, gexe, sizeof gexe);
         // shebang: exec the #! interpreter instead (parse_shebang is shared with the initial loader)
         char sh_interp[256], sh_arg[256], shpb[4200];
         if (parse_shebang(p, sh_interp, sizeof sh_interp, sh_arg, sizeof sh_arg) == 1) {
+            snprintf(gexe, sizeof gexe, "%s", sh_interp); // a script exec: /proc/self/exe names the interpreter
             char *na[258];
             int ni = 0;
             // [interp, (optarg), scriptpath, args...]
@@ -2096,6 +2107,8 @@ static void service_local(struct cpu *c) {
         free(xpath);
         for (int i = 0; i < ac && i < 255; i++)
             free(xargv[i]);
+        snprintf(g_exe_path_store, sizeof g_exe_path_store, "%s", gexe); // /proc/self/exe -> the new image
+        g_exe_path = g_exe_path_store;
         G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;
