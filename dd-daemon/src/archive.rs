@@ -83,6 +83,28 @@ pub(crate) fn archive_host_path(rootfs: &str, binds: &[String], volumes_dir: &st
 }
 
 
+/// Resolve a container path to its host path through the per-container copy-on-write overlay. A path under
+/// a bind/volume mount maps to the host source (as in `archive_host_path`); a plain rootfs path lands in
+/// the writable UPPER (`upper`). For reads (`write == false`) a rootfs path the container hasn't copied up
+/// yet falls back to the read-only image rootfs (`lower`) so `docker cp` can read unmodified image files;
+/// a `.wh.NAME` whiteout in the upper hides a lower file (the upper path, which doesn't exist, is kept so
+/// the read 404s). For writes (`write == true`) the upper is always selected so `docker cp` INTO the
+/// container lands in the writable layer and never mutates the shared image. Empty `upper` (darwin/legacy
+/// containers) means a flat rootfs -- identical to `archive_host_path`.
+pub(crate) fn overlay_host_path(upper: &str, lower: &str, binds: &[String], volumes_dir: &str, path: &str, write: bool) -> std::path::PathBuf {
+    if upper.is_empty() { return archive_host_path(lower, binds, volumes_dir, path); }
+    let up = archive_host_path(upper, binds, volumes_dir, path);
+    // A bind/volume path resolves to the same host source regardless of base, so up.exists() already
+    // covers it; only genuine rootfs paths absent from the upper fall through to the lower.
+    if write || up.exists() { return up; }
+    if let (Some(dir), Some(name)) = (up.parent(), up.file_name()) {
+        // deleted in the container (whiteout) -> keep the nonexistent upper path so the read reports absent
+        if dir.join(format!(".wh.{}", name.to_string_lossy())).exists() { return up; }
+    }
+    archive_host_path(lower, binds, volumes_dir, path)
+}
+
+
 /// Join `rel` onto `base`, dropping `.`/`..` so the result stays within `base`.
 pub(crate) fn clamp_join(base: &str, rel: &str) -> std::path::PathBuf {
     let root = std::path::Path::new(base).to_path_buf();
@@ -127,7 +149,7 @@ pub(crate) async fn archive_head(State(a): State<App>, Path(id): Path<String>, Q
     let g = a.inner.lock().await;
     let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
     let binds: Vec<String> = c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect();
-    match path_stat_b64(&archive_host_path(&c.rootfs, &binds, &a.volumes_dir, &q.path)) {
+    match path_stat_b64(&overlay_host_path(&c.upper, &c.rootfs, &binds, &a.volumes_dir, &q.path, false)) {
         Some(stat) => (StatusCode::OK, [("X-Docker-Container-Path-Stat", stat)]).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(),
     }
@@ -135,10 +157,10 @@ pub(crate) async fn archive_head(State(a): State<App>, Path(id): Path<String>, Q
 
 
 pub(crate) async fn archive_get(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>) -> Response {
-    let (rootfs, binds) = { let g = a.inner.lock().await;
+    let (upper, rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-        (c.rootfs.clone(), c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect::<Vec<_>>()) };
-    let host = archive_host_path(&rootfs, &binds, &a.volumes_dir, &q.path);
+        (c.upper.clone(), c.rootfs.clone(), c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect::<Vec<_>>()) };
+    let host = overlay_host_path(&upper, &rootfs, &binds, &a.volumes_dir, &q.path, false);
     let Some(stat) = path_stat_b64(&host) else {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("Could not find the file {} in container {id}", q.path)}))).into_response(); };
     let parent = host.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
@@ -153,10 +175,17 @@ pub(crate) async fn archive_get(State(a): State<App>, Path(id): Path<String>, Qu
 
 
 pub(crate) async fn archive_put(State(a): State<App>, Path(id): Path<String>, Query(q): Query<ArchiveQ>, body: axum::body::Bytes) -> Response {
-    let (rootfs, binds) = { let g = a.inner.lock().await;
+    let (upper, rootfs, binds) = { let g = a.inner.lock().await;
         let Some(c) = resolve_cid(&g, &id).and_then(|f| g.containers.get(&f)) else { return no_such(&id); };
-        (c.rootfs.clone(), c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect::<Vec<_>>()) };
-    let host = archive_host_path(&rootfs, &binds, &a.volumes_dir, &q.path);
+        (c.upper.clone(), c.rootfs.clone(), c.binds.iter().cloned().chain(mounts_as_binds(&c.mounts)).collect::<Vec<_>>()) };
+    // cp INTO the container writes to the upper layer. The extraction dir may exist only in the read-only
+    // image (lower); mirror it into the upper (copy-up the dir) so the files land in the writable layer
+    // and the image is never touched.
+    let host = overlay_host_path(&upper, &rootfs, &binds, &a.volumes_dir, &q.path, true);
+    if !host.is_dir() {
+        let lower = overlay_host_path("", &rootfs, &binds, &a.volumes_dir, &q.path, false);
+        if lower.is_dir() { let _ = std::fs::create_dir_all(&host); }
+    }
     if !host.is_dir() {
         return (StatusCode::BAD_REQUEST, Json(json!({"message": format!("extraction point {} is not a directory", q.path)}))).into_response(); }
     let tmp = std::env::temp_dir().join(format!("dd-cp-{}.tar", std::process::id()));

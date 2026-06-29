@@ -99,7 +99,13 @@ fn resolve_user(rootfs: &str, spec: &str) -> Option<(u32, u32)> {
 /// was built for the image's arch.
 pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: Option<(String, String)>) -> Option<(String, Vec<String>)> {
     let guest = c.arch.unwrap_or(Guest::LinuxAarch64);
-    let mut cfg = SpawnConfig::new(String::new(), c.rootfs.clone()); // work_dir is the HOST cwd; leave empty
+    // Per-container copy-on-write: the private writable UPPER (`c.upper`) is overlaid on the read-only
+    // image rootfs (the lower), so the guest's writes/creates go to the upper and deletions become
+    // whiteouts -- the shared image is never mutated. Linux guests only (darwin runs natively jailed, and
+    // overrides cfg.lowers below); a flat rootfs is used when no upper was allocated (empty `c.upper`).
+    let overlay = guest.os() != "darwin" && !c.upper.is_empty();
+    let mut cfg = SpawnConfig::new(String::new(), if overlay { c.upper.clone() } else { c.rootfs.clone() }); // work_dir is the HOST cwd; leave empty
+    if overlay { cfg.lowers = vec![c.rootfs.clone()]; }
     cfg.argv = c.cmd.clone();
     // `-w DIR` (WorkingDir): the guest's initial cwd, read as DD_CWD by the runtime at startup.
     if !c.working_dir.is_empty() { cfg.env.push(("DD_CWD".into(), c.working_dir.clone())); }
@@ -255,7 +261,11 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
     // Write the table best-effort — Docker manages /etc/hosts, so overwriting with the generated
     // reach-by-name content is correct; never fail the spawn on an I/O error.
     {
-        let etc = format!("{}/etc", c.rootfs);
+        // Write /etc/hosts into the writable layer the guest actually sees: the per-container overlay UPPER
+        // (so it shadows the image's /etc/hosts via the overlay and never drifts the shared image), or the
+        // flat rootfs when there's no upper (darwin / legacy containers).
+        let base = if c.upper.is_empty() { &c.rootfs } else { &c.upper };
+        let etc = format!("{base}/etc");
         let _ = std::fs::create_dir_all(&etc);
         if let Err(e) = std::fs::write(format!("{etc}/hosts"), &hosts) {
             if std::env::var("DD_DEBUG").is_ok() { eprintln!("[live] {} write /etc/hosts failed: {e}", &c.id[..c.id.len().min(12)]); }
@@ -460,6 +470,8 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
             if let Some(dc) = g.containers.remove(&cid) {
                 crate::events::emit_event(&app.events, "container", "destroy", &cid, serde_json::json!({"name": dc.name, "image": dc.image}));
                 for n in g.networks.iter_mut() { leave_network(n, &cid); }
+                // Reclaim the private writable upper layer (mirrors `docker rm`; the shared image is untouched).
+                discard_container_layer(&dc.upper);
             }
             g.live.remove(&cid);
             save_state(&g, &app.state_path);

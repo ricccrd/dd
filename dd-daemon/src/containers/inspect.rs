@@ -388,14 +388,15 @@ pub(crate) async fn containers_inspect(State(a): State<App>, Path(id): Path<Stri
 #[derive(Deserialize)]
 pub(crate) struct PsQ { all: Option<String>, filters: Option<String>, size: Option<String> }
 
-/// `docker ps --size` -> (SizeRw, SizeRootFs). dd runs a container directly in the (shared) image
-/// rootfs with NO copy-on-write upper layer, so there is no isolated writable diff to measure: like
-/// `docker diff` (see `containers_changes`, which reports no rootfs changes), SizeRw is 0. SizeRootFs is
-/// the full rootfs `du`-style walk. The host-fs `macos` image (rootfs "/") is skipped -- walking it
-/// would be catastrophic, exactly as `image_size` guards against.
+/// `docker ps --size` -> (SizeRw, SizeRootFs). dd gives each container a private copy-on-write UPPER over
+/// the read-only image rootfs, so SizeRw is the `du`-style size of that writable upper layer (matching
+/// docker, which measures the container's writable diff) and SizeRootFs is the full image rootfs walk.
+/// The host-fs `macos` image (rootfs "/") is skipped -- walking it would be catastrophic, exactly as
+/// `image_size` guards against.
 fn container_sizes(c: &Container) -> (i64, i64) {
     if c.image == "macos" || c.rootfs.is_empty() || c.rootfs == "/" { return (0, 0); }
-    (0, dir_size(std::path::Path::new(&c.rootfs)))
+    let rw = if c.upper.is_empty() { 0 } else { dir_size(std::path::Path::new(&c.upper)) };
+    (rw, dir_size(std::path::Path::new(&c.rootfs)))
 }
 
 /// Apply `docker ps --filter`. `f` is the decoded `filters` map (`{"status":[..],"name":[..],"label":[..]}`).
@@ -523,100 +524,86 @@ pub(crate) async fn containers_prune(State(a): State<App>) -> Json<Value> {
         .filter(|(_, c)| c.status != "running" && c.status != "paused")
         .map(|(id, _)| id.clone()).collect();
     for id in &dead {
-        // Reclaim each pruned container's writable additions (mirrors `docker rm`; see discard_container_writes).
-        if let (Some(c), Some(base)) = (g.containers.get(id), g.diff_base.get(id)) {
-            discard_container_writes(&c.rootfs.clone(), &base.clone());
-        }
-        g.containers.remove(id); g.live.remove(id); g.diff_base.remove(id);
+        // Reclaim each pruned container's private writable upper layer (mirrors `docker rm`).
+        if let Some(c) = g.containers.get(id) { discard_container_layer(&c.upper.clone()); }
+        g.containers.remove(id); g.live.remove(id);
     }
     save_state(&g, &a.state_path);
     Json(json!({"ContainersDeleted": dead, "SpaceReclaimed": 0}))
 }
 
-/// Recursively snapshot a rootfs into `path -> (mtime_nanos, size, is_dir)`, keyed by container-absolute
-/// path ("/etc/hostname"). Symlinks are recorded as leaves (not followed), matching `docker diff`, which
-/// reports a changed/added/deleted symlink rather than its target. Used as the baseline for `docker diff`.
-pub(crate) fn snapshot_rootfs(rootfs: &str) -> HashMap<String, (i64, u64, bool)> {
-    fn walk(dir: &std::path::Path, prefix: &str, out: &mut HashMap<String, (i64, u64, bool)>) {
+/// Reclaim a container's private writable upper layer (its copy-on-write files + whiteouts). dd gives
+/// each container an UPPER over the read-only image rootfs, so `docker rm`/prune drops it just as docker
+/// drops the container's writable layer — the shared image (the lower) is never touched. Removes the whole
+/// `<dd_home>/containers/<id>` tree (the `upper` dir's parent). A no-op for darwin/flat-rootfs containers
+/// (empty `upper`).
+pub(crate) fn discard_container_layer(upper: &str) {
+    if upper.is_empty() { return; }
+    let dir = std::path::Path::new(upper).parent().unwrap_or_else(|| std::path::Path::new(upper));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Diff a container's copy-on-write upper layer against the image rootfs (the lower), producing the
+/// Docker `diff` kinds keyed by container-absolute path: 0=Modified, 1=Added, 2=Deleted. A file/symlink
+/// present in the upper is Modified if it also exists in the lower, else Added; a `.wh.NAME` whiteout
+/// marks NAME Deleted; a directory present only in the upper is Added (a copied-up dir that also exists
+/// in the lower is merely a parent and is surfaced via ancestor marking). Every ancestor directory of a
+/// change is then marked Modified, matching docker (`C /etc` for `A /etc/foo`).
+pub(crate) fn overlay_changes(upper: &str, rootfs: &str) -> HashMap<String, u8> {
+    fn in_lower(rootfs: &str, path: &str) -> bool {
+        std::fs::symlink_metadata(format!("{rootfs}{path}")).is_ok()
+    }
+    fn walk(dir: &std::path::Path, prefix: &str, rootfs: &str, out: &mut HashMap<String, u8>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
-            let Ok(md) = e.path().symlink_metadata() else { continue };
             let name = e.file_name();
-            let path = format!("{prefix}/{}", name.to_string_lossy());
-            let is_dir = md.file_type().is_dir(); // is_dir() follows nothing for symlink_metadata
-            let mtime = md.modified().ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64).unwrap_or(0);
-            out.insert(path.clone(), (mtime, md.len(), is_dir));
-            if is_dir { walk(&e.path(), &path, out); }
-        }
-    }
-    let mut out = HashMap::new();
-    walk(std::path::Path::new(rootfs), "", &mut out);
-    out
-}
-
-/// Discard the files a container added to its rootfs, given the baseline snapshot taken at start. dd
-/// shares the image rootfs with the container (no copy-on-write upper layer), so `docker rm` must
-/// reclaim the container's writable additions itself — otherwise each run permanently pollutes the
-/// image (e.g. a second `docker run alpine mkdir /x` would see "/x already exists"). Only entries the
-/// container *added* (present now, absent in the baseline) are removed, deepest path first so a created
-/// directory is empty before its `remove_dir`; pre-existing files it merely modified are left intact
-/// (we can't restore their prior content, and removing them would corrupt the image). A no-op when no
-/// baseline exists (an unstarted container, or one whose baseline didn't survive a daemon restart).
-pub(crate) fn discard_container_writes(rootfs: &str, base: &HashMap<String, (i64, u64, bool)>) {
-    let now = snapshot_rootfs(rootfs);
-    let mut added: Vec<&String> = now.keys().filter(|p| !base.contains_key(*p)).collect();
-    added.sort_by(|a, b| b.len().cmp(&a.len())); // deepest first
-    for p in added {
-        let full = format!("{rootfs}{p}");
-        let is_dir = now.get(p).map(|&(_, _, d)| d).unwrap_or(false);
-        let _ = if is_dir { std::fs::remove_dir(&full) } else { std::fs::remove_file(&full) };
-    }
-}
-
-/// `GET /containers/{id}/changes` — `docker diff`. dd shares the image rootfs with the container (no
-/// copy-on-write upper layer), so we diff the current rootfs against the snapshot taken at start
-/// (`Inner::diff_base`). Reports the Docker shape: an array of `{Path, Kind}` (0=modified, 1=added,
-/// 2=deleted), with each changed entry's ancestor directories also reported as modified, as docker does.
-/// A container that was never started (or whose baseline didn't survive a daemon restart) reports none.
-pub(crate) async fn containers_changes(State(a): State<App>, Path(id): Path<String>) -> Response {
-    let (rootfs, base) = {
-        let g = a.inner.lock().await;
-        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
-        let Some(rootfs) = g.containers.get(&full).map(|c| c.rootfs.clone()) else { return no_such(&id) };
-        (rootfs, g.diff_base.get(&full).cloned())
-    };
-    let Some(base) = base else { return Json(json!([])).into_response() };
-    let now = tokio::task::spawn_blocking(move || snapshot_rootfs(&rootfs)).await.unwrap_or_default();
-
-    // Kind per Docker: 0=Modified, 1=Added, 2=Deleted. A directory's content change isn't a "modify"
-    // (only its metadata/children matter), so dirs only ever appear as Added/Deleted or as a modified
-    // ancestor; regular files compare mtime+size.
-    let mut kinds: HashMap<String, u8> = HashMap::new();
-    for (path, &(mtime, size, is_dir)) in &now {
-        match base.get(path) {
-            None => { kinds.insert(path.clone(), 1); }
-            Some(&(bmt, bsz, bdir)) => {
-                if !is_dir && !bdir && (bmt != mtime || bsz != size) { kinds.insert(path.clone(), 0); }
+            let name = name.to_string_lossy();
+            if let Some(stripped) = name.strip_prefix(".wh.") {
+                out.insert(format!("{prefix}/{stripped}"), 2); // whiteout -> deleted
+                continue;
+            }
+            let Ok(md) = e.path().symlink_metadata() else { continue };
+            let path = format!("{prefix}/{name}");
+            if md.file_type().is_dir() {
+                if !in_lower(rootfs, &path) { out.insert(path.clone(), 1); }
+                walk(&e.path(), &path, rootfs, out);
+            } else {
+                let kind = if in_lower(rootfs, &path) { 0 } else { 1 };
+                out.insert(path, kind);
             }
         }
     }
-    for path in base.keys() {
-        if !now.contains_key(path) { kinds.insert(path.clone(), 2); }
-    }
-    // Mark every ancestor directory of a change as modified (docker reports `C /etc` for `D /etc/hostname`),
+    let mut out = HashMap::new();
+    walk(std::path::Path::new(upper), "", rootfs, &mut out);
+    // Mark every ancestor directory of a change as modified (docker reports `C /etc` for `A /etc/foo`),
     // without overriding a more specific Added/Deleted on that ancestor itself.
-    let leaves: Vec<String> = kinds.keys().cloned().collect();
+    let leaves: Vec<String> = out.keys().cloned().collect();
     for path in leaves {
         let mut p = path.as_str();
         while let Some(idx) = p.rfind('/') {
             let parent = if idx == 0 { "/" } else { &p[..idx] };
-            kinds.entry(parent.to_string()).or_insert(0);
+            out.entry(parent.to_string()).or_insert(0);
             if idx == 0 { break; }
             p = &p[..idx];
         }
     }
+    out
+}
+
+/// `GET /containers/{id}/changes` — `docker diff`. dd gives each container a copy-on-write UPPER over the
+/// read-only image rootfs, so the changes are exactly that upper layer diffed against the image (see
+/// `overlay_changes`). Reports the Docker shape: an array of `{Path, Kind}` (0=modified, 1=added,
+/// 2=deleted), with each changed entry's ancestor directories also reported as modified, as docker does.
+/// A darwin/flat-rootfs container (no upper) reports none.
+pub(crate) async fn containers_changes(State(a): State<App>, Path(id): Path<String>) -> Response {
+    let (upper, rootfs) = {
+        let g = a.inner.lock().await;
+        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+        let Some(c) = g.containers.get(&full) else { return no_such(&id) };
+        (c.upper.clone(), c.rootfs.clone())
+    };
+    if upper.is_empty() { return Json(json!([])).into_response(); }
+    let kinds = tokio::task::spawn_blocking(move || overlay_changes(&upper, &rootfs)).await.unwrap_or_default();
     let mut out: Vec<Value> = kinds.into_iter().map(|(p, k)| json!({"Path": p, "Kind": k})).collect();
     out.sort_by(|a, b| a["Path"].as_str().cmp(&b["Path"].as_str()));
     Json(Value::Array(out)).into_response()

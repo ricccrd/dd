@@ -106,8 +106,18 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
     }
     let id = new_id(&image);
     let hc = body.host_config;
+    // Per-container copy-on-write upper layer over the read-only image rootfs (linux guests only; darwin
+    // runs natively jailed and writes into its own rootfs). The guest's writes/creates/deletes land in
+    // this private dir, so the shared image is never mutated. Reclaimed on `docker rm`/prune.
+    let upper = if img.arch.os() == "darwin" {
+        String::new()
+    } else {
+        let dir = dd_home().join("containers").join(&id).join("upper");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.to_string_lossy().into_owned()
+    };
     let c = Container {
-        id: id.clone(), image, rootfs: img.rootfs, cmd, arch: Some(img.arch),
+        id: id.clone(), image, rootfs: img.rootfs, upper, cmd, arch: Some(img.arch),
         binds: hc.as_ref().and_then(|h| h.binds.clone()).unwrap_or_default(),
         hostname: body.hostname.unwrap_or_default(),
         memory: hc.as_ref().and_then(|h| h.memory).unwrap_or(0),
@@ -159,19 +169,9 @@ pub(crate) async fn containers_start(State(a): State<App>, Path(id): Path<String
         (c, g.volumes.clone(), live)
     };
     if std::env::var("DD_DEBUG").is_ok() { eprintln!("[start] {} cmd={:?}", &c.id[..12], c.cmd); }
-    snapshot_diff_base(&a, &c).await;
     spawn_live(&a, &c, &vols, live).await;
     crate::events::emit_event(&a.events, "container", "start", &c.id, json!({"name": c.name, "image": c.image}));
     StatusCode::NO_CONTENT.into_response()
-}
-
-/// Snapshot the container's rootfs (pre-run) so a later `docker diff` (GET /changes) can report the
-/// files this run mutated. dd shares the image rootfs with the container (no copy-on-write layer), so the
-/// pre-run state is the only baseline. Runs off-thread (a plain fs walk) so it never blocks the runtime.
-async fn snapshot_diff_base(a: &App, c: &Container) {
-    let rootfs = c.rootfs.clone();
-    let base = tokio::task::spawn_blocking(move || snapshot_rootfs(&rootfs)).await.unwrap_or_default();
-    a.inner.lock().await.diff_base.insert(c.id.clone(), base);
 }
 
 #[derive(Deserialize)]
@@ -227,7 +227,6 @@ pub(crate) async fn containers_restart(State(a): State<App>, Path(id): Path<Stri
         (c, g.volumes.clone(), live)
     };
     if std::env::var("DD_DEBUG").is_ok() { eprintln!("[restart] {} cmd={:?}", &c.id[..12], c.cmd); }
-    snapshot_diff_base(&a, &c).await;
     spawn_live(&a, &c, &vols, live).await;
     crate::events::emit_event(&a.events, "container", "start", &c.id, json!({"name": c.name, "image": c.image}));
     crate::events::emit_event(&a.events, "container", "restart", &c.id, json!({"name": c.name}));
@@ -325,10 +324,10 @@ pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<Strin
         crate::events::emit_event(&a.events, "container", "destroy", &full, json!({"name": dc.name, "image": dc.image}));
         // Drop the container from any network membership too.
         for n in g.networks.iter_mut() { leave_network(n, &full); }
-        // Reclaim the container's writable additions (Docker discards the writable layer on rm); dd shares
-        // the image rootfs, so without this each run would permanently pollute the image. Drop its live IO
-        // plumbing (log buffers + channels) and its `docker diff` baseline too; otherwise `docker rm` leaks them.
-        if let Some(base) = g.diff_base.remove(&full) { discard_container_writes(&dc.rootfs, &base); }
+        // Reclaim the container's private writable upper layer (Docker discards the writable layer on rm).
+        // The shared image rootfs (the read-only lower) is never touched. Also drop its live IO plumbing
+        // (log buffers + channels); otherwise `docker rm` leaks them.
+        discard_container_layer(&dc.upper);
         g.live.remove(&full);
         save_state(&g, &a.state_path);
         StatusCode::NO_CONTENT.into_response()

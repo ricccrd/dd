@@ -78,6 +78,13 @@ pub(crate) struct Container {
     pub(crate) id: String,
     pub(crate) image: String,
     pub(crate) rootfs: String,
+    // Per-container copy-on-write UPPER layer: a private writable dir overlaid on the read-only image
+    // `rootfs` (the lower). The guest's writes/creates land here and deletions become whiteouts, so a
+    // container never mutates the shared image. Allocated under `<dd_home>/containers/<id>/upper` at
+    // create (linux guests only; darwin uses the native jail) and reclaimed on `docker rm`/prune. Empty
+    // for darwin containers and for state predating overlay, in which case the flat `rootfs` is used.
+    #[serde(default)]
+    pub(crate) upper: String,
     pub(crate) cmd: Vec<String>,
     pub(crate) binds: Vec<String>,
     pub(crate) hostname: String,
@@ -248,11 +255,6 @@ pub(crate) struct Inner {
     pub(crate) networks: Vec<Net>,
     pub(crate) live: HashMap<String, Arc<Live>>, // running containers' (and execs') IO plumbing (not persisted)
     pub(crate) execs: HashMap<String, Exec>,     // exec id -> its spec
-    /// Per-container rootfs baseline snapshot taken at start, so `docker diff` (GET /changes) can report
-    /// the files this run mutated. dd shares the image rootfs with the container (no copy-on-write upper
-    /// layer), so the pre-run snapshot is the only baseline to diff against. Keyed by full container id;
-    /// values map a container-absolute path -> (mtime_nanos, size, is_dir). Not persisted (like `live`).
-    pub(crate) diff_base: HashMap<String, HashMap<String, (i64, u64, bool)>>,
 }
 
 

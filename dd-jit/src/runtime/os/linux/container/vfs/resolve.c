@@ -138,5 +138,9 @@ static int jail_at(int dirfd, const char *raw, char *final, size_t fn, int nofol
     while (al > 1 && abs[al - 1] == '/')
         // strip trailing '/' (mkdir foo/, rmdir foo/)
         abs[--al] = 0;
+    // Overlay: jail_at confines to the upper, but the create/rename/metadata syscalls that call it may
+    // target a path whose parent dir is still only in a read-only lower (the image). Materialize the upper
+    // parent chain (copy-up) so the op lands in the writable layer. No-op outside overlay mode (g_nlower==0).
+    overlay_mkparents(abs);
     return resolve_at(abs, final, fn, nofollow);
 }

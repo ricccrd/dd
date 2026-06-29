@@ -136,6 +136,55 @@ static const char *xresolve_overlay(const char *p, char *buf, size_t n) {
     overlay_resolve(p, buf, n, 0);
     return buf;
 }
+// Overlay: ensure every PARENT directory of `guest` exists in the writable upper, copying up (mkdir, with
+// the lower's mode) each ancestor that currently lives only in a read-only lower layer. A create syscall
+// (openat O_CREAT via overlay_copyup, or mkdirat/symlinkat/mknodat/renameat via jail_at) confines to the
+// upper, so without this it fails with ENOENT whenever the target's parent dir is still only in the image.
+// The FINAL component is never created (that is the syscall's job), and an ancestor present in NO layer is
+// left missing so a genuine bad path still fails ENOENT as the kernel would. Overlay mode only (no-op when
+// g_nlower==0 -> non-overlay behavior is byte-identical); rootfs-routed paths only (a volume has its own
+// real backing dir and must not be mirrored into the upper).
+static void overlay_mkparents(const char *guest) {
+    if (!g_nlower || !guest || guest[0] != '/') return;
+    const char *canon;
+    size_t clen;
+    const char *rel;
+    if (jail_pick(guest, &canon, &clen, &rel) != g_root_fd) return;
+    char par[4200];
+    snprintf(par, sizeof par, "%s", guest);
+    char *sl = strrchr(par, '/');
+    // parent is the root dir -> always present
+    if (!sl || sl == par) return;
+    *sl = 0;
+    // Build each ancestor prefix ("/a", "/a/b", ...) and copy it up if missing in the upper. Each level is
+    // created before the next, so confine_in always resolves the (now-present) parent.
+    char acc[4200];
+    size_t al = 0;
+    acc[0] = 0;
+    for (char *seg = par + 1;;) {
+        char *next = strchr(seg, '/');
+        if (next) *next = 0;
+        int w = snprintf(acc + al, sizeof acc - al, "/%s", seg);
+        if (w < 0 || (size_t)w >= sizeof acc - al) return;
+        al += (size_t)w;
+        char up[4300];
+        confine_in(g_rootfs_canon, g_rootfs_canon_len, acc, up, sizeof up, 1);
+        struct stat st;
+        if (lstat(up, &st) != 0)
+            // missing in the upper -> copy it up from the first lower that has it as a directory
+            for (int i = 0; i < g_nlower; i++) {
+                char lo[4300];
+                layer_follow(g_lower[i].canon, g_lower[i].clen, acc, lo, sizeof lo, 0);
+                if (lstat(lo, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    mkdir(up, st.st_mode & 0777);
+                    break;
+                }
+            }
+        if (!next) break;
+        *next = '/';
+        seg = next + 1;
+    }
+}
 // Copy-up: bring a lower file into the UPPER so it can be modified, then return the upper host path.
 // If the file is only in a lower, copy its bytes up; if absent everywhere, return the upper path (create).
 static void overlay_copyup(const char *guest, char *host, size_t hn) {
@@ -161,8 +210,12 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
         else if (wh_exists(g_lower[i].canon, g_lower[i].clen, guest))
             break;
     }
-    // new file -> upper path as-is
-    if (!have) return;
+    // brand-new file: nothing to copy, but its parent dir may be lower-only -> materialize it in the upper
+    // so the caller's open(O_CREAT) lands there (otherwise the create ENOENTs on a missing upper parent).
+    if (!have) {
+        overlay_mkparents(guest);
+        return;
+    }
     char dir[4300];
     snprintf(dir, sizeof dir, "%s", up);
     // mkdir -p the upper parent
