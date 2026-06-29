@@ -59,8 +59,24 @@ static char g_fdpath[1024][192];
 static char g_ovldir[1024][192];
 // eventfd(read-end) -> pipe write-end + 1 (0 = not an eventfd)
 static int g_eventfd_peer[1024];
-// eventfd accumulating counter: write() adds, read() returns + resets (the pipe is only readiness)
-static uint64_t g_eventfd_count[1024];
+// eventfd accumulating counter: write() adds, read() returns + resets (the pipe is only readiness).
+// _xproc-eventfd-lockf_: the counter array lives in a MAP_SHARED anonymous region so a child created by
+// dd's real host fork() updates the SAME physical counters the parent reads -- the readiness pipe is
+// already fork-shared (inherited fds), but the accumulating count must be too, or the parent reads 0
+// while the child's write()s land in its COW-private copy. Created ONCE at startup (constructor, before
+// any guest fork) so every forked worker inherits the same physical array. All g_eventfd_count[fd]
+// indexing (io.c, the eventfd2 creation in service.c) is unchanged.
+static uint64_t *g_eventfd_count;
+static void eventfd_count_init(void) {
+    if (g_eventfd_count) return;
+    size_t sz = sizeof(uint64_t) * 1024;
+    void *mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (mem == MAP_FAILED) // cross-process counters degrade, but in-process eventfd still works
+        mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    g_eventfd_count = (uint64_t *)mem;
+}
+__attribute__((constructor)) static void eventfd_count_ctor(void) { eventfd_count_init(); }
 static uint8_t g_eventfd_sema[1024]; // EFD_SEMAPHORE: read() returns 1 and decrements by 1, not the whole counter
 
 // ===================== in-memory temp-file backing (sqlite sorter/index spill) =====================

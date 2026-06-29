@@ -493,5 +493,11 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 84: G_RET(c) = memf_get((int)a0) ? 0 : s3db_sync_fd((int)a0); break; // sync_file_range -> fsync (no-op for RAM scratch)
     default: return 0;
     }
+    // Boundary errno translation: like the main switch (service.c), every case above set G_RET to a host
+    // (macOS) errno on error -- map it to the Linux errno the guest expects. Without this the early return
+    // here bypasses service_local's trailing m2l_errno, so a divergent code (e.g. macOS EAGAIN=35, which is
+    // Linux EDEADLK) reaches the guest unchanged (the fcntl F_SETLK record-lock EAGAIN was misread as EDEADLK).
+    int64_t io_rv = (int64_t)G_RET(c);
+    if (io_rv < 0 && io_rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-io_rv)));
     return 1;
 }
