@@ -8,6 +8,11 @@ static char g_cwd[4200] = "/";
 static uint8_t g_auxv_data[1024];
 // serialized auxv for /proc/self/auxv
 static int g_auxv_len;
+// Guest main-thread stack bounds, published by build_stack. Used to synthesize a [stack] line in
+// /proc/self/maps so glibc's pthread_getattr_np(pthread_self()) finds the main stack (it scans the
+// maps for the line containing %rsp). Without it that call returns ENOENT, which derails Rust std's
+// startup (stack-overflow guard init) and cascades into wrong behavior later. 0 => not published yet.
+uint64_t g_stack_lo, g_stack_hi;
 // Sandbox: normalize a guest absolute path -- drop '.', collapse '//', and clamp '..' at the
 // ROOT so a translated path can never escape the rootfs ("/../../etc" -> "/etc"). Without this,
 // the guest reads host files by traversing above $rootfs. Result always starts with '/'.
@@ -536,6 +541,15 @@ static int proc_open(const char *rp) {
             n = snprintf(buf, sizeof buf, "max\n");
     } else if (!strcmp(rp, "/sys/fs/cgroup/pids.current")) {
         n = snprintf(buf, sizeof buf, "%d\n", atomic_load(&g_pids_cur));
+    } else if ((!strcmp(rp, "/proc/self/maps") || !strcmp(rp, "/proc/self/task/1/maps")) && g_stack_hi) {
+        // Minimal but valid maps: glibc's pthread_getattr_np scans for the [stack] line containing %rsp.
+        // One stack line (+ a guard line below it, as the kernel shows) is enough; the guest's own mmaps
+        // aren't enumerated here, which is fine -- nothing in the guest relies on a complete map.
+        unsigned long lo = (unsigned long)g_stack_lo, hi = (unsigned long)g_stack_hi;
+        n = snprintf(buf, sizeof buf,
+                     "%012lx-%012lx ---p 00000000 00:00 0 \n"
+                     "%012lx-%012lx rw-p 00000000 00:00 0 %*s[stack]\n",
+                     lo > 0x1000 ? lo - 0x1000 : 0, lo, lo, hi, 26, "");
     } else if (!strcmp(rp, "/proc/self/status") || !strcmp(rp, "/proc/self/stat")) {
         // status (key:value)
         if (rp[11] == 'a' && rp[12] == 't' && rp[13] == 'u')

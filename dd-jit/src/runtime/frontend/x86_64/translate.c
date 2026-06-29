@@ -253,6 +253,56 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
     } // merge low w bytes
 }
 
+// Byte/word ADC/SBB. do_alu only handles width>=4 (ARM ADCS/SBCS); ARM has no narrow add-with-carry, and
+// the high-bit trick can't inject the carry at the byte's LSB. So compute the masked result + the EXACT
+// x86 CF/OF/SF/ZF explicitly, then store the borrow-convention NZCV via e_nzcv_save_setcf. `dst`>=0 gets
+// the low w bytes merged (bfi); a/b are value regs. Scratch x19..x27 (callee-saved host regs the
+// trampoline preserves; never a guest x0..x15, the value x16, or the EA x17 -- so a mem dest still works).
+static void narrow_adcsbb(int adc, int dst, int a, int b, int w) {
+    int bits = 8 * w;
+    e_uxt(21, a, w); // x21 = a & mask  (read operands FIRST -- a/b may alias scratch like x19/x16)
+    e_uxt(22, b, w); // x22 = b & mask
+    e_movconst(25, 1);
+    // x19 = x86 CF (0/1): stored nzcv C (bit29) is the BORROW (= NOT x86 CF), so x86CF = NOT bit29.
+    e_ldr(19, 28, OFF_NZCV);
+    e_lsr_i(19, 19, 29, 1);
+    e_rrr(A_AND, 19, 19, 25, 0, 0);
+    e_rrr(A_EOR, 19, 19, 25, 0, 0);
+    if (adc) {
+        e_rrr(A_ADD, 23, 21, 22, 0, 0);
+        e_rrr(A_ADD, 23, 23, 19, 0, 0); // x23 = a8 + b8 + cf
+    } else {
+        e_rrr(A_SUB, 23, 21, 22, 0, 0);
+        e_rrr(A_SUB, 23, 23, 19, 0, 0); // x23 = a8 - b8 - cf (negative -> bits>=`bits` set = borrow)
+    }
+    e_uxt(24, 23, w);              // x24 = result (low w bytes)
+    e_lsr_i(20, 23, bits, 0);      // new x86 CF / borrow = bit `bits` of the wide result
+    e_rrr(A_AND, 20, 20, 25, 0, 0);
+    // OF: add = ((a^res)&(b^res))msb ; sub = ((a^b)&(a^res))msb
+    if (adc) {
+        e_rrr(A_EOR, 26, 21, 24, 0, 0);
+        e_rrr(A_EOR, 27, 22, 24, 0, 0);
+    } else {
+        e_rrr(A_EOR, 26, 21, 22, 0, 0);
+        e_rrr(A_EOR, 27, 21, 24, 0, 0);
+    }
+    e_rrr(A_AND, 26, 26, 27, 0, 0);
+    e_lsr_i(26, 26, bits - 1, 0);
+    e_rrr(A_AND, 26, 26, 25, 0, 0); // x26 = OF (0/1)
+    e_lsr_i(27, 24, bits - 1, 0);
+    e_rrr(A_AND, 27, 27, 25, 0, 0); // x27 = SF (0/1)
+    e_rrr(A_SUBS, 31, 24, 31, 0, 0);
+    e_cset(23, 0 /*EQ*/, 0); // x23 = ZF
+    e_lsl_i(27, 27, 31, 1);
+    e_lsl_i(23, 23, 30, 1);
+    e_lsl_i(26, 26, 28, 1);
+    e_rrr(A_ORR, 27, 27, 23, 1, 0);
+    e_rrr(A_ORR, 27, 27, 26, 1, 0);
+    emit32(0xD51B4200u | 27);   // msr nzcv, x27  (live N/Z/V)
+    e_nzcv_save_setcf(20);      // store N/Z/V, set stored C = NOT new-CF
+    if (dst >= 0) e_bfi(dst, 24, 0, bits, 1); // merge low w bytes into dst
+}
+
 // LOCK-prefixed read-modify-write to a memory operand, done ATOMICALLY via an LSE op (x17 = EA already
 // computed). `rs` is the operand value register. `k` is the alu kind (0 add, 1 or, 4 and, 5 sub, 6 xor).
 // x86 flags are set from (old OP operand); x19/x20 are scratch. Returns 1 if it emitted an atomic, 0 if
@@ -319,6 +369,15 @@ static void *translate_block(uint64_t gpc) {
         uint64_t next = gpc + I.len;
         uint8_t op = I.op;
         int sf = I.opsize == 8;
+        // VEX/EVEX (AVX/AVX2/AVX-512): not lowered to NEON. Exit the block and emulate this single insn in C
+        // (do_avx), which owns the full v[]/vhi/vz/vx/kreg register file + memory. rip := gpc so do_avx
+        // decodes the insn at rip and advances past it. Done BEFORE the lazy-flag classifier (which only
+        // knows legacy opcodes) -- AVX touches no EFLAGS we model, so just spill any pending flags first.
+        if (I.vex) {
+            if (g_fl_pending) flags_materialize();
+            emit_exit_const(gpc, R_AVX);
+            break;
+        }
         if (g_trace)
             fprintf(stderr, "[dec] %llx %s%02x len=%d mod%d rm%d reg%d mem%d base%d idx%d disp=%lld imm=%lld\n",
                     (unsigned long long)gpc, I.two ? "0F " : "", op, I.len, I.mod, I.rm_reg, I.reg, I.is_mem,
@@ -449,10 +508,21 @@ static void *translate_block(uint64_t gpc) {
             if (op < 0x40 && (op & 7) <= 3 && alu_kind_primary(op) >= 0) {
                 int k = alu_kind_primary(op), dir = op & 2; // dir 0: r/m,reg ; 2: reg,r/m
                 int w = (op & 1) ? I.opsize : 1, mem;
-                if ((k == 2 || k == 3) && w < 4) {
-                    report_unimpl(gpc, &I);
-                    break;
-                } // ADC/SBB 8/16: TODO
+                if ((k == 2 || k == 3) && w < 4) { // byte/word ADC/SBB -> narrow_adcsbb (do_alu is 32/64 only)
+                    int adc = (k == 2), m2;
+                    int rmv2 = rm_load(&I, next, w, &m2);
+                    int regv2 = (w == 1) ? byte_val(&I, I.reg, 24) : I.reg;
+                    if (dir) { // dst = reg
+                        narrow_adcsbb(adc, 16, regv2, rmv2, w);
+                        if (w == 1) byte_wb(&I, I.reg, 16);
+                        else e_bfi(I.reg, 16, 0, 8 * w, 1);
+                    } else { // dst = r/m
+                        narrow_adcsbb(adc, 16, rmv2, regv2, w);
+                        rm_store(&I, w, 16);
+                    }
+                    gpc = next;
+                    continue;
+                }
                 int rmv = rm_load(&I, next, w, &mem);
                 int regv = (w == 1) ? byte_val(&I, I.reg, 24) : I.reg; // reg operand value (handle ah/ch)
                 if (dir) {                                             // dst = reg
@@ -498,6 +568,14 @@ static void *translate_block(uint64_t gpc) {
                     // compute into scratch x16, then rm_store -> correct dest (handles mem + hi/lo byte regs)
                     do_alu(k, (k == 7) ? -1 : 16, rmv, 19, w);
                     if (k != 7) rm_store(&I, w, 16);
+                    gpc = next;
+                    continue;
+                } else { // byte/word ADC/SBB r/m, imm
+                    int adc = (k == 2);
+                    int rmv = rm_load(&I, next, w, &mem); // value -> x16
+                    e_movconst(19, (uint64_t)I.imm);      // imm in x19 (narrow_adcsbb reads b before clobbering x19)
+                    narrow_adcsbb(adc, 16, rmv, 19, w);
+                    rm_store(&I, w, 16);
                     gpc = next;
                     continue;
                 }
@@ -630,9 +708,15 @@ static void *translate_block(uint64_t gpc) {
                     continue;
                 }
                 if (k == 3) {
+                    // neg r/m == 0 - r/m. Route through do_alu (SUB, a=xzr) so the x86 flags are computed at
+                    // the operand WIDTH: do_alu shifts byte/word operands into the ARM high bits, making N/Z/V
+                    // correct for w<4. A raw 32-bit SUBS got OF wrong for negb 0x80 / negw 0x8000 (the INT_MIN
+                    // overflow case) -- e.g. icu_locid's Option-niche PartialEq does `negb; jno` on the 0x80
+                    // None marker, so a stale OF made two equal LanguageIdentifiers compare unequal.
                     int rmv = rm_load(&I, next, w, &mem); // neg -> x16
-                    e_rrr(A_SUBS, 16, 31, rmv, w == 8, 0);
-                    e_nzcv_save();
+                    do_alu(5, 16, 31, rmv, w);            // x16 = 0 - rmv, x86 SUB flags at width w
+                    if (g_fl_pending)
+                        flags_materialize(); // result goes to r/m (not kept live in a reg); pin the flags now
                     rm_store(&I, w, 16);
                     gpc = next;
                     continue;
@@ -2023,21 +2107,33 @@ static void *translate_block(uint64_t gpc) {
                     continue; // (x87/MMX + MXCSR areas left as-is; we don't honor them)
                 }
             }
-            // bsf/tzcnt (0F BC), bsr/lzcnt (0F BD): bit scan -> RBIT+CLZ / CLZ
+            // bsf/tzcnt (0F BC), bsr/lzcnt (0F BD). The F3 prefix selects the BMI/ABM count form, which is
+            // DISTINCT from the legacy bit-scan: tzcnt==bsf result for src!=0 but lzcnt != bsr (lzcnt = leading
+            // ZERO COUNT = CLZ; bsr = bit INDEX = (w-1)-CLZ). Mixing them up silently corrupts BMI codegen
+            // (e.g. tinystr length math) -- the bug behind uutils' garbled "en-US" locale.
             if (op == 0xBC || op == 0xBD) {
                 int mem;
                 int rmv = rm_load(&I, next, I.opsize, &mem);
-                if (op == 0xBC) {
+                int cnt = I.rep; // F3 -> tzcnt/lzcnt (counts; src==0 -> opsize, the ARM CLZ result naturally)
+                if (op == 0xBC) { // tzcnt / bsf: trailing zeros = RBIT+CLZ (same value; src==0 -> opsize)
                     e_rbit(I.reg, rmv, sf);
                     e_clz(I.reg, I.reg, sf);
-                } // bsf = ctz
-                else {
+                } else if (cnt) { // lzcnt: leading zeros = CLZ
+                    e_clz(I.reg, rmv, sf);
+                } else { // bsr: (w-1) - clz
                     e_clz(16, rmv, sf);
                     e_movconst(19, sf ? 63 : 31);
                     e_rrr(A_SUB, I.reg, 19, 16, sf, 0);
-                } // bsr = (w-1)-clz
-                e_rrr(A_ANDS, 31, rmv, rmv, sf, 0);
-                e_nzcv_save(); // ZF = (src == 0)
+                }
+                if (cnt) { // tzcnt/lzcnt: x86 CF = (src==0), ZF = (result==0)
+                    e_rrr(A_SUBS, 31, rmv, 31, sf, 0);
+                    e_cset(19, 0 /*EQ*/, sf);               // x19 = (src==0) = x86 CF
+                    e_rrr(A_ANDS, 31, I.reg, I.reg, sf, 0); // live N/Z from the result
+                    e_nzcv_save_setcf(19);                  // store N/Z, stored C = NOT(src==0)
+                } else {                                    // bsf/bsr: ZF = (src==0)
+                    e_rrr(A_ANDS, 31, rmv, rmv, sf, 0);
+                    e_nzcv_save();
+                }
                 gpc = next;
                 continue;
             }

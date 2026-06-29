@@ -33,6 +33,13 @@ struct cpu {
     uint64_t divop;      // 64-bit div/idiv divisor -> 128/64 division done in C (ARM has no 128/64 divide)
     uint64_t ibtc_base;  // opt2: base of the x86 2-way IBTC g_xibtc (set once at run_guest entry) -> 1-insn
                          // load on the indirect hot path (replaces the 3-insn movz/movk &table materialize)
+    // AVX/AVX2/AVX-512 register file, emulated in avx.c (R_AVX). v[] above already holds xmm0..15 (= the
+    // low 128 bits of zmm0..15), so legacy-SSE codegen that bakes OFF_V stays byte-identical; these hold
+    // the extra width. ymm_n = v[2n..2n+1] ++ vhi[2n..2n+1]; zmm0..15 add vz[]; zmm16..31 live in vx[].
+    uint64_t vhi[32];  // bits[128:256) of ymm/zmm0..15
+    uint64_t vz[64];   // bits[256:512) of zmm0..15
+    uint64_t vx[128];  // zmm16..31 (full 512-bit each)
+    uint64_t kreg[8];  // AVX-512 opmask registers k0..k7
 };
 #define OFF_IBSRC ((int)__builtin_offsetof(struct cpu, dbg_ibsrc))
 #define OFF_ICMISS ((int)__builtin_offsetof(struct cpu, ic_miss))
@@ -69,5 +76,9 @@ struct cpu {
 // compare/scan in one round-trip (descriptor in cpu->divop), writing the exact x86 RCX/RSI/RDI +
 // ZF/SF/CF/OF end-state. Gate NOREPCMP=1 -> naive per-element oracle loop. See do_repstr().
 #define R_REPSTR 8
+// VEX/EVEX-encoded AVX/AVX2/AVX-512 instruction -> exit the block and emulate it in C (do_avx), which
+// reads/writes the v[]/vhi[]/vz[]/vx[]/kreg[] register file + guest memory, then advances rip past it.
+// Correctness-first (one block exit per AVX insn); the SSE/scalar fast paths are untouched.
+#define R_AVX 9
 // x86 register encodings (== host reg numbers)
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };

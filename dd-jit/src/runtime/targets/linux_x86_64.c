@@ -78,6 +78,7 @@
 #include "../os/linux/service.c"             // SHARED: the canonical syscall layer
 #include "../os/linux/sentry.c"              // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../frontend/x86_64/x86_ops.c"        // x86 cpuid + x87 m80 block-exit helpers
+#include "../frontend/x86_64/avx.c"            // AVX/AVX2/AVX-512 (VEX/EVEX) emulation (R_AVX block-exit)
 #include "../jit/dispatch.c"                  // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
                                               // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../frontend/x86_64/elf.c"      // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)

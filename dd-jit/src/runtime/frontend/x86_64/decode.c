@@ -22,6 +22,12 @@ struct insn {
     int rm_reg; // when mod==3: the r/m register number
     int64_t imm;
     int imm_bytes;
+    // ---- VEX/EVEX (AVX/AVX2/AVX-512). vex=1 means a C4/C5/62-prefixed insn; the shared exit-to-C AVX
+    // emulator (avx.c) reads these. vex_map: 1=0F,2=0F38,3=0F3A. vex_pp: 0=none,1=66,2=F3,3=F2.
+    // vex_l: vector length (0=128/xmm,1=256/ymm,2=512/zmm). vvvv: 2nd source reg (already un-inverted).
+    int vex, evex;
+    int vex_map, vex_pp, vex_l, vex_w, vvvv;
+    int evex_mask, evex_z, evex_b; // EVEX: opmask k-reg (aaa), zeroing, broadcast/rc
 };
 
 static int op_has_modrm(int two, uint8_t op) {
@@ -62,6 +68,15 @@ static int op_imm_bytes(struct insn *I) {
     int two = I->two;
     uint8_t op = I->op;
     int os = I->opsize;
+    if (I->vex) {
+        // VEX/EVEX immediates: the 0F3A map is almost entirely "...,imm8" forms; in the 0F map only the
+        // shuffle/compare/insert group carries an imm8; the 0F38 map carries none. (vex_l/W never add bytes.)
+        if (I->vex_map == 3) return 1;
+        if (I->vex_map == 1 && (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 || op == 0xC2 ||
+                                op == 0xC4 || op == 0xC5 || op == 0xC6))
+            return 1;
+        return 0;
+    }
     if (two) {
         if ((op & 0xF0) == 0x80) return 4;      // jcc rel32
         if (op == 0xBA) return 1;               // bt/bts/btr/btc r/m, imm8
@@ -149,25 +164,80 @@ static int decode(uint64_t pc, struct insn *I) {
         }
         break;
     }
-    // REX
-    if ((p[n] & 0xF0) == 0x40) {
-        uint8_t rex = p[n++];
-        I->has_rex = 1;
-        I->rexW = (rex >> 3) & 1;
-        I->rexR = (rex >> 2) & 1;
-        I->rexX = (rex >> 1) & 1;
-        I->rexB = rex & 1;
-        if (I->rexW) I->opsize = 8;
-    }
-    // opcode
-    uint8_t op = p[n++];
-    if (op == 0x0F) {
+    // VEX (C5 2-byte / C4 3-byte) and EVEX (62) -- AVX/AVX2/AVX-512. These REPLACE REX + the 0F escape:
+    // the opcode map (0F/0F38/0F3A), an implied mandatory prefix (pp), the vvvv 2nd source, vector length
+    // (L) and W are packed in. We decode them so the instruction LENGTH is correct (otherwise the whole
+    // block desyncs) and avx.c can emulate. C4/C5/62 are unambiguous in 64-bit mode (their legacy meanings
+    // LES/LDS/BOUND are invalid in long mode), so the lead byte alone disambiguates.
+    uint8_t op;
+    if (p[n] == 0xC5) { // 2-byte VEX: C5 R̄v̄v̄v̄v̄Lpp  (map fixed to 0F)
+        uint8_t b1 = p[n + 1];
+        n += 2;
+        I->vex = 1;
         I->two = 1;
+        I->rexR = ((b1 >> 7) & 1) ^ 1;
+        I->vvvv = (~(b1 >> 3)) & 0xF;
+        I->vex_l = (b1 >> 2) & 1;
+        I->vex_pp = b1 & 3;
+        I->vex_map = 1;
+        if (I->vex_pp == 1) I->p66 = 1;
         op = p[n++];
+    } else if (p[n] == 0xC4) { // 3-byte VEX: C4 R̄X̄B̄mmmmm  Wv̄v̄v̄v̄Lpp
+        uint8_t b1 = p[n + 1], b2 = p[n + 2];
+        n += 3;
+        I->vex = 1;
+        I->two = 1;
+        I->rexR = ((b1 >> 7) & 1) ^ 1;
+        I->rexX = ((b1 >> 6) & 1) ^ 1;
+        I->rexB = ((b1 >> 5) & 1) ^ 1;
+        I->vex_map = b1 & 0x1F;
+        I->vex_w = (b2 >> 7) & 1;
+        if (I->vex_w) I->opsize = 8;
+        I->vvvv = (~(b2 >> 3)) & 0xF;
+        I->vex_l = (b2 >> 2) & 1;
+        I->vex_pp = b2 & 3;
+        if (I->vex_pp == 1) I->p66 = 1;
+        op = p[n++];
+    } else if (p[n] == 0x62) { // EVEX: 62 R̄X̄B̄R̄'00mm  Wv̄v̄v̄v̄1pp  z L'L b V̄' aaa
+        uint8_t e0 = p[n + 1], e1 = p[n + 2], e2 = p[n + 3];
+        n += 4;
+        I->vex = 1;
+        I->evex = 1;
+        I->two = 1;
+        I->rexR = ((e0 >> 7) & 1) ^ 1;
+        I->rexX = ((e0 >> 6) & 1) ^ 1;
+        I->rexB = ((e0 >> 5) & 1) ^ 1;
+        I->vex_map = e0 & 3;
+        I->vex_w = (e1 >> 7) & 1;
+        if (I->vex_w) I->opsize = 8;
+        I->vvvv = ((~(e1 >> 3)) & 0xF) | (((e2 >> 3) & 1) ? 0 : 16); // V' extends vvvv to 5 bits
+        I->vex_pp = e1 & 3;
+        if (I->vex_pp == 1) I->p66 = 1;
+        I->vex_l = (e2 >> 5) & 3; // L'L: 0=128, 1=256, 2=512
+        I->evex_z = (e2 >> 7) & 1;
+        I->evex_b = (e2 >> 4) & 1;
+        I->evex_mask = e2 & 7;
+        op = p[n++];
+    } else {
+        // REX (legacy)
+        if ((p[n] & 0xF0) == 0x40) {
+            uint8_t rex = p[n++];
+            I->has_rex = 1;
+            I->rexW = (rex >> 3) & 1;
+            I->rexR = (rex >> 2) & 1;
+            I->rexX = (rex >> 1) & 1;
+            I->rexB = rex & 1;
+            if (I->rexW) I->opsize = 8;
+        }
+        op = p[n++];
+        if (op == 0x0F) {
+            I->two = 1;
+            op = p[n++];
+        }
     }
     I->op = op;
-    // modrm + sib + disp
-    if (op_has_modrm(I->two, op)) {
+    // modrm + sib + disp. Every VEX/EVEX insn we handle carries a ModRM except vzeroupper/vzeroall (0F 77).
+    if (I->vex ? (op != 0x77) : op_has_modrm(I->two, op)) {
         uint8_t m = p[n++];
         I->has_modrm = 1;
         I->modrm = m;

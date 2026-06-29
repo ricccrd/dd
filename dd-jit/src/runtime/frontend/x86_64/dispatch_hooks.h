@@ -221,6 +221,10 @@ static int smc_on_write(uint64_t a) {
         do_cpuid(c);                                                                                                    \
         continue;                                                                                                       \
     } /* rip already = next */                                                                                          \
+    if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C; rip = the insn, do_avx advances it */              \
+        do_avx(c);                                                                                                      \
+        continue;                                                                                                       \
+    }                                                                                                                   \
     if ((c)->reason == R_REPSTR) {                                                                                      \
         do_repstr(c);                                                                                                   \
         continue;                                                                                                       \

@@ -135,6 +135,9 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     // with 16-byte SSE loads -> those over-read past the top. Keep that region mapped.
     uint8_t *stk = mmap(NULL, SZ + GUARD, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     uint8_t *top = stk + SZ;
+    extern uint64_t g_stack_lo, g_stack_hi; // publish for /proc/self/maps [stack] synthesis (vfs.c)
+    g_stack_lo = (uint64_t)stk;
+    g_stack_hi = (uint64_t)(stk + SZ + GUARD);
     uint64_t argp[256], envp_[256];
     int envc = 0;
     for (int i = 0; i < argc; i++) {
@@ -173,8 +176,12 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {16, 0},
         {15, plat},
         {25, rnd},
-        {23, 0},
-        {0, 0}, // AT_EGID 0; AT_SECURE 0
+        {23, 0},     // AT_SECURE 0
+        {17, 100},   // AT_CLKTCK
+        {26, 0},     // AT_HWCAP2
+        {31, argp[0]}, // AT_EXECFN -> argv[0] path string. Rust std / uutils' multicall read this to pick the
+                       // applet name; missing it made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
+        {0, 0},      // AT_NULL terminator
     };
     int naux = (int)(sizeof aux / sizeof aux[0]);
     size_t nslots = 1 + (argc + 1) + (envc + 1) + (size_t)naux * 2;
@@ -191,6 +198,14 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     for (int i = 0; i < naux; i++) {
         *p++ = aux[i][0];
         *p++ = aux[i][1];
+    }
+    // Serialize the same auxv for /proc/self/auxv (read by Rust std / hwcap crates; the x86 path previously
+    // left it empty -> a 0-length auxv that those readers mis-parse). g_auxv_data/_len live in vfs.c (same TU).
+    g_auxv_len = 0;
+    for (int i = 0; i < naux && g_auxv_len + 16 <= (int)sizeof g_auxv_data; i++) {
+        memcpy(g_auxv_data + g_auxv_len, &aux[i][0], 8);
+        memcpy(g_auxv_data + g_auxv_len + 8, &aux[i][1], 8);
+        g_auxv_len += 16;
     }
     extern int g_diag;
     if (g_diag)
