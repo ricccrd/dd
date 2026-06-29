@@ -170,14 +170,19 @@ The differential oracle (`make test` / `make test-diff` / `make coverage`) stays
 The **other axis**: what `dd` does not yet *do*, independent of the open bugs (PART A) and the structural
 refactor (PART B). These are features/productization/testing-breadth/ops — capability gaps, not defects.
 Status legend: **EXISTS** (shipped, works) · **PARTIAL** (works for the common case, real gaps) ·
-**DESIGNED** (design doc only, no code) · **MISSING** (not designed, not built). Priority is rough
-product priority, not urgency vs PART A bugs (bugs always come first per PHASE 0).
+**DESIGNED** (design doc only, no code) · **MISSING** (not designed, not built) · **NON-GOAL**
+(deliberately out of scope — will not be built). Priority is rough product priority, not urgency
+vs PART A bugs (bugs always come first per PHASE 0).
 
 > Do not re-list PART A bugs or PART B refactor steps here. Observability/debug-build work is owned by
 > **PHASE 10** + [`DEBUGGING.md`](DEBUGGING.md) — referenced, not duplicated. Extensibility to a **new
 > guest OS/ISA** (a Windows row, a riscv64 column) is *illustrative only* — it validates the refactor's
 > two-axis tree ([`architecture/REFACTOR.md`](architecture/REFACTOR.md), [`architecture/TREE.md`](architecture/TREE.md))
 > and is **not planned work**; it appears nowhere below as a roadmap item.
+>
+> **Declared non-goals (will NOT be built):** BuildKit/buildx (the classic builder stays the only
+> builder), Docker Swarm/services, and new guest OS/ISA targets (Windows/riscv64). Tagged NON-GOAL
+> below — they are deliberate exclusions, not gaps to close.
 
 ### C.1 Networking (container L3 identity & DNS)
 
@@ -200,9 +205,9 @@ auth/push/df — see `dd-daemon/src/main.rs`). Remaining capability gaps:
 | Core CLI + lifecycle, exec, attach, logs (`--follow`/`--tail`), stats, events, prune, df, auth, push, commit, save/load | EXISTS | conformance suite green (`make test-docker[-full]`) | `dd-daemon/src/*` | — |
 | Compose (`up`/`ps`/`logs`/`exec`/`down`) | PARTIAL | works **via the Engine API** driven by the `docker compose` plugin (`make test-compose`); no dd-native compose; depends on C.1 for multi-service networking | `dd-tests/scenarios/compose.sh` | MED |
 | **Healthchecks** | MISSING | no health model — every container reports `health=none`; `HEALTHCHECK` Dockerfile verb is parsed-then-ignored; no `--health-*` runtime, no `(healthy)` state, no health events | `containers/inspect.rs:429`, `build.rs:553` | **HIGH** |
-| **BuildKit / buildx** | MISSING | classic builder only (copy base rootfs, run each `RUN` in the JIT); no BuildKit frontend, cache mounts, multi-stage parallelism, `--platform` matrix, secrets/ssh mounts | `dd-daemon/src/build.rs:33` | MED |
+| **BuildKit / buildx** | NON-GOAL | intentionally NOT implemented; the classic builder (copy base rootfs, run each `RUN` in the JIT) stays the only builder. BuildKit frontend / cache mounts / multi-stage parallelism / secrets-ssh mounts are out of scope | `dd-daemon/src/build.rs:33` | — |
 | Registry **pull/push auth depth** | PARTIAL | `/auth` + push exist; verify token-refresh, multi-registry creds, manifest-list/OCI index handling | `dd-daemon/src/registry.rs` | MED |
-| Swarm / services | MISSING (by design) | reported `inactive`; out of scope for a single-host runtime — list only so it's a conscious non-goal | `system.rs:52` | LOW |
+| Swarm / services | NON-GOAL | intentionally NOT implemented; reported `inactive`; out of scope for a single-host runtime | `system.rs:52` | — |
 | Resource limits enforcement (cpu/io) | MISSING | `update`/`--cpus`/blkio accepted but no cgroup on macOS; mem+pids via rlimit only | PART A.4 | MED |
 
 ### C.3 Guest coverage (the three EXISTING targets only)
@@ -239,7 +244,7 @@ fork-server — OPTIMIZATIONS.md). Pending levers:
 |---|---|---|---|---|
 | `dd-gui` (GTK4/relm4 desktop app: home/containers/images/networks/volumes/system/settings/onboarding) | EXISTS | macOS-only; pure GTK4 (no libadwaita) | `dd-gui/src/ui/views/` | — |
 | `ddcli` / `dd` CLI (run/daemon/context) | EXISTS | thin; proxies docker CLI; no native `ps`/`build`/compose verbs | `dd-cli/src/` | LOW |
-| **GUI/GPU rendering of guest apps to macOS** (Wayland/X11→DDP→Metal, IOSurface zero-copy, Vulkan/Zink→Metal) | DESIGNED | no code; large effort; build gated on review | [`ideas/RENDERING.md`](ideas/RENDERING.md), [`ideas/RENDERING_PLAN.md`](ideas/RENDERING_PLAN.md) | MED |
+| **GUI/GPU rendering of guest apps to macOS** (Wayland/X11→DDP→Metal, IOSurface zero-copy, Vulkan/Zink→Metal) | SEPARATE TRACK | confronted as its OWN initiative (own plan + review), **not part of this plan's roadmap**; design captured in ideas/RENDERING*.md for when that track starts | [`ideas/RENDERING.md`](ideas/RENDERING.md), [`ideas/RENDERING_PLAN.md`](ideas/RENDERING_PLAN.md) | own track |
 | Cross-platform terminal emulator | MISSING (roadmap idea) | website pillar; no design doc | `website/roadmap.html` | LOW |
 | Linux-as-host (run dd on Linux; macOS containers on Linux) | DESIGNED/roadmap | website pillar; partial harness facts, no host port | `website/roadmap.html` | MED |
 
@@ -261,7 +266,7 @@ fd-virtualization + per-process fd tables + `DD_*` input validation are **shippe
 |---|---|---|---|---|
 | DMG packaging + ad-hoc/Developer-ID signing | EXISTS | `make dmg`, signing wired (`dd-sign` keychain) | `dd-gui/package/`, memory `notarization-clock-skew` | — |
 | CI: release DMG, Pages, real-image smoke (both arches) | EXISTS | `.github/workflows/{release,pages,smoke}.yml`; stale-engine guard via `cargo clean -p ddjit` | memory `dd-ci-stale-engine` | — |
-| **Notarization** | PARTIAL/BLOCKED | signing proven; notarize blocked by orbstack clock skew + `xcrun` not on nix PATH | memory `notarization-clock-skew` | **HIGH** |
+| Notarization | EXISTS (CI/CD only) | runs only in CI/CD (GitHub macOS runners) where it works; the local orbstack clock-skew / `xcrun`-not-on-nix-PATH block is irrelevant — notarization is **not** a local/dev step and is not meant to run there | `.github/workflows/release.yml` | — |
 | Auto-update | PARTIAL | `dd-gui/src/update.rs` exists — verify the feed/channel + signature check end-to-end | `dd-gui/src/update.rs` | MED |
 | **Homebrew / public distribution channel** | MISSING | no tap/cask; DMG is the only artifact | — | MED |
 | Debug-vs-production build flavor | MISSING | one `clang -O2` flavor today; owned by **PHASE 10.1** (`make engine-{debug,asan,tsan}`) | PHASE 10, DEBUGGING.md | (see PHASE 10) |
