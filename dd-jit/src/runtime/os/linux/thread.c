@@ -129,7 +129,7 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
             pthread_mutex_unlock(&g_futex_m);
             return rc == ETIMEDOUT ? -ETIMEDOUT : 0;
         }
-        if (op == 1 || op == 10) {
+        if (op == 1 || op == 10 || op == 3 || op == 4) { // WAKE / WAKE_BITSET / REQUEUE / CMP_REQUEUE
             pthread_mutex_lock(&g_futex_m);
             pthread_cond_broadcast(&g_futex_c);
             pthread_mutex_unlock(&g_futex_m);
@@ -167,8 +167,16 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
         // A pure-timeout wait must report -ETIMEDOUT so the guest stops re-waiting.
         return rc == ETIMEDOUT ? -ETIMEDOUT : 0;
     }
-    // FUTEX_WAKE / WAKE_BITSET: wake up to `val` waiters on THIS address's bucket only
-    if (op == 1 || op == 10) {
+    // FUTEX_WAKE / WAKE_BITSET / REQUEUE / CMP_REQUEUE: wake the waiters on THIS address's bucket.
+    // REQUEUE(3)/CMP_REQUEUE(4) ask to wake `val` waiters on uaddr and MOVE the rest onto a second
+    // futex (uaddr2) to be woken later by its owner. musl's pthread_cond_broadcast issues exactly this
+    // (wake 1, requeue the rest onto the mutex) -- so dropping it (the old "other ops -> return 0")
+    // silently lost every broadcast wakeup and any joiner/cond waiter slept forever (node's V8 worker
+    // threads never exit -> hang at process shutdown). We don't model the secondary queue; instead we
+    // broadcast ALL waiters on uaddr. Waking is always safe -- a spuriously woken waiter re-checks its
+    // word and re-waits if needed -- and the requeue target is only an optimization to avoid a
+    // thundering herd, so broadcasting is correct, just less efficient under heavy contention.
+    if (op == 1 || op == 10 || op == 3 || op == 4) {
         // The guest changed *uaddr before this syscall; fence so that store is ordered before the
         // waiters load (SEQ_CST), completing the Dekker handshake with an arriving waiter.
         atomic_thread_fence(memory_order_seq_cst);
@@ -182,7 +190,7 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
         pthread_mutex_unlock(&b->m);
         return val;
     }
-    // other ops (REQUEUE/CMP_REQUEUE/WAKE_OP/...): unchanged -- pretend success (baseline behavior)
+    // other ops (WAKE_OP/LOCK_PI/...): unchanged -- pretend success (baseline behavior)
     return 0;
 }
 static void futex_wake_addr(uint64_t uaddr) {

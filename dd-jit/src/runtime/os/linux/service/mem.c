@@ -74,7 +74,25 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         size_t len = (size_t)a1;
         uint64_t full = gmap_find_len(a0);
         if (full == (uint64_t)a1 + 0x10000) len = (size_t)full; // complete unmap of a guarded mapping
-        int r = munmap((void *)a0, len);
+        // Page-size mismatch: guest pages are 4 KB (AT_PAGESZ) but the macOS host uses 16 KB pages.
+        // A guest that releases a 4 KB-granular SUB-RANGE of a larger mapping -- e.g. V8's page
+        // allocator freeing an interior chunk of a reservation -- passes an address that is 4 KB- but
+        // not 16 KB-aligned, which host munmap rejects with EINVAL (V8 then aborts on its CHECK(0 ==
+        // munmap)). A host-page-aligned address keeps the exact original path (native munmap rounds the
+        // length up to a host page, preserving the guarded-complete-unmap behaviour above). For an
+        // unaligned start we can only release whole HOST pages lying ENTIRELY inside [a0, a0+len); the
+        // partially-covered edge pages stay mapped because they still back the neighbouring sub-regions
+        // the guest keeps. The guest's logical unmap still succeeds (return 0) -- matching Linux, which
+        // never faults an unmap of a partially/already-unmapped range.
+        size_t hp = (size_t)getpagesize();
+        int r;
+        if ((a0 & (hp - 1)) == 0) {
+            r = munmap((void *)a0, len);
+        } else {
+            uint64_t lo = (a0 + hp - 1) & ~(uint64_t)(hp - 1); // first host page fully in range
+            uint64_t hi = (a0 + len) & ~(uint64_t)(hp - 1);    // end of last host page fully in range
+            r = (lo < hi) ? munmap((void *)lo, (size_t)(hi - lo)) : 0;
+        }
         if (r == 0) {
             gmap_del(a0);          // drop from the execve() teardown registry
             anon_untrack(a0, len); // and from the DONTNEED anon-range registry (covers the freed tail)
