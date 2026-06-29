@@ -956,6 +956,126 @@ static void sse_get_rm(struct cpu *c, struct insn *I, uint64_t next, uint8_t buf
         memcpy(buf, &c->v[2 * I->rm_reg], 16);
 }
 
+// ---- SSE4.2 packed string compare core (PCMP{I,E}STR{I,M}) --------------------------------------
+// imm8 control byte: [0]=word(1)/byte(0) elements, [1]=signed, [3:2]=aggregation (0 equal-any,
+// 1 ranges, 2 equal-each, 3 equal-ordered), [4]=negate polarity, [5]=negate valid positions only,
+// [6]=index lsb(0)/msb(1) OR mask bit(0)/element-wide(1). a=operand1 (reg/xmm1), b=operand2 (r/m);
+// la/lb are the element lengths of a/b (implicit: first-null scan; explicit: EAX/EDX, saturated).
+static int64_t sse42_elem(const uint8_t *p, int i, int wordsz, int sgn) {
+    if (wordsz == 1)
+        return sgn ? (int64_t)(int8_t)p[i] : (int64_t)p[i];
+    uint16_t w;
+    memcpy(&w, p + 2 * i, 2);
+    return sgn ? (int64_t)(int16_t)w : (int64_t)w;
+}
+
+// Implicit length: index of the first null element, else n.
+static int sse42_ilen(const uint8_t *p, int wordsz, int n) {
+    for (int i = 0; i < n; i++) {
+        uint64_t e = 0;
+        memcpy(&e, p + i * wordsz, wordsz);
+        if (e == 0) return i;
+    }
+    return n;
+}
+
+// Explicit length (PCMPESTR*): abs value of the GPR, saturated to the element count.
+static int sse42_elen(int64_t v, int n) {
+    if (v < 0) v = -v;
+    return (v > n) ? n : (int)v;
+}
+
+// Compute the polarity-adjusted intermediate mask (IntRes2) over n elements per the imm8 control.
+static int sse42_intres(const uint8_t *a, const uint8_t *b, int la, int lb, int imm, int n) {
+    int wordsz = (imm & 1) ? 2 : 1;
+    int sgn = (imm >> 1) & 1;
+    int agg = (imm >> 2) & 3;
+    int res = 0;
+    for (int i = 0; i < n; i++) {
+        int bit = 0;
+        switch (agg) {
+        case 0: // equal-any: b[i] occurs anywhere in the set a[0..la)
+            if (i < lb)
+                for (int j = 0; j < la; j++)
+                    if (sse42_elem(a, j, wordsz, sgn) == sse42_elem(b, i, wordsz, sgn)) {
+                        bit = 1;
+                        break;
+                    }
+            break;
+        case 1: // ranges: a[] holds [lo,hi] pairs; test lo <= b[i] <= hi
+            if (i < lb) {
+                int64_t bi = sse42_elem(b, i, wordsz, sgn);
+                for (int j = 0; j + 1 < la; j += 2)
+                    if (sse42_elem(a, j, wordsz, sgn) <= bi && bi <= sse42_elem(a, j + 1, wordsz, sgn)) {
+                        bit = 1;
+                        break;
+                    }
+            }
+            break;
+        case 2: // equal-each: a[i]==b[i], with both-invalid forced equal
+            if (i < la && i < lb)
+                bit = (sse42_elem(a, i, wordsz, sgn) == sse42_elem(b, i, wordsz, sgn));
+            else if (i >= la && i >= lb)
+                bit = 1;
+            break;
+        case 3: // equal-ordered: needle a[0..la) matches b starting at position i
+            bit = 1;
+            for (int j = 0; j < la; j++) {
+                int k = i + j;
+                if (k >= lb || sse42_elem(a, j, wordsz, sgn) != sse42_elem(b, k, wordsz, sgn)) {
+                    bit = 0;
+                    break;
+                }
+            }
+            break;
+        }
+        if (bit) res |= (1 << i);
+    }
+    if ((imm >> 4) & 1) {           // negate polarity
+        if ((imm >> 5) & 1)
+            res ^= ((1 << lb) - 1); // masked: negate only valid operand2 positions
+        else
+            res ^= ((1 << n) - 1);
+    }
+    return res;
+}
+
+// SSE4.2 string-compare flags (Intel SDM): CF=(IntRes2!=0), ZF=operand2 has a null (lb<n),
+// SF=operand1 has a null (la<n), OF=IntRes2[0], AF=PF=0. glibc's SSE4.2 strlen/strchr/strstr branch
+// on these (jbe/ja/jc/jz) right after the op, so they MUST be set. Substrate: x86 CF = NOT stored-C.
+static void sse42_flags(struct cpu *c, int res, int la, int lb, int n) {
+    int cf = (res != 0), zf = (lb < n), sf = (la < n), of = (res & 1);
+    c->nzcv = ((uint64_t)sf << 31) | ((uint64_t)zf << 30) | ((uint64_t)(!cf) << 29) | ((uint64_t)of << 28);
+    c->pf = 1; // PF source byte with odd popcount -> x86 PF=0
+}
+
+// Index output (PCMP*STRI) -> ECX: first/last set bit of IntRes2 (imm[6] picks lsb/msb), else n.
+static void sse42_index(struct cpu *c, int res, int imm, int n) {
+    int idx;
+    if (res == 0)
+        idx = n;
+    else if ((imm >> 6) & 1)
+        idx = 31 - __builtin_clz(res);
+    else
+        idx = __builtin_ctz(res);
+    c->r[RCX] = idx;
+}
+
+// Mask output (PCMP*STRM) -> XMM0. imm[6]=0: bit mask zero-extended; 1: element-wide (per-element) mask.
+static void sse42_mask(struct cpu *c, int res, int imm, int n) {
+    int wordsz = (imm & 1) ? 2 : 1;
+    uint8_t out[16];
+    memset(out, 0, 16);
+    if ((imm >> 6) & 1) {
+        for (int i = 0; i < n; i++)
+            if (res & (1 << i)) memset(out + i * wordsz, 0xFF, wordsz);
+    } else {
+        out[0] = res & 0xFF;
+        if (n > 8) out[1] = (res >> 8) & 0xFF;
+    }
+    memcpy(&c->v[0], out, 16); // XMM0 == c->v[0..1]; legacy SSE leaves the upper YMM bits intact
+}
+
 static void do_sse3b(struct cpu *c) {
     struct insn I;
     decode(c->rip, &I);
@@ -1066,78 +1186,28 @@ static void do_sse3b(struct cpu *c) {
         return;
     }
 
-    // ---- PCMPISTRI (0F3A 63): packed string compare, implicit-length -> index in ECX ---------------
-    if (map == 3 && op == 0x63) {
-        sse_get_rm(c, &I, next, s);
+    // ---- PCMP{I,E}STR{I,M} (0F3A 60/61/62/63): SSE4.2 packed string compare -------------------------
+    // 60=PCMPESTRM (explicit len -> mask in xmm0), 61=PCMPESTRI (explicit len -> index in ECX),
+    // 62=PCMPISTRM (implicit len -> mask in xmm0), 63=PCMPISTRI (implicit len -> index in ECX).
+    if (map == 3 && (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x63)) {
+        sse_get_rm(c, &I, next, s); // s = operand2 (r/m), D = operand1 (reg/xmm1)
         int imm = (int)I.imm;
-        int wordsz = (imm & 1) ? 2 : 1;       // element size: 0=byte,1=word
-        int n = 16 / wordsz;                   // element count
-        int agg = (imm >> 2) & 3;              // 0=equal-any,1=ranges,2=equal-each,3=equal-ordered
-        int neg = (imm >> 4) & 1;              // polarity bit (negate)
-        int neg_valid_only = (imm >> 5) & 1;   // masked negation
-        int msb = (imm >> 6) & 1;              // index select: 0=lsb,1=msb
-        int la = n, lb = n;                    // implicit lengths: first null element
-        for (int i = 0; i < n; i++) {
-            uint64_t e = 0;
-            memcpy(&e, D + i * wordsz, wordsz);
-            if (e == 0) { la = i; break; }
+        int wordsz = (imm & 1) ? 2 : 1;
+        int n = 16 / wordsz;
+        int la, lb;
+        if (op == 0x60 || op == 0x61) { // explicit lengths from EAX (op1) / EDX (op2)
+            la = sse42_elen(I.rexW ? (int64_t)c->r[RAX] : (int32_t)c->r[RAX], n);
+            lb = sse42_elen(I.rexW ? (int64_t)c->r[RDX] : (int32_t)c->r[RDX], n);
+        } else { // implicit lengths: first null element
+            la = sse42_ilen(D, wordsz, n);
+            lb = sse42_ilen(s, wordsz, n);
         }
-        for (int i = 0; i < n; i++) {
-            uint64_t e = 0;
-            memcpy(&e, s + i * wordsz, wordsz);
-            if (e == 0) { lb = i; break; }
-        }
-        int res = 0;
-        for (int i = 0; i < n; i++) {
-            int bit = 0, bvalid = (i < lb);
-            uint64_t bi = 0;
-            memcpy(&bi, s + i * wordsz, wordsz);
-            if (agg == 0 || agg == 3) { // equal-any / equal-ordered: compare s[i] against a[]
-                for (int j = 0; j < n; j++) {
-                    int avalid = (j < la);
-                    uint64_t aj = 0;
-                    memcpy(&aj, D + j * wordsz, wordsz);
-                    if (agg == 0) { // equal-any: any a[j]==s[i]
-                        if (avalid && bvalid && aj == bi) { bit = 1; break; }
-                    }
-                }
-            } else if (agg == 2) { // equal-each: a[i]==s[i] with validity override
-                int avalid = (i < la);
-                uint64_t ai = 0;
-                memcpy(&ai, D + i * wordsz, wordsz);
-                if (avalid && bvalid)
-                    bit = (ai == bi);
-                else if (!avalid && !bvalid)
-                    bit = 1;
-                else
-                    bit = 0;
-            }
-            if (bit) res |= (1 << i);
-        }
-        if (neg) {
-            int mask = (1 << n) - 1;
-            if (neg_valid_only)
-                res ^= ((1 << lb) - 1); // negate only valid-element positions
-            else
-                res ^= mask;
-        }
-        int idx;
-        if (res == 0)
-            idx = n;
-        else if (msb)
-            idx = 31 - __builtin_clz(res);
+        int res = sse42_intres(D, s, la, lb, imm, n);
+        if (op == 0x60 || op == 0x62)
+            sse42_mask(c, res, imm, n);
         else
-            idx = __builtin_ctz(res);
-        c->r[RCX] = idx;
-        // PCMPISTRI flags (Intel SDM): CF=(IntRes2!=0), ZF=(operand2/rm reached its null, lb<n),
-        // SF=(operand1/reg reached its null, la<n), OF=IntRes2[0], AF=PF=0. glibc's SSE4.2 strlen/
-        // strchr/strstr branch on these (jbe/ja/jc/jz) right after the op, so they MUST be set; leaving
-        // stale flags was the debian-glibc grep miscount. Substrate: x86 CF = NOT stored-C (borrow).
-        {
-            int cf = (res != 0), zf = (lb < n), sf = (la < n), of = (res & 1);
-            c->nzcv = ((uint64_t)sf << 31) | ((uint64_t)zf << 30) | ((uint64_t)(!cf) << 29) | ((uint64_t)of << 28);
-            c->pf = 1; // PF source byte: odd popcount -> x86 PF=0
-        }
+            sse42_index(c, res, imm, n);
+        sse42_flags(c, res, la, lb, n);
         c->rip = next;
         return;
     }
