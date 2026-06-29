@@ -132,30 +132,25 @@ static void emit_prologue(void) {
         e_ldur(17, 31, -24);
     }
 }
-// Spill: recover &cpu into x0 (guest x0 stashed in the red zone), store all GPRs+sp+flags.
+// Spill: store all guest GPRs+sp+flags+V to cpu-> via x28 (= &cpu, stolen/maintained for the whole
+// block). Must NOT touch the guest red zone [sp,#-16..]: the guest (e.g. Go runtime.clone.abi0) keeps
+// live data just below SP across a syscall block-exit, and a real kernel preserves it. Leaves x0 = &cpu.
 static void emit_spill(void) {
-    // save guest x0
-    e_stur(0, 31, -16);
-    emit32(0xD53B4200u | 0);
-    // mrs x0, nzcv; stash flags (none of this clobbers flags)
-    e_stur(0, 31, -24);
-    // x0 = cpu (thread-local)
-    e_load_cpu(0);
     for (int t = 0; t < 32; t += 2)
         // guest V0..V31 (paired)
-        e_stp_q(t, t + 1, 0, OFF_V + t * 16);
-    for (int r = 1; r <= 30; r++)
-        // skip x18 (volatile) + x28 (= cpu)
-        if (!is_stolen(r)) e_str(r, 0, r * 8);
-    e_ldur(9, 31, -16);
-    // cpu->x[0] = saved guest x0
-    e_str(9, 0, 0);
-    e_ldur(9, 31, -24);
-    // cpu->nzcv
-    e_str(9, 0, OFF_NZCV);
-    e_mov_from_sp(9);
+        e_stp_q(t, t + 1, CPUREG, OFF_V + t * 16);
+    for (int r = 0; r <= 30; r++)
+        // guest x0..x30 (x0 included -> no red-zone stash needed); skip x18 (volatile) + x28 (= cpu)
+        if (!is_stolen(r)) e_str(r, CPUREG, r * 8);
+    // x0 is saved now; reuse it as scratch
+    emit32(0xD53B4200u | 0);
+    // mrs x0, nzcv -> cpu->nzcv
+    e_str(0, CPUREG, OFF_NZCV);
+    e_mov_from_sp(0);
     // cpu->sp
-    e_str(9, 0, OFF_SP);
+    e_str(0, CPUREG, OFF_SP);
+    // callers expect x0 = &cpu after the spill
+    e_movr(0, CPUREG);
 }
 static void emit_exit_const(uint64_t pc, uint64_t reason) {
     // x0 = cpu
