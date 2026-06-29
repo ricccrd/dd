@@ -104,9 +104,9 @@ static void container_init(const char *rootfs) {
         // override. Without this g_uid stayed -1 and cuid() fell back to the HOST uid -> the guest saw
         // getuid()/geteuid() == the host's 501 ("I have no name!", non-root shell) on x86-64 only.
         const char *eu = getenv("DD_UID");
-        if (eu && g_uid < 0) g_uid = atoi(eu);
+        if (eu && g_uid < 0) g_uid = dd_parse_id("DD_UID", eu);
         const char *eg = getenv("DD_GID");
-        if (eg && g_gid < 0) g_gid = atoi(eg);
+        if (eg && g_gid < 0) g_gid = dd_parse_id("DD_GID", eg);
         if (g_uid < 0) g_uid = 0;
         if (g_gid < 0) g_gid = 0;
     }
@@ -352,10 +352,10 @@ int main(int argc, char **argv) {
             ai += 2;
         } // overlay read-only layer
         else if (strcmp(argv[ai], "--uid") == 0) { // docker --user uid (USER-ns uid); else container default 0
-            g_uid = atoi(argv[ai + 1]);
+            g_uid = dd_parse_id("--uid", argv[ai + 1]);
             ai += 2;
         } else if (strcmp(argv[ai], "--gid") == 0) {
-            g_gid = atoi(argv[ai + 1]);
+            g_gid = dd_parse_id("--gid", argv[ai + 1]);
             ai += 2;
         } else
             break;

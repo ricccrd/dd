@@ -219,7 +219,7 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         const char *m = getenv("DD_MEM_MAX");
         if (m && !g_mem_max) g_mem_max = parse_size(m);
         const char *p = getenv("DD_PIDS_MAX");
-        if (p && !g_pids_max) g_pids_max = atoi(p);
+        if (p && !g_pids_max) g_pids_max = dd_parse_id("DD_PIDS_MAX", p);
         const char *pub = getenv("DD_PUBLISH");
         if (pub && !g_nportmap) parse_publish(pub);
         const char *low = getenv("DD_LOWER");
@@ -238,9 +238,9 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
             // private loopback ns
         }
         const char *eu = getenv("DD_UID");
-        if (eu && g_uid < 0) g_uid = atoi(eu);
+        if (eu && g_uid < 0) g_uid = dd_parse_id("DD_UID", eu);
         const char *eg = getenv("DD_GID");
-        if (eg && g_gid < 0) g_gid = atoi(eg);
+        if (eg && g_gid < 0) g_gid = dd_parse_id("DD_GID", eg);
         // USER ns (process.user)
     }
     if (getenv("CRASHDBG")) {
@@ -458,7 +458,7 @@ int main(int argc, char **argv) {
             g_mem_max = parse_size(argv[ai + 1]);
             ai += 2;
         } else if (!strcmp(argv[ai], "--pids-max") && ai + 1 < argc) {
-            g_pids_max = atoi(argv[ai + 1]);
+            g_pids_max = dd_parse_id("--pids-max", argv[ai + 1]);
             ai += 2;
         } else if (!strcmp(argv[ai], "--publish") && ai + 1 < argc) {
             parse_publish(argv[ai + 1]);
@@ -473,11 +473,11 @@ int main(int argc, char **argv) {
             ai += 2;
             // private loopback ns
         } else if (!strcmp(argv[ai], "--uid") && ai + 1 < argc) {
-            g_uid = atoi(argv[ai + 1]);
+            g_uid = dd_parse_id("--uid", argv[ai + 1]);
             ai += 2;
             // USER ns uid
         } else if (!strcmp(argv[ai], "--gid") && ai + 1 < argc) {
-            g_gid = atoi(argv[ai + 1]);
+            g_gid = dd_parse_id("--gid", argv[ai + 1]);
             ai += 2;
         } else
             break;

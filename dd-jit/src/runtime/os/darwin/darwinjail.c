@@ -29,6 +29,7 @@
 #include <mach/machine.h>
 #include <libkern/OSByteOrder.h>
 #include <libkern/OSCacheControl.h>
+#include "../container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
 extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 // libcompiler_rt symbol that __builtin___clear_cache lowers to (aliased to dodge the clang builtin,
 // whose address can't be taken); we interpose it to flip emulated-RWX pages executable.
@@ -41,9 +42,24 @@ static struct { int host, cont; } g_pub[16]; static int g_npub;
 
 static void split(char *v, void (*f)(char*)){ if(!v) return; char *s=strdup(v),*t,*sp=0;
     for(t=strtok_r(s,",",&sp); t; t=strtok_r(0,",",&sp)) f(t); }
-static void add_low(char *d){ if(g_nlow<8) g_low[g_nlow++]=strdup(d); }
-static void add_vol(char *hc){ char *c=strchr(hc,':'); if(c&&g_nvol<16){ *c=0; g_vol[g_nvol].host=strdup(hc); g_vol[g_nvol].cont=strdup(c+1); g_nvol++; } }
-static void add_pub(char *hc){ char *c=strchr(hc,':'); if(c&&g_npub<16){ *c=0; g_pub[g_npub].host=atoi(hc); g_pub[g_npub].cont=atoi(c+1); g_npub++; } }
+// Collections fail loud on cap overflow (never silently drop) and ports are strictly range-checked.
+static void add_low(char *d){
+    if(g_nlow>=8){ fprintf(stderr,"dd: too many DD_LOWERS entries (max 8)\n"); exit(2); }
+    g_low[g_nlow++]=strdup(d);
+}
+static void add_vol(char *hc){
+    char *c=strchr(hc,':');
+    if(!c){ fprintf(stderr,"dd: invalid DD_VOLUMES '%s': expected HOST:CONTAINER\n",hc); exit(2); }
+    if(g_nvol>=16){ fprintf(stderr,"dd: too many DD_VOLUMES entries (max 16)\n"); exit(2); }
+    *c=0; g_vol[g_nvol].host=strdup(hc); g_vol[g_nvol].cont=strdup(c+1); g_nvol++;
+}
+static void add_pub(char *hc){
+    char *c=strchr(hc,':');
+    if(!c){ fprintf(stderr,"dd: invalid DD_PUBLISH '%s': expected HOST:CONTAINER\n",hc); exit(2); }
+    if(g_npub>=16){ fprintf(stderr,"dd: too many DD_PUBLISH entries (max 16)\n"); exit(2); }
+    *c=0; g_pub[g_npub].host=(int)dd_parse_port("DD_PUBLISH host port",hc);
+    g_pub[g_npub].cont=(int)dd_parse_port("DD_PUBLISH container port",c+1); g_npub++;
+}
 
 static const char *jail(const char *p, char *out); // defined below; used by init for DD_CWD
 
@@ -54,8 +70,8 @@ __attribute__((constructor)) static void init(void){
     const char *cwd = getenv("DD_CWD");
     if(cwd && cwd[0] && g_rootfs){ char b[1024]; chdir(jail(cwd, b)); }
     char *mm=getenv("DD_MEM_MAX"), *pm=getenv("DD_PIDS_MAX");
-    if(mm){ struct rlimit r={strtoull(mm,0,10),strtoull(mm,0,10)}; setrlimit(RLIMIT_AS,&r); }
-    if(pm){ struct rlimit r={strtoull(pm,0,10),strtoull(pm,0,10)}; setrlimit(RLIMIT_NPROC,&r); }
+    if(mm){ rlim_t v=dd_parse_u64("DD_MEM_MAX",mm,0,RLIM_INFINITY); struct rlimit r={v,v}; setrlimit(RLIMIT_AS,&r); }
+    if(pm){ rlim_t v=dd_parse_u64("DD_PIDS_MAX",pm,0,INT_MAX); struct rlimit r={v,v}; setrlimit(RLIMIT_NPROC,&r); }
     if(getenv("DD_SANDBOX") && g_rootfs){
         char prof[4096]; int n=snprintf(prof,sizeof prof,
             "(version 1)(allow default)(deny file-write* (subpath \"/\"))"

@@ -1,4 +1,5 @@
 // dd/runtime/os/linux/container -- container config state (UTS/cgroup/USER-ns/port-map) + parsers.
+#include "../../container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
 
 // ---- container namespace + cgroup state (SentryConfig: ddockerd -> jit) ----
 // UTS ns: container hostname (uname/sethostname); "" = host default
@@ -35,36 +36,51 @@ static uint16_t pm_host(uint16_t c) {
         if (g_portmap[i].cport == c) return g_portmap[i].hport;
     return c;
 }
-// "H:C,H:C,..." (docker -p order: host:container)
+// "H:C,H:C,..." (docker -p order: host:container). Ports are strictly validated (1..65535);
+// a bad field or more than the cap of entries is an error, not a silent drop.
 static void parse_publish(const char *s) {
-    while (s && *s && g_nportmap < 32) {
-        int h = atoi(s);
-        const char *colon = strchr(s, ':');
-        if (!colon) break;
-        int cc = atoi(colon + 1);
-        if (h > 0 && cc > 0) {
-            g_portmap[g_nportmap].cport = (uint16_t)cc;
-            g_portmap[g_nportmap].hport = (uint16_t)h;
-            g_nportmap++;
+    while (s && *s) {
+        if (g_nportmap >= 32) {
+            fprintf(stderr, "dd: too many DD_PUBLISH entries (max 32)\n");
+            exit(2);
         }
+        const char *colon = strchr(s, ':');
         const char *comma = strchr(s, ',');
+        if (!colon || (comma && colon > comma)) {
+            fprintf(stderr, "dd: invalid DD_PUBLISH '%s': expected HOST:CONTAINER\n", s);
+            exit(2);
+        }
+        unsigned h = dd_parse_port_field("DD_PUBLISH host port", s, colon);
+        unsigned cc = dd_parse_port_field("DD_PUBLISH container port", colon + 1, comma);
+        g_portmap[g_nportmap].cport = (uint16_t)cc;
+        g_portmap[g_nportmap].hport = (uint16_t)h;
+        g_nportmap++;
         if (!comma) break;
         s = comma + 1;
     }
 }
-// "128M"/"2G"/"512K"/"1048576" -> bytes (docker-style suffixes)
+// "128M"/"2G"/"512K"/"1048576" -> bytes (docker-style suffixes). Strict: empty/non-numeric/an
+// unknown suffix is an error (atoi/strtoull would have silently yielded 0 = unlimited).
 static uint64_t parse_size(const char *s) {
-    if (!s) return 0;
-    char *e;
+    if (!s || !*s) return 0;
+    errno = 0;
+    char *e = NULL;
     uint64_t v = strtoull(s, &e, 10);
+    if (errno != 0 || e == s) {
+        fprintf(stderr, "dd: invalid size '%s': not a number\n", s);
+        exit(2);
+    }
     switch (*e) {
+    case '\0': return v;
     case 'k':
     case 'K': return v << 10;
     case 'm':
     case 'M': return v << 20;
     case 'g':
     case 'G': return v << 30;
-    default: return v;
+    default:
+        fprintf(stderr, "dd: invalid size '%s': bad suffix\n", s);
+        exit(2);
     }
 }
 
