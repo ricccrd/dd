@@ -30,8 +30,41 @@ struct futex_bucket {
     pthread_cond_t c;
     _Atomic int waiters;
 };
-static struct futex_bucket g_fbk[FUTEX_NBUCKET] = {
-    [0 ...(FUTEX_NBUCKET - 1)] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0}};
+// _xproc-futex-fork_: the bucket table lives in a MAP_SHARED anonymous region whose mutex/condvar are
+// PTHREAD_PROCESS_SHARED, so a FUTEX_WAKE in one process matches a FUTEX_WAIT in another across dd's
+// fork() -- e.g. a glibc process-shared (named/unnamed-on-shm) semaphore where the child sem_post()s
+// and the parent sem_wait()s. dd's fork() is a real host fork(): the child inherits the identical guest
+// address space, so a shared-memory futex word resolves to the SAME host address in parent and child
+// and both hash to the same bucket, while the underlying MAP_SHARED guest page is one physical page.
+// The table is created ONCE at engine startup (constructor, before any guest fork) so every forked
+// worker inherits the same physical buckets. The lock-free no-sleeper WAKE fast path is unchanged --
+// only the slow path (a real sleeper exists) touches the now-cross-process mutex/condvar. In-process
+// (multi-threaded) futexes still hit the same table, keyed by their shared virtual address, as before.
+static struct futex_bucket *g_fbk;
+static void futex_table_init(void) {
+    if (g_fbk) return;
+    size_t sz = sizeof(struct futex_bucket) * FUTEX_NBUCKET;
+    void *mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (mem == MAP_FAILED) // cross-process wakeups degrade, but in-process futexes still work
+        mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    struct futex_bucket *t = (struct futex_bucket *)mem;
+    pthread_mutexattr_t ma;
+    pthread_condattr_t ca;
+    pthread_mutexattr_init(&ma);
+    pthread_condattr_init(&ca);
+    pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED);
+    pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED);
+    for (int i = 0; i < FUTEX_NBUCKET; i++) {
+        pthread_mutex_init(&t[i].m, &ma);
+        pthread_cond_init(&t[i].c, &ca);
+        atomic_store_explicit(&t[i].waiters, 0, memory_order_relaxed);
+    }
+    pthread_mutexattr_destroy(&ma);
+    pthread_condattr_destroy(&ca);
+    g_fbk = t;
+}
+__attribute__((constructor)) static void futex_table_ctor(void) { futex_table_init(); }
 static inline struct futex_bucket *fbk_of(const void *uaddr) {
     uint32_t h = (uint32_t)(((uintptr_t)uaddr >> 2) * 2654435761u) & (FUTEX_NBUCKET - 1);
     return &g_fbk[h];
