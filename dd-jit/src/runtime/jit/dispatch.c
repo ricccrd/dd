@@ -79,6 +79,10 @@ __attribute__((naked)) static void block_return(void) {
 static void run_guest(struct cpu *c) {
     // this thread's cpu, for emitted block exits
     pthread_setspecific(g_cpu_key, c);
+    // Join the stop-the-world thread registry so a peer's cache-full flush can quiesce us at a safepoint
+    // (and so we are enumerated when WE flush). Unregistered after the loop -> an exited thread is never
+    // signalled.
+    stw_register();
     // Frontend hook: one-time per-thread entry setup (x86 publishes the 2-way IBTC base; empty on aarch64).
     G_DISPATCH_ENTER(c);
     while (!c->exited) {
@@ -102,19 +106,23 @@ static void run_guest(struct cpu *c) {
             uint64_t _t0 = g_prof ? now_ns() : 0;
             // near full -> wholesale flush
             if (g_cp + (1u << 16) > g_cache + CACHE_SZ) {
-                if (g_threaded) {
-                    fprintf(stderr, "[jit] code cache full with threads (unsupported)\n");
-                    _exit(70);
+                if (g_threaded && stw_peers_live()) {
+                    // More than one guest thread is live: reusing the arena in place could free code out
+                    // from under a peer mid-block. Stop the world and switch to a fresh cache instead
+                    // (the old one is retained until peers drift off it). See jit/cache.c.
+                    stw_flush();
+                } else {
+                    // Single-threaded (or every spawned peer has exited): safe wholesale in-place flush.
+                    jit_wprot(0);
+                    g_cp = g_cache;
+                    memset(g_map, 0, sizeof g_map);
+                    g_npend = 0;
+                    // IBTC bodies point into the cache we just dropped
+                    memset(g_ibtc, 0, sizeof g_ibtc);
+                    // §B: shadow host_rets point into the dropped cache too -> clear (frontend hook)
+                    G_SHADOW_CLEAR(c);
+                    jit_wprot(1);
                 }
-                jit_wprot(0);
-                g_cp = g_cache;
-                memset(g_map, 0, sizeof g_map);
-                g_npend = 0;
-                // IBTC bodies point into the cache we just dropped
-                memset(g_ibtc, 0, sizeof g_ibtc);
-                // §B: shadow host_rets point into the dropped cache too -> clear (frontend hook)
-                G_SHADOW_CLEAR(c);
-                jit_wprot(1);
             }
             jit_wprot(0);
             // A3 §B-off: align each new block ENTRY to 16B. §B-off shrinks the per-bl stubs, which
@@ -145,13 +153,18 @@ static void run_guest(struct cpu *c) {
         // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
         // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).
         G_IBTC_FILL(c);
+        // Resolve the RX alias to execute through WHILE STILL HOLDING the lock: a concurrent stop-the-world
+        // flush may swap g_rw2rx (and g_cache) the instant we drop it, yet `code` is an address in the cache
+        // that was current under the lock -- so J_RX(code) must use the matching g_rw2rx. (Single-threaded
+        // takes no lock and cannot race a flush; the computation is identical.)
+        void *rxcode = J_RX(code);
         if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
         // Frontend hook: per-block JT trace dump (per-arch register/flag layout). See §A.3 (5th divergence).
         G_TRACE_DUMP(c);
         c->reason = 0;
         if (g_prof) g_prof_cross++;
         // map_host()/translate_block() return RW-alias addresses; execute via the RX alias.
-        run_block(c, J_RX(code));
+        run_block(c, rxcode);
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
         // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
         G_DISPATCH_REASON(c);
@@ -169,4 +182,6 @@ static void run_guest(struct cpu *c) {
         // async signal -> guest handler
         if (g_pending) maybe_deliver_signal(c);
     }
+    // Leave the stop-the-world registry: this thread will never execute in the cache again.
+    stw_unregister();
 }

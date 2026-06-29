@@ -456,6 +456,166 @@ static void patch_links_to(uint64_t gpc, void *body) {
     }
 }
 
+// ============================================================================
+// Stop-the-world code-cache flush (multi-threaded).
+// ============================================================================
+// The single-threaded wholesale flush (dispatch.c) reuses the 64MB arena in place: it resets the bump
+// pointer and the block map, then re-translates over the old bytes. That is unsafe once a SECOND guest
+// thread is live -- a peer may be executing a translated block we would overwrite. Rather than bail (the
+// old `code cache full with threads (unsupported)` _exit(70)), we stop the world: every OTHER guest
+// thread is parked at a safepoint (in a host signal handler, on its host stack, OFF the code cache),
+// then we switch to a FRESH cache and release them. Each peer re-translates on demand. The OLD cache is
+// retained and never modified, so a peer parked mid-block resumes into valid code and drifts onto the
+// fresh cache at its next dispatcher round-trip.
+//
+// The common single-thread path never reaches here (dispatch.c gates on a live peer count), so this adds
+// ZERO overhead to single-threaded execution.
+
+// A host signal the guest signal map never targets (os/linux/signal.c sig_l2m()'s range omits 7/EMT and
+// 29/INFO), so installing a process-wide handler for it cannot collide with an emulated guest signal.
+#define STW_SIG SIGEMT
+#define STW_MAXTHREAD 4096
+// Registry of live guest threads: every thread that runs run_guest registers on entry and unregisters on
+// exit, so a flusher can enumerate the peers to quiesce. `used` is atomic so peers_live()/the flusher see
+// a consistent snapshot; the reg lock serializes slot allocation.
+static struct {
+    _Atomic int used;
+    pthread_t th;
+} g_stw_threads[STW_MAXTHREAD];
+static pthread_mutex_t g_stw_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_stw_active; // 1 while a flush is in progress -> parked peers spin until cleared
+static _Atomic int g_stw_parked; // # of peers currently parked at the safepoint
+static uint64_t g_stw_flushes;   // PROF: stop-the-world flushes performed
+
+// Park safepoint handler -- async-signal-safe (atomics + nanosleep only). A peer caught here is, by
+// definition, no longer executing a translated block (it is on its host stack in this handler), so the
+// flusher may safely retire the cache while we spin.
+static void stw_park_handler(int sig) {
+    (void)sig;
+    atomic_fetch_add_explicit(&g_stw_parked, 1, memory_order_seq_cst);
+    while (atomic_load_explicit(&g_stw_active, memory_order_seq_cst)) {
+        struct timespec ts = {0, 200000}; // 0.2ms
+        nanosleep(&ts, NULL);
+    }
+    atomic_fetch_sub_explicit(&g_stw_parked, 1, memory_order_seq_cst);
+}
+static pthread_once_t g_stw_once = PTHREAD_ONCE_INIT;
+static void stw_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = stw_park_handler;
+    sa.sa_flags = SA_RESTART; // auto-restart interrupted host syscalls so a flush never perturbs a peer
+    sigemptyset(&sa.sa_mask);
+    sigaction(STW_SIG, &sa, NULL);
+}
+static void stw_register(void) {
+    pthread_once(&g_stw_once, stw_install);
+    // Guarantee the park signal is deliverable on this thread (a blocked STW_SIG would stall a flush).
+    sigset_t unb;
+    sigemptyset(&unb);
+    sigaddset(&unb, STW_SIG);
+    pthread_sigmask(SIG_UNBLOCK, &unb, NULL);
+    pthread_mutex_lock(&g_stw_reg_lock);
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed)) {
+            g_stw_threads[i].th = pthread_self();
+            atomic_store_explicit(&g_stw_threads[i].used, 1, memory_order_release);
+            break;
+        }
+    pthread_mutex_unlock(&g_stw_reg_lock);
+}
+static void stw_unregister(void) {
+    pthread_t me = pthread_self();
+    pthread_mutex_lock(&g_stw_reg_lock);
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
+            pthread_equal(g_stw_threads[i].th, me)) {
+            atomic_store_explicit(&g_stw_threads[i].used, 0, memory_order_release);
+            break;
+        }
+    pthread_mutex_unlock(&g_stw_reg_lock);
+}
+// # of OTHER live guest threads (excludes the caller). 0 -> the cheap in-place flush is safe.
+static int stw_peers_live(void) {
+    pthread_t me = pthread_self();
+    int n = 0;
+    pthread_mutex_lock(&g_stw_reg_lock);
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
+            !pthread_equal(g_stw_threads[i].th, me))
+            n++;
+    pthread_mutex_unlock(&g_stw_reg_lock);
+    return n;
+}
+
+// Switch to a brand-new cache and drop every cross-block link (map / IBTC / pending chains). The OLD
+// cache is left mapped and UNMODIFIED (its blocks may still be reached by parked peers and by baked-in
+// chains/inline ICs), so it is retained for the process lifetime; flushes are rare, so the retained
+// memory is bounded by the few times a fully-threaded 64MB cache fills. MUST run with all peers quiesced
+// (stw_flush) and the dispatcher holding g_jit_lock.
+static void jit_flush_to_fresh(void) {
+    if (g_dualmap) {
+        uint8_t *rw;
+        ptrdiff_t d;
+        if (dualmap_alloc(&rw, &d) == 0) {
+            g_cache = g_cp = rw;
+            g_rw2rx = d;
+        } else {
+            g_cp = g_cache; // fresh map unavailable: reuse in place (safe here -- peers are quiesced off it)
+        }
+    } else {
+        uint8_t *nc = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (nc != MAP_FAILED) {
+            g_cache = g_cp = nc;
+        } else {
+            jit_wprot(0);
+            g_cp = g_cache;
+            jit_wprot(1);
+        }
+    }
+    memset(g_map, 0, sizeof g_map);
+    memset(g_ibtc, 0, sizeof g_ibtc);
+    g_npend = 0;
+}
+
+// Stop-the-world flush. Called from the dispatcher (holding g_jit_lock) when the cache is full and a peer
+// guest thread is live: quiesce every peer at the park safepoint, switch to a fresh cache, then release.
+static void stw_flush(void) {
+    g_stw_flushes++;
+    atomic_store_explicit(&g_stw_active, 1, memory_order_seq_cst);
+    pthread_t me = pthread_self();
+    int target = 0;
+    pthread_mutex_lock(&g_stw_reg_lock);
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
+            !pthread_equal(g_stw_threads[i].th, me))
+            if (pthread_kill(g_stw_threads[i].th, STW_SIG) == 0) target++;
+    pthread_mutex_unlock(&g_stw_reg_lock);
+    // Wait until every signaled peer has reached the safepoint (so none is executing in the cache).
+    while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) < target) {
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+    jit_flush_to_fresh();
+    atomic_store_explicit(&g_stw_active, 0, memory_order_seq_cst); // release the world
+    // Wait for all peers to leave the handler so the counters are clean for the next flush.
+    while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) > 0) {
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+}
+// fork(): drop the inherited (parent-only) thread registry -- host fork() duplicates only the calling
+// thread -- so a later flush in the child never signals a dead handle. Re-register the child's own thread.
+static void stw_after_fork(void) {
+    atomic_store_explicit(&g_stw_active, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_stw_parked, 0, memory_order_relaxed);
+    pthread_mutex_init(&g_stw_reg_lock, NULL);
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        atomic_store_explicit(&g_stw_threads[i].used, 0, memory_order_relaxed);
+    g_stw_threads[0].th = pthread_self();
+    atomic_store_explicit(&g_stw_threads[0].used, 1, memory_order_relaxed);
+}
+
 // fork() COWs the RW and RX aliases independently, so after a guest fork the child's two views of the
 // SAME cache silently diverge (writes through RW never reach the COW'd RX -> the child executes stale/
 // zero pages). In the child we build a FRESH dual map (private, correctly re-aliased) and drop the
@@ -463,6 +623,7 @@ static void patch_links_to(uint64_t gpc, void *body) {
 // RWX fallback's execute permission lives in the page tables and is inherited across fork() correctly.
 // Must run in the child after fork(), before its next run_block.
 static void jit_after_fork(void) {
+    stw_after_fork(); // single-threaded child: shed the inherited thread registry (also for the MAP_JIT path)
     if (!g_dualmap) return;
     uint8_t *old_rw = g_cache, *old_rx = (uint8_t *)J_RX(g_cache);
     uint8_t *rw;
