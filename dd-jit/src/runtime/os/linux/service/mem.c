@@ -1,6 +1,32 @@
-// Extracted from service(): Memory — mmap/brk/mprotect/madvise syscalls. Returns 1 if nr was handled, 0 otherwise. Included by service.c
-// after service/helpers.c, before service() — same TU scope (globals + helpers).
-static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+// Extracted from service(): Memory — mmap/brk/mprotect/madvise syscalls. Returns 1 if nr was handled, 0 otherwise.
+// Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
+// process_vm_readv/writev between two iovec arrays. In this single-address-space DBT the "remote"
+// process is always the guest itself, so both vectors point into directly-dereferenceable guest memory
+// and the transfer is a scatter/gather memcpy -- exactly the kernel's stream semantics: bytes flow from
+// the src vectors into the dst vectors in order, stopping when either side is exhausted. Returns the
+// number of bytes copied.
+static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, const struct iovec *src,
+                               unsigned long scnt) {
+    ssize_t total = 0;
+    unsigned long di = 0, si = 0;
+    size_t doff = 0, soff = 0;
+    while (di < dcnt && si < scnt) {
+        size_t drem = dst[di].iov_len - doff, srem = src[si].iov_len - soff;
+        size_t n = drem < srem ? drem : srem;
+        if (n) {
+            memcpy((char *)dst[di].iov_base + doff, (char *)src[si].iov_base + soff, n);
+            total += (ssize_t)n;
+            doff += n;
+            soff += n;
+        }
+        if (doff == dst[di].iov_len) di++, doff = 0;
+        if (soff == src[si].iov_len) si++, soff = 0;
+    }
+    return total;
+}
+
+static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                   uint64_t a5) {
     switch (nr) {
     // ===================== Memory — mmap/brk/mprotect/madvise (anon charged against cgroup memory.max)
     // =====================
@@ -24,7 +50,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     // over limit -> break unchanged (ENOMEM)
                     break;
                 }
-            // shrink -> uncharge
+                // shrink -> uncharge
             } else if (g_mem_max && a0 < brk_cur) {
                 uint64_t delta = brk_cur - a0, cur = atomic_load(&g_mem_charged);
                 atomic_fetch_sub(&g_mem_charged, delta > cur ? cur : delta);
@@ -50,7 +76,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (full == (uint64_t)a1 + 0x10000) len = (size_t)full; // complete unmap of a guarded mapping
         int r = munmap((void *)a0, len);
         if (r == 0) {
-            gmap_del(a0); // drop from the execve() teardown registry
+            gmap_del(a0);          // drop from the execve() teardown registry
             anon_untrack(a0, len); // and from the DONTNEED anon-range registry (covers the freed tail)
         }
         if (r == 0 && g_mem_max) {
@@ -81,7 +107,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             gmap_del(a0);
             anon_untrack(a0, (size_t)old_full); // untrack the FULL extent (was untracking only `old`)
         }
-        gmap_add((uint64_t)r, (uint64_t)a2);    // track the new region for execve() teardown
+        gmap_add((uint64_t)r, (uint64_t)a2);                         // track the new region for execve() teardown
         anon_track((uint64_t)r, (size_t)a2, PROT_READ | PROT_WRITE); // fresh private-anon copy
         G_RET(c) = (uint64_t)r;
         break;
@@ -123,8 +149,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             prot = (prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE;
             g_rwx_guest = 1; // a JIT guest is present (informational + SMC gate)
         }
-        void *r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4,
-                       (off_t)a5);
+        void *r =
+            mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
         // 16 KB-vs-4 KB MAP_FIXED reconciliation. macOS arm64 mmap REQUIRES a 16 KB-aligned address for
         // MAP_FIXED, but x86_64 .so PT_LOAD segments are only p_align=0x1000 (4 KB), so ld.so's MAP_FIXED
         // mapping of e.g. libc's text segment at a 4 KB- (not 16 KB-) aligned guest address returns EINVAL
@@ -147,12 +173,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             void *hsave = head ? malloc(head) : NULL;
             if (hsave) memcpy(hsave, (void *)lo, head);
             // RW only: the JIT never executes guest pages, and an ANON PROT_EXEC map hits macOS W^X EPERM.
-            void *ar = mmap((void *)lo, (size_t)a1 + head, PROT_READ | PROT_WRITE,
-                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            void *ar =
+                mmap((void *)lo, (size_t)a1 + head, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
             if (ar != MAP_FAILED) {
-                if (hsave) memcpy((void *)lo, hsave, head);                // restore the previous seg's tail
-                if (!(a3 & 0x20) && (int)a4 >= 0)                          // file-backed: load the file bytes;
-                    pread((int)a4, (void *)a0, (size_t)a1, (off_t)a5);     //   short read => trailing BSS zeros
+                if (hsave) memcpy((void *)lo, hsave, head);            // restore the previous seg's tail
+                if (!(a3 & 0x20) && (int)a4 >= 0)                      // file-backed: load the file bytes;
+                    pread((int)a4, (void *)a0, (size_t)a1, (off_t)a5); //   short read => trailing BSS zeros
                 r = (void *)a0; // success: the mapping now lives at the requested fixed guest address
             }
             free(hsave);
@@ -185,9 +211,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // MS_SYNC=16 != Linux 4; MS_ASYNC=1/MS_INVALIDATE=2 match), tolerating EINVAL.
         if (s3db_durability() == 2) {
             int lf = (int)a2, mf = 0;
-            if (lf & 0x1) mf |= MS_ASYNC;       // Linux MS_ASYNC=1
-            if (lf & 0x2) mf |= MS_INVALIDATE;  // Linux MS_INVALIDATE=2
-            if (lf & 0x4) mf |= MS_SYNC;        // Linux MS_SYNC=4 -> macOS MS_SYNC(16)
+            if (lf & 0x1) mf |= MS_ASYNC;                    // Linux MS_ASYNC=1
+            if (lf & 0x2) mf |= MS_INVALIDATE;               // Linux MS_INVALIDATE=2
+            if (lf & 0x4) mf |= MS_SYNC;                     // Linux MS_SYNC=4 -> macOS MS_SYNC(16)
             if (!(mf & (MS_ASYNC | MS_SYNC))) mf |= MS_SYNC; // default to a sync flush
             int r = msync((void *)a0, (size_t)a1, mf);
             G_RET(c) = (r < 0 && errno != EINVAL) ? (uint64_t)(-errno) : 0;
@@ -203,8 +229,23 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // Container-init compat: in the single-process model these are no-ops that return success so
     // entrypoints (mount /proc, unshare, drop caps, set hostname) proceed; the path-jail is the
     // real boundary, and a faked namespace grants no actual privilege (program still runs as our uid).
-    // mincore -> unsupported (callers fall back)
-    case 232: G_RET(c) = (uint64_t)(-ENOSYS); break;
+    // mincore: report page residency. The host mincore(2) fills one status byte per HOST page; Linux
+    // wants one byte per page with bit0 = resident. macOS sets MINCORE_INCORE(0x1) in bit0 already, so
+    // masking each byte to bit0 yields the Linux convention. (Host pages are 16 KB vs the guest's 4 KB,
+    // so sub-host-page granularity is coarser than a real 4 KB kernel, but residency of the covering
+    // page is faithful.) Untouched trailing bytes (the guest zero-filled its vector) stay 0 = absent.
+    case 232: {
+        int r = mincore((void *)a0, (size_t)a1, (char *)a2);
+        if (r == 0 && a1) {
+            size_t hps = (size_t)getpagesize();
+            size_t npages = ((size_t)a1 + hps - 1) / hps;
+            unsigned char *vec = (unsigned char *)a2;
+            for (size_t i = 0; i < npages; i++)
+                vec[i] &= 1u; // Linux: bit0 = resident
+        }
+        G_RET(c) = (r < 0) ? (uint64_t)(-errno) : 0;
+        break;
+    }
     case 233: {
         // madvise: best-effort, advisory (never fail the guest). Only forward advice values whose
         // meaning is identical on both kernels -- NORMAL/RANDOM/SEQUENTIAL/WILLNEED/DONTNEED(0..4)
@@ -229,12 +270,39 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // remap failed (e.g. unaligned) -> never fail the guest; fall through to advisory
             }
         }
-        if (adv >= 0 && adv <= 4) hadv = adv;
-        else if (adv == 8) hadv = MADV_FREE;
-        if (hadv >= 0 && madvise((void *)a0, (size_t)a1, hadv) < 0) { /* advisory: ignore */ }
+        if (adv >= 0 && adv <= 4)
+            hadv = adv;
+        else if (adv == 8)
+            hadv = MADV_FREE;
+        if (hadv >= 0 && madvise((void *)a0, (size_t)a1, hadv) < 0) { /* advisory: ignore */
+        }
         G_RET(c) = 0;
         break;
     }
+    // process_vm_readv: copy FROM the remote iovecs (a3/a4) INTO the local iovecs (a1/a2). Same address
+    // space here, so it's a direct scatter/gather memcpy (the remote pid in a0 is the guest itself).
+    case 270:
+        G_RET(c) = (uint64_t)svc_vm_iov_copy((const struct iovec *)a1, (unsigned long)a2, (const struct iovec *)a3,
+                                             (unsigned long)a4);
+        break;
+    // process_vm_writev: the mirror -- copy FROM the local iovecs (a1/a2) INTO the remote iovecs (a3/a4).
+    case 271:
+        G_RET(c) = (uint64_t)svc_vm_iov_copy((const struct iovec *)a3, (unsigned long)a4, (const struct iovec *)a1,
+                                             (unsigned long)a2);
+        break;
+    // membarrier: CMD_QUERY(0) returns the bitmask of supported commands; CMD_GLOBAL(1) issues a process-
+    // wide full memory barrier. The host is cache-coherent and a seq-cst fence orders all threads, so
+    // GLOBAL is satisfied by a single host barrier. We advertise (and implement) only CMD_GLOBAL=(1<<0).
+    case 283:
+        switch ((int)a0) {
+        case 0: G_RET(c) = 1u << 0; break; // CMD_QUERY -> supported = CMD_GLOBAL
+        case 1:                            // CMD_GLOBAL -> full memory barrier
+            atomic_thread_fence(memory_order_seq_cst);
+            G_RET(c) = 0;
+            break;
+        default: G_RET(c) = (uint64_t)(-EINVAL); break;
+        }
+        break;
     default: return 0;
     }
     return 1;
