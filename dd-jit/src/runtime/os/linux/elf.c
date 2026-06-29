@@ -293,6 +293,54 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         return 1;
     }
 
+    // ---- AdvSIMD load/store SINGLE structure (one lane, or load-and-replicate): bit31=0, bits[29:24]=001101.
+    //      Covers LD1/ST1..LD4/ST4 to/from one lane and LD1R/LD2R/LD3R/LD4R. Go's runtime broadcasts constants
+    //      through `ld4r`/`ld1r` and indexes lanes via LD1[i]; on the non-PIE image these land on the low link
+    //      address. selem (1..4 consecutive V regs) = ((opcode[0]<<1)|R)+1. The element size / lane index follow
+    //      the ARM single-structure tables: replicate (opcode 11x) uses size as the element width; the lane
+    //      forms key off opcode[2:1] (00=B 01=H 10=S/D) with the index packed into Q:S:size.
+    if ((insn & 0xBF000000u) == 0x0D000000u) {
+        int q = (insn >> 30) & 1, post = (insn >> 23) & 1, load = (insn >> 22) & 1, r = (insn >> 21) & 1;
+        int opcode = (insn >> 13) & 7, s = (insn >> 12) & 1, size = (insn >> 10) & 3;
+        int selem = ((opcode & 1) << 1 | r) + 1;
+        int esize, index;
+        if ((opcode >> 1) == 3) { // LD#R replicate (load only): element width = size, fills every lane
+            if (!load) return 0;
+            esize = 1 << size;
+            int regbytes = q ? 16 : 8, lanes = regbytes / esize;
+            for (int i = 0; i < selem; i++) {
+                uint8_t elem[8] = {0};
+                memcpy(elem, (void *)(real + (size_t)i * esize), (size_t)esize);
+                __uint128_t acc = 0;
+                for (int l = 0; l < lanes; l++)
+                    memcpy((uint8_t *)&acc + (size_t)l * esize, elem, (size_t)esize);
+                V[(rt + i) & 31] = acc;
+            }
+        } else { // single lane: opcode[2:1] selects width, the index is packed into Q:S:size
+            switch (opcode >> 1) {
+            case 0: esize = 1; index = (q << 3) | (s << 2) | size; break;       // B
+            case 1: esize = 2; index = (q << 2) | (s << 1) | (size >> 1); break; // H
+            default:                                                            // S (size==x0) or D (size==01)
+                if ((size & 1) == 0) { esize = 4; index = (q << 1) | s; } else { esize = 8; index = q; }
+                break;
+            }
+            for (int i = 0; i < selem; i++) {
+                uint8_t *lane = (uint8_t *)&V[(rt + i) & 31] + (size_t)index * esize;
+                void *mem = (void *)(real + (size_t)i * esize);
+                if (load)
+                    memcpy(lane, mem, (size_t)esize);
+                else
+                    memcpy(mem, lane, (size_t)esize);
+            }
+        }
+        if (post) { // post-index writeback: Xn = guest addr + (Rm==31 ? bytes transferred : Xm)
+            int rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
+            X[rn] = va + (rm == 31 ? (uint64_t)(selem * esize) : X[rm]);
+        }
+        uc->uc_mcontext->__ss.__pc += 4;
+        return 1;
+    }
+
     // ---- Load/store register, single (unsigned-offset / unscaled / pre / post / unpriv / register-offset).
     //      bits[29:27]==111; V=bit26. Addressing: bit24=scaled-unsigned, else bit21=register-offset, and
     //      bits[11:10] select unscaled(00)/post(01)/unpriv(10)/pre(11). Reject anything else (clean abort).
