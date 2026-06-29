@@ -1,0 +1,229 @@
+diff --git a/dd-jit/src/runtime/frontend/aarch64/dispatch_hooks.h b/dd-jit/src/runtime/frontend/aarch64/dispatch_hooks.h
+index b23bdd7..ccf4b83 100644
+--- a/dd-jit/src/runtime/frontend/aarch64/dispatch_hooks.h
++++ b/dd-jit/src/runtime/frontend/aarch64/dispatch_hooks.h
+@@ -21,6 +21,12 @@
+ // so reset the shadow stack pointer. (Was the inline `c->ssp = 0;`.)
+ #define G_SHADOW_CLEAR(c) ((c)->ssp = 0)
+ 
++// A3: align each freshly translated block ENTRY to 16B when §B is OFF (shadowgate()<0). The §B-off
++// codegen emits smaller per-bl stubs, which can shift hot NEON loops into a worse cache/predictor
++// alignment (sha256 wobbled ~7% with no hot returns at all). Padding precedes the entry, so it never
++// executes. §B-on (incl. NOSHADOWTUNE=1) -> 0 -> byte-identical to baseline.
++#define G_BLOCK_ALIGN (shadowgate() < 0)
++
+ // (1) IBTC miss fill. aarch64 keys off c->ic_site (0=none, 1=shared-only, else=per-site IC literal addr),
+ // stores body-8 (the indirect-entry stub that restores guest x16/x17), and patches the per-site
+ // monomorphic IC literals in the W^X cache. Byte-for-byte the prior inline block.
+diff --git a/dd-jit/src/runtime/frontend/aarch64/translate.c b/dd-jit/src/runtime/frontend/aarch64/translate.c
+index d463a74..53a2e81 100644
+--- a/dd-jit/src/runtime/frontend/aarch64/translate.c
++++ b/dd-jit/src/runtime/frontend/aarch64/translate.c
+@@ -123,6 +123,20 @@ static void x18_epilog(void) {
+     e_ldur(1, 31, -24);
+     e_ldur(0, 31, -16);
+ }
++// A3 §B instrumentation (PROF=1 only): bump a 64-bit global counter from emitted code. Self-contained:
++// spills x9/x10 to the [sp,#-16/-24] red zone (same convention as emit_t2_counter / the IBTC), so it is
++// independent of whatever scratch the surrounding shadow push/ret is juggling. Gated on g_prof, so the
++// non-PROF codegen is byte-identical to baseline (zero steady-state cost).
++static void emit_prof_bump(void *ctr) {
++    e_stur(9, 31, -16);
++    e_stur(10, 31, -24);
++    e_adrp_add(9, (uint64_t)ctr); // x9 = &counter (plain RW data; adrp+add reaches it)
++    e_ldr(10, 9, 0);
++    e_addi(10, 10, 1);
++    e_str(10, 9, 0);
++    e_ldur(9, 31, -16);
++    e_ldur(10, 31, -24);
++}
+ // §B: store a constant to cpu->x[30] (the stolen guest link reg). x28=cpu; x0 scratched via mscratch.
+ static void emit_set_x30(uint64_t val) {
+     e_str(0, CPUREG, (int)OFF_MSCRATCH);
+@@ -134,6 +148,7 @@ static void emit_set_x30(uint64_t val) {
+ // cpu->mscratch (all guest regs are live across the call). Returns the `adr x1,Lcont` to backpatch.
+ static uint32_t *emit_shadow_push(uint64_t gpc) {
+     int M = (int)OFF_MSCRATCH;
++    if (g_prof) emit_prof_bump(&g_prof_shpush); // A3: count §B shadow pushes executed (PROF only)
+     e_stp(0, 1, CPUREG, M);
+     // spill x0..x3 -> mscratch (paired: 2 stp not 4 str)
+     e_stp(2, 3, CPUREG, M + 16);
+@@ -174,8 +189,36 @@ static uint32_t *emit_shadow_push(uint64_t gpc) {
+ // -- so paying the per-bl shadow push is pure overhead (floatk: sqrt/sin/pow). Only non-leaf targets
+ // (depth -> the hardware RAS predicts nested returns: stringk/recursion) get §B. Static, no profiling
+ // overhead; the ret auto-adapts (no frame pushed -> classify falls to the IC return).
++// A3 §B depth-gate tuning. The baseline gate (scan_calls + target_is_leaf) is depth-2 static and
++// MISCLASSIFIES two important cases as "leaf" (-> withholds §B -> the return falls to the IBTC):
++//   (1) a function LARGER than the 64-insn scan window whose calls live past it (fib at -O2, most of
++//       sqlite's VDBE helpers) -- the scan exhausts having seen no bl and reports "leaf";
++//   (2) a "shallow" helper that calls only leaves but is itself called from MANY sites -- its single
++//       return site is polymorphic, so the per-site IC thrashes (exactly what the RAS fixes).
++// §B is self-validating (emit_shadow_ret checks guest_ret AND guest_sp; a wrong guess -> IBTC, never a
++// misland), so the gate only ever trades cycles, never correctness. MEASUREMENT (see arm-a3.md) shows
++// §B is NET-NEGATIVE on every return-heavy workload tested -- sqlite, qsort, AND the ideal polymorphic
++// deep-recursion cases (longfib 2x, deepcall 1.4x) -- because the shadow push (~19 insn + sstk stores)
++// plus the shadow-ret validate (~22 insn: guest_ret AND guest_sp compares) cost FAR more than the IBTC
++// return path they replace (a monomorphic per-site IC hit, or even a thrashing shared-hash probe). The
++// host RAS's 1-cycle `ret` is buried under ~40 insn of software bookkeeping. So the right tune is the
++// OPPOSITE of "widen": DISABLE §B and return every ret through the proven IBTC. Levels (env, once):
++//   -1 (DEFAULT)      -> §B OFF: no shadow push; every ret -> bare IBTC (IC + shared hash). The win.
++//   -2 SHADOWGATE=-2  -> §B OFF on the push side, but ret keeps the shadow-ret stub (empty -> IBTC).
++//    0 NOSHADOWTUNE=1 -> EXACT original §B-on gate (byte-identical baseline codegen). A/B kill switch.
++//    1 SHADOWGATE=1   -> widen-fix: window-exhaustion = large/complex fn -> DEEP not leaf (measured: worse).
++//    2 SHADOWGATE=2   -> widen more: ANY direct call -> §B (measured: worse / no better).
++static int g_shadowgate = -2;
++static int shadowgate(void) {
++    if (g_shadowgate == -2) {
++        if (getenv("NOSHADOWTUNE")) g_shadowgate = 0;
++        else { const char *e = getenv("SHADOWGATE"); g_shadowgate = e ? atoi(e) : -1; }
++    }
++    return g_shadowgate;
++}
+ // Scan target's straight-line extent (bounded by forward-branch reach). Returns -1 if a blr (unknown
+-// callee), else the count of direct-call (bl) targets, writing up to `max` of them to calls[].
++// callee) -- or, when tuned, if the scan window is exhausted with no clean terminal (large/complex fn,
++// treat as deep) -- else the count of direct-call (bl) targets, writing up to `max` of them to calls[].
+ static int scan_calls(uint64_t target, uint64_t calls[], int max) {
+     int64_t reach = 0;
+     int n = 0;
+@@ -215,7 +258,9 @@ static int scan_calls(uint64_t target, uint64_t calls[], int max) {
+             // terminal past all branches
+             if (i >= reach) return n;
+     }
+-    return n;
++    // window exhausted with no clean terminal: a function larger than the scan window. Baseline reported
++    // whatever bl count it happened to see (usually 0 -> "leaf"); tuned treats it as deep/unknown.
++    return shadowgate() ? -1 : n;
+ }
+ static int is_leaf0(uint64_t t) {
+     uint64_t c[1];
+@@ -228,22 +273,30 @@ static int is_leaf0(uint64_t t) {
+ static int target_is_leaf(uint64_t target) {
+     uint64_t calls[16];
+     int n = scan_calls(target, calls, 16);
+-    // indirect callee -> assume deep -> §B
++    // SHADOWGATE=-1: never §B (every bl -> leaf path, every ret -> IBTC). Floor experiment.
++    if (shadowgate() < 0) return 1;
++    // indirect callee / large-complex fn (tuned) -> assume deep -> §B
+     if (n < 0) return 0;
++    // true leaf (no calls at all: sqrt/sin/pow) -> Stage-B, regardless of level
++    if (n == 0) return 1;
++    // L2/L3: ANY direct call -> §B (covers multiply-called shallow helpers whose ret site is polymorphic)
++    if (shadowgate() >= 2) return 0;
+     for (int i = 0; i < n && i < 16; i++)
+         // calls a non-leaf -> deep -> §B
+         if (!is_leaf0(calls[i])) return 0;
+-    // leaf / all-leaf-calls (shallow) -> Stage-B
++    // all-leaf-calls (shallow) -> Stage-B
+     return 1;
+ }
+ // §B guest bl: push shadow, host `bl body(target)` (RAS pushes &Lcont), Lcont continues at gpc+4.
+ static void emit_bl_ras(uint64_t gpc, uint64_t target) {
+     if (target_is_leaf(target)) {
++        if (g_prof) g_prof_bl_leaf++; // A3: depth-gate steered this bl to the cheap leaf Stage-B path
+         emit_set_x30(gpc + 4);
+         emit_chain_exit(target);
+         return;
+     // leaf -> cheap Stage-B (IC return)
+     }
++    if (g_prof) g_prof_bl_shadow++; // A3: depth-gate steered this bl to §B (shadow push + RAS ret)
+     uint32_t *p_adr = emit_shadow_push(gpc);
+     void *body = map_body(target);
+     uint32_t *slot = (uint32_t *)g_cp;
+@@ -308,6 +361,7 @@ static void emit_shadow_ret(void) {
+     e_ldp(0, 1, CPUREG, M);
+     // restore x0..x3 (paired)
+     e_ldp(2, 3, CPUREG, M + 16);
++    if (g_prof) emit_prof_bump(&g_prof_shret_hit); // A3: §B predicted-return FAST hit (PROF only)
+     // host ret -> &Lcont (hardware-RAS predicted)
+     e_hret();
+     uint8_t *Lfb = g_cp;
+@@ -319,6 +373,7 @@ static void emit_shadow_ret(void) {
+     e_ldp(0, 1, CPUREG, M);
+     // restore x0..x3 (paired)
+     e_ldp(2, 3, CPUREG, M + 16);
++    if (g_prof) emit_prof_bump(&g_prof_shret_fb); // A3: §B return fell to the IBTC fallback (PROF only)
+     // UNWIND/FOREIGN -> IBTC (per-site IC + hash), NOT the dispatcher
+     emit_ibranch(30);
+ }
+@@ -785,8 +840,9 @@ static void *translate_block(uint64_t gpc) {
+         if ((in & 0xFFFFFC1Fu) == 0xD65F0000u) {
+             int rrn = (in >> 5) & 31;
+             if (rrn == 30)
+-                // §B: FAST shadow ret (guest_ret+guest_sp match -> host ret) / IBTC fallback
+-                emit_shadow_ret();
++                // A3: §B OFF (default) -> bare IBTC return (no shadow-ret preamble); §B ON -> shadow ret
++                // (FAST host-ret on guest_ret+guest_sp match, else IBTC fallback).
++                shadowgate() == -1 ? emit_ibranch(30) : emit_shadow_ret();
+             else
+                 // ret xN via another reg -> ordinary indirect branch
+                 emit_ibranch(rrn);
+diff --git a/dd-jit/src/runtime/frontend/x86_64/dispatch_hooks.h b/dd-jit/src/runtime/frontend/x86_64/dispatch_hooks.h
+index f364e21..0e40f28 100644
+--- a/dd-jit/src/runtime/frontend/x86_64/dispatch_hooks.h
++++ b/dd-jit/src/runtime/frontend/x86_64/dispatch_hooks.h
+@@ -125,6 +125,10 @@ static int smc_on_write(uint64_t a) {
+ // after the flush in frontend/x86_64/dispatch.c.
+ #define G_SHADOW_CLEAR(c) memset(g_xibtc, 0, sizeof g_xibtc)
+ 
++// A3 (aarch64-only lever): no §B-off block-entry alignment on x86. Defined so the shared jit/dispatch.c
++// compiles; expands to a compile-time 0 -> the alignment `while` is dead-stripped on x86.
++#define G_BLOCK_ALIGN 0
++
+ // Post-translate chaining. x86's translate_block() already calls patch_links_to() internally (frontend/
+ // x86_64/translate.c, gated !g_threaded), so the dispatcher must NOT chain again. (aarch64 moved chaining
+ // to the dispatcher; x86 keeps it in translate_block -- the per-arch placement the shared loop hides here.)
+diff --git a/dd-jit/src/runtime/jit/cache.c b/dd-jit/src/runtime/jit/cache.c
+index 6b0a824..1d9957f 100644
+--- a/dd-jit/src/runtime/jit/cache.c
++++ b/dd-jit/src/runtime/jit/cache.c
+@@ -151,6 +151,11 @@ static inline void ibtc_publish(ibtc_ent *e, uint64_t target, void *body) {
+ static uint64_t g_prof_cross, g_prof_miss, g_prof_xlate, g_prof_sys, g_lse_n;
+ // PROF=1: dispatcher crossings / IBTC misses / translations
+ static int g_prof;
++// A3 §B instrumentation (PROF=1). Runtime: shadow pushes executed, predicted-return FAST hits (host
++// ret, RAS), and returns that fell through emit_shadow_ret to the IBTC fallback. Translate-time:
++// how many guest `bl` sites the depth-gate steered to §B (shadow push) vs the cheap leaf Stage-B path.
++static uint64_t g_prof_shpush, g_prof_shret_hit, g_prof_shret_fb;
++static uint64_t g_prof_bl_shadow, g_prof_bl_leaf;
+ 
+ // ---------------- W4E adaptive tier-2 ----------------
+ // W4E tier-2: a hot self-loop's in-cache back-edge counter reached threshold -> the dispatcher
+diff --git a/dd-jit/src/runtime/jit/dispatch.c b/dd-jit/src/runtime/jit/dispatch.c
+index adbadd5..00cdc60 100644
+--- a/dd-jit/src/runtime/jit/dispatch.c
++++ b/dd-jit/src/runtime/jit/dispatch.c
+@@ -117,6 +117,12 @@ static void run_guest(struct cpu *c) {
+                 jit_wprot(1);
+             }
+             jit_wprot(0);
++            // A3 §B-off: align each new block ENTRY to 16B. §B-off shrinks the per-bl stubs, which
++            // shifts where hot loops land in the cache and can deterministically de-align a NEON loop
++            // (e.g. sha256, which has no hot returns yet wobbled ~7%). Padding lives BEFORE the entry
++            // (branch/IBTC targets the aligned body), so the nops never execute -> zero runtime cost,
++            // just stable layout. Gated on §B-off so NOSHADOWTUNE=1 stays byte-identical to baseline.
++            if (G_BLOCK_ALIGN) while ((uintptr_t)g_cp & 15) emit32(0xD503201Fu); // nop
+             g_emit_start = g_cp;
+             code = translate_block(G_PC(c));
+             g_prof_xlate++;
+diff --git a/dd-jit/src/runtime/os/linux/service.c b/dd-jit/src/runtime/os/linux/service.c
+index 219b0f3..046fbc6 100644
+--- a/dd-jit/src/runtime/os/linux/service.c
++++ b/dd-jit/src/runtime/os/linux/service.c
+@@ -1334,6 +1334,16 @@ static void service_local(struct cpu *c) {
+                     (unsigned long long)g_lse_n, (unsigned long long)g_wx_toggles, g_dualmap, g_xlate_ns / 1e6,
+                     g_mtibtc, (unsigned long long)g_mtfill, g_futexq, (unsigned long long)g_futex_wake_fast,
+                     (unsigned long long)g_futex_wake_slow, (unsigned long long)g_futex_wait_n);
++        // A3: §B shadow-return coverage. hit-rate = shret_hit / (shret_hit + shret_fb). bl_shadow /
++        // bl_leaf show how the depth-gate split call sites at translate time.
++        {
++            unsigned long long h = (unsigned long long)g_prof_shret_hit, f = (unsigned long long)g_prof_shret_fb;
++            double hr = (h + f) ? 100.0 * (double)h / (double)(h + f) : 0.0;
++            fprintf(stderr,
++                    "[prof] shadow_push=%llu shret_hit=%llu shret_fb=%llu hit_rate=%.1f%% bl_shadow=%llu bl_leaf=%llu\n",
++                    (unsigned long long)g_prof_shpush, h, f, hr, (unsigned long long)g_prof_bl_shadow,
++                    (unsigned long long)g_prof_bl_leaf);
++        }
+ #ifdef R_REPSTR // W4-C: x86-only rep cmps/scas idiom firing counts
+         if (getenv("PROF")) fprintf(stderr, "[prof] repstr=%llu repstr_elems=%llu\n",
+                                     (unsigned long long)g_repstr_n, (unsigned long long)g_repstr_elems);
