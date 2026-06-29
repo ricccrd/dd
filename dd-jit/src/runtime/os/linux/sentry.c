@@ -116,6 +116,11 @@ static int g_sentry_sandbox = 0; // DDJIT_SANDBOX:   wrap the worker in a deny-d
 // the worker maps it locally, then drops the borrowed fd -- so the worker's fds stay virtual and memory
 // authority stays worker-side. Encoded as a sentinel in `rawnr` so the lend rides the SAME ring round-trip.
 #define SENTRY_OP_FDPASS 0xFFFFFFFEu
+// Per-process virtual fd table control ops (rawnr sentinels, like FDPASS -- not real syscalls). FORK tells
+// the sentry to give a freshly forked child its OWN fd table as a dup-COPY of the parent's; EXIT releases a
+// worker process's table (closes its owned real fds) at process exit. Both ride the SAME ring round-trip.
+#define SENTRY_OP_FORK 0xFFFFFFFDu // a[0]=parent wpid, a[1]=child wpid -> clone the parent's virtual->real map
+#define SENTRY_OP_EXIT 0xFFFFFFFCu // R->wpid -> free that worker process's fd table
 
 // ------------------------------------------------------------------ per-context ring pool
 // THE SCALING FIX. A single SPSC ring is single-producer: but a guest thread is a HOST pthread
@@ -141,6 +146,7 @@ struct sentry_ring {
     _Atomic uint32_t busy;  // worker-side producer lock: held across one round-trip (uncontended at <=N threads)
     _Atomic uint32_t owner; // ring-pool free-list: 0 = free lane, else the owning worker thread's token
     // request: the post-normalize syscall registers (frontend-agnostic via G_RAWNR / G_A0..G_A5)
+    uint32_t wpid;  // stamping worker PROCESS pid: selects this guest's per-process virtual fd table (P1/P2)
     uint64_t rawnr; // raw syscall-number register (so the sentry's G_NR re-derives the canonical nr)
     uint64_t a[6];  // a0..a5 (G_A0..G_A5)
     // Generalized pointer marshaling: redir[i] is the byte offset within buf[] that arg i is redirected
@@ -221,6 +227,28 @@ static void sentry_fork_child(void) {
     t_ring = -1;             // drop the inherited lane index; claim a fresh one lazily
     t_token = 0;             // mint a fresh ownership token on the next claim
     g_guest_children = 0;    // the child starts with no children of its own
+}
+
+// Worker-side control round-trip: stamp a rawnr sentinel + args onto a claimed ring and ping-pong it once.
+// Used for the per-process fd-table FORK/EXIT ops (no buffer payload, no copy-back). Forwarded-syscall
+// requests use the inline path in syscall_route, not this helper.
+static void sentry_ctl_op(uint32_t op, uint64_t a0, uint64_t a1) {
+    struct sentry_ring *R = ring_for_thread();
+    while (atomic_exchange_explicit(&R->busy, 1, memory_order_acquire)) sched_yield();
+    R->wpid = (uint32_t)g_worker_pid;
+    R->rawnr = op;
+    R->a[0] = a0;
+    R->a[1] = a1;
+    R->iovn = 0;
+    for (int i = 0; i < 6; i++) R->redir[i] = -1;
+    atomic_store_explicit(&R->turn, 1, memory_order_release);
+    uint32_t sp = 0;
+    while (atomic_load_explicit(&R->turn, memory_order_acquire) != 0)
+        if (++sp > 256) {
+            sched_yield();
+            sp = 0;
+        }
+    atomic_store_explicit(&R->busy, 0, memory_order_release);
 }
 
 // SCM_RIGHTS fd passing over a control socketpair. sentry_send_fd lends one fd; sentry_recv_fd borrows it.
@@ -405,66 +433,192 @@ static void worker_sandbox(void) {
 #endif
 }
 
-// ------------------------------------------------------------------ guest fd-ownership set (P1: FDPASS / SCM)
-// SCM_RIGHTS fd-lend (SENTRY_OP_FDPASS) must only ever surface an fd the sentry opened ON BEHALF OF THE
-// GUEST -- never one of the sentry's own control sockets (g_ctl[]), the daemon stdio, or any other non-guest
-// host fd. We record every fd service_local() hands back for this guest (openat/socket/accept*/dup*/pipe2/
-// socketpair/fcntl-F_DUPFD/recvmsg-SCM_RIGHTS) in a sentry-PRIVATE bitset and clear it on close. This array
-// lives in the sentry process's own memory (NOT the shared ring) so a malicious worker cannot tamper with
-// it; it IS shared across the per-ring servicer threads (one sentry process), so mutate with atomic word
-// ops. An fd >= the cap is untrackable and therefore never lendable -> rejected -EBADF.
-#define SENTRY_FDSET_MAX 65536u
-static _Atomic uint64_t g_guest_fds[SENTRY_FDSET_MAX / 64];
-static void sentry_fd_track(int fd) {
-    if (fd < 0 || (unsigned)fd >= SENTRY_FDSET_MAX) return;
-    atomic_fetch_or_explicit(&g_guest_fds[(unsigned)fd >> 6], 1ull << ((unsigned)fd & 63), memory_order_relaxed);
-}
-static void sentry_fd_untrack(int fd) {
-    if (fd < 0 || (unsigned)fd >= SENTRY_FDSET_MAX) return;
-    atomic_fetch_and_explicit(&g_guest_fds[(unsigned)fd >> 6], ~(1ull << ((unsigned)fd & 63)), memory_order_relaxed);
-}
-static int sentry_fd_owned(int fd) {
-    if (fd < 0 || (unsigned)fd >= SENTRY_FDSET_MAX) return 0;
-    return (int)((atomic_load_explicit(&g_guest_fds[(unsigned)fd >> 6], memory_order_relaxed) >> ((unsigned)fd & 63)) & 1u);
-}
-// Walk a (sentry-produced, Linux-layout) cmsg buffer and track every SCM_RIGHTS fd a recvmsg received, so a
-// later FDPASS of that fd is recognized as guest-owned. Strictly bounded by `len` -- never derefs past it.
-static void sentry_track_cmsg_fds(const uint8_t *ctl, size_t len) {
-    size_t o = 0;
-    while (o + 16u <= len) {                          // Linux struct cmsghdr: {u64 cmsg_len; int level; int type}
-        uint64_t clen = *(const uint64_t *)(ctl + o);
-        int level = *(const int *)(ctl + o + 8);
-        int type = *(const int *)(ctl + o + 12);
-        if (clen < 16u || o + clen > len) break;
-        if (level == SOL_SOCKET && type == SCM_RIGHTS) {
-            size_t nfd = (size_t)(clen - 16u) / sizeof(int);
-            for (size_t i = 0; i < nfd; i++) sentry_fd_track(*(const int *)(ctl + o + 16u + i * sizeof(int)));
-        }
-        o += (size_t)((clen + 7u) & ~(uint64_t)7u);  // CMSG_ALIGN to 8
+// ------------------------------------------------------------------ per-process VIRTUAL fd table (P1/P2)
+// SECURITY HARDENING. Each guest WORKER PROCESS gets its OWN virtual fd namespace: a sentry-PRIVATE table
+// mapping the small, dense fd NUMBERS the guest sees (VIRTUAL) to the real sentry-owned fds (REAL). Two
+// invariants follow:
+//   (1) guest-fd virtualization -- a guest can only ever name an fd the sentry handed IT. A raw integer that
+//       happens to equal a sentry-internal fd (a g_ctl[] control socket, the daemon stdio, ANOTHER guest's
+//       fd) is simply not in this process's table, so it translates to -EBADF and can never address
+//       sentry-internal state. Every fd the guest RECEIVES (openat/socket/accept*/dup*/pipe2/socketpair/
+//       fcntl-F_DUPFD/epoll_create1/recvmsg-SCM_RIGHTS) is virtualized on the way out; every fd it PASSES is
+//       translated virtual->real on the way in.
+//   (2) per-process fd tables -- a forked worker gets its OWN table: fork() copies the parent's virtual->real
+//       map (each inherited real fd is dup()'d so the child holds an INDEPENDENT real fd over the same open
+//       file description, exactly like Linux fd inheritance), so two long-lived post-fork processes can
+//       mutate/close their fds without aliasing the shared sentry fd space.
+// The tables live in the sentry process's OWN memory (NOT the shared ring) so a hostile worker cannot tamper
+// with them; a single global mutex serializes table mutation across the per-ring servicer threads (one sentry
+// process). stdio (vfd 0/1/2) is pre-mapped 1:1 as BORROWED -- translated like any fd, but never close()'d
+// when the guest drops it (that real fd is the sentry's own inherited stdio, shared with its servicer threads).
+// GATE: built only under g_untrusted; the trusted fast path never touches any of this.
+#define SENTRY_VFD_MAX 1024u // per-process virtual fd slots (dense; far beyond any test/jail guest's fd use)
+#define SENTRY_NPROC   64u   // worker processes the sentry tracks a table for at once (the init guest + forks)
+
+struct sentry_proc {
+    int inuse;                        // 0 = free slot, 1 = a live worker process owns this table
+    pid_t wpid;                       // the owning worker process pid (stamped on every request, R->wpid)
+    int real[SENTRY_VFD_MAX];         // virtual fd -> real sentry fd (-1 = unused slot)
+    uint8_t borrowed[SENTRY_VFD_MAX]; // 1 = inherited/borrowed real fd (stdio): never close() it on drop
+};
+static struct sentry_proc g_proc[SENTRY_NPROC];
+static pthread_mutex_t g_fd_lock = PTHREAD_MUTEX_INITIALIZER; // guards g_proc[] (alloc / lookup / map)
+
+// Initialize a freshly claimed table: empty except stdio 0/1/2 mapped 1:1 and marked BORROWED. (All helpers
+// below run with g_fd_lock held by the caller.)
+static void proc_init_table(struct sentry_proc *p, pid_t wpid) {
+    p->wpid = wpid;
+    for (uint32_t i = 0; i < SENTRY_VFD_MAX; i++) {
+        p->real[i] = -1;
+        p->borrowed[i] = 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        p->real[i] = i;
+        p->borrowed[i] = 1;
     }
 }
-// SEND-path mirror of sentry_track_cmsg_fds (P2 finding G): the same Linux-layout cmsg walk, but it
-// VALIDATES instead of tracks. Before the sentry forwards a guest sendmsg carrying an SCM_RIGHTS cmsg, every
-// fd that cmsg would emit on the wire must be one the sentry handed THIS guest (g_guest_fds). A malicious
-// worker that smuggles a sentry-internal fd -- a g_ctl[] control socket, the ring shm, a daemon fd -- into
-// the cmsg would otherwise leak it to the socket peer. Returns 0 if all SCM_RIGHTS fds are guest-owned (a
-// correct guest only ever passes its OWN fds, so this is always 0 for it), -1 if any fd is not (reject).
-// Strictly bounded by `len` -- never derefs past it.
-static int sentry_cmsg_fds_owned(const uint8_t *ctl, size_t len) {
+// Find a worker process's table WITHOUT creating one (NULL if it has none yet).
+static struct sentry_proc *proc_lookup_locked(pid_t wpid) {
+    for (uint32_t i = 0; i < SENTRY_NPROC; i++)
+        if (g_proc[i].inuse && g_proc[i].wpid == wpid) return &g_proc[i];
+    return NULL;
+}
+// Find a worker process's table, lazily creating a default (stdio-only) one on first contact. Returns NULL
+// only if the table pool is exhausted (treated as -EBADF upstream -- a fail-closed bound, never a leak).
+static struct sentry_proc *proc_find_locked(pid_t wpid) {
+    struct sentry_proc *p = proc_lookup_locked(wpid), *free_slot = NULL;
+    if (p) return p;
+    for (uint32_t i = 0; i < SENTRY_NPROC; i++)
+        if (!g_proc[i].inuse) { free_slot = &g_proc[i]; break; }
+    if (!free_slot) return NULL;
+    proc_init_table(free_slot, wpid);
+    free_slot->inuse = 1;
+    return free_slot;
+}
+// Allocate the lowest free virtual fd >= minv, map it to (owned, closeable) real fd `rfd`. Returns vfd, or -1
+// if the table is full (caller closes `rfd` and returns -EMFILE -- never leaks the real fd to the guest).
+static int vfd_alloc(struct sentry_proc *p, int rfd, uint32_t minv) {
+    for (uint32_t v = minv; v < SENTRY_VFD_MAX; v++)
+        if (p->real[v] < 0) {
+            p->real[v] = rfd;
+            p->borrowed[v] = 0;
+            return (int)v;
+        }
+    return -1;
+}
+// Translate a guest virtual fd to its real sentry fd, or -1 if it is not mapped in this table (=> -EBADF).
+static int vfd_real(struct sentry_proc *p, int vfd) {
+    if (vfd < 0 || (uint32_t)vfd >= SENTRY_VFD_MAX) return -1;
+    return p->real[vfd];
+}
+// Drop a guest virtual fd from the table. Returns the real fd the caller must close(), or -1 if the entry was
+// BORROWED (stdio) or unmapped -- in which case the caller must NOT close the real fd.
+static int vfd_drop(struct sentry_proc *p, int vfd) {
+    if (vfd < 0 || (uint32_t)vfd >= SENTRY_VFD_MAX || p->real[vfd] < 0) return -1;
+    int rfd = p->borrowed[vfd] ? -1 : p->real[vfd];
+    p->real[vfd] = -1;
+    p->borrowed[vfd] = 0;
+    return rfd;
+}
+// fork inheritance (P2): give the CHILD process its own table as a dup-COPY of the parent's virtual->real
+// map. Each owned inherited fd is dup()'d so the child holds an INDEPENDENT real fd over the same open file
+// description (Linux semantics); borrowed stdio stays 1:1 borrowed. If the parent has no table yet (forked
+// before any forwarded syscall), the child gets a default stdio-only table.
+static void sentry_proc_fork(pid_t parent, pid_t child) {
+    pthread_mutex_lock(&g_fd_lock);
+    struct sentry_proc *pp = proc_lookup_locked(parent);
+    struct sentry_proc *cp = proc_find_locked(child); // default (stdio) table for the child
+    if (cp && pp)
+        for (uint32_t v = 3; v < SENTRY_VFD_MAX; v++) { // 0/1/2 already mapped borrowed by proc_init_table
+            if (pp->real[v] < 0) continue;
+            if (pp->borrowed[v]) {
+                cp->real[v] = pp->real[v];
+                cp->borrowed[v] = 1;
+            } else {
+                int d = dup(pp->real[v]);
+                cp->real[v] = d;
+                cp->borrowed[v] = (d < 0); // dup failure: leave the slot unusable but never closeable
+            }
+        }
+    pthread_mutex_unlock(&g_fd_lock);
+}
+// Release a worker process's table on its exit: close every OWNED real fd it still holds and free the slot.
+// (Borrowed stdio is never closed -- it belongs to the sentry.) The init guest's table is reclaimed by the
+// sentry process tearing down; only forked children call this.
+static void sentry_proc_release(pid_t wpid) {
+    pthread_mutex_lock(&g_fd_lock);
+    struct sentry_proc *p = proc_lookup_locked(wpid);
+    if (p) {
+        for (uint32_t v = 0; v < SENTRY_VFD_MAX; v++)
+            if (p->real[v] >= 0 && !p->borrowed[v]) close(p->real[v]);
+        p->inuse = 0;
+    }
+    pthread_mutex_unlock(&g_fd_lock);
+}
+// SENDMSG SCM_RIGHTS (P2 finding G, virtualized): translate every guest VFD in a (Linux-layout, PRIVATE) cmsg
+// buffer to its real sentry fd IN PLACE. Returns 0 if every passed fd was a live guest fd (a correct guest
+// only ever passes its own, so this is always 0 for it), -1 if any was not mapped -- in which case the whole
+// sendmsg is rejected, so a smuggled sentry-internal fd (g_ctl[]/ring/daemon) can never reach the wire.
+// Caller holds g_fd_lock. Strictly bounded by `len` -- never derefs past it.
+static int sentry_cmsg_translate_out(struct sentry_proc *p, uint8_t *ctl, size_t len) {
     size_t o = 0;
-    while (o + 16u <= len) {                          // Linux struct cmsghdr: {u64 cmsg_len; int level; int type}
+    while (o + 16u <= len) { // Linux struct cmsghdr: {u64 cmsg_len; int level; int type}
         uint64_t clen = *(const uint64_t *)(ctl + o);
         int level = *(const int *)(ctl + o + 8);
         int type = *(const int *)(ctl + o + 12);
         if (clen < 16u || o + clen > len) break;
         if (level == SOL_SOCKET && type == SCM_RIGHTS) {
             size_t nfd = (size_t)(clen - 16u) / sizeof(int);
-            for (size_t i = 0; i < nfd; i++)
-                if (!sentry_fd_owned(*(const int *)(ctl + o + 16u + i * sizeof(int)))) return -1; // not ours -> reject
+            for (size_t i = 0; i < nfd; i++) {
+                int *slot = (int *)(ctl + o + 16u + i * sizeof(int));
+                int rfd = vfd_real(p, *slot);
+                if (rfd < 0) return -1; // not this guest's fd -> reject the whole sendmsg
+                *slot = rfd;
+            }
         }
-        o += (size_t)((clen + 7u) & ~(uint64_t)7u);  // CMSG_ALIGN to 8
+        o += (size_t)((clen + 7u) & ~(uint64_t)7u); // CMSG_ALIGN to 8
     }
     return 0;
+}
+// RECVMSG SCM_RIGHTS (virtualized): the sentry received real fds; allocate a guest VFD for each and rewrite it
+// IN PLACE so the guest only ever sees virtual fds. An exhausted table closes the real fd and writes -1.
+// Caller holds g_fd_lock. Strictly bounded by `len` -- never derefs past it.
+static void sentry_cmsg_translate_in(struct sentry_proc *p, uint8_t *ctl, size_t len) {
+    size_t o = 0;
+    while (o + 16u <= len) {
+        uint64_t clen = *(uint64_t *)(ctl + o);
+        int level = *(int *)(ctl + o + 8);
+        int type = *(int *)(ctl + o + 12);
+        if (clen < 16u || o + clen > len) break;
+        if (level == SOL_SOCKET && type == SCM_RIGHTS) {
+            size_t nfd = (size_t)(clen - 16u) / sizeof(int);
+            for (size_t i = 0; i < nfd; i++) {
+                int *slot = (int *)(ctl + o + 16u + i * sizeof(int));
+                int v = vfd_alloc(p, *slot, 0);
+                if (v < 0) {
+                    close(*slot);
+                    *slot = -1;
+                } else {
+                    *slot = v;
+                }
+            }
+        }
+        o += (size_t)((clen + 7u) & ~(uint64_t)7u);
+    }
+}
+// 1 if this canonical syscall carries its OPERATING fd in the a0 register (so the boundary translates a0
+// virtual->real). The fd-bearing-but-NOT-a0 cases (openat/stat dirfd, dup3 newfd, epoll_ctl target, ppoll/
+// pselect fd containers) are handled explicitly in sentry_service_one.
+static int fd_in_a0(uint64_t nr) {
+    switch (nr) {
+    case 61: case 62: case 63: case 64: case 65: case 66: case 67: case 68: case 80: // fs r/w/seek/stat
+    case 200: case 201: case 202: case 203: case 204: case 205: case 206: case 207:  // socket family
+    case 208: case 209: case 210: case 211: case 212: case 242:                      // sockopt/shutdown/msg/accept4
+    case 23: case 25: case 29: case 22:                                              // dup/fcntl/ioctl/epoll_pwait
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 // ------------------------------------------------------------------ sentry process body
@@ -484,14 +638,31 @@ static void sentry_service_one(struct sentry_ring *R) {
     // worker's matching recv stays in lockstep with the round-trip and never desyncs the next lend.
     if (R->rawnr == SENTRY_OP_FDPASS) {
         int idx = (int)(R - g_shm->ring);
-        int fd = (int)(int64_t)R->a[0];
-        if (sentry_fd_owned(fd)) {
-            sentry_send_fd(g_ctl[idx][1], fd);
+        pthread_mutex_lock(&g_fd_lock);
+        struct sentry_proc *p = proc_lookup_locked((pid_t)R->wpid);
+        int rfd = p ? vfd_real(p, (int)(int64_t)R->a[0]) : -1; // guest VFD -> real (only a guest-owned fd maps)
+        pthread_mutex_unlock(&g_fd_lock);
+        if (rfd >= 0) {
+            sentry_send_fd(g_ctl[idx][1], rfd);
             R->ret = 0;
         } else {
             sentry_send_fd(g_ctl[idx][1], -1); // empty datagram: keep the worker recv in lockstep
             R->ret = -EBADF;
         }
+        R->nserved++;
+        return;
+    }
+    // Per-process fd-table control ops (P1/P2): clone the parent's map into a fresh child table on fork;
+    // release a worker's table (close its owned real fds) on exit. Neither reconstructs a cpu.
+    if (R->rawnr == SENTRY_OP_FORK) {
+        sentry_proc_fork((pid_t)R->a[0], (pid_t)R->a[1]);
+        R->ret = 0;
+        R->nserved++;
+        return;
+    }
+    if (R->rawnr == SENTRY_OP_EXIT) {
+        sentry_proc_release((pid_t)R->wpid);
+        R->ret = 0;
         R->nserved++;
         return;
     }
@@ -682,7 +853,14 @@ static void sentry_service_one(struct sentry_ring *R) {
                     //      from the validated PRIVATE copy, not attacker-writable shared memory. ----
                     uint64_t ccap = clen > SENTRY_MSGCTLCAP ? SENTRY_MSGCTLCAP : clen; // legit cmsg already <= cap
                     memcpy(pctl, R->buf + coff, (size_t)ccap);
-                    if (sentry_cmsg_fds_owned(pctl, (size_t)ccap) != 0) { R->ret = -EPERM; R->nserved++; return; }
+                    // VIRTUALIZE the SCM_RIGHTS fds in the PRIVATE copy: translate each guest VFD -> its real
+                    // sentry fd. A non-guest fd (smuggled g_ctl[]/ring/daemon fd) is not in the table -> reject
+                    // the whole sendmsg -EPERM, so it can never reach the wire.
+                    pthread_mutex_lock(&g_fd_lock);
+                    struct sentry_proc *cp = proc_find_locked((pid_t)R->wpid);
+                    int ctl_ok = cp && sentry_cmsg_translate_out(cp, pctl, (size_t)ccap) == 0;
+                    pthread_mutex_unlock(&g_fd_lock);
+                    if (!ctl_ok) { R->ret = -EPERM; R->nserved++; return; }
                     *(uint64_t *)(ph + 32) = (uint64_t)pctl; // msg_control -> validated PRIVATE copy
                     *(uint64_t *)(ph + 40) = ccap;           // msg_controllen, clamped to the control window
                 } else {
@@ -702,6 +880,108 @@ static void sentry_service_one(struct sentry_ring *R) {
         return;
     }
 
+    // ---- per-process VIRTUAL fd translation (P1): map every guest fd ARGUMENT to its real sentry fd. A guest
+    //      fd not in THIS process's table (a sentry-internal fd, another guest's fd, a stale fd) translates to
+    //      -EBADF and never reaches the kernel. close + dup3 also mutate the table here (handled fully, then
+    //      short-circuit); fds the call CREATES are virtualized on the OUT-path after service_local. ----
+    static __thread uint8_t psel_save[3][128]; // pselect: saved ORIGINAL virtual fd_sets, for the result remap
+    static __thread uint32_t psel_nfds;        // pselect: guest nfds (bounded to the table)
+    static __thread uint8_t psel_present[3];    // pselect: which of rd/wr/ex sets were supplied
+    int handled_local = 0;
+    int64_t local_ret = 0;
+    {
+        pthread_mutex_lock(&g_fd_lock);
+        struct sentry_proc *p = proc_find_locked((pid_t)R->wpid);
+        int eb = (p == NULL);
+        if (p) switch (snr) {
+        case 56: case 79: case 291: { // openat/newfstatat/statx: a0 = dirfd; AT_FDCWD (<0) passes through
+            int d = (int)(int64_t)G_A0(&tmp);
+            if (d >= 0) {
+                int r = vfd_real(p, d);
+                if (r < 0) eb = 1; else G_A0(&tmp) = (uint64_t)(int64_t)r;
+            }
+            break;
+        }
+        case 57: { // close: translate + drop the mapping. A BORROWED (stdio) fd is unmapped but NOT closed.
+            int v = (int)(int64_t)G_A0(&tmp);
+            int r = vfd_real(p, v);
+            if (r < 0) { eb = 1; break; }
+            if (vfd_drop(p, v) < 0) { handled_local = 1; local_ret = 0; break; } // borrowed: success, real fd stays
+            G_A0(&tmp) = (uint64_t)(int64_t)r; // fall through to service_local: real close + fscache flush
+            break;
+        }
+        case 24: { // dup3(oldfd, newfd, flags): handled ENTIRELY here -- never let the kernel use the guest's
+                   //   virtual newfd as a real target. dup the real oldfd, then bind the guest's chosen virtual
+                   //   newfd to the result (closing whatever it named). (fscache flush is skipped -- a pure
+                   //   fd-table op.)
+            int oldv = (int)(int64_t)G_A0(&tmp), newv = (int)(int64_t)G_A1(&tmp), flags = (int)G_A2(&tmp);
+            int rold = vfd_real(p, oldv);
+            if (rold < 0) { eb = 1; break; }
+            handled_local = 1;
+            if (oldv == newv) { local_ret = -EINVAL; break; } // Linux dup3 EINVAL on equal fds
+            if (newv < 0 || (uint32_t)newv >= SENTRY_VFD_MAX) { local_ret = -EBADF; break; }
+            int rnew = fcntl(rold, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
+            if (rnew < 0) { local_ret = -errno; break; }
+            int prev = vfd_drop(p, newv);
+            if (prev >= 0) close(prev);
+            p->real[newv] = rnew;
+            p->borrowed[newv] = 0;
+            local_ret = newv;
+            break;
+        }
+        case 21: { // epoll_ctl(epfd, op, fd, ev): translate BOTH the epoll fd (a0) and the target fd (a2)
+            int r0 = vfd_real(p, (int)(int64_t)G_A0(&tmp));
+            int r2 = vfd_real(p, (int)(int64_t)G_A2(&tmp));
+            if (r0 < 0 || r2 < 0) eb = 1;
+            else { G_A0(&tmp) = (uint64_t)(int64_t)r0; G_A2(&tmp) = (uint64_t)(int64_t)r2; }
+            break;
+        }
+        case 73: { // ppoll: translate each pollfd.fd (8B/entry, fd at +0) in the ring array to its real fd
+            uint32_t nfds = (uint32_t)G_A1(&tmp);
+            for (uint32_t k = 0; k < nfds; k++) {
+                int *fdp = (int *)(R->buf + (size_t)k * 8u);
+                int r = vfd_real(p, *fdp);
+                *fdp = (r < 0) ? -1 : r; // an unmapped fd polls as -1 (kernel ignores it), never a wrong fd
+            }
+            break;
+        }
+        case 72: { // pselect6: rebuild REAL fd_sets from the virtual ones in place; save the originals so the
+                   //   result can be remapped back to virtual fds on the OUT-path
+            uint32_t nfds = (uint32_t)G_A0(&tmp);
+            if (nfds > SENTRY_VFD_MAX) nfds = SENTRY_VFD_MAX;
+            psel_nfds = nfds;
+            uint8_t *win[3] = {R->buf + SENTRY_PSEL_RD, R->buf + SENTRY_PSEL_WR, R->buf + SENTRY_PSEL_EX};
+            psel_present[0] = (uint8_t)have[1];
+            psel_present[1] = (uint8_t)have[2];
+            psel_present[2] = (uint8_t)have[3];
+            int maxreal = -1;
+            for (int s = 0; s < 3; s++) {
+                if (!psel_present[s]) continue;
+                memcpy(psel_save[s], win[s], 128); // stash the ORIGINAL virtual set
+                memset(win[s], 0, 128);            // rebuild it as the REAL set
+                for (uint32_t v = 0; v < nfds; v++) {
+                    if (!(psel_save[s][v >> 3] & (1u << (v & 7)))) continue;
+                    int r = vfd_real(p, (int)v);
+                    if (r < 0 || (uint32_t)r >= 1024u) continue; // unmapped/unrepresentable -> not selectable
+                    win[s][r >> 3] |= (uint8_t)(1u << (r & 7));
+                    if (r > maxreal) maxreal = r;
+                }
+            }
+            G_A0(&tmp) = (uint64_t)(maxreal + 1); // real nfds
+            break;
+        }
+        default:
+            if (fd_in_a0(snr)) {
+                int r = vfd_real(p, (int)(int64_t)G_A0(&tmp));
+                if (r < 0) eb = 1; else G_A0(&tmp) = (uint64_t)(int64_t)r;
+            }
+            break;
+        }
+        pthread_mutex_unlock(&g_fd_lock);
+        if (eb) { R->ret = -EBADF; R->nserved++; return; }
+        if (handled_local) { R->ret = local_ret; R->nserved++; return; }
+    }
+
     service_local(&tmp); // real host authority + container policy (touches only ring + private memory now)
     int64_t ret = (int64_t)G_RET(&tmp);
     R->ret = ret;
@@ -714,25 +994,67 @@ static void sentry_service_one(struct sentry_ring *R) {
         *(uint32_t *)(R->buf + 48) = *(uint32_t *)(ph + 48); // updated msg_flags
     }
 
-    // ---- P1 finding F: record every fd the sentry just handed THIS guest, so only such fds are
-    //      FDPASS-lendable; drop it on close. (g_ctl[]/stdio/non-guest host fds are never tracked.) ----
-    switch (snr) {
-    case 56: case 198: case 202: case 242: case 23: case 24: case 20: // openat/socket/accept*/dup*/epoll_create1
-        if (ret >= 0) sentry_fd_track((int)ret);
-        break;
-    case 25: // fcntl F_DUPFD(0) / F_DUPFD_CLOEXEC(1030) return a new fd
-        if ((G_A1(&tmp) == 0 || G_A1(&tmp) == 1030) && ret >= 0) sentry_fd_track((int)ret);
-        break;
-    case 59: case 199: // pipe2 / socketpair: the two new fds landed at buf[0..8)
-        if (ret == 0) { sentry_fd_track(*(int *)(R->buf)); sentry_fd_track(*(int *)(R->buf + 4)); }
-        break;
-    case 57: // close
-        if (ret == 0) sentry_fd_untrack((int)R->a[0]);
-        break;
-    case 212: // recvmsg: track any SCM_RIGHTS fds received in the (sentry-written) control window
-        if (ret >= 0 && coff) sentry_track_cmsg_fds(R->buf + coff, (size_t)*(uint64_t *)(R->buf + 40));
-        break;
-    default: break;
+    // ---- VIRTUALIZE newly-created fds (P1): every real fd service_local just produced is mapped to a fresh
+    //      per-process virtual fd, so the worker only ever sees virtual numbers. Also remap pselect's narrowed
+    //      result fd_sets back to the guest's virtual fd positions. (close drops its mapping on the IN-path;
+    //      dup3 is fully handled there.) ----
+    {
+        pthread_mutex_lock(&g_fd_lock);
+        struct sentry_proc *p = proc_lookup_locked((pid_t)R->wpid);
+        if (p) switch (snr) {
+        case 56: case 198: case 202: case 242: case 23: case 20: // openat/socket/accept*/dup/epoll_create1
+            if (ret >= 0) {
+                int v = vfd_alloc(p, (int)ret, 0);
+                if (v < 0) { close((int)ret); R->ret = -EMFILE; } else R->ret = v;
+            }
+            break;
+        case 25: // fcntl F_DUPFD(0)/F_DUPFD_CLOEXEC(1030): the result is a new real fd -> virtualize it,
+                 //   honoring the guest's minimum-fd hint (a2, a virtual lower bound)
+            if ((G_A1(&tmp) == 0 || G_A1(&tmp) == 1030) && ret >= 0) {
+                uint32_t minv = (uint32_t)R->a[2];
+                int v = vfd_alloc(p, (int)ret, minv < SENTRY_VFD_MAX ? minv : 0);
+                if (v < 0) { close((int)ret); R->ret = -EMFILE; } else R->ret = v;
+            }
+            break;
+        case 59: case 199: // pipe2 / socketpair: two real fds at buf[0..8) -> virtualize both in place
+            if (ret == 0) {
+                int r0 = *(int *)(R->buf), r1 = *(int *)(R->buf + 4);
+                int v0 = vfd_alloc(p, r0, 0), v1 = (v0 >= 0) ? vfd_alloc(p, r1, 0) : -1;
+                if (v0 < 0 || v1 < 0) {
+                    if (v0 >= 0) vfd_drop(p, v0);
+                    close(r0);
+                    close(r1);
+                    R->ret = -EMFILE;
+                } else {
+                    *(int *)(R->buf) = v0;
+                    *(int *)(R->buf + 4) = v1;
+                }
+            }
+            break;
+        case 212: // recvmsg: virtualize any SCM_RIGHTS real fds the sentry received in the control window
+            if (ret >= 0 && coff)
+                sentry_cmsg_translate_in(p, R->buf + coff, (size_t)*(uint64_t *)(R->buf + 40));
+            break;
+        case 72: // pselect6: remap the kernel-narrowed REAL fd_sets back to the guest's VIRTUAL fd positions
+            if (ret >= 0) {
+                uint8_t *win[3] = {R->buf + SENTRY_PSEL_RD, R->buf + SENTRY_PSEL_WR, R->buf + SENTRY_PSEL_EX};
+                for (int s = 0; s < 3; s++) {
+                    if (!psel_present[s]) continue;
+                    uint8_t out[128];
+                    memset(out, 0, sizeof out);
+                    for (uint32_t v = 0; v < psel_nfds; v++) {
+                        if (!(psel_save[s][v >> 3] & (1u << (v & 7)))) continue; // only originally-requested fds
+                        int r = vfd_real(p, (int)v);
+                        if (r < 0 || (uint32_t)r >= 1024u) continue;
+                        if (win[s][r >> 3] & (1u << (r & 7))) out[v >> 3] |= (uint8_t)(1u << (v & 7));
+                    }
+                    memcpy(win[s], out, 128); // worker copies the window -> guest fd_set
+                }
+            }
+            break;
+        default: break;
+        }
+        pthread_mutex_unlock(&g_fd_lock);
     }
     R->nserved++;
 }
@@ -841,7 +1163,12 @@ static void syscall_route(struct cpu *c) {
     // owner reaps the sentry FIRST (sentry_shutdown is owner-gated -> a forked child just releases its
     // lane). exit(93) ends only THIS THREAD: free its lane but DON'T tear the sentry down (siblings need it).
     if (nr == 93 || nr == 94) {
-        if (nr == 94) sentry_shutdown();
+        if (nr == 94) {
+            // exit_group ends the PROCESS. A forked CHILD worker releases its OWN sentry-side fd table (closing
+            // its inherited/owned real fds); the OWNER tears the whole sentry down (reclaiming everything).
+            if (getpid() != g_sentry_owner_pid) sentry_ctl_op(SENTRY_OP_EXIT, 0, 0);
+            sentry_shutdown();
+        }
         ring_release();
         service_local(c);
         return;
@@ -857,7 +1184,13 @@ static void syscall_route(struct cpu *c) {
         int is_thread = (nr == 220) ? ((G_A0(c) & 0x10000) != 0)
                                     : (G_A0(c) ? ((*(uint64_t *)G_A0(c) & 0x10000) != 0) : 0);
         service_local(c); // spawn_thread (CLONE_THREAD) or fork() -- both worker-local
-        if (getpid() != g_worker_pid) { sentry_fork_child(); return; } // we are the new child worker
+        if (getpid() != g_worker_pid) { // we are the new child worker
+            pid_t parent = g_worker_pid; // still the parent's pid until sentry_fork_child() rewrites it
+            sentry_fork_child();         // drop inherited lane, mint a fresh token + identity
+            // give this child its OWN sentry-side fd table: a dup-COPY of the parent's virtual->real map (P2)
+            sentry_ctl_op(SENTRY_OP_FORK, (uint64_t)(uint32_t)parent, (uint64_t)(uint32_t)g_worker_pid);
+            return;
+        }
         if (!is_thread && (int64_t)G_RET(c) > 0) atomic_fetch_add(&g_guest_children, 1); // parent: a child appeared
         return;
     }
@@ -889,8 +1222,9 @@ static void syscall_route(struct cpu *c) {
         struct sentry_ring *R = ring_for_thread();
         while (atomic_exchange_explicit(&R->busy, 1, memory_order_acquire)) sched_yield();
         int idx = t_ring;
+        R->wpid = (uint32_t)g_worker_pid; // select this process's table: the guest VFD is translated there
         R->rawnr = SENTRY_OP_FDPASS;
-        R->a[0] = (uint64_t)(uint32_t)(int)G_A4(c);
+        R->a[0] = (uint64_t)(uint32_t)(int)G_A4(c); // the guest's (virtual) mmap fd
         R->iovn = 0;
         for (int i = 0; i < 6; i++) R->redir[i] = -1;
         atomic_store_explicit(&R->turn, 1, memory_order_release);
@@ -919,6 +1253,7 @@ static void syscall_route(struct cpu *c) {
     // uncontended single TAS; overflow threads (sharing a lane) serialize here, preserving the SPSC
     // ping-pong on the shared ring. Held across the whole round-trip + the output copy-back.
     while (atomic_exchange_explicit(&R->busy, 1, memory_order_acquire)) sched_yield();
+    R->wpid = (uint32_t)g_worker_pid; // stamp the worker PROCESS: selects this guest's virtual fd table (P1/P2)
     R->rawnr = G_RAWNR(c);
     R->a[0] = G_A0(c);
     R->a[1] = G_A1(c);
@@ -1325,8 +1660,13 @@ static void syscall_route(struct cpu *c) {
         }
         break;
     // ---- multiplexing copy-back (item 3) ----
-    case 73: // ppoll: revents updated in place in the ring pollfd array
-        if (ret >= 0 && G_A0(c)) memcpy((void *)G_A0(c), R->buf, (uint32_t)R->a[1] * 8u);
+    case 73: // ppoll: copy back ONLY each entry's revents (+6, 2B). The sentry rewrote the ring pollfd.fd
+             //   fields to REAL fds for the kernel, so the guest's own pollfd.fd/events must be left untouched.
+        if (ret >= 0 && G_A0(c)) {
+            uint32_t nf = (uint32_t)R->a[1];
+            for (uint32_t k = 0; k < nf; k++)
+                memcpy((uint8_t *)G_A0(c) + (size_t)k * 8u + 6u, R->buf + (size_t)k * 8u + 6u, 2u);
+        }
         break;
     case 72: // pselect6: the three fd_sets were narrowed in place
         if (ret >= 0) {
@@ -1378,9 +1718,16 @@ static void syscall_route(struct cpu *c) {
 //    so it draws its own lane and never tears the shared sentry down. EXECVE stays local (it reloads the
 //    image in-process, keeping ring/sentry/confinement). WAIT4 reaps child WORKERS, short-circuits a
 //    wait-any with no guest children to -ECHILD (so it can't block on the hidden sentry child) and never
-//    surfaces the sentry's pid. exit_group reap is OWNER-GATED.  FOLLOW-UP: PER-PROCESS sentry fd tables --
-//    forked workers currently SHARE the sentry's fd table (correct for the fork+exec inherit pattern that
-//    sh/popen use, but two long-lived post-fork processes that independently mutate fds would alias).
+//    surfaces the sentry's pid. exit_group reap is OWNER-GATED.  PER-PROCESS VIRTUAL fd tables -- DONE: each
+//    worker process gets its OWN virtual fd namespace (struct sentry_proc, keyed by the request's R->wpid).
+//    Every fd the guest RECEIVES is virtualized on the way out and every fd it PASSES is translated
+//    virtual->real on the way in, so a guest fd can never name a sentry-internal fd (g_ctl[]/stdio/another
+//    guest's fd -> -EBADF). fork() gives the child its OWN table as a dup-COPY of the parent's map (Linux fd
+//    inheritance), and a forked child releases its table (closing its owned real fds) on exit -- so two
+//    long-lived post-fork processes no longer alias the shared sentry fd space.  FOLLOW-UP: the R->wpid stamp
+//    is worker-supplied, so cross-PROCESS fd isolation between two cooperating malicious workers is best-effort
+//    (still a strict improvement over the prior fully-shared table); bind the table to a fork-time secret if
+//    that threat matters. dup3 is serviced by a direct host fcntl() (skips the dup fscache-flush nicety).
 // 2. fs/net/proc forwarded set -- DONE this PR: sendmsg/recvmsg (211/212) with the full nested msghdr graph
 //    (msg_name + scatter/gather msg_iov + msg_control flattened to the ring, rebased by the sentry) and
 //    SCM_RIGHTS that "just works" -- a guest fd in the cmsg is ALREADY a sentry fd, so the control bytes
