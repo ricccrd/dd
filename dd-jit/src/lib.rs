@@ -52,31 +52,52 @@ impl Guest {
     /// LaunchAgent points `DDJIT_DIR` at `Contents/Resources`), then the path `build.rs` baked in at
     /// compile time (the dev/`cargo` layout). Returns `None` if neither exists.
     pub fn jit_path(self) -> Option<String> {
-        if let Ok(dir) = std::env::var("DDJIT_DIR") {
-            let cand = format!("{dir}/ddjit-{}", self.target());
-            if Path::new(&cand).exists() {
-                return Some(cand);
-            }
-        }
-        let p = match self {
-            Guest::LinuxAarch64 => env!("DDJIT_LINUX_AARCH64"),
-            Guest::LinuxX86_64 => env!("DDJIT_LINUX_X86_64"),
-            Guest::DarwinAarch64 => env!("DDJIT_DARWIN_AARCH64"),
-        };
-        if p.is_empty() { None } else { Some(p.to_string()) }
+        resolve_bundled(
+            &format!("ddjit-{}", self.target()),
+            match self {
+                Guest::LinuxAarch64 => env!("DDJIT_LINUX_AARCH64"),
+                Guest::LinuxX86_64 => env!("DDJIT_LINUX_X86_64"),
+                Guest::DarwinAarch64 => env!("DDJIT_DARWIN_AARCH64"),
+            },
+        )
     }
 
     /// Path to the darwinjail interposing dylib (DYLD_INSERT) that runs native macOS arm64 binaries in a
-    /// container. `DDJIT_DIR/darwinjail.dylib` (bundle) wins, else the build-time path. `None` if absent.
+    /// container. Resolved the same way as the engines (see `resolve_bundled`). `None` if absent.
     pub fn jail_dylib(&self) -> Option<String> {
-        if let Ok(dir) = std::env::var("DDJIT_DIR") {
-            let cand = format!("{dir}/darwinjail.dylib");
-            if Path::new(&cand).exists() {
-                return Some(cand);
-            }
+        resolve_bundled("darwinjail.dylib", env!("DDJAIL_DARWIN_AARCH64"))
+    }
+}
+
+/// Resolve a shipped artifact (a `ddjit-<target>` engine or `darwinjail.dylib`) from where the app
+/// actually puts it, falling back to the dev build path. Order:
+///   1. `$DDJIT_DIR` (set by the GUI + the daemon LaunchAgent),
+///   2. the directory of the running executable — the `.app` `Resources/`, where `ddcli`/`dd-daemon`
+///      sit beside the engines + dylib, so a terminal `ddcli` works with no env set,
+///   3. the installed bundle `/Applications/dd.app/Contents/Resources`,
+///   4. the `build.rs`-baked compile-time path (cargo/dev layout).
+/// Critically, every candidate is existence-checked — so a stale baked CI path is never returned.
+fn resolve_bundled(name: &str, baked: &str) -> Option<String> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(d) = std::env::var("DDJIT_DIR") {
+        dirs.push(std::path::PathBuf::from(d));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.to_path_buf());
         }
-        let p = env!("DDJAIL_DARWIN_AARCH64");
-        if p.is_empty() { None } else { Some(p.to_string()) }
+    }
+    dirs.push(std::path::PathBuf::from("/Applications/dd.app/Contents/Resources"));
+    for d in dirs {
+        let cand = d.join(name);
+        if cand.exists() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    if !baked.is_empty() && Path::new(baked).exists() {
+        Some(baked.to_string())
+    } else {
+        None
     }
 }
 

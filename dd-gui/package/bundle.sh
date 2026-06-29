@@ -50,11 +50,15 @@ sed "s/@VERSION@/$VERSION/g" "$ROOT/dd-gui/package/Info.plist.in" > "$C/Info.pli
 [ -f "$ROOT/assets/logo.png" ] && cp "$ROOT/assets/logo.png" "$RES/logo.png" || true # onboarding logo
 [ -d "$ROOT/assets/images" ] && cp -R "$ROOT/assets/images" "$RES/images" || true # bundled starter images (hello-dd)
 
-# JIT engines, copied next to the daemon (found at runtime via DDJIT_DIR=Resources).
+# JIT engines, copied next to the daemon (resolved at runtime next to the executable / via DDJIT_DIR).
 for t in linux_aarch64 linux_x86_64 darwin_aarch64; do
   f="$(find "$ROOT/target/release/build" -name "ddjit-$t" -type f 2>/dev/null | head -1)"
   if [ -n "$f" ]; then cp "$f" "$RES/ddjit-$t"; log "  + ddjit-$t"; else log "  ! ddjit-$t not built (skipping)"; fi
 done
+# darwinjail.dylib — the DYLD_INSERT jail dylib for `ddcli mac`; MUST ship next to the engines or
+# `ddcli mac` falls back to the build-time path and dyld can't find it on the user's machine.
+djf="$(find "$ROOT/target/release/build" -name "darwinjail.dylib" -type f 2>/dev/null | head -1)"
+if [ -n "$djf" ]; then cp "$djf" "$RES/darwinjail.dylib"; log "  + darwinjail.dylib"; else log "  ! darwinjail.dylib not built (skipping)"; fi
 
 # 3. Stage gdk-pixbuf loaders (png from gdk-pixbuf, svg from librsvg) with a RELATIVE cache.
 #    They live under Resources/ (NOT Frameworks/) so Frameworks stays a flat set of dylibs —
@@ -165,6 +169,7 @@ done
 for b in dd-daemon ddjit-linux_aarch64 ddjit-linux_x86_64 ddjit-darwin_aarch64; do
   [ -f "$RES/$b" ] && codesign -s "$SIGN_ID" $SIGN_FLAGS -f --entitlements "$ENT" "$RES/$b" >/dev/null 2>&1 || true
 done
+[ -f "$RES/darwinjail.dylib" ] && codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$RES/darwinjail.dylib" >/dev/null 2>&1 || true
 for cli in dd ddcli; do [ -f "$RES/$cli" ] && codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$RES/$cli" >/dev/null 2>&1 || true; done
 codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$MACOS/dd-app" >/dev/null 2>&1 || true
 codesign -s "$SIGN_ID" $SIGN_FLAGS -f "$APP" >/dev/null 2>&1 || true   # outermost signed last
