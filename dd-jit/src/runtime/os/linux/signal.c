@@ -12,6 +12,8 @@ static volatile uint64_t g_pending;
 // rt_sigqueueinfo extras carried to the handler's siginfo: si_code + si_value (consumed on delivery)
 static int g_sigcode[65];
 static uint64_t g_sigval[65];
+// synchronous-fault address carried to the handler's siginfo (si_addr; consumed on delivery, 0 for async)
+static uint64_t g_sigaddr[65];
 // sentinel lr: handler return -> sigreturn
 #define SIGRETURN_PC 0xFFFFFFFFFFF0ull
 
@@ -51,6 +53,11 @@ static void host_sigh(int sig) {
 // build_signal_frame + do_sigreturn are per-arch (the sigframe register layout) -> frontend/<arch>/sigframe.c
 static void build_signal_frame(struct cpu *c, int sig);
 static void do_sigreturn(struct cpu *c);
+// per-arch (the host<->guest register model differs): on a synchronous fault inside translated code,
+// reconstruct the guest register state from the host fault context (returns 1 iff the faulting host PC is
+// in the code cache), and steer the host context back into the dispatcher so a guest handler can run.
+static int sigframe_capture_fault(struct cpu *c, void *ucv);
+static void sigframe_resume_dispatch(struct cpu *c, void *ucv);
 static void maybe_deliver_signal(struct cpu *c) {
     uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
     for (int sig = 1; sig <= 64; sig++) {
@@ -99,6 +106,38 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     c->exited = 1;
     // fallback if raise returns / signo invalid on host
     c->exit_code = 128 + sig;
+}
+
+// A synchronous CPU fault (SIGSEGV/SIGBUS) taken inside translated code is the GUEST's own fault. If the
+// guest installed a handler for it, reconstruct the guest register state from the host fault context,
+// synthesize the Linux siginfo (si_addr = the guest fault address), queue the signal, and steer the host
+// context back into the dispatcher so the handler runs and sigreturn/siglongjmp resumes. Called from the
+// per-arch SIGSEGV/SIGBUS guard AFTER its own engine-managed fixups (non-PIE data-ref / SMC / lazy map)
+// decline. `hostsig` is the macOS signo; returns 1 iff the fault was routed to a guest handler.
+//
+// We deliberately do NOT build the guest sigframe here: this host handler runs on the faulting thread's
+// stack, which on the aarch64 frontend IS the guest stack (the block's host SP == guest SP), so writing the
+// frame inline would clobber the live handler stack. Instead we mark the signal pending and hand control
+// back to run_guest -- its maybe_deliver_signal builds the frame in the engine's own stack context (the
+// exact, already-tested async-delivery path). A synchronous fault cannot be ignored or masked, so force it
+// deliverable first.
+static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv) {
+    int sig = sig_m2l(hostsig);
+    if (sig < 1 || sig > 64 || !ucv) return 0;
+    // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
+    if (g_sigact[sig].handler <= 1) return 0;
+    struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
+    if (!c) return 0;
+    // Not a fault inside translated code -> a genuine engine fault; never mask it as a guest signal.
+    if (!sigframe_capture_fault(c, ucv)) return 0;
+    g_sigaddr[sig] = si ? (uint64_t)si->si_addr : 0;
+    // Linux si_code for a hardware fault: SIGBUS -> BUS_ADRERR(2), else SEGV_MAPERR(1).
+    g_sigcode[sig] = (sig == 7) ? 2 : 1;
+    c->sigmask &= ~(1ull << (sig - 1)); // a sync fault forces delivery even if the guest blocked it
+    c->reason = R_BRANCH;               // resume as a plain branch (no stale syscall/special-op handling)
+    __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+    sigframe_resume_dispatch(c, ucv);
+    return 1;
 }
 
 // Linux mmap flags -> macOS.

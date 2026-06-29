@@ -439,6 +439,11 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
         g_npend = 0;
         return;
     }
+    // A genuine guest fault (isolated wild pointer / null deref) with a registered handler is the guest's
+    // to handle; legitimate glibc vector over-reads are ADJACENT to a live mapping and still fall through
+    // to the lazy zero-page map below.
+    { void *fa = si ? si->si_addr : NULL; uintptr_t fpg = (uintptr_t)fa & ~(uintptr_t)0xFFF;
+      if (!(fa && !lazy_nofix() && lazy_neighbor_mapped(fpg)) && deliver_guest_fault(sig, si, uc)) return; }
     void *a = si ? si->si_addr : NULL;
     if (a) {
         uintptr_t pg = (uintptr_t)a & ~(uintptr_t)0xFFF;

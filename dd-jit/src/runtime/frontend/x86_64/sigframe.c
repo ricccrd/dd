@@ -31,8 +31,9 @@ static void build_signal_frame(struct cpu *c, int sig) {
     memcpy((void *)xs, c->v, sizeof c->v);                // preserve guest xmm across the handler
     *(int *)(info + 0) = sig;                             // siginfo.si_signo
     *(int *)(info + 8) = g_sigcode[sig];                  // si_code (SI_QUEUE for sigqueue, else 0)
+    *(uint64_t *)(info + 16) = g_sigaddr[sig];            // si_addr (synchronous fault address; 0 for async)
     *(uint64_t *)(info + 24) = g_sigval[sig];             // si_value
-    g_sigcode[sig] = 0; g_sigval[sig] = 0;                // consumed
+    g_sigcode[sig] = 0; g_sigval[sig] = 0; g_sigaddr[sig] = 0; // consumed
     uint64_t rsp = sp - 8;
     *(uint64_t *)rsp = SIGRETURN_PC; // pushed return address
     c->r[7] = (uint64_t)sig;
@@ -54,4 +55,26 @@ static void do_sigreturn(struct cpu *c) {
     c->nzcv = eflags_to_nzcv(*(uint64_t *)(mc + 17 * 8));
     c->sigmask = *(uint64_t *)(uc + 296);
     memcpy(c->v, (void *)xs, sizeof c->v);
+}
+
+// Synchronous-fault delivery support (driven by os/linux/signal.c's deliver_guest_fault; see the matching
+// frontend/aarch64/sigframe.c for the model). In a translated x86 block the 16 guest GPRs rax..r15 live in
+// host x0..x15 and xmm0..15 in host v0..v15, with cpu pinned in host x28. Reconstruct the guest GPR/xmm
+// state from the host fault context (the deferred-flag NZCV is left as last spilled). block_return
+// (frontend/x86_64/translate.c) unwinds the block back to the run_guest loop, which runs cpu->rip == handler.
+static int sigframe_capture_fault(struct cpu *c, void *ucv) {
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint64_t hpc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+    uint64_t lo = (uint64_t)g_cache + g_rw2rx, hi = lo + CACHE_SZ;
+    if (hpc < lo || hpc >= hi) return 0; // host PC outside the code cache -> a genuine engine fault
+    uint64_t *X = uc->uc_mcontext->__ss.__x;
+    for (int i = 0; i < 16; i++)
+        c->r[i] = X[i];                                   // rax..r15 == host x0..x15
+    memcpy(c->v, uc->uc_mcontext->__ns.__v, sizeof c->v); // xmm0..15 == host v0..v15
+    return 1;
+}
+static void sigframe_resume_dispatch(struct cpu *c, void *ucv) {
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uc->uc_mcontext->__ss.__x[28] = (uint64_t)c; // block_return reads &cpu from x28 (pinned through the block)
+    uc->uc_mcontext->__ss.__pc = (uint64_t)block_return;
 }
