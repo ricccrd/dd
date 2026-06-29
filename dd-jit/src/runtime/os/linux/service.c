@@ -201,6 +201,7 @@ static void service_local(struct cpu *c) {
         int fd = (int)a0;
         unsigned long rq = (unsigned long)a1;
         void *arg = (void *)a2;
+        static pid_t g_vfg = 0; // virtual controlling-tty foreground pgrp for guest job control
         switch (rq) {
         case 0x5401: {
             struct termios t;
@@ -283,21 +284,21 @@ static void service_local(struct cpu *c) {
         // it stays consistent with the value TIOCSPGRP installs below. For a non-tty fd (the piped,
         // non-interactive container path) fall back to getpgrp() exactly as before.
         case 0x540f: {
-            if (arg) {
-                pid_t fg = isatty(fd) ? tcgetpgrp(fd) : -1;
-                *(int *)arg = (int)(fg > 0 ? fg : getpgrp());
-            }
+            // tcgetpgrp: return the VIRTUAL foreground pgrp last stored by TIOCSPGRP, so bash reads back
+            // exactly what it set. The host pty's real fg group is the engine's pgid (the guest runs in-process
+            // under the engine, which login_tty made the session leader); it never matches a guest pgid, and
+            // that set/get mismatch is what made bash bail with "cannot set terminal process group".
+            if (arg) *(int *)arg = (int)(g_vfg > 0 ? g_vfg : getpgrp());
             G_RET(c) = 0;
             break;
         }
-        // TIOCSPGRP -- tcsetpgrp() (bash job control). A linux guest's process groups ARE real host pgids
-        // (the JIT forks real host processes), so when `fd` is a real controlling terminal we install the
-        // foreground group for real -> Ctrl-C / fg/bg actually work. We ALWAYS report success though: the
-        // guest's terminal fd is valid (login_tty), but even if a pgid can't be set we must not surface the
-        // EBADF/EPERM that makes bash print "cannot set terminal process group ...: Bad file descriptor"
-        // and "no job control in this shell".
+        // TIOCSPGRP -- tcsetpgrp() (bash job control). Store the guest's chosen foreground pgrp VIRTUALLY and
+        // report success. We deliberately do NOT push it to the host pty: a guest (Linux) pgid is not a valid
+        // foreground group for the macOS pty, and the engine must remain the pty's real fg group so the kernel
+        // keeps delivering Ctrl-C/Ctrl-Z to the engine (which forwards them to the guest). TIOCGPGRP reads this
+        // value back, so bash's set/get is self-consistent -> job control initializes cleanly, no warning.
         case 0x5410:
-            if (isatty(fd) && arg) { pid_t pg = *(int *)arg; if (pg > 0) (void)tcsetpgrp(fd, pg); }
+            if (arg) { pid_t pg = *(int *)arg; if (pg > 0) g_vfg = pg; }
             G_RET(c) = 0;
             break;
         // TIOCSCTTY -- acquire the controlling terminal for real when `fd` is a tty (best effort; the
@@ -2588,7 +2589,7 @@ static void service_local(struct cpu *c) {
         strcpy(u + 65, g_hostname[0] ? g_hostname : "jit");
         strcpy(u + 130, "6.1.0");
         strcpy(u + 195, "#1 jit");
-        strcpy(u + 260, "aarch64");
+        strcpy(u + 260, G_UNAME_MACHINE); // per guest ISA: "x86_64" on jit86, "aarch64" on the arm engine
         G_RET(c) = 0;
         break;
     }
