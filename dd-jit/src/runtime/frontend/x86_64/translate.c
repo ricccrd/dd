@@ -89,6 +89,12 @@ static void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already
 enum { FL_NONE, FL_SUB, FL_ADD, FL_LOGIC };
 static int g_fl_pending;
 
+// x86 direction flag (DF), tracked at translate time. Compilers/libc emit `std`/`cld` straight-line
+// around the string op they govern (e.g. runtime.memmove's backward `std; rep movsq; cld`), so the
+// flag is always block-local -- no runtime cpu state needed. Reset to 0 (forward) at each block entry;
+// `std` sets it, `cld` clears it, and the string-op lowering picks forward/backward stride accordingly.
+static int g_df;
+
 // opt3 kill-switch: NOLAZY=1 (any non-"0") reverts to the PR1 partial scheme (only sub/cmp defers;
 // add/logical materialize inline; no dead-flag elimination). Read once, cached.
 static int lazyflags_on(void) {
@@ -381,6 +387,7 @@ static void *translate_block(uint64_t gpc) {
     emit_prologue();
     void *body = g_cp;
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
+    g_df = 0;               // direction flag: forward at block entry (std/cld are block-local around string ops)
     g_fp_known = 0;         // x87: top unknown at block entry until a finit anchors it
     g_fp_dirty = 0;
     g_prof_xlate++; // PROF (measurement-only): translate_block calls
@@ -1050,8 +1057,9 @@ static void *translate_block(uint64_t gpc) {
                 //   - `lods` (its result is RAX = last element, not a bulk move),
                 //   - a segment override (I.seg) or 32-bit address size (I.addr32) -- the scalar
                 //     loop ignores both too, so behavior is identical, but stay conservative,
-                //   - DF=1: never reached here (the engine report_unimpl's `std`, so DF==0 always).
-                if (I.rep && !lods && !I.seg && !I.addr32 && (w == 1 || w == 2 || w == 4 || w == 8) &&
+                //   - DF=1 (g_df): the host helper only copies forward; the backward case takes the
+                //     per-element scalar loop below (decrementing stride) which matches x86 exactly.
+                if (I.rep && !lods && !I.seg && !I.addr32 && !g_df && (w == 1 || w == 2 || w == 4 || w == 8) &&
                     !norep_disabled()) {
                     int shift = w == 1 ? 0 : w == 2 ? 1 : w == 4 ? 2 : 3;
                     emit_rep_string(movs, w, shift);
@@ -1064,17 +1072,19 @@ static void *translate_block(uint64_t gpc) {
                     cbz = (uint32_t *)g_cp;
                     emit32(0);
                 } // cbz RCX,done
+                // DF: forward (g_df==0) advances pointers by +w; backward (std) by -w.
+                void (*e_step)(int, int, unsigned, int) = g_df ? e_subi : e_addi;
                 if (movs) {
                     e_load(w, 16, RSI);
                     e_store(w, 16, RDI);
-                    e_addi(RSI, RSI, w, 1);
-                    e_addi(RDI, RDI, w, 1);
+                    e_step(RSI, RSI, w, 1);
+                    e_step(RDI, RDI, w, 1);
                 } else if (lods) {
                     e_load(w, RAX, RSI);
-                    e_addi(RSI, RSI, w, 1);
+                    e_step(RSI, RSI, w, 1);
                 } else {
                     e_store(w, RAX, RDI);
-                    e_addi(RDI, RDI, w, 1);
+                    e_step(RDI, RDI, w, 1);
                 } // stos
                 if (I.rep) {
                     e_subi(RCX, RCX, 1, 1);
@@ -1091,6 +1101,10 @@ static void *translate_block(uint64_t gpc) {
             // bit-exact RCX/RSI/RDI + ZF/SF/CF/OF end-state, fast host memcmp/memchr inside (gate NOREPCMP
             // for the naive per-element oracle loop). Descriptor (width | isscas | isrepne | isrep) -> cpu->divop.
             if (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF) {
+                if (g_df) { // do_repstr() only scans forward; backward cmps/scas isn't emitted by real code
+                    report_unimpl(gpc, &I);
+                    break;
+                }
                 int w = (op & 1) ? I.opsize : 1;
                 int isscas = (op == 0xAE || op == 0xAF);
                 int isrep = (I.rep || I.repne);
@@ -1102,13 +1116,15 @@ static void *translate_block(uint64_t gpc) {
                 break;                           // block ends here (helper runs, dispatcher continues)
             }
             if (op == 0xFC) {
+                g_df = 0; // cld: forward string ops
                 gpc = next;
                 continue;
-            } // cld (DF=0): we assume forward already
+            }
             if (op == 0xFD) {
-                report_unimpl(gpc, &I);
-                break;
-            } // std (DF=1): backward string ops -> TODO
+                g_df = 1; // std: backward string ops (consumed at translate time by the lowering below)
+                gpc = next;
+                continue;
+            }
             // ---- jmp rel (E9/EB) ----
             if (op == 0xE9 || op == 0xEB) {
                 uint64_t tgt = next + (uint64_t)I.imm;
@@ -2373,25 +2389,60 @@ static void *translate_block(uint64_t gpc) {
                 int mem;
                 int rmv = rm_load(&I, next, I.opsize, &mem);
                 int cnt = I.rep;  // F3 -> tzcnt/lzcnt (counts; src==0 -> opsize, the ARM CLZ result naturally)
+                // The destination write below clobbers the source register when dest==src (e.g.
+                // `bsf %edx,%edx` -- exactly the form Go's bytealg.IndexByteString emits). The flag
+                // computation below reads the source AFTER that write, so without this guard the x86
+                // ZF/CF would reflect the RESULT, not the source -> a no-match bsf wrongly clears ZF and
+                // the caller mis-reads a hit. Preserve the source in a scratch (x23) so flags stay correct.
+                int src = rmv;
+                if (!mem && I.reg == rmv) {
+                    e_mov_rr(23, rmv, sf);
+                    src = 23;
+                }
                 if (op == 0xBC) { // tzcnt / bsf: trailing zeros = RBIT+CLZ (same value; src==0 -> opsize)
-                    e_rbit(I.reg, rmv, sf);
+                    e_rbit(I.reg, src, sf);
                     e_clz(I.reg, I.reg, sf);
                 } else if (cnt) { // lzcnt: leading zeros = CLZ
-                    e_clz(I.reg, rmv, sf);
+                    e_clz(I.reg, src, sf);
                 } else { // bsr: (w-1) - clz
-                    e_clz(16, rmv, sf);
+                    e_clz(16, src, sf);
                     e_movconst(19, sf ? 63 : 31);
                     e_rrr(A_SUB, I.reg, 19, 16, sf, 0);
                 }
                 if (cnt) { // tzcnt/lzcnt: x86 CF = (src==0), ZF = (result==0)
-                    e_rrr(A_SUBS, 31, rmv, 31, sf, 0);
+                    e_rrr(A_SUBS, 31, src, 31, sf, 0);
                     e_cset(19, 0 /*EQ*/, sf);               // x19 = (src==0) = x86 CF
                     e_rrr(A_ANDS, 31, I.reg, I.reg, sf, 0); // live N/Z from the result
                     e_nzcv_save_setcf(19);                  // store N/Z, stored C = NOT(src==0)
                 } else {                                    // bsf/bsr: ZF = (src==0)
-                    e_rrr(A_ANDS, 31, rmv, rmv, sf, 0);
+                    e_rrr(A_ANDS, 31, src, src, sf, 0);
                     e_nzcv_save();
                 }
+                gpc = next;
+                continue;
+            }
+            // popcnt (F3 0F B8): dest = popcount(src). x86 sets ZF=(src==0) and clears CF/OF/SF/AF/PF.
+            // (Without F3, 0F B8 is the reserved JMPE -> falls through to report_unimpl.)
+            if (op == 0xB8 && I.rep) {
+                int mem;
+                int rmv = rm_load(&I, next, I.opsize, &mem);
+                // dest==src (e.g. `popcnt %rax,%rax`): the result write clobbers the source before the
+                // ZF computation reads it, so preserve the source in a scratch first (mirrors bsf above).
+                int src = rmv;
+                if (!mem && I.reg == rmv) {
+                    e_mov_rr(23, rmv, sf);
+                    src = 23;
+                }
+                // NEON popcount: move src into scratch v16 (upper lanes zeroed), per-byte CNT, sum via ADDV.
+                if (sf)
+                    e_fmov_to_d(16, src); // fmov d16, x[src]  (zeroes bits[64:128])
+                else
+                    e_fmov_to_s(16, src);             // fmov s16, w[src] (zeroes bits[32:128])
+                emit32(0x0E205800u | (16 << 5) | 16); // cnt v16.8b, v16.8b  (per-byte popcount)
+                emit32(0x0E31B800u | (16 << 5) | 16); // addv b16, v16.8b    (sum the 8 byte counts -> 0..64)
+                e_fmov_from_s(I.reg, 16);             // dest = count; the W-write zero-extends (correct for both widths)
+                e_rrr(A_ANDS, 31, src, src, sf, 0);   // N/Z from the source: ZF = (src == 0)
+                e_nzcv_save_c1();                     // store N/Z, force x86 CF=0/OF=0
                 gpc = next;
                 continue;
             }
