@@ -36,7 +36,7 @@
 #include <stdatomic.h>
 
 #include "../include/cpu_aarch64.h"
-#include "../frontend/aarch64/abi.h"   // the cpu interface os/linux/ is written against
+#include "../frontend/aarch64/abi.h"       // the cpu interface os/linux/ is written against
 #include "../frontend/aarch64/fill_stat.c" // the per-arch struct-stat layout os/linux/ fills
 
 // container/ns config state + parsers (early globals)
@@ -194,13 +194,13 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         if (nn && nn[0] && !g_netns[0]) {
             snprintf(g_netns, sizeof g_netns, "/tmp/.ddnet-%.40s", nn);
             mkdir(g_netns, 0700);
-        // private loopback ns
+            // private loopback ns
         }
         const char *eu = getenv("DD_UID");
         if (eu && g_uid < 0) g_uid = atoi(eu);
         const char *eg = getenv("DD_GID");
         if (eg && g_gid < 0) g_gid = atoi(eg);
-    // USER ns (process.user)
+        // USER ns (process.user)
     }
     if (getenv("CRASHDBG")) {
         // SA_ONSTACK + an alternate signal stack so the handler survives a corrupted/overflowed guest
@@ -215,6 +215,16 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGBUS, &sa, NULL);
         install_mach_exc();
+    } else {
+        // Normal runs: serve a non-PIE ET_EXEC's absolute DATA refs (baked at the low link vaddr) at +bias
+        // and resume. Inert for PIE/static-PIE (nonpie_guard checks g_nonpie_lo, set only for ET_EXEC by
+        // load_elf below); a fault it doesn't own re-raises with the default action.
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = nonpie_guard;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
     }
     if (rootfs && rootfs[0]) {
         g_rootfs = (char *)rootfs;
@@ -309,8 +319,8 @@ int jit_run(const char *rootfs, int argc, char *const argv[]) {
 
     g_trace = getenv("JT") != NULL;
     g_prof = getenv("PROF") != NULL;
-    g_ibprof = getenv("IBPROF") != NULL; // ARM-B1 feasibility: indirect-branch traffic + stability log
-    g_vdbetrace = getenv("VDBETRACE") != NULL; // ARM-B1 prototype: VDBE dispatch threading PoC
+    g_ibprof = getenv("IBPROF") != NULL;          // ARM-B1 feasibility: indirect-branch traffic + stability log
+    g_vdbetrace = getenv("VDBETRACE") != NULL;    // ARM-B1 prototype: VDBE dispatch threading PoC
     g_vt_hitcount = getenv("VTHITCOUNT") != NULL; // ARM-B1: inline SDC guard-hit counter (diagnostic)
     // A1: steal host x16/x17 for the engine (default on). NOSTEAL1617=1 -> legacy 3-reg stolen set
     // (guest x16/x17 in host regs, per-branch red-zone stash/restore). Read once before any translation.
@@ -408,20 +418,17 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[ai], "--lower") && ai + 1 < argc) {
             add_lower(argv[ai + 1]);
             ai += 2;
-        // ro overlay lower layer
-        }
-        else if (!strcmp(argv[ai], "--netns") && ai + 1 < argc) {
+            // ro overlay lower layer
+        } else if (!strcmp(argv[ai], "--netns") && ai + 1 < argc) {
             snprintf(g_netns, sizeof g_netns, "/tmp/.ddnet-%.40s", argv[ai + 1]);
             mkdir(g_netns, 0700);
             ai += 2;
-        // private loopback ns
-        }
-        else if (!strcmp(argv[ai], "--uid") && ai + 1 < argc) {
+            // private loopback ns
+        } else if (!strcmp(argv[ai], "--uid") && ai + 1 < argc) {
             g_uid = atoi(argv[ai + 1]);
             ai += 2;
-        // USER ns uid
-        }
-        else if (!strcmp(argv[ai], "--gid") && ai + 1 < argc) {
+            // USER ns uid
+        } else if (!strcmp(argv[ai], "--gid") && ai + 1 < argc) {
             g_gid = atoi(argv[ai + 1]);
             ai += 2;
         } else
