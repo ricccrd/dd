@@ -290,3 +290,61 @@ green after every step. No behavior change in any step.
 Stop after step 7 for the "isolate collisions" goal; step 8 is the long-horizon convergence.
 Steps 0 + 3 + 4 (entrypoint + launch + domain renames) are the "dead-clean naming" win and
 are the safest to do first — they change no behavior, only make the tree say what it does.
+
+The full final layout (every file) + the per-step move-map is in `TREE.md`.
+
+## How NOT to enter bug hell (this is a live, baked-offset JIT)
+
+The danger isn't the logic — it's that emitted machine code bakes `struct cpu` offsets and the
+unity build resolves everything by `#include` ORDER. A move can compile clean and miscompile
+the *guest*. Rules that keep every step boring:
+
+| risk | guard |
+|---|---|
+| **a "pure move" silently changes codegen** | classify each step **STRUCTURAL** (no behavior) vs **BEHAVIORAL**. STRUCTURAL steps (0,3,4,5,6) must produce a **byte-identical engine binary** — verify with the diff below, not just a green matrix. |
+| **baked offsets drift** | the `_Static_assert(offsetof==OFF_*)` (step 1) goes in BEFORE any struct touches; a wrong offset then fails the *build*. |
+| **include-order / forward-ref breakage** (unity TU) | only `targets/*.c` change includes; never reorder within a step. `.clang-format` has `SortIncludes:false` — keep it; never let a tool reorder includes. |
+| **one commit changes two things** | one mechanical change per commit, each independently revertable → `git bisect` lands on the exact culprit. Never bundle a rename with an edit. |
+| **a regression hides until a specific guest** | run the FULL matrix (`make test`) between steps, not a subset; add the differential oracle (below) for codegen-identity. |
+| **concurrency regressions** (cache/IBTC) | run the threaded scenarios (`make test-realsw`, redis/postgres) — single-thread green hides STW/IBTC races. |
+
+**Byte-identity check for STRUCTURAL steps** (the strongest safety net):
+```
+clang -O2 -E targets/<t>.c | clang -O2 -x c - -S -o before.s   # preprocessed → asm, before
+# … do the git mv + include-path fix …
+clang -O2 -E targets/<t>.c | clang -O2 -x c - -S -o after.s    # after
+diff before.s after.s      # MUST be empty for a pure rename/move
+```
+If `diff` is non-empty, the "pure move" wasn't pure — stop and find what leaked. Behavioral
+steps (2 split-by-family, 7 split-by-class) can't be byte-identical, so they rely on the
+matrix + the per-syscall/per-opcode coverage tool (`make coverage`).
+
+**Phase order rationale:** do the zero-behavior steps first (0,1,3,4,5,6 — names/moves/asserts)
+so the tree is clean and stable BEFORE the behavioral splits (2,7), and leave the
+register-model dedup (8) for last. Never refactor a file in the same week someone is fixing a
+bug in it (the owner pushes x86 `translate.c` upstream — coordinate step 7 around that).
+
+## Static analysis & bug-finding tooling
+
+The build is plain `clang -O2`, no warnings/sanitizers/analysis today. High-leverage adds,
+roughly in order of value for THIS codebase:
+
+| tool | finds | notes for a unity-build JIT |
+|---|---|---|
+| **`-Wall -Wextra -Wshadow -Wconversion`** | shadowed vars, implicit narrowing (the `atoi`/offset bugs), unused | cheapest win; turn on in `build.rs`, fix or `-Wno-` per case |
+| **UBSan** (`-fsanitize=undefined`) | signed overflow, OOB shifts, misaligned loads, bad enum — rife in bit-twiddling emitters | instruments the ENGINE C only (not JITed guest code); run the matrix under it |
+| **ASan** (`-fsanitize=address`) | heap/stack OOB, UAF in cache/loader/parsers | works with MAP_JIT; **cannot** instrument the guest's own memory — still catches engine bugs |
+| **TSan** (`-fsanitize=thread`) | data races in the cache / IBTC / STW flush (the threaded hazards the code comments worry about) | run `make test-realsw` (redis/postgres = real threads) under it |
+| **clang static analyzer** (`scan-build`) | null deref, leaks, dead stores, uninit reads — across the whole TU | works great on unity TUs (one big TU = whole-program view) |
+| **`cppcheck --enable=all`** | buffer caps, `strtok` misuse, format strings | fast, no build; good for the parsers (the validation gaps) |
+| **`semgrep`** (custom rules) | **enforce the boundaries**: ban `translate/x86_64` ↦ `translate/aarch64` includes; ban `atoi` in config parsers; require `DD_*`/`DDJIT_*` prefixes | turns the ownership rules into CI gates |
+| **the existing oracle** | guest correctness vs real CPU/OS | `make test` (cross-engine matrix), `make coverage` (syscall/opcode gaps), the QEMU/Docker differential oracle — already the primary net; keep it the gate |
+
+What does NOT help here: **valgrind** (can't cope with MAP_JIT self-modifying code on macOS),
+and **IWYU / include-sorting** (would break the load-bearing unity include order — keep
+`SortIncludes:false`). Sanitizers can't see *guest* memory (it's the guest's, not malloc'd by
+us); the differential oracle remains the only check for translation correctness.
+
+Recommended baseline: a `make analyze` that runs `scan-build` + `cppcheck` + a UBSan/ASan
+matrix run, plus a `semgrep` boundary-rule gate in CI. Add the boundary rules WITH the renames
+(steps 3–4) so the new structure can't silently rot.
