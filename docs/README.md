@@ -20,10 +20,23 @@ website lives under `website/docs/`).
 - [architecture/OPTIMIZATIONS.md](architecture/OPTIMIZATIONS.md) — engine-internal optimization design (chaining, IBTC, §B, register-stealing).
 - [PERFORMANCE.md](PERFORMANCE.md) — developer-facing perf defaults & knobs.
 
-## Design subplans
+## Design & mechanism references
 
-- [design/](design/) — per-topic subplans + gated bit-exact diffs (arm-a1/a3/b1 SQLite levers, sentry-security, netstack, x86-perf, engine-dedup, fix-postgres, test-coverage).
-- [ideas/](ideas/) — forward-looking, not-yet-built: [RENDERING.md](ideas/RENDERING.md) + [RENDERING_PLAN.md](ideas/RENDERING_PLAN.md) (GUI display layer).
+`design/` documents **how implemented mechanisms work** — read the relevant one *before*
+touching that area so you don't reintroduce a fixed bug or break an invariant. These are
+**reference docs for SHIPPED behavior, not pending work** — pending work lives only in
+[PLAN.md](PLAN.md). (Don't treat a "we should…" sentence here as a TODO; it's history.)
+
+- [design/nonpie-pagezero.md](design/nonpie-pagezero.md) — **`__PAGEZERO` / non-PIE guest_base bias-fold** (SHIPPED). Why non-PIE `ET_EXEC` is mapped high + per-access biased, the strict `[lo,hi)` span-gate, and the permanent platform limitation. **Read before touching the non-PIE path in `translate.c`/`elf.c`** — this is the highest future-conflict area.
+- [design/DIAGNOSIS.md](design/DIAGNOSIS.md) — root-cause + invariants of the original jit86 (x86_64) codegen bugs (SHIPPED reference).
+- [design/sentry-split.md](design/sentry-split.md) — the untrusted-guest sentry split design (SHIPPED).
+- [design/fix-nonpie-crash.md](design/fix-nonpie-crash.md) — a **rejected** non-PIE approach + why it fails (so it isn't retried).
+- [design/w6a-deepbugs.md](design/w6a-deepbugs.md), [design/w6b-sentry.md](design/w6b-sentry.md) — deep-bug cluster + sentry PoC notes (SHIPPED).
+- other subplans (some still forward-looking): arm-a1/a3/b1 SQLite levers, sentry-security, netstack, x86-perf, engine-dedup, fix-postgres, test-coverage.
+
+## Ideas (not yet built)
+
+- [ideas/](ideas/) — [RENDERING.md](ideas/RENDERING.md) + [RENDERING_PLAN.md](ideas/RENDERING_PLAN.md) (GUI display layer).
 
 ## Testing
 
