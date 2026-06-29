@@ -28,6 +28,17 @@ static void oc_reset(void);
 // symlink is stat'd/removed as the link itself rather than its target.
 static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int nofollow) {
     if (!raw) return raw;
+    // POSIX shm + named semaphores: glibc backs both with files under /dev/shm (shm_open -> /dev/shm/<name>,
+    // sem_open -> /dev/shm/sem.<name>). The rootfs has no tmpfs, so route EVERY op (open/link/unlink/stat/
+    // rename) at a stable host file -- the SAME mapping the open(2) handler uses (case 56) -- so glibc's
+    // multi-step named-sem create (temp file + link to the final name) and sem_unlink all resolve together.
+    if (raw[0] == '/' && !strncmp(raw, "/dev/shm/", 9)) {
+        int m = snprintf(buf, n, "/tmp/.ddshm-%s", raw + 9);
+        if (m > (int)n - 1) m = (int)n - 1;
+        for (int i = 12; i < m; i++)
+            if (buf[i] == '/') buf[i] = '_';
+        return buf;
+    }
     // absolute -> rootfs-relative + confine (final component followed unless nofollow)
     if (raw[0] == '/') {
         // S2: serve the memoized host path (only when a rootfs is configured -- without one the

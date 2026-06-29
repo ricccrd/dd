@@ -59,6 +59,100 @@ static void service_local(struct cpu *c); // fwd: the canonical syscall switch (
 static inline uint64_t nonpie_p(uint64_t a) {
     return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
 }
+// adjtimex/clock_adjtime read-only query: macOS has no adjtimex, so report an OK-but-unsynchronised
+// kernel clock and fill the Linux struct timex the caller passed. Setting the clock (modes != 0) needs
+// CAP_SYS_TIME, which the container lacks -> EPERM (mirrors clock_settime). Returns the clock state
+// (TIME_OK) or a negative errno. Offsets match the LP64 Linux struct timex.
+static int svc_adjtimex(uint8_t *tx) {
+    if (!tx) return -EFAULT;
+    uint32_t modes = *(uint32_t *)(tx + 0);
+    if (modes != 0) return -EPERM; // any clock-adjusting call -> EPERM (no CAP_SYS_TIME)
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    *(int64_t *)(tx + 8) = 0;          // offset (us)
+    *(int64_t *)(tx + 16) = 0;         // freq (scaled ppm)
+    *(int64_t *)(tx + 24) = 16384;     // maxerror (us)
+    *(int64_t *)(tx + 32) = 16384;     // esterror (us)
+    *(int32_t *)(tx + 40) = 0x0040;    // status = STA_UNSYNC
+    *(int64_t *)(tx + 48) = 2;         // constant
+    *(int64_t *)(tx + 56) = 1;         // precision (us)
+    *(int64_t *)(tx + 64) = 32768000;  // tolerance (default)
+    *(int64_t *)(tx + 72) = now.tv_sec;
+    *(int64_t *)(tx + 80) = now.tv_usec;
+    *(int64_t *)(tx + 88) = 10000;     // tick (us)
+    return 0;                          // TIME_OK
+}
+// pidfd support: macOS has no pidfd, so pidfd_open() hands back a real (/dev/null) fd and we remember
+// which guest pid it stands for, so pidfd_send_signal() can resolve the fd back to its target pid.
+#define PIDFD_MAX 64
+static struct {
+    int fd;
+    pid_t pid;
+} g_pidfd[PIDFD_MAX];
+static void pidfd_register(int fd, pid_t pid) {
+    for (int i = 0; i < PIDFD_MAX; i++)
+        if (g_pidfd[i].fd == 0 || g_pidfd[i].fd == fd) {
+            g_pidfd[i].fd = fd;
+            g_pidfd[i].pid = pid;
+            return;
+        }
+}
+static int pidfd_lookup(int fd, pid_t *pid) {
+    for (int i = 0; i < PIDFD_MAX; i++)
+        if (g_pidfd[i].fd == fd) {
+            *pid = g_pidfd[i].pid;
+            return 0;
+        }
+    return -1;
+}
+// POSIX message queues (mq_*): macOS has no POSIX mqueue, so emulate an in-process named priority queue.
+// Each queue keeps messages highest-priority-first (FIFO within a priority); descriptors are real
+// (/dev/null-backed) fds so close()/poll() stay valid, with an fd->queue table to map them back. This
+// covers single-process producers/consumers; it is not shared across fork and does not block (full/empty
+// return EAGAIN), which is sufficient for the queue depths POSIX mqueue programs exercise here.
+#define MQ_MAXQ 16
+#define MQ_MAXMSG 64
+struct mq_qmsg {
+    unsigned prio;
+    size_t len;
+    char *data;
+};
+struct mq_queue {
+    int used, unlinked, refs, n;
+    char name[80];
+    long maxmsg, msgsize;
+    struct mq_qmsg msg[MQ_MAXMSG];
+};
+static struct mq_queue g_mqq[MQ_MAXQ];
+static struct {
+    int fd, qi;
+} g_mqfd[64];
+static int mq_find(const char *name) {
+    for (int i = 0; i < MQ_MAXQ; i++)
+        if (g_mqq[i].used && !g_mqq[i].unlinked && !strcmp(g_mqq[i].name, name)) return i;
+    return -1;
+}
+static int mq_qof(int fd) {
+    for (int i = 0; i < 64; i++)
+        if (g_mqfd[i].fd == fd) return g_mqfd[i].qi;
+    return -1;
+}
+static void mq_bind(int fd, int qi) {
+    for (int i = 0; i < 64; i++)
+        if (g_mqfd[i].fd == 0 || g_mqfd[i].fd == fd) {
+            g_mqfd[i].fd = fd;
+            g_mqfd[i].qi = qi;
+            return;
+        }
+}
+static void mq_maybe_free(int qi) {
+    struct mq_queue *q = &g_mqq[qi];
+    if (q->refs <= 0 && q->unlinked) {
+        for (int j = 0; j < q->n; j++)
+            free(q->msg[j].data);
+        memset(q, 0, sizeof *q);
+    }
+}
 static void service(struct cpu *c) {
     if (__builtin_expect(g_untrusted, 0)) {
         syscall_route(c);
@@ -783,6 +877,14 @@ static void service_local(struct cpu *c) {
         break;
         // fchown(fd,uid,gid) -- best-effort
     }
+    // openat2(dirfd, path, open_how*, size): unpack open_how { u64 flags; u64 mode; u64 resolve; } into
+    // the openat arg positions, then share the full openat path (O_* xlate, overlay, jail). The RESOLVE_*
+    // restriction flags are advisory here -- the rootfs jail already confines every resolution.
+    case 437: {
+        uint64_t *how = (uint64_t *)a2;
+        a2 = how ? how[0] : 0; // open_how.flags -> openat flags
+        a3 = how ? how[1] : 0; // open_how.mode  -> openat mode
+    } /* fall through to openat */
     case 56: {
         // openat -- Linux O_* -> macOS O_* (they differ!)
         int lf = (int)a2, mf = lf & 0x3;
@@ -1254,6 +1356,14 @@ static void service_local(struct cpu *c) {
         G_RET(c) = 0;
         // sync
         break;
+    // syncfs(fd): no macOS syncfs -> flush this fd then sync the system. RAM-backed scratch is a no-op.
+    case 267:
+        if (!memf_get((int)a0)) {
+            fsync((int)a0);
+            sync();
+        }
+        G_RET(c) = 0;
+        break;
     // utimensat(dirfd, path, times, flags)
     case 88: {
         struct timespec *ts = (struct timespec *)a2;
@@ -1300,15 +1410,16 @@ static void service_local(struct cpu *c) {
         struct stat s;
         // statx(dfd, path, flags, mask, buf)
         char pb[4200];
-        const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, 0);
+        int nofollow = (a2 & 0x100); // AT_SYMLINK_NOFOLLOW: stat the link itself, don't dereference
+        const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, nofollow);
         int rc, empty = (raw && !raw[0] && (a2 & 0x1000));
         const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
         if (synth_stat_raw(gp, &s)) {
             rc = 0;
             // synth /proc or /sys -> fill from s below
         }
-        // cacheable
-        else if (raw && raw[0] && !empty) {
+        // cacheable (only the follow case -- the path cache doesn't distinguish follow vs nofollow)
+        else if (raw && raw[0] && !empty && !nofollow) {
             if (!mc_lookup(p, &rc, &s)) {
                 int rr = fstatat(ATFD(a0), p, &s, 0);
                 rc = rr < 0 ? -errno : 0;
@@ -1317,7 +1428,7 @@ static void service_local(struct cpu *c) {
         } else {
             int rr = (empty && memf_get((int)a0)) ? memf_fstat((int)a0, &s)
                      : empty                      ? fstat((int)a0, &s)
-                                                  : fstatat(ATFD(a0), p, &s, 0);
+                                                  : fstatat(ATFD(a0), p, &s, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
             rc = rr < 0 ? -errno : 0;
         }
         if (rc < 0) {
@@ -1351,14 +1462,46 @@ static void service_local(struct cpu *c) {
         G_RET(c) = 0;
         break;
     }
-    // openat2(dirfd, path, open_how*, size) -- glibc uses it; MUST confine
-    case 437: {
-        //   open_how { u64 flags; u64 mode; u64 resolve; }
-        uint64_t *how = (uint64_t *)a2;
-        a2 = how ? how[0] : 0;
-        // -> openat(dirfd, path, flags, mode); resolve flags ignored (jail confines)
-        a3 = how ? how[1] : 0;
-    } /* fall through to openat */
+    // name_to_handle_at(dfd, path, file_handle*, mount_id*, flags): macOS has no FS file handles, so
+    // synthesize a stable 16-byte handle from st_dev+st_ino (round-trips file identity). file_handle is
+    // { u32 handle_bytes; i32 handle_type; u8 f_handle[]; }; handle_bytes is the buffer size on input
+    // and is rewritten to the produced size (-EOVERFLOW if the caller's buffer is too small).
+    case 264: {
+        uint8_t *fh = (uint8_t *)a2;
+        if (!fh) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        int empty = (a4 & 0x1000);     // AT_EMPTY_PATH
+        int nofollow = !(a4 & 0x400);  // default: don't dereference the final symlink (AT_SYMLINK_FOLLOW=0x400)
+        struct stat s;
+        char pb[4200];
+        int rr;
+        if (empty && memf_get((int)a0)) rr = memf_fstat((int)a0, &s);
+        else if (empty) rr = fstat((int)a0, &s);
+        else {
+            const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, nofollow);
+            rr = fstatat(ATFD(a0), p, &s, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+        }
+        if (rr < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        const uint32_t need = 16; // dev(8) + ino(8)
+        if (*(uint32_t *)(fh + 0) < need) {
+            *(uint32_t *)(fh + 0) = need;
+            G_RET(c) = (uint64_t)(int64_t)(-EOVERFLOW);
+            break;
+        }
+        uint64_t dev = (uint64_t)s.st_dev, ino = (uint64_t)s.st_ino;
+        *(uint32_t *)(fh + 0) = need; // handle_bytes
+        *(int32_t *)(fh + 4) = 1;     // handle_type (stable, arbitrary)
+        memcpy(fh + 8, &dev, 8);
+        memcpy(fh + 16, &ino, 8);
+        if (a3) *(int *)a3 = (int)s.st_dev; // mount_id
+        G_RET(c) = 0;
+        break;
+    }
     // faccessat2(dirfd,path,mode,flags) -- glibc access() uses it; same path/confinement, flags ignored
     case 439:
     case 48: {
@@ -1834,8 +1977,12 @@ static void service_local(struct cpu *c) {
     }
     case 199: {
         int sv[2];
-        // socketpair (translate Linux domain -> macOS)
-        int r = socketpair(af_l2m((int)a0), (int)a1 & 0xf, (int)a2, sv);
+        // socketpair (translate Linux domain -> macOS). macOS AF_UNIX has no SOCK_SEQPACKET socketpair;
+        // emulate it with SOCK_DGRAM, which over a local AF_UNIX pair is reliable, ordered, and preserves
+        // message boundaries -- exactly the SEQPACKET guarantees the guest relies on.
+        int lty = (int)a1 & 0xf;
+        int hty = (lty == SOCK_SEQPACKET) ? SOCK_DGRAM : lty;
+        int r = socketpair(af_l2m((int)a0), hty, (int)a2, sv);
         if (r == 0) {
             // SO_NOSIGPIPE on both ends so a write/send to a peer-closed pair returns EPIPE, never a
             // fatal SIGPIPE (matches Linux EPIPE-to-guest behaviour). See case 198 for the rationale.
@@ -2220,6 +2367,25 @@ static void service_local(struct cpu *c) {
     // getsockopt(fd, level, optname, val, len)
     case 209: {
         int lvl = (int)a1, opt = (int)a2;
+        // SO_PEERCRED (Linux SOL_SOCKET/17): macOS has no SO_PEERCRED. Report the peer's credentials as the
+        // container identity (so cr.uid/gid match the guest's getuid/getgid) and the peer pid via macOS
+        // LOCAL_PEERPID. struct ucred is { pid_t pid; uid_t uid; gid_t gid; } (3x u32 = 12 bytes).
+        if (lvl == 1 && opt == 17) {
+            if (a3 && a4 && *(socklen_t *)a4 >= 12) {
+                pid_t ppid = 0;
+                socklen_t pl = sizeof ppid;
+                if (getsockopt((int)a0, SOL_LOCAL, LOCAL_PEERPID, &ppid, &pl) < 0 || ppid <= 0 ||
+                    ppid == getpid())
+                    ppid = container_pid(); // self/own-process peer (e.g. socketpair) -> this guest's pid
+                uint32_t *u = (uint32_t *)a3;
+                u[0] = (uint32_t)ppid;   // pid
+                u[1] = (uint32_t)cuid(); // uid
+                u[2] = (uint32_t)cgid(); // gid
+                *(socklen_t *)a4 = 12;
+            }
+            G_RET(c) = 0;
+            break;
+        }
         if (lvl == 1) {
             lvl = SOL_SOCKET;
             opt = so_opt_l2m((int)a2);
@@ -2750,6 +2916,198 @@ static void service_local(struct cpu *c) {
     }
     // flock(fd, op): macOS flock(2); Linux LOCK_SH/EX/UN/NB op values match the host
     case 32: G_RET(c) = flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    // close_range(first, last, flags): close every fd in [first,last]. CLOSE_RANGE_CLOEXEC(4) sets
+    // FD_CLOEXEC instead of closing; CLOSE_RANGE_UNSHARE(2) (file-table unshare) is a no-op here.
+    case 436: {
+        unsigned first = (unsigned)a0, last = (unsigned)a1;
+        int flags = (int)a2;
+        if (first > last) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd <= 0 || maxfd > 65536) maxfd = 65536;
+        if (last >= (unsigned)maxfd) last = (unsigned)maxfd - 1;
+        for (unsigned fd = first; fd <= last; fd++) {
+            if (flags & 4) { // CLOSE_RANGE_CLOEXEC
+                int fl = fcntl((int)fd, F_GETFD);
+                if (fl >= 0) fcntl((int)fd, F_SETFD, fl | FD_CLOEXEC);
+            } else {
+                close((int)fd);
+            }
+        }
+        G_RET(c) = 0;
+        break;
+    }
+    // pidfd_open(pid, flags): no macOS pidfd -> back it with a real fd and record the target pid.
+    case 434: {
+        pid_t pid = (pid_t)a0;
+        if (pid <= 0 || (pid != container_pid() && kill(pid, 0) < 0 && errno == ESRCH)) {
+            G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
+            break;
+        }
+        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        pidfd_register(fd, pid);
+        G_RET(c) = (uint64_t)fd;
+        break;
+    }
+    // pidfd_send_signal(pidfd, sig, siginfo, flags): resolve the pidfd back to its pid, then deliver.
+    // sig 0 is the existence check. Self/own-pgrp signals raise into the guest (mirrors kill, case 129).
+    case 424: {
+        pid_t pid;
+        if (pidfd_lookup((int)a0, &pid) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        int sig = (int)a1;
+        if (pid == container_pid() || pid <= 0) {
+            if (sig != 0) raise_guest_signal(c, sig);
+            G_RET(c) = 0;
+        } else {
+            G_RET(c) = kill(pid, sig) < 0 ? (uint64_t)(-errno) : 0;
+        }
+        break;
+    }
+    // mq_open(name, oflag, mode, attr): find-or-create the named queue, hand back a real fd bound to it.
+    case 180: {
+        const char *name = (const char *)a0;
+        int oflag = (int)a1;
+        const long *at = (const long *)a3; // struct mq_attr: {flags, maxmsg, msgsize, curmsgs, ...}
+        if (!name) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        int qi = mq_find(name);
+        if (qi < 0) {
+            if (!(oflag & 0x40)) { // O_CREAT
+                G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
+                break;
+            }
+            for (int i = 0; i < MQ_MAXQ; i++)
+                if (!g_mqq[i].used) {
+                    qi = i;
+                    break;
+                }
+            if (qi < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-ENOSPC);
+                break;
+            }
+            memset(&g_mqq[qi], 0, sizeof g_mqq[qi]);
+            g_mqq[qi].used = 1;
+            snprintf(g_mqq[qi].name, sizeof g_mqq[qi].name, "%s", name);
+            g_mqq[qi].maxmsg = (at && at[1] > 0) ? at[1] : 10;
+            g_mqq[qi].msgsize = (at && at[2] > 0) ? at[2] : 8192;
+            if (g_mqq[qi].maxmsg > MQ_MAXMSG) g_mqq[qi].maxmsg = MQ_MAXMSG;
+        } else if ((oflag & 0x40) && (oflag & 0x80)) { // O_CREAT | O_EXCL
+            G_RET(c) = (uint64_t)(int64_t)(-EEXIST);
+            break;
+        }
+        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        g_mqq[qi].refs++;
+        mq_bind(fd, qi);
+        G_RET(c) = (uint64_t)fd;
+        break;
+    }
+    // mq_unlink(name): mark removed; freed once the last descriptor is gone.
+    case 181: {
+        int qi = mq_find((const char *)a0);
+        if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
+            break;
+        }
+        g_mqq[qi].unlinked = 1;
+        mq_maybe_free(qi);
+        G_RET(c) = 0;
+        break;
+    }
+    // mq_timedsend(mqdes, msg, len, prio, abs_timeout): insert highest-priority-first, FIFO within a prio.
+    case 182: {
+        int qi = mq_qof((int)a0);
+        if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        struct mq_queue *q = &g_mqq[qi];
+        size_t len = (size_t)a2;
+        unsigned prio = (unsigned)a3;
+        if ((long)len > q->msgsize) {
+            G_RET(c) = (uint64_t)(int64_t)(-EMSGSIZE);
+            break;
+        }
+        if (q->n >= q->maxmsg) {
+            G_RET(c) = (uint64_t)(int64_t)(-EAGAIN); // no blocking sender
+            break;
+        }
+        char *buf = malloc(len ? len : 1);
+        if (!buf) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+            break;
+        }
+        memcpy(buf, (const void *)a1, len);
+        int pos = q->n;
+        while (pos > 0 && q->msg[pos - 1].prio < prio) {
+            q->msg[pos] = q->msg[pos - 1];
+            pos--;
+        }
+        q->msg[pos].prio = prio;
+        q->msg[pos].len = len;
+        q->msg[pos].data = buf;
+        q->n++;
+        G_RET(c) = 0;
+        break;
+    }
+    // mq_timedreceive(mqdes, msg, len, prio*, abs_timeout): pop the head (highest priority, oldest first).
+    case 183: {
+        int qi = mq_qof((int)a0);
+        if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        struct mq_queue *q = &g_mqq[qi];
+        if ((long)(size_t)a2 < q->msgsize) {
+            G_RET(c) = (uint64_t)(int64_t)(-EMSGSIZE);
+            break;
+        }
+        if (q->n == 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EAGAIN); // no blocking receiver
+            break;
+        }
+        struct mq_qmsg m = q->msg[0];
+        for (int j = 1; j < q->n; j++)
+            q->msg[j - 1] = q->msg[j];
+        q->n--;
+        memcpy((void *)a1, m.data, m.len);
+        if (a3) *(unsigned *)a3 = m.prio;
+        free(m.data);
+        G_RET(c) = (uint64_t)m.len;
+        break;
+    }
+    // mq_getsetattr(mqdes, newattr, oldattr): report flags/maxmsg/msgsize/curmsgs; flag-set is ignored.
+    case 185: {
+        int qi = mq_qof((int)a0);
+        if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        struct mq_queue *q = &g_mqq[qi];
+        if (a2) {
+            long *o = (long *)a2;
+            o[0] = 0;
+            o[1] = q->maxmsg;
+            o[2] = q->msgsize;
+            o[3] = q->n;
+        }
+        G_RET(c) = 0;
+        break;
+    }
     // setsid(): new session / process-group leader
     case 157: {
         pid_t s = setsid();
@@ -2765,7 +3123,7 @@ static void service_local(struct cpu *c) {
         G_RET(c) = 0;
         break;                                                 // sched_getparam -> priority 0
     case 125: G_RET(c) = (a0 == 1 || a0 == 2) ? 99 : 0; break; // sched_get_priority_max: FIFO/RR=99 else 0
-    case 126: G_RET(c) = 0; break;                             // sched_get_priority_min -> 0
+    case 126: G_RET(c) = (a0 == 1 || a0 == 2) ? 1 : 0; break;  // sched_get_priority_min: FIFO/RR=1 else 0
     case 127:                                                  // sched_rr_get_interval -> a nominal 100ms slice
         if (a1) {
             ((struct timespec *)a1)->tv_sec = 0;
@@ -2888,8 +3246,17 @@ static void service_local(struct cpu *c) {
         G_RET(c) = 0;
         break; // setrlimit -> accepted
 
-    // clock_adjtime(clk_id, timex): container has no CAP_SYS_TIME -> EPERM (mirrors clock_settime case 112)
-    case 266: G_RET(c) = (uint64_t)(-1); break;
+    // adjtimex(2)/clock_adjtime(2): read-only query fills struct timex + TIME_OK; setting -> EPERM.
+    case 266: { // clock_adjtime(clk_id, timex)
+        int r = svc_adjtimex((uint8_t *)a1);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+        break;
+    }
+    case 171: { // adjtimex(timex)
+        int r = svc_adjtimex((uint8_t *)a0);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
+        break;
+    }
     // sched_getattr(pid, attr, size, flags): report a SCHED_OTHER profile. Zero the caller's struct, then
     // fill size + sched_policy=SCHED_OTHER(0); nice/priority stay 0. (sched_setattr is case 274, ignored.)
     case 275: {
