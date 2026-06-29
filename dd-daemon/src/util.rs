@@ -203,12 +203,82 @@ pub(crate) fn discover_images(images_dir: &str) -> Vec<Image> {
         };
         let arr = |k: &str| meta.as_ref().and_then(|m| m[k].as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+        let entrypoint = arr("entrypoint");
         let workdir = meta.as_ref().and_then(|m| m["workdir"].as_str()).unwrap_or("").to_string();
         let created = std::fs::metadata(&rootfs).and_then(|m| m.modified()).ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
-        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env: arr("env"), entrypoint: arr("entrypoint"), workdir, created, ..Default::default() });
+        // The sidecar is the source of truth, but pre-seeded/umoci-built images (and any image cached
+        // before the pull path recorded env) carry an empty `env` — their environment lives only in the
+        // on-disk OCI config. Recover it from there so a daemon restart doesn't drop TERM/HOME/LANG/PATH,
+        // then persist it back into the sidecar so subsequent discovery is self-contained.
+        let mut env = arr("env");
+        if env.is_empty() {
+            let recovered = oci_disk_env(&e.path());
+            if !recovered.is_empty() {
+                persist_discovered_env(&e.path(), meta.as_ref(), &name, &cmd, &recovered, &entrypoint, &workdir, arch);
+                env = recovered;
+            }
+        }
+        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env, entrypoint, workdir, created, ..Default::default() });
     }
     out
+}
+
+
+/// Best-effort recovery of an image's environment from an on-disk OCI config, used by
+/// [`discover_images`] when the `dd-image.json` sidecar recorded no `env` (pre-seeded / umoci-built
+/// images, or images cached before the pull path persisted env). Two layouts are understood, in order:
+///   1. umoci's runtime `config.json` at the image dir root -> `process.env`.
+///   2. an OCI image layout in the dir (`index.json` + `blobs/sha256/`) -> manifest -> image config
+///      blob -> `config.Env`.
+/// Returns an empty vec if neither is present/parseable — never panics, never fails discovery.
+fn oci_disk_env(dir: &std::path::Path) -> Vec<String> {
+    let strs = |v: &Value| v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
+        .unwrap_or_default();
+    // 1. umoci runtime config: process.env.
+    if let Some(cfg) = std::fs::read_to_string(dir.join("config.json")).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    {
+        let env = strs(&cfg["process"]["env"]);
+        if !env.is_empty() { return env; }
+    }
+    // 2. OCI image layout: index.json -> first manifest blob -> image config blob -> config.Env.
+    let read_blob = |digest: &str| -> Option<Value> {
+        let hex = digest.strip_prefix("sha256:")?;
+        std::fs::read_to_string(dir.join("blobs/sha256").join(hex)).ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    };
+    let index = std::fs::read_to_string(dir.join("index.json")).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    if let Some(mdigest) = index.as_ref()
+        .and_then(|i| i["manifests"].as_array()).and_then(|a| a.first())
+        .and_then(|m| m["digest"].as_str())
+    {
+        if let Some(cfg) = read_blob(mdigest)
+            .and_then(|m| m["config"]["digest"].as_str().map(String::from))
+            .and_then(|d| read_blob(&d))
+        {
+            return strs(&cfg["config"]["Env"]);
+        }
+    }
+    Vec::new()
+}
+
+/// Persist an env recovered by [`oci_disk_env`] back into the image's `dd-image.json` sidecar so the
+/// next discovery round-trips it directly (and never has to re-parse the OCI config). Merges into the
+/// existing sidecar when present so other recorded fields are preserved; otherwise writes a fresh one
+/// from the values [`discover_images`] already resolved. Best-effort: a write failure (e.g. a
+/// read-only image store) is ignored — the in-memory env is still surfaced for this run.
+#[allow(clippy::too_many_arguments)]
+fn persist_discovered_env(dir: &std::path::Path, meta: Option<&Value>, name: &str, cmd: &[String],
+                          env: &[String], entrypoint: &[String], workdir: &str, arch: Guest) {
+    let mut m = meta.cloned().unwrap_or_else(|| json!({
+        "name": name, "cmd": cmd, "entrypoint": entrypoint, "workdir": workdir,
+        "arch": arch.arch(), "os": arch.os(),
+    }));
+    m["env"] = json!(env);
+    let _ = std::fs::write(dir.join("dd-image.json"), m.to_string());
 }
 
 
