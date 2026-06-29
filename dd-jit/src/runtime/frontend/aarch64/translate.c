@@ -2,6 +2,26 @@
 // most instructions verbatim; MANGLE only stolen-register (x18/x28/x30) users. Optimizations: LSE
 // atomic upgrade, §B shadow-return prediction (depth-gated), tier-2 purity gate. See OPTIMIZATIONS.md.
 
+// Non-PIE ET_EXEC link span + high-map bias. Really defined (and set by load_elf) in os/linux/container/
+// vfs.c and os/linux/elf.c, both compiled LATER in the same unity TU; forward-declared here (static, so
+// it merges into the single later definition) so adr/adrp can un-bias the PC. 0 for PIE/static-PIE.
+static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
+
+// PC-relative base for adr/adrp materialization. A non-PIE ET_EXEC maps HIGH (the low 4GB is reserved),
+// so the dispatcher biases the guest PC to the high mapping before translate_block -> gpc here is HIGH.
+// But the image's baked absolute data pointers are LOW (non-PIE => no dynamic relocations), and Go/gcc
+// compare an adr/adrp-computed pointer against such a stored pointer for identity; a HIGH result then
+// mismatches the LOW baked pointer (gcc ICEs in set_static_spec; cc1 hits an invalid free()). Materialize
+// adr/adrp against the LOW (un-biased) PC so the produced value matches the baked pointers; the
+// nonpie_fixup SIGSEGV handler transparently serves the resulting LOW data access from the real high
+// mapping (+bias). Branch/stitch/dispatch logic keeps the HIGH gpc -- only the *address value* adr/adrp
+// produces becomes LOW. Inert for PIE/static-PIE (g_nonpie_lo == 0, the only state the test matrix sees).
+static uint64_t pcrel_base(uint64_t gpc) {
+    if (g_nonpie_lo && gpc >= g_nonpie_lo + g_nonpie_bias && gpc < g_nonpie_hi + g_nonpie_bias)
+        return gpc - g_nonpie_bias;
+    return gpc;
+}
+
 // ---- x18 stealing ----
 // macOS asynchronously zeroes the real x18 (it is reserved on Apple platforms), but a
 // Linux guest uses x18 as a normal GP register. So guest x18 must NEVER live in the real
@@ -1152,13 +1172,14 @@ static void *translate_block(uint64_t gpc) {
         if ((in & 0x9F000000u) == 0x10000000u) {
             int rd = in & 31;
             int64_t imm = sext((((in >> 5) & 0x7FFFF) << 2) | ((in >> 29) & 3), 21);
+            uint64_t v = pcrel_base(gpc) + imm;
             if (is_stolen(rd)) {
                 x18_prolog();
-                e_movconst(0, gpc + imm);
+                e_movconst(0, v);
                 e_str(0, 1, rd * 8);
                 x18_epilog();
             } else
-                e_movconst(rd, gpc + imm);
+                e_movconst(rd, v);
             gpc += 4;
             continue;
         }
@@ -1166,7 +1187,7 @@ static void *translate_block(uint64_t gpc) {
         if ((in & 0x9F000000u) == 0x90000000u) {
             int rd = in & 31;
             int64_t imm = sext((((in >> 5) & 0x7FFFF) << 2) | ((in >> 29) & 3), 21) << 12;
-            uint64_t v = (gpc & ~0xFFFull) + imm;
+            uint64_t v = (pcrel_base(gpc) & ~0xFFFull) + imm;
             if (is_stolen(rd)) {
                 x18_prolog();
                 e_movconst(0, v);
