@@ -198,7 +198,9 @@ static uint32_t *emit_shadow_push(uint64_t gpc) {
     e_stp(0, 1, CPUREG, M);
     // spill x0..x3 -> mscratch (paired: 2 stp not 4 str)
     e_stp(2, 3, CPUREG, M + 16);
-    e_movconst(0, gpc + 4);
+    // guest_ret is the guest-VISIBLE link value (spilled to the guest stack + matched on the ret),
+    // so use the UN-BIASED (low) link vaddr for non-PIE; pcrel_base is identity for PIE.
+    e_movconst(0, pcrel_base(gpc) + 4);
     // x0 = guest_ret; cpu->x[30] = guest_ret (ALWAYS)
     e_str(0, CPUREG, 30 * 8);
     // x1 = ssp (capped at 1024)
@@ -337,7 +339,10 @@ static int target_is_leaf(uint64_t target) {
 static void emit_bl_ras(uint64_t gpc, uint64_t target) {
     if (target_is_leaf(target)) {
         if (g_prof) g_prof_bl_leaf++; // A3: depth-gate steered this bl to the cheap leaf Stage-B path
-        emit_set_x30(gpc + 4);
+        // Guest LR is a guest-VISIBLE value (the guest spills it to its stack), so it must be the
+        // UN-BIASED (low) link vaddr -- non-PIE runs gpc HIGH; the dispatcher re-biases low->high on
+        // the ret. pcrel_base is identity for PIE (no codegen change for the matrix).
+        emit_set_x30(pcrel_base(gpc) + 4);
         emit_chain_exit(target);
         return;
     // leaf -> cheap Stage-B (IC return)
@@ -960,8 +965,10 @@ static void *translate_block(uint64_t gpc) {
         }
         // blr
         if ((in & 0xFFFFFC1Fu) == 0xD63F0000u) {
-            // guest x30 lives in cpu->x[30] (stolen); RAS push needs a host blr
-            emit_set_x30(gpc + 4);
+            // guest x30 lives in cpu->x[30] (stolen); RAS push needs a host blr. The link value is
+            // guest-visible (spilled to the guest stack), so store the UN-BIASED (low) return vaddr
+            // for non-PIE; the dispatcher re-biases on the ret. pcrel_base is identity for PIE.
+            emit_set_x30(pcrel_base(gpc) + 4);
             emit_ibranch((in >> 5) & 31);
             //   (Section 3) -- deferred; Stage-B IBTC for the function-ptr return
             break;
