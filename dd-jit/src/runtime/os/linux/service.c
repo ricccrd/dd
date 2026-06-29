@@ -2788,6 +2788,19 @@ static void service_local(struct cpu *c) {
         break;
     }
 
+// struct epoll_event has a DIFFERENT layout per guest arch: x86-64 forces __attribute__((packed)) so it
+// is 12 bytes with `data` at offset 4; every other arch (aarch64/asm-generic) leaves it naturally aligned
+// at 16 bytes (4 bytes pad after the u32 events, then `data` at offset 8). Derive both from the same
+// G_O_DIRECTORY discriminator io.c uses, so epoll_ctl reads `data` and epoll_pwait writes the out-array at
+// the stride/offset the guest's libc/runtime expects (Go's netpoller stores a pointer in `data`).
+#if G_O_DIRECTORY == 0x10000
+#define G_EPEV_SZ 12u   // x86-64 (packed)
+#define G_EPEV_DOFF 4u
+#else
+#define G_EPEV_SZ 16u   // aarch64 / asm-generic
+#define G_EPEV_DOFF 8u
+#endif
+
     // ===================== Event loop — epoll/eventfd/timerfd/signalfd/inotify (macOS kqueue) =====================
     // eventfd2(initval, flags) -> pipe
     case 19: {
@@ -2834,8 +2847,8 @@ static void service_local(struct cpu *c) {
         uint64_t data = (uint64_t)(unsigned)fd;
         if (a3) {
             ev = *(uint32_t *)a3;
-            memcpy(&data, (void *)(a3 + 4), 8);
-            // struct epoll_event {u32 events; u64 data} packed
+            memcpy(&data, (void *)(a3 + G_EPEV_DOFF), 8);
+            // struct epoll_event {u32 events; [pad;] u64 data} -- layout per guest arch (see G_EPEV_*)
         }
         // op: 1=ADD 2=DEL 3=MOD ; EPOLLET=0x80000000 -> EV_CLEAR ; EPOLLONESHOT=0x40000000 -> EV_ONESHOT
         uint16_t xf = (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0));
@@ -2926,8 +2939,8 @@ static void service_local(struct cpu *c) {
             if (kv[i].flags & EV_EOF) ev |= 0x10u;
             // EPOLLERR (immediate-path semantics preserved when opt is off)
             if (!opt && (kv[i].flags & EV_ERROR)) ev |= 0x8u;
-            *(uint32_t *)(out + oi * 12) = ev;
-            memcpy(out + oi * 12 + 4, &kv[i].udata, 8);
+            *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ev;
+            memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &kv[i].udata, 8);
             // EPOLLONESHOT: the kernel auto-removed this registration; keep our armed map in sync.
             if (opt && kv[i].ident < 1024 && g_ep_os[kv[i].ident]) {
                 if (kv[i].filter == EVFILT_READ)
@@ -2950,8 +2963,8 @@ static void service_local(struct cpu *c) {
                 if (kv[i].flags & EV_ERROR) continue;
                 uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
                 if (kv[i].flags & EV_EOF) ev |= 0x10u;
-                *(uint32_t *)(out + oi * 12) = ev;
-                memcpy(out + oi * 12 + 4, &kv[i].udata, 8);
+                *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ev;
+                memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &kv[i].udata, 8);
                 if (kv[i].ident < 1024 && g_ep_os[kv[i].ident]) {
                     if (kv[i].filter == EVFILT_READ)
                         g_ep_rd[kv[i].ident] = 0;
