@@ -1,5 +1,14 @@
 // Extracted from service(): I/O — fd read/write/seek + plain fd ops (dup/dup3/fcntl/pipe2/sendfile/splice/tee/copy_file_range/fsync/etc).
 // Returns 1 if nr was handled, 0 otherwise. Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
+
+// Guest O_DIRECT differs per arch (aarch64/asm-generic = 0x10000, x86-64 = 0x4000); derive it from the
+// arch's O_DIRECTORY (provided by abi.h) so pipe2(O_DIRECT) is recognised on both targets.
+#if G_O_DIRECTORY == 0x10000
+#define G_O_DIRECT 0x4000 // x86-64
+#else
+#define G_O_DIRECT 0x10000 // aarch64 / asm-generic
+#endif
+
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
     // ===================== I/O — read/write/seek (+ eventfd/timerfd/signalfd fd redirection) =====================
@@ -405,13 +414,16 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         break;
     }
     case 59: {
-        int fds[2];
-        if (pipe(fds) < 0) {
+        // pipe2(fds, flags). O_DIRECT requests "packet mode": each write is a distinct record that reads
+        // back whole, never coalesced. macOS pipes can't do this, but an AF_UNIX SOCK_DGRAM socketpair
+        // preserves message boundaries exactly, so back an O_DIRECT pipe with one (SOCK_SEQPACKET would be
+        // closer but macOS PF_LOCAL doesn't support it). A plain pipe is fine for the non-O_DIRECT case.
+        int fds[2], fl = (int)a1;
+        int mk = (fl & G_O_DIRECT) ? socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) : pipe(fds);
+        if (mk < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
-        // pipe2(fds, flags)
         }
-        int fl = (int)a1;
         if (fl & 0x80000) {
             fcntl(fds[0], F_SETFD, FD_CLOEXEC);
             fcntl(fds[1], F_SETFD, FD_CLOEXEC);
