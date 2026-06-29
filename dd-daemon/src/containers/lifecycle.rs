@@ -59,10 +59,18 @@ pub(crate) struct CreateQ { name: Option<String>, platform: Option<String> }
 
 pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<CreateQ>, Json(body): Json<CreateBody>) -> Response {
     let image = body.image.unwrap_or_default();
-    let mut g = a.inner.lock().await;
     // Match the image by name and, when --platform is given, by arch. A platform mismatch returns 404 so
     // the docker CLI pulls the right arch (its default --pull=missing won't re-pull otherwise) and retries.
     let want_arch = platform_arch(cq.platform.as_deref());
+    // On a miss, re-scan the images dir from disk before giving up: the image may be on disk (freshly
+    // pulled/built) yet absent from the in-memory store, which would otherwise force a spurious re-pull.
+    {
+        let g = a.inner.lock().await;
+        let present = g.images.iter().filter(|i| ref_name(&i.name) == ref_name(&image))
+            .any(|i| want_arch.map_or(true, |a| docker_arch(i.arch) == a));
+        if !present { drop(g); rescan_images(&a).await; }
+    }
+    let mut g = a.inner.lock().await;
     let img = match g.images.iter()
         .filter(|i| ref_name(&i.name) == ref_name(&image))
         .find(|i| want_arch.map_or(true, |a| docker_arch(i.arch) == a))

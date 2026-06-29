@@ -282,7 +282,11 @@ pub(crate) fn build_err(mut lines: Vec<String>, msg: String) -> Response {
 
 pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, body: axum::body::Bytes) -> Response {
     let raw_tag = q.t.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| "built:latest".into());
-    let name = ref_name(&raw_tag);
+    // Register under the FULL normalized tag (keeping any namespace + an explicit/implicit tag), exactly
+    // as `pull` stores images, so a namespaced/tagged build (`-t org/app:v2`) round-trips and a later
+    // `docker run org/app:v2` finds it. `ref_name` alone would collapse it to a bare `app`, dropping the
+    // tag from `RepoTags` and colliding distinct images that share a short name.
+    let name = image_ref(&raw_tag, "").short();
     let dfname = q.dockerfile.filter(|d| !d.is_empty()).unwrap_or_else(|| "Dockerfile".into());
     let mut log: Vec<String> = Vec::new();
 
@@ -315,8 +319,9 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
     let steps = parse_dockerfile(&dockerfile);
     let total = steps.len();
 
-    // the new image's rootfs dir under DD_IMAGES
-    let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    // the new image's rootfs dir under DD_IMAGES — derived from the user's raw `-t` so a bare tag keeps a
+    // predictable dir name (`scen-built`), while a namespaced/tagged build still gets a distinct dir.
+    let safe: String = raw_tag.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
     let img_dir = std::path::PathBuf::from(format!("{}/{}", a.images_dir, safe));
     let _ = std::fs::remove_dir_all(&img_dir);
     let mut rootfs = img_dir.join("rootfs"); // the CURRENT stage's rootfs (reassigned at each FROM)
@@ -585,7 +590,8 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
     // register the built image (persist the full config so it survives a daemon restart)
     if cmd.is_empty() && entrypoint.is_empty() { cmd = default_shell(&rootfs); }
     std::fs::write(img_dir.join("dd-image.json"),
-        json!({"name": name, "cmd": cmd, "entrypoint": entrypoint, "env": env, "workdir": workdir, "labels": labels}).to_string()).ok();
+        json!({"name": name, "cmd": cmd, "entrypoint": entrypoint, "env": env, "workdir": workdir,
+               "labels": labels, "arch": arch.arch(), "os": arch.os()}).to_string()).ok();
 
     // a real content digest for the image ID: sha256 over the image's defining content — the Dockerfile,
     // a deterministic content hash of the assembled rootfs, and the final config (incl. sorted labels, so
@@ -602,8 +608,8 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
     };
     {
         let mut g = a.inner.lock().await;
-        g.images.retain(|im| ref_name(&im.name) != name);
-        g.images.push(Image { name: name.to_string(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, entrypoint, env, workdir, labels, created: now_secs() });
+        g.images.retain(|im| repo_tag(&im.name) != repo_tag(&name));
+        g.images.push(Image { name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, entrypoint, env, workdir, labels, created: now_secs() });
     }
     log.push(json!({"stream": format!("Successfully built {}\n", &id[..12.min(id.len())])}).to_string());
     log.push(json!({"stream": format!("Successfully tagged {raw_tag}\n")}).to_string());

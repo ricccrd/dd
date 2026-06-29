@@ -79,6 +79,11 @@ pub(crate) async fn distribution_inspect(Path(name): Path<String>) -> Response {
 /// GET /images/:name/json — `docker image inspect` / `docker run`'s local-image probe. Returns the
 /// image config (Cmd/Entrypoint/Env) so the CLI doesn't treat the image as missing and re-pull.
 pub(crate) async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Response {
+    // On a miss, re-scan the images dir from disk before reporting 404: the image may be on disk
+    // (freshly pulled/built) yet absent from the in-memory store.
+    if !a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name)) {
+        rescan_images(&a).await;
+    }
     let g = a.inner.lock().await;
     match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
         Some(i) => {
@@ -294,7 +299,8 @@ pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: C
     // its identity AND its entrypoint/env/workdir across a daemon restart (the dir name alone doesn't
     // round-trip -- e.g. "docker.io_library_alpine_latest"). Mirrors the `docker load` path (`image_load`).
     let mut meta = json!({ "name": name.clone(), "cmd": cmd.clone(), "env": env.clone(),
-                           "entrypoint": entrypoint.clone(), "workdir": workdir.clone() });
+                           "entrypoint": entrypoint.clone(), "workdir": workdir.clone(),
+                           "arch": arch.arch(), "os": arch.os() });
     if darwin { meta["os"] = json!("darwin"); }
     let _ = std::fs::write(format!("{images_dir}/{}/dd-image.json", safe_name(&iref)), meta.to_string());
     Ok(Image {
@@ -618,6 +624,25 @@ pub(crate) async fn image_import(a: App, repo: String, tag: String, src: &str, b
     let _ = std::fs::write(target.join("dd-image.json"), json!({ "name": name, "cmd": cmd }).to_string());
     register_image(&a, img).await;
     import_progress(Ok(format!("sha256:{}", fake_id(&name))))
+}
+
+/// Re-scan the writable images dir from disk and merge any images not already in the in-memory store
+/// (keyed by `repository:tag`). A safety net for a lookup miss: an image whose rootfs + `dd-image.json`
+/// exist on disk but isn't registered in memory (e.g. pulled/built by another daemon process, or dropped
+/// in out-of-band) becomes visible without a daemon restart. Returns true if anything new was added.
+pub(crate) async fn rescan_images(a: &App) -> bool {
+    let dir = a.images_dir.clone();
+    let found = tokio::task::spawn_blocking(move || discover_images(&dir)).await.unwrap_or_default();
+    let mut g = a.inner.lock().await;
+    let mut added = false;
+    for img in found {
+        let tag = repo_tag(&img.name);
+        if !g.images.iter().any(|i| repo_tag(&i.name) == tag) {
+            g.images.push(img);
+            added = true;
+        }
+    }
+    added
 }
 
 /// Register a freshly load/import-ed image in the daemon's in-memory state, replacing any existing

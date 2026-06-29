@@ -186,9 +186,13 @@ pub(crate) fn discover_images(images_dir: &str) -> Vec<Image> {
             Some(m) => {
                 let name = m["name"].as_str().unwrap_or("img").to_string();
                 let cmd: Vec<String> = m["cmd"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-                // os:darwin marks a native-macOS (darwinjail) image; otherwise detect from the rootfs.
-                let arch = if m["os"].as_str() == Some("darwin") { Guest::DarwinAarch64 }
-                           else { detect_arch(&rootfs).unwrap_or(Guest::LinuxAarch64) };
+                // Prefer the arch the sidecar recorded at pull/build time (round-trips exactly, even for
+                // images whose binaries can't be sniffed — distroless/scratch). `os:darwin` marks a
+                // native-macOS (darwinjail) image. Fall back to probing the rootfs, then native arm64.
+                let arch = m["arch"].as_str().and_then(|a| Guest::detect(m["os"].as_str().unwrap_or("linux"), a))
+                    .or_else(|| (m["os"].as_str() == Some("darwin")).then_some(Guest::DarwinAarch64))
+                    .or_else(|| detect_arch(&rootfs))
+                    .unwrap_or(Guest::LinuxAarch64);
                 (name, if cmd.is_empty() { vec!["/bin/sh".into()] } else { cmd }, arch)
             }
             None => {
@@ -208,33 +212,76 @@ pub(crate) fn discover_images(images_dir: &str) -> Vec<Image> {
 }
 
 
-/// Probe a likely executable in the rootfs and pick the guest target from its binary magic:
-/// ELF -> linux (e_machine = aarch64/x86_64), Mach-O 64 -> darwin (cputype = arm64).
-pub(crate) fn detect_arch(rootfs: &std::path::Path) -> Option<Guest> {
-    // Includes darwin-userland paths (`profile/bin/*`, `opt/homebrew/bin/*`) so a *pulled* macOS image
-    // — whose `dd-image.json` sidecar didn't survive the registry round-trip — is still detected as
-    // darwin from its packed Mach-O binaries. `std::fs::read` follows the profile symlinks to the real
-    // Mach-O in the packed `/nix` (or Homebrew) closure.
-    for probe in ["bin/busybox", "bin/sh", "bin/true", "usr/bin/coreutils", "usr/lib/dyld",
-                  "profile/bin/bash", "profile/bin/sh", "opt/homebrew/bin/brew"] {
-        let p = rootfs.join(probe);
-        if let Ok(b) = std::fs::read(&p) {
-            if b.len() > 19 && &b[0..4] == b"\x7fELF" {
-                return match u16::from_le_bytes([b[18], b[19]]) {  // ELF e_machine
-                    0xB7 => Some(Guest::LinuxAarch64),
-                    0x3E => Some(Guest::LinuxX86_64),
-                    _ => None,
-                };
-            }
-            if b.len() > 7 && b[0..4] == [0xCF, 0xFA, 0xED, 0xFE] {   // MH_MAGIC_64 (little-endian)
-                return match u32::from_le_bytes([b[4], b[5], b[6], b[7]]) {  // cputype
-                    0x0100000C => Some(Guest::DarwinAarch64),   // CPU_TYPE_ARM64
-                    _ => None,
-                };
+/// Classify a binary by its leading magic bytes: ELF -> linux (e_machine = aarch64/x86_64),
+/// Mach-O 64 -> darwin (cputype = arm64). Returns `None` for anything else (scripts, data, an
+/// unrecognized machine).
+fn sniff_magic(b: &[u8]) -> Option<Guest> {
+    if b.len() > 19 && &b[0..4] == b"\x7fELF" {
+        return match u16::from_le_bytes([b[18], b[19]]) {  // ELF e_machine
+            0xB7 => Some(Guest::LinuxAarch64),
+            0x3E => Some(Guest::LinuxX86_64),
+            _ => None,
+        };
+    }
+    if b.len() > 7 && b[0..4] == [0xCF, 0xFA, 0xED, 0xFE] {   // MH_MAGIC_64 (little-endian)
+        return match u32::from_le_bytes([b[4], b[5], b[6], b[7]]) {  // cputype
+            0x0100000C => Some(Guest::DarwinAarch64),   // CPU_TYPE_ARM64
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Read just the header of `p` (following symlinks) and classify its magic. Cheap: only the first 20
+/// bytes are read, never the whole binary.
+fn sniff_path(p: &std::path::Path) -> Option<Guest> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p).ok()?;
+    let mut buf = [0u8; 20];
+    let n = f.read(&mut buf).ok()?;
+    sniff_magic(&buf[..n])
+}
+
+/// Fallback arch probe: a bounded breadth-first scan of the rootfs for the first binary whose magic
+/// identifies a guest target. Catches images that ship a single executable at a non-standard path
+/// (hello-world's `/hello`, nats's `/nats-server`) which the fixed probe list in [`detect_arch`] misses.
+/// Shallow entries are examined first (top-level binaries win immediately) and the total entry budget is
+/// capped so a large rootfs can never make discovery pathological. Symlinked directories are not
+/// descended (avoids cycles); symlinked *files* are still classified (their target is read).
+fn scan_for_binary(rootfs: &std::path::Path) -> Option<Guest> {
+    use std::collections::VecDeque;
+    let mut queue = VecDeque::from([rootfs.to_path_buf()]);
+    let mut budget = 4096; // cap on entries examined across the whole walk
+    while let Some(dir) = queue.pop_front() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if budget == 0 { return None; }
+            budget -= 1;
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => queue.push_back(e.path()),
+                Ok(ft) if ft.is_file() || ft.is_symlink() => {
+                    if let Some(g) = sniff_path(&e.path()) { return Some(g); }
+                }
+                _ => {}
             }
         }
     }
     None
+}
+
+/// Probe the rootfs and pick the guest target from a binary's magic. Tries a handful of well-known
+/// executable locations first (fast path), then falls back to a bounded scan of the whole rootfs so an
+/// image with its binary at a non-standard path is still detected.
+pub(crate) fn detect_arch(rootfs: &std::path::Path) -> Option<Guest> {
+    // Includes darwin-userland paths (`profile/bin/*`, `opt/homebrew/bin/*`) so a *pulled* macOS image
+    // — whose `dd-image.json` sidecar didn't survive the registry round-trip — is still detected as
+    // darwin from its packed Mach-O binaries. `sniff_path` follows the profile symlinks to the real
+    // Mach-O in the packed `/nix` (or Homebrew) closure.
+    for probe in ["bin/busybox", "bin/sh", "bin/true", "usr/bin/coreutils", "usr/lib/dyld",
+                  "profile/bin/bash", "profile/bin/sh", "opt/homebrew/bin/brew"] {
+        if let Some(g) = sniff_path(&rootfs.join(probe)) { return Some(g); }
+    }
+    scan_for_binary(rootfs)
 }
 
 
