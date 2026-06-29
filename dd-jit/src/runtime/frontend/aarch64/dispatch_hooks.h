@@ -13,6 +13,20 @@
 // g_prof_*, IBTC_N, R_SYSCALL, ...) are in scope there even though this header is included early via abi.h.
 // The x86 frontend supplies its own definitions of these names in a later PR (PR3/PR4).
 
+// ---- SMC (self-modifying code) for in-process JIT guests ----  gate NOSMC=1
+// A guest that mmaps RWX (g_rwx_guest, set in os/linux/service/mem.c) or otherwise generates code can
+// overwrite bytes we already translated+cached. ARM requires such a guest to issue the icache-flush dance
+// (dc cvau; dsb; IC IVAU; dsb; isb) before executing freshly-written code, so the frontend intercepts the
+// guest's `ic ivau` (translate.c) -> R_ICFLUSH -> smc_icflush() drops the stale gpc->host translations and
+// the IBTC so the modified bytes re-translate on the next execution. Entirely inert until a guest issues an
+// `ic ivau` (g_smc_seen) or takes a PROT_EXEC mmap (g_rwx_guest) -> zero effect on the normal matrix.
+//   R_ICFLUSH      reason a block exits with after a guest `ic ivau` (4 is free: R_BRANCH/SYSCALL/TIER2/IBLOG=0..3)
+//   g_smc_seen     a guest icache flush was observed -> indirect branches must stay invalidatable (see G_IBTC_FILL)
+//   g_smc_flushes  PROF: number of SMC re-translate events
+#define R_ICFLUSH 4
+static int g_smc_seen;
+static uint64_t g_smc_flushes;
+
 // (4) x86-only top-of-loop instrumentation (g_prevpc/g_disp_n/trace cap/g_w8 watchpoint/malloc track).
 // aarch64 has no such block -> empty.
 #define G_DISPATCH_DEBUG(c) ((void)0)
@@ -81,7 +95,12 @@
             } else {                                                                                            \
                 g_ibtc[h].body = bind; /* body_ind; written first */                                           \
                 __atomic_store_n(&g_ibtc[h].target, (c)->pc, __ATOMIC_RELEASE);                                \
-                if ((c)->ic_site != 1) { /* per-site monomorphic cache (literals in the code cache) */         \
+                /* SMC: a JIT guest reaches code through an indirect branch (function pointer); the per-site \
+                 * monomorphic IC literal lives in the CALLER's block, which is NOT on the modified page, so \
+                 * smc_icflush() (which only drops g_map/g_ibtc) can't reset it -> a re-call would HIT the    \
+                 * stale body. So once SMC is in play, skip the per-site IC: the indirect branch falls to the \
+                 * shared-hash IBTC (g_ibtc), which smc_icflush() DOES clear -> the re-call re-translates. */  \
+                if ((c)->ic_site != 1 && !(g_rwx_guest || g_smc_seen)) { /* per-site monomorphic IC */        \
                     /* ic_site is the RX address of the literal pair (from a runtime adr); write via RW. */     \
                     uint64_t *site = (uint64_t *)J_RW((c)->ic_site);                                           \
                     jit_wprot(0);                                                                               \
@@ -99,7 +118,9 @@
 // on the non-redirect path (x86 will instead rely on rip pre-set in the emitter). `break` exits the
 // dispatcher loop into which this expands. Byte-for-byte the prior inline block.
 #define G_DISPATCH_REASON(c)                                                                                    \
-    if ((c)->reason == R_SYSCALL) {                                                                             \
+    if ((c)->reason == R_ICFLUSH) {                                                                             \
+        smc_icflush(); /* guest `ic ivau`: drop stale translations + IBTC; pc already = past the ic ivau */   \
+    } else if ((c)->reason == R_SYSCALL) {                                                                      \
         if (g_prof) g_prof_sys++;                                                                               \
         service(c);                                                                                             \
         if ((c)->exited) break;                                                                                 \

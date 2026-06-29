@@ -765,6 +765,29 @@ static void stitch_cond(uint32_t inv, uint64_t taken) {
     *patch = recode_cond(inv, ((uint8_t *)g_cp - (uint8_t *)patch) / 4);
 }
 
+// ---- SMC: self-modifying-code support (gate NOSMC=1) ----
+// NOSMC=1 reverts to the legacy behavior (guest `ic ivau` emitted verbatim, no translation-cache drop) so
+// a stale-translation A/B is still possible. Read once (idempotent static guard).
+static int g_smc_off = -1;
+static int smc_disabled(void) {
+    if (g_smc_off < 0) g_smc_off = (getenv("NOSMC") != NULL);
+    return g_smc_off;
+}
+// A guest `ic ivau` reached the dispatcher (R_ICFLUSH): the guest is about to execute code it just rewrote,
+// so every gpc->host translation may be stale. Drop the whole block map + IBTC + pending chains (mirrors the
+// x86 smc_on_write flush). We deliberately do NOT reset g_cp: the just-exited block's host code stays intact
+// and is reclaimed by the normal wholesale flush; stale entries are simply re-emitted on demand. The §B
+// shadow stack is left alone -- its host_rets point at old code that is still present in g_cp (valid targets).
+// g_smc_seen latches so indirect branches stop populating the per-site IC (see G_IBTC_FILL): that literal
+// lives in the unmodified CALLER block, which this flush cannot reach.
+static void smc_icflush(void) {
+    g_smc_seen = 1;
+    memset(g_map, 0, sizeof g_map);
+    memset(g_ibtc, 0, sizeof g_ibtc);
+    g_npend = 0;
+    g_smc_flushes++;
+}
+
 static void *translate_block(uint64_t gpc) {
     // W4E tier-2: read NOTIER2 / TIER2_THRESHOLD once (idempotent) before any self-loop detection.
     tier2_env_init();
@@ -1079,6 +1102,49 @@ static void *translate_block(uint64_t gpc) {
             }
             gpc += 4;
             continue;
+        }
+
+        // --- SMC prerequisite: mrs Xt, ctr_el0 (cache-type register) ---
+        // __clear_cache reads CTR_EL0 to size its dc/ic strides. Reading it from EL0 FAULTS for the JIT'd
+        // guest on macOS (SCTLR_EL1.UCT is not enabled for it), so the verbatim mrs crashed every guest that
+        // flushes its icache. Materialize a synthetic value describing the DBT's coherence model instead:
+        //   IminLine/DminLine = 4 -> 64-byte I/D lines        L1Ip = PIPT
+        //   IDC (bit28) = 1 -> "DC clean to PoU not required": TRUE here, the host re-translates the page by
+        //                      reading the SAME coherent memory the guest wrote, so __clear_cache skips DC.
+        //   DIC (bit29) = 0 -> "IC invalidate IS required": keeps the guest issuing `ic ivau`, our SMC hook.
+        if ((in & 0xFFFFFFE0u) == 0xD53B0020u) {
+            int rd = in & 31;
+            uint64_t ctr = 0x9444C004ull;
+            if (is_stolen(rd)) {
+                x18_prolog();
+                e_movconst(0, ctr);
+                e_str(0, 1, rd * 8);
+                x18_epilog();
+            } else
+                e_movconst(rd, ctr);
+            gpc += 4;
+            continue;
+        }
+        // --- SMC: dc cvau, Xt (data-cache clean to PoU) -> nop ---
+        // A pure no-op for a DBT: the host never instruction-fetches guest pages, so the guest's data writes
+        // need no clean for our re-translation (which is a normal coherent data read). Standard __clear_cache
+        // already skips DC via IDC=1 above; this also covers callers that issue it unconditionally and avoids
+        // any EL0 trap on the instruction. (NOSMC keeps it -- it is unrelated to the stale-translation A/B.)
+        if ((in & 0xFFFFFFE0u) == 0xD50B7B20u) {
+            emit32(0xD503201Fu); // nop
+            gpc += 4;
+            continue;
+        }
+        // --- SMC: ic ivau, Xt (instruction-cache invalidate by VA to PoU) ---
+        // A code-generating guest issues this (the __clear_cache / dc;dsb;ic;dsb;isb dance) before running
+        // freshly-written bytes. The host never instruction-fetches guest pages (we execute the TRANSLATED
+        // copy), so emitting `ic ivau` verbatim is a no-op for our cache -> the guest would re-run the STALE
+        // translation. Instead end the block here and exit R_ICFLUSH: the dispatcher drops the stale gpc->host
+        // map + IBTC (smc_icflush) and the modified bytes re-translate. pc resumes PAST the ic ivau. Gated by
+        // NOSMC; the dc cvau / isb in the same dance run verbatim (harmless: they touch real data memory).
+        if ((in & 0xFFFFFFE0u) == 0xD50B7520u && !smc_disabled()) {
+            emit_exit_const(gpc + 4, R_ICFLUSH);
+            break;
         }
 
         // --- non-branch, PC-relative: rewrite to materialize the (relocated) addr ---
