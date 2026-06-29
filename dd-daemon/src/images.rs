@@ -331,6 +331,17 @@ pub(crate) fn repo_tag(name: &str) -> String {
     if last.contains(':') { name.to_string() } else { format!("{name}:latest") }
 }
 
+/// The tag portion of an image reference, defaulting to `latest` when none is given. A `:port` inside a
+/// registry host (`localhost:5000/foo`) is NOT a tag — only a final `:tag` with no slash after the colon
+/// counts: `ubuntu:24.04` -> `24.04`, `ubuntu` -> `latest`, `localhost:5000/foo` -> `latest`. Lets `rmi`
+/// (and `push`) tell `ubuntu:24.04` apart from `ubuntu` (`:latest`) so an untag is tag-precise.
+pub(crate) fn ref_tag(name: &str) -> String {
+    match name.rsplit_once(':') {
+        Some((_, t)) if !t.contains('/') => t.to_string(),
+        _ => "latest".to_string(),
+    }
+}
+
 
 /// A filesystem-safe directory name for an image reference.
 pub(crate) fn safe_name(r: &ImageRef) -> String { r.canonical().replace(['/', ':'], "_") }
@@ -385,30 +396,32 @@ pub(crate) async fn image_tag(State(a): State<App>, Path(name): Path<String>, Qu
     StatusCode::CREATED.into_response()
 }
 
-/// DELETE /images/:name -- `docker rmi`. Reports the image's real tag in `Untagged`.
+/// DELETE /images/:name -- `docker rmi`. Tag-precise, matching Docker semantics: `rmi <name>:<tag>`
+/// (or bare `<name>`, which means `<name>:latest`) removes ONLY that one tag entry from the store. The
+/// on-disk rootfs is deleted only when this was its LAST reference; if another tag (a `docker tag` alias)
+/// still points at the same rootfs we just drop the tag (an untag) and keep the layers. So `rmi ubuntu`
+/// with `ubuntu:24.04` also present untags only `ubuntu:latest` and leaves `ubuntu:24.04` resolvable.
 pub(crate) async fn image_delete(State(a): State<App>, Path(name): Path<String>) -> Response {
     let mut g = a.inner.lock().await;
-    let bare = ref_name(&name).to_string();
-    let untagged = g.images.iter().find(|i| ref_name(&i.name) == bare).map(|i| repo_tag(&i.name));
-    // The rootfs dirs of the images we're about to drop: a real `rmi` deletes the on-disk layers, not
-    // just the in-memory store entry.
-    let dropped: Vec<(String, String)> = g.images.iter()
-        .filter(|i| ref_name(&i.name) == bare)
-        .map(|i| (i.name.clone(), i.rootfs.clone())).collect();
-    if dropped.is_empty() {
+    let (want_repo, want_tag) = (ref_name(&name).to_string(), ref_tag(&name));
+    // The single tag entry the reference names (repository AND tag must match). `ref_name`/`ref_tag`
+    // mirror the lenient matching used elsewhere (registry/namespace ignored).
+    let matches = |i: &Image| ref_name(&i.name) == want_repo && ref_tag(&i.name) == want_tag;
+    let Some(target) = g.images.iter().find(|i| matches(i)).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
+    };
+    let untagged = repo_tag(&target.name);
+    g.images.retain(|i| !matches(i)); // remove only this tag, never sibling tags of the same repo
+    // Delete the on-disk rootfs only when this was its last reference: another tag sharing the same
+    // rootfs (a `docker tag` alias) keeps it alive, so we report an untag and leave the layers in place.
+    let last_ref = !g.images.iter().any(|i| i.rootfs == target.rootfs);
+    let mut report = vec![json!({ "Untagged": untagged })];
+    if last_ref && target.name != "macos" { // the host `macos` image's rootfs is the live `/` — never delete
+        remove_image_dir(&a.images_dir, &target.rootfs);
+        report.push(json!({ "Deleted": format!("sha256:{}", fake_id(&target.name)) }));
     }
-    g.images.retain(|i| ref_name(&i.name) != bare);
-    // Delete each dropped image's on-disk directory, but only when it lives under the writable image
-    // store AND no surviving image still points at the same rootfs (a `docker tag` alias shares it).
-    for (nm, rootfs) in &dropped {
-        if nm == "macos" { continue; } // the host image's rootfs is the live `/` — never delete it
-        if g.images.iter().any(|i| &i.rootfs == rootfs) { continue; } // a remaining alias still uses it
-        remove_image_dir(&a.images_dir, rootfs);
-    }
-    crate::events::emit_event(&a.events, "image", "delete", &bare, json!({"name": bare}));
-    let untagged = untagged.unwrap_or_else(|| format!("{bare}:latest"));
-    Json(json!([{ "Untagged": untagged }, { "Deleted": format!("sha256:{}", fake_id(&bare)) }])).into_response()
+    crate::events::emit_event(&a.events, "image", "delete", &want_repo, json!({"name": repo_tag(&target.name)}));
+    Json(json!(report)).into_response()
 }
 
 /// Remove an image's on-disk directory (`<images_dir>/<safe>/`, the parent of its `rootfs/`). Guarded
@@ -431,10 +444,9 @@ pub(crate) async fn image_push(State(a): State<App>, Path(name): Path<String>, Q
     // it AND the requested tag, then push to the image's FULL stored name so the registry namespace
     // (`huttarichard/…`) is preserved — otherwise the upload targets `library/<name>` and is denied.
     let want_tag = q.tag.filter(|t| !t.is_empty()).unwrap_or_else(|| "latest".into());
-    let name_tag = |n: &str| match n.rsplit_once(':') { Some((_, t)) if !t.contains('/') => t.to_string(), _ => "latest".into() };
     let img = {
         let g = a.inner.lock().await;
-        g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name) && name_tag(&i.name) == want_tag)
+        g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name) && ref_tag(&i.name) == want_tag)
             .or_else(|| g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)))
             .cloned()
     };
