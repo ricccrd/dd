@@ -2,7 +2,7 @@
 
 dd is tested on **two surfaces**, in **two run-classes**, across **three targets**. This document is the
 operator's guide: what to run for daily development vs. full compatibility, and how the pieces fit.
-See `CHARTER.md` for *why* (the goal/requirements) and `GAPS.md` for the live list of known breakage.
+See `CHARTER.md` for *why* (the goal/requirements) and `../STATUS.md` for the live list of known breakage.
 
 ## The two surfaces
 
@@ -67,13 +67,13 @@ Each case reports one of: `✓ pass` · `✗ fail` (a real, unexpected break —
 passes — the engine was fixed; drop the marker) · `· skip` (image absent / target n/a).
 
 **Known engine bugs are written as real tests and marked `xfail`** on the affected target. The gate
-stays green; the gap is documented in `GAPS.md`; XPASS auto-alerts the moment the engine lane fixes it.
+stays green; the gap is documented in `../STATUS.md`; XPASS auto-alerts the moment the engine lane fixes it.
 
 ## When a test finds a bug
 
 Do **not** debug the engine inside a test. Instead:
 1. Mark the case `xfail <id> <target> "<one-line reason>"` so the gate stays green.
-2. Add a row to `GAPS.md` (id, target, symptom, suspected area).
+2. Add a row to `../STATUS.md` (id, target, symptom, suspected area).
 3. A dedicated **diagnostic agent** is spawned to root-cause it. Tests only document; they never fix the
    dd-jit engine C (see `CHARTER.md`).
 
@@ -89,10 +89,11 @@ dd-tests/
     scenario.rs             # Real-software framework: Target/Scenario/Daemon/run_one (universal API)
     scenarios/              # Real-software: one module per category (distros, languages, databases, …)
     bin/scenarios.rs        # the real-software runner (boots ONE daemon, the entry point)
-  docs/
-    CHARTER.md              # goal + all requirements (the contract)
-    TESTING.md              # this file
-    GAPS.md                 # live inventory of crashes / missing / divergences + owning agent
+/docs/                      # repo-root docs (unified)
+  testing/CHARTER.md        # goal + all requirements (the contract)
+  testing/TESTING.md        # this file
+  STATUS.md                 # live inventory of coverage gaps / divergences + owning agent
+  PLAN.md                   # PART A = open-bug inventory · PART B = phased refactor
 ```
 
 ## Authoring a real-software case (the universal API, in Rust)
@@ -107,7 +108,7 @@ pub fn group() -> ScenGroup {
         scen("databases/redis-ping", "redis:alpine")
             .exec("redis-server --save '' --daemonize yes; sleep 1; redis-cli ping")
             .has("PONG")
-            .xfail(&[Target::ArmLinux]),   // known fork+exec engine gap — see GAPS.md
+            .xfail(&[Target::ArmLinux]),   // known fork+exec engine gap — see ../STATUS.md
     ])
 }
 ```

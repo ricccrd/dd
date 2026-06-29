@@ -1,7 +1,9 @@
 # Sentry security review — threat model for the untrusted-guest split
 
-Status: security review (read-only over `dd-jit/src/runtime/os/linux/sentry.c`, the design docs
-`sentry-split.md` + `w6b-sentry.md`, and the daemon gate in `dd-daemon/src/runtime.rs`).
+Status: security review (read-only over `dd-jit/src/runtime/os/linux/sentry.c` — the now-shipped
+sentry process-split — and the daemon gate in `dd-daemon/src/runtime.rs`). The split's original design +
+PoC docs have been removed now that the code has landed; this review tracks the **remaining** hardening
+(seccomp, guard page, mach-lookup filter — see [`../PLAN.md` A.3](../PLAN.md)).
 Scope: the **untrusted-guest sentry process-split**, whose purpose is to safely run *untrusted*
 container images. This document is the security basis for deciding whether the sandbox can be
 trusted with real untrusted images. **Short answer today: not yet — see the GAPs in §3.**

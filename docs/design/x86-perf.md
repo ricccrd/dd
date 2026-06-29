@@ -30,7 +30,7 @@ All file/line references are to the tree as of this writing; treat them as ancho
   **only** the bits that consumer reads — mapping x86 condition → ARM condition directly off the live
   flags. Materialize the canonical `cpu->nzcv` only at a **block/dispatch boundary** (keeping the
   cross-block ABI byte-identical, so the change is intra-block and provably safe).
-* This is **not** the "dead-NZCV-flag elimination" dud from `docs/OPTIMIZATIONS.md`. That dud removed a
+* This is **not** the "dead-NZCV-flag elimination" dud from `../architecture/OPTIMIZATIONS.md`. That dud removed a
   *native* flag-set the wide OoO core already hides. Here we remove **explicit `str`/`ldr` memory traffic
   and `mrs`/`msr` system-register moves** — real instructions with real latency and serialization that
   the core cannot hide. Different cost, different verdict. (§5 makes the argument in full.)
@@ -229,7 +229,7 @@ the frontend.)
 
 ### 3.5 Why this is safe where the aarch64 dud was not
 
-`docs/OPTIMIZATIONS.md` lists "Dead-NZCV-flag elimination" as a ~1.0× dud and warns the cross-ISA-DBT
+`../architecture/OPTIMIZATIONS.md` lists "Dead-NZCV-flag elimination" as a ~1.0× dud and warns the cross-ISA-DBT
 intuition doesn't transfer to Apple Silicon. That verdict is about the **aarch64** guest, where flags are
 the host's flags: eliding a dead native `cmp` saves one instruction the 8-wide OoO core was already
 hiding behind other work. **The x86 case is categorically different:** each x86 flag def today carries an
@@ -457,4 +457,4 @@ elimination.
 | prologue / spill / exits / chaining / IBTC | `emit.c:315 emit_prologue`, `:327 emit_spill`, `:334 emit_exit_const`, `:345 emit_chain_exit`, `:365 emit_ibranch` |
 | aarch64 native-NZCV reference | `frontend/aarch64/translate.c:54` (only nzcv mention) |
 | bench harness (perf gate) | `dd-tests/src/bin/bench.rs` (`int-sieve`/`float-nbody`/`sha256`/`sqlite`) |
-| dud note to reconcile | `docs/OPTIMIZATIONS.md` ("Duds — Dead-NZCV-flag elimination") |
+| dud note to reconcile | `../architecture/OPTIMIZATIONS.md` ("Duds — Dead-NZCV-flag elimination") |

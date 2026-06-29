@@ -3,7 +3,7 @@
 > Scope: this is the **core engine** optimization design (block chaining, IBTC, §B shadow-return,
 > register-stealing). The wave-1–6 optimization **sweep** (20 measured opts: SSE→NEON, rep-string, lazy
 > flags, traces, tier-2, inline syscalls, path/openat caches, pcache, fork-server, …) is **landed** and lives
-> in [`/docs/PLAN.md`](../docs/PLAN.md) (remaining work) + [`/dd-daemon/PERFORMANCE.md`](../dd-daemon/PERFORMANCE.md)
+> in [`/docs/PLAN.md`](../PLAN.md) (remaining work) + [`/docs/PERFORMANCE.md`](../PERFORMANCE.md)
 > (developer-facing list). This doc is engine-internal reference, not published on the website.
 
 The honest thesis: on a wide out-of-order Apple-Silicon core, **most classic DBT tricks do nothing** —

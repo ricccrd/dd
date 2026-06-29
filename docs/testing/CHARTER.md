@@ -56,7 +56,7 @@ arches) so any architectural divergence is caught. macOS does **not** need the s
 - **This orchestrator only WRITES TESTS and DOCUMENTS** what is missing / crashing / not-ok.
 - **It does NOT fix the engine.** Project memory is explicit: do not edit dd-jit engine C in this lane.
 - **Every time a test surfaces a bug → spawn a dedicated diagnostic agent** to root-cause it and record
-  the finding in `GAPS.md`. Builder agents never stop to debug the engine themselves.
+  the finding in `../STATUS.md`. Builder agents never stop to debug the engine themselves.
 - **Keep delegating; do not stop** until coverage is broad. Idle capacity = launch the next category or
   diagnostic agent.
 
@@ -64,5 +64,5 @@ arches) so any architectural divergence is caught. macOS does **not** need the s
 
 `--list`/count (basics) + scenario count ≥ **1000** distinct cases · full run **green** (no *unexpected*
 failure; known engine bugs xfail-tracked) · **all 3 targets** exercised · real images **actually pulled
-and executed** (never mocked) · `quick` and `long` both documented and runnable · `GAPS.md` enumerates
+and executed** (never mocked) · `quick` and `long` both documented and runnable · `../STATUS.md` enumerates
 every crash/missing/divergence with an owning diagnostic agent.

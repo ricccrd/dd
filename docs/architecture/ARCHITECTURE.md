@@ -4,7 +4,7 @@ dd-jit JIT-translates guest machine code (linux/x86_64, linux/aarch64, darwin/aa
 to host ARM64 macOS and emulates the guest OS in userspace — no VM. One C codebase,
 three Mach-O executables (one per `(guest OS, guest ISA)` target).
 
-See also `../README.md` (Layout / Decomposition state). This doc is the **interface map**;
+See also `../../dd-jit/README.md` (Layout / Decomposition state). This doc is the **interface map**;
 `REFACTOR.md` is the **structure/change plan**; `LAUNCH.md` is the **launch/env contract**;
 `TREE.md` is the **full target folder layout** (every file + the move-map).
 
