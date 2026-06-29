@@ -20,6 +20,12 @@ website lives under `website/docs/`).
 - [architecture/OPTIMIZATIONS.md](architecture/OPTIMIZATIONS.md) — engine-internal optimization design (chaining, IBTC, §B, register-stealing).
 - [PERFORMANCE.md](PERFORMANCE.md) — developer-facing perf defaults & knobs.
 
+## Operating / debugging
+
+- [DEBUGGING.md](DEBUGGING.md) — the consolidated debug/profiling guide: knob inventory, the
+  debug-vs-production build split, standard dumps (crash/unimpl/trace/guest-PC sampler), the
+  `DDJIT_*` knob namespace + env-forwarding fix, and the external-bug-report **runbook**.
+
 ## Design & mechanism references
 
 `design/` documents **how implemented mechanisms work** — read the relevant one *before*

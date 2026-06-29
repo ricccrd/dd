@@ -110,6 +110,29 @@ Each step below is classified **STRUCTURAL** (must produce a byte-identical engi
 **Stop after PHASE 8 for the "isolate collisions" goal; PHASE 9 is the long-horizon convergence.**
 Safest-first ordering: the zero-behavior phases (1,2,4,6,7) before the behavioral splits (3,5,8), dedup (9) last.
 
+### PHASE 10 — Observability/debug-build consolidation
+
+> **Goal (owner's words):** *standard mechanisms that dump what we need, a debug-vs-production build,
+> and a clear way to launch in debug mode when an external report comes in.* Today there is **one**
+> build flavor (`clang -O2`, no `-g`/asserts/sanitizer), every diagnostic is a runtime `getenv` in the
+> hot path, the knobs use three naming schemes, and — the killer — **the binding does not forward
+> them** (only `DD_*` reaches the `exec env …` launch prefix). Full spec + runbook:
+> [`DEBUGGING.md`](DEBUGGING.md).
+
+Independent of the structural moves; can proceed alongside PHASE 1–8 (mostly additive). **BEHAVIORAL.**
+
+| step | kind | goal | exit criteria |
+|---|---|---|---|
+| 10.1 build profiles | build | `DD_DEBUG`/`DD_SAN` in `build.rs` → release (trace **compiled out**, `-DNDEBUG`) vs debug (`-g`+asserts+`_Static_assert`s) vs asan/tsan; `make engine-{debug,asan,tsan}` | release binary byte-identical to today (trace points compiled out, not just gated); debug build carries symbols+asserts; matrix green on release |
+| 10.2 knob namespace | behavioral | fold bare/`JIT86_*` knobs under `DDJIT_*` (`DDJIT_TRACE=`, `DDJIT_PROF=`, `DDJIT_NO=`, `DDJIT_CRASHDUMP=`, `DDJIT_SAMPLE=`, `DDJIT_DEBUG=` umbrella) with back-compat readers for the old names | both old + new names work; matrix green |
+| 10.3 env forwarding | behavioral | `SpawnConfig::script()` copies any ambient `DDJIT_*` into the launch prefix (allow-listed), like `DD_*` | `DDJIT_TRACE=block,syscall dd run …` reproduces with full diagnostics via the normal/daemon path |
+| 10.4 standard dumps | behavioral | unify the UNIMPL spellings → `[syscall-unimpl]`/`[op-unimpl]`; one tagged-line crash dump; add the **guest-PC sampler** + promote the **indirect-branch/IBTC log** + engine banner (§3 DEBUGGING.md) | a spin bug is localizable from `DDJIT_SAMPLE` alone; bundle reproduces the 5 symptom classes |
+| 10.5 runbook | doc | the copy-pasteable single-bundle collection (§6 DEBUGGING.md) is the standard external-repro path | DEBUGGING.md runbook validated against one real open bug (e.g. `toolchain-link-hang` via the sampler/ibranch log) |
+
+**Exit:** one switch flips debug↔prod; the hot dispatch path is zero-cost in prod; a `DDJIT_*` knob
+set on a normal `dd run` reaches the engine; an external report is reproduced + a full diagnostic
+bundle collected by following [`DEBUGGING.md`](DEBUGGING.md) §6 without hand-instrumenting the engine.
+
 ### Byte-identity check (STRUCTURAL phases only)
 
 ```
