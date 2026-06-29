@@ -93,6 +93,28 @@ fn resolve_user(rootfs: &str, spec: &str) -> Option<(u32, u32)> {
 }
 
 
+/// Docker's default container PATH (moby's `system.DefaultPathEnv` for unix). Used when neither the
+/// image config nor a `-e PATH=` override supplies one, so bare commands in the standard sbin/bin dirs
+/// (e.g. alpine's `apk` in /sbin) resolve without an absolute path.
+const DEFAULT_GUEST_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Resolve the guest environment from a container's merged `env` ("K=V" lines: image `Config.Env`
+/// followed by `docker run -e` overrides). Duplicate keys collapse to their LAST value (so an explicit
+/// `-e KEY=` overrides the image's), forward order is preserved, and a default PATH is injected when the
+/// image set none -- mirroring docker's env semantics. Returns the lines ready to join into DD_GUEST_ENV.
+fn guest_env(env: &[String]) -> Vec<String> {
+    let key = |kv: &str| kv.split('=').next().unwrap_or(kv).to_string();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::with_capacity(env.len());
+    // Walk back-to-front so the LAST assignment of each key wins, then restore forward order.
+    for kv in env.iter().rev() {
+        if seen.insert(key(kv)) { out.push(kv.clone()); }
+    }
+    out.reverse();
+    if !seen.contains("PATH") { out.push(DEFAULT_GUEST_PATH.to_string()); }
+    out
+}
+
 /// Translate the container into a typed [`SpawnConfig`] and run it in the matching guest's JIT.
 /// Named-volume binds (`name:/path`, no leading `/`) are resolved against `volumes_dir`.
 /// Build the (program, args) that launches this container in the matching guest's JIT. `None` if no JIT
@@ -110,8 +132,10 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
     // `-w DIR` (WorkingDir): the guest's initial cwd, read as DD_CWD by the runtime at startup.
     if !c.working_dir.is_empty() { cfg.env.push(("DD_CWD".into(), c.working_dir.clone())); }
     // container env (image ENV + `docker run -e`) -> one DD_GUEST_ENV var so the JIT forwards EXACTLY
-    // these to the guest, never the daemon/host environment.
-    if !c.env.is_empty() { cfg.env.push(("DD_GUEST_ENV".into(), c.env.join("\n"))); }
+    // these to the guest, never the daemon/host environment. Deduped (last assignment of a key wins, so
+    // an explicit `-e KEY=` overrides the image) with a docker-default PATH when the image set none.
+    let genv = guest_env(&c.env);
+    if !genv.is_empty() { cfg.env.push(("DD_GUEST_ENV".into(), genv.join("\n"))); }
     cfg.hostname = (!c.hostname.is_empty()).then(|| c.hostname.clone());
     cfg.mem_max = c.memory.max(0) as u64;
     cfg.pids_max = c.pids_limit.max(0) as u32;
