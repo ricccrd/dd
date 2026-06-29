@@ -1128,7 +1128,16 @@ static void do_sse3b(struct cpu *c) {
             idx = 31 - __builtin_clz(res);
         else
             idx = __builtin_ctz(res);
-        c->r[RCX] = idx; // flags (CF/ZF/SF/OF) are not consumed by any modelled path -> left as-is
+        c->r[RCX] = idx;
+        // PCMPISTRI flags (Intel SDM): CF=(IntRes2!=0), ZF=(operand2/rm reached its null, lb<n),
+        // SF=(operand1/reg reached its null, la<n), OF=IntRes2[0], AF=PF=0. glibc's SSE4.2 strlen/
+        // strchr/strstr branch on these (jbe/ja/jc/jz) right after the op, so they MUST be set; leaving
+        // stale flags was the debian-glibc grep miscount. Substrate: x86 CF = NOT stored-C (borrow).
+        {
+            int cf = (res != 0), zf = (lb < n), sf = (la < n), of = (res & 1);
+            c->nzcv = ((uint64_t)sf << 31) | ((uint64_t)zf << 30) | ((uint64_t)(!cf) << 29) | ((uint64_t)of << 28);
+            c->pf = 1; // PF source byte: odd popcount -> x86 PF=0
+        }
         c->rip = next;
         return;
     }

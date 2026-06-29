@@ -219,6 +219,13 @@ static void flags_materialize(void) {
     g_fl_pending = FL_NONE;
 }
 
+// PUSHFQ/POPFQ flag shuffling: OR the single bit at position `sp` of x[src] into x[dst] at
+// position `dp`, via a scratch reg `tmp`. (ubfx wtmp,wsrc,#sp,#1 ; orr xdst,xdst,xtmp,lsl #dp)
+static void e_bit_move(int dst, int src, int sp, int dp, int tmp) {
+    emit32(0x53000000u | (sp << 16) | (sp << 10) | (src << 5) | tmp); // ubfx wtmp,wsrc,#sp,#1
+    e_rrr(A_ORR, dst, dst, tmp, 0, dp);                               // orr xdst,xdst,xtmp,lsl #dp
+}
+
 // opt3 dead-flag elimination: 1 iff I's handler provably writes the FULL NZCV while reading no
 // flags -- so a pending producer's flags are dead (overwritten before any read) and need not be
 // materialized at all. Conservative whitelist: add/or/and/sub/xor/cmp/test/neg only. EXCLUDES
@@ -1491,6 +1498,52 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue; // AH = w17
             }
+            // pushfq (9C): materialize x86 RFLAGS from the flag substrate and push it. Bits assembled in
+            // x17: reserved bit1=1, IF(bit9)=1 (userspace), DF(bit10)=g_df (block-local), then CF/PF/ZF/
+            // SF/OF from cpu->nzcv + the PF lane. AF (bit4) is not modeled (read as 0).
+            if (op == 0x9C) {
+                if (g_fl_pending) flags_materialize(); // make cpu->nzcv current
+                e_ldr(16, 28, OFF_NZCV);               // x16 = ARM NZCV substrate
+                e_movconst(17, 0x202u | (g_df ? 0x400u : 0u));
+                emit32(0x53000000u | (29 << 16) | (29 << 10) | (16 << 5) | 18); // ubfx w18,w16,#29,#1 (borrow C)
+                e_movconst(19, 1);
+                e_rrr(A_EOR, 18, 18, 19, 0, 0); // x86 CF = NOT stored-C (borrow convention)
+                e_rrr(A_ORR, 17, 17, 18, 0, 0); // -> bit0
+                e_bit_move(17, 16, 30, 6, 18);  // ZF: NZCV.Z(30) -> bit6
+                e_bit_move(17, 16, 31, 7, 18);  // SF: NZCV.N(31) -> bit7
+                e_bit_move(17, 16, 28, 11, 18); // OF: NZCV.V(28) -> bit11
+                e_pf_compute(18);               // x18 = x86 PF (0/1); clobbers x16
+                e_rrr(A_ORR, 17, 17, 18, 0, 2); // -> bit2
+                e_subi(RSP, RSP, 8, 1);
+                e_store(8, 17, RSP);
+                gpc = next;
+                continue;
+            }
+            // popfq (9D): pop RFLAGS and distribute back into the flag substrate (cpu->nzcv + PF lane).
+            // DF (bit10) is intentionally not restored: runtime DF lives only as translate-time g_df, so a
+            // dynamic DF cannot be threaded here (a pre-existing limitation -- libc brackets string ops with
+            // straight-line std/cld, never with popfq).
+            if (op == 0x9D) {
+                e_load(8, 16, RSP); // x16 = popped RFLAGS
+                e_addi(RSP, RSP, 8, 1);
+                e_movconst(17, 0);
+                e_bit_move(17, 16, 6, 30, 18);  // ZF(bit6) -> NZCV.Z(30)
+                e_bit_move(17, 16, 7, 31, 18);  // SF(bit7) -> NZCV.N(31)
+                e_bit_move(17, 16, 11, 28, 18); // OF(bit11) -> NZCV.V(28)
+                emit32(0x53000000u | (0 << 16) | (0 << 10) | (16 << 5) | 18); // ubfx w18,w16,#0,#1 (CF)
+                e_movconst(19, 1);
+                e_rrr(A_EOR, 18, 18, 19, 0, 0);  // stored borrow-C = NOT x86 CF
+                e_rrr(A_ORR, 17, 17, 18, 0, 29); // -> NZCV.C(29)
+                e_str(17, 28, OFF_NZCV);
+                emit32(0xD51B4200u | 17); // msr nzcv, x17  (sync live ARM flags)
+                emit32(0x53000000u | (2 << 16) | (2 << 10) | (16 << 5) | 18); // ubfx w18,w16,#2,#1 (PF)
+                e_movconst(19, 1);
+                e_rrr(A_EOR, 18, 18, 19, 0, 0); // PF lane source byte = NOT PF (consumer takes even-parity)
+                e_str(18, 28, OFF_PF);
+                g_fl_pending = FL_NONE; // flags now materialized directly into cpu->nzcv
+                gpc = next;
+                continue;
+            }
             // ===== x87 FPU (D8-DF): double-precision stack emulation =====
             if (op >= 0xD8 && op <= 0xDF) {
                 int reg = I.reg & 7, rm = I.rm_reg & 7;
@@ -2498,6 +2551,10 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
+            if (op == 0x01 && I.has_modrm && I.modrm == 0xD5) { // xend (TSX): no transaction -> NOP
+                gpc = next;
+                continue;
+            }
             if (op == 0xC3) { // movnti: non-temporal store r32/r64 -> m
                 emit_ea(&I, next);
                 e_store(I.opsize, I.reg, 17);
@@ -2729,7 +2786,28 @@ static void *translate_block(uint64_t gpc) {
                     break;
                 }
                 int w = I.opsize, mem, bits = w * 8;
-                int val = rm_load(&I, next, w, &mem);
+                int logbits = w == 8 ? 6 : w == 4 ? 5 : 4; // log2(bits): 64/32/16
+                int logw = w == 8 ? 3 : w == 4 ? 2 : 1;    // log2(w)
+                int val;
+                // x86 bit-string addressing: with a MEMORY base and a REGISTER bit offset, the high bits of
+                // the (signed) offset select the addressed word (EA + (offset/bits)*w); only the low
+                // log2(bits) bits index within it. (An immediate offset is taken modulo the operand size,
+                // for both reg and mem.) Dropping the high bits -- the pre-fix behavior -- mis-tests a
+                // 256-bit bitset (e.g. glibc/grep's DFA charclass `bt %reg,(%mem)`), the debian-grep miss.
+                if (I.is_mem && !isimm) {
+                    emit_ea(&I, next);            // x17 = base EA
+                    if (w == 8)
+                        e_mov_rr(20, I.reg, 1);
+                    else
+                        e_sxt(20, I.reg, w);           // sxtw/sxth: index as a 64-bit signed value
+                    e_asr_i(20, 20, logbits, 1);       // x20 = signed word offset = index >> log2(bits)
+                    e_rrr(A_ADD, 17, 17, 20, 1, logw); // EA += wordoff * w
+                    e_load(w, 16, 17);
+                    val = 16;
+                    mem = 1;
+                } else {
+                    val = rm_load(&I, next, w, &mem);
+                }
                 if (isimm)
                     e_movconst(19, (uint64_t)(((uint64_t)I.imm) & (bits - 1))); // idx -> x19
                 else {
