@@ -8,7 +8,7 @@ use crate::archive::*;
 use crate::volumes::*;
 use crate::networks::*;
 use crate::runtime::*;
-use crate::registry::{Client, Credentials, ImageRef};
+use crate::registry::{Client, Credentials, ImageRef, PullEvent, layer_short};
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, Uri, HeaderMap};
@@ -146,22 +146,68 @@ pub(crate) async fn images_create(State(a): State<App>, Query(q): Query<ImageCre
     }
     let creds = registry_auth(&headers);
     let archs = platform_archs(q.platform.as_deref());
-    let (dir, nm, tg) = (a.images_dir.clone(), name.clone(), tag.clone());
-    let res = tokio::task::spawn_blocking(move || pull_image(&dir, &nm, &tg, creds, &archs)).await
-        .unwrap_or_else(|e| Err(format!("pull task crashed: {e}")));
-    match res {
-        Ok(img) => {
-            // Capture the synthetic content digest + rootfs size BEFORE the image is moved into state,
-            // so the progress stream can report a docker-shaped per-layer download for it.
-            let digest = format!("sha256:{}", fake_id(&img.name));
-            let size = image_size(&img.rootfs, &img.name);
-            let mut g = a.inner.lock().await;
-            g.images.retain(|i| repo_tag(&i.name) != want); // a re-pull (e.g. a new platform) replaces the old
-            g.images.push(img);
-            crate::events::emit_event(&a.events, "image", "pull", &want, json!({"name": want}));
-            pull_progress(&name, &tag, Ok(false), &digest, size)
+    pull_stream(a, name, tag, want, creds, archs)
+}
+
+/// Stream a fresh `docker pull` as newline-delimited JSON, flushing each status line as the download
+/// proceeds (mirrors the `events.rs` streamed-body pattern). A background task drives the blocking
+/// registry pull, forwarding its per-layer [`PullEvent`]s into the response body live; on completion it
+/// registers the image and emits the closing `Digest:`/`Status:` lines (or an error line). This replaces
+/// the old "block until done, then dump a fixed sequence" behavior so the client renders moving bars.
+fn pull_stream(a: App, name: String, tag: String, want: String, creds: Credentials, archs: Vec<&'static str>) -> Response {
+    // Lines flow out through `line_rx`; the body stream just drains it (closed when the worker drops tx).
+    // An awaited `send` gives natural backpressure (a slow/stalled client throttles the producer rather
+    // than silently dropping lines); a send error just means the client hung up — stop quietly.
+    let (line_tx, line_rx) = mpsc::channel::<Vec<u8>>(256);
+    tokio::spawn(async move {
+        macro_rules! emit { ($v:expr) => {
+            if line_tx.send(($v.to_string() + "\r\n").into_bytes()).await.is_err() { return; }
+        }; }
+        let repo = image_ref(&name, &tag).repository;
+        emit!(json!({ "status": format!("Pulling from {repo}"), "id": tag }));
+        // The blocking pull reports progress over `pev`; forward+format each event into a status line.
+        let (pev_tx, mut pev_rx) = mpsc::channel::<PullEvent>(256);
+        let (dir, nm, tg) = (a.images_dir.clone(), name.clone(), tag.clone());
+        let blocking = tokio::task::spawn_blocking(move || {
+            let mut cb = |e: PullEvent| { let _ = pev_tx.blocking_send(e); };
+            pull_image(&dir, &nm, &tg, creds, &archs, &mut cb)
+        });
+        while let Some(e) = pev_rx.recv().await {
+            emit!(pull_event_json(&e));
         }
-        Err(e) => pull_progress(&name, &tag, Err(e), "", 0),
+        let res = blocking.await.unwrap_or_else(|e| Err(format!("pull task crashed: {e}")));
+        match res {
+            Ok(img) => {
+                let digest = format!("sha256:{}", fake_id(&img.name));
+                {
+                    let mut g = a.inner.lock().await;
+                    g.images.retain(|i| repo_tag(&i.name) != want); // a re-pull (new platform) replaces the old
+                    g.images.push(img);
+                }
+                crate::events::emit_event(&a.events, "image", "pull", &want, json!({"name": want}));
+                emit!(json!({ "status": format!("Digest: {digest}") }));
+                emit!(json!({ "status": format!("Status: Downloaded newer image for {name}:{tag}") }));
+            }
+            Err(e) => emit!(json!({ "errorDetail": { "message": e.clone() }, "error": e })),
+        }
+    });
+    let body = futures_util::stream::unfold(line_rx, |mut rx| async move {
+        rx.recv().await.map(|b| (Ok::<Vec<u8>, std::io::Error>(b), rx))
+    });
+    Response::builder().status(StatusCode::OK).header("Content-Type", "application/json")
+        .body(Body::from_stream(body)).unwrap()
+}
+
+/// Format one live [`PullEvent`] into the docker-shaped JSON status object the CLI renders as a bar.
+fn pull_event_json(e: &PullEvent) -> Value {
+    match e {
+        PullEvent::Layer { id } => json!({ "status": "Pulling fs layer", "id": id }),
+        PullEvent::Downloading { id, current, total } =>
+            json!({ "status": "Downloading", "progressDetail": { "current": current, "total": total }, "id": id }),
+        PullEvent::DownloadComplete { id } => json!({ "status": "Download complete", "id": id }),
+        PullEvent::Extracting { id, current, total } =>
+            json!({ "status": "Extracting", "progressDetail": { "current": current, "total": total }, "id": id }),
+        PullEvent::PullComplete { id } => json!({ "status": "Pull complete", "id": id }),
     }
 }
 
@@ -217,10 +263,10 @@ pub(crate) fn image_ref(from_image: &str, tag: &str) -> ImageRef {
 
 /// Pull an image from its registry (any registry) and unpack it under `<images_dir>/<safe>/rootfs`,
 /// preferring the linux/arm64 variant (native; falls back to amd64). Returns the registered [`Image`].
-pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials, archs: &[&str]) -> Result<Image, String> {
+pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: Credentials, archs: &[&str], progress: &mut dyn FnMut(PullEvent)) -> Result<Image, String> {
     let iref = image_ref(from_image, tag);
     let rootfs = std::path::PathBuf::from(format!("{images_dir}/{}/rootfs", safe_name(&iref)));
-    let pulled = Client::new(iref.clone(), creds).pull(&rootfs, archs)?;
+    let pulled = Client::new(iref.clone(), creds).pull(&rootfs, archs, progress)?;
     // Distroless/scratch images carry no ELF/Mach-O to sniff, so the rootfs scan comes up empty.
     // Fall back to the manifest config's `architecture`+`os`, then to native arm64 — never fail the
     // pull just because the arch couldn't be detected.

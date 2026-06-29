@@ -447,7 +447,7 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
                         _ => (base.clone(), "latest".to_string()),
                     };
                     let (dir, archs) = (a.images_dir.clone(), platform_archs(None));
-                    match tokio::task::spawn_blocking(move || pull_image(&dir, &n, &t, Credentials::default(), &archs)).await
+                    match tokio::task::spawn_blocking(move || pull_image(&dir, &n, &t, Credentials::default(), &archs, &mut |_| {})).await
                         .unwrap_or_else(|e| Err(format!("pull task crashed: {e}"))) {
                         Ok(img) => { found = Some(pick(&img)); a.inner.lock().await.images.push(img); }
                         Err(e) => { cleanup(&ctx); return build_err(log, format!("pull of base image '{base}' failed: {e}")); }

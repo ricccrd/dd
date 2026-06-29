@@ -99,6 +99,30 @@ pub struct Pulled {
     pub config: Value, // the image config blob (Cmd/Entrypoint/Env/Architecture)
 }
 
+/// A live progress event for a single image pull, surfaced per-layer as the download/unpack proceeds.
+/// `images_create` formats these into docker's newline-delimited JSON status lines and streams them to
+/// the client, so the user sees moving download/extract bars instead of one post-hoc dump. `id` is the
+/// docker-style short layer id (first 12 hex of the blob digest). Byte counts are the compressed blob
+/// size from the manifest (the same units docker's registry pull reports).
+#[derive(Clone, Debug)]
+pub enum PullEvent {
+    /// A layer was discovered in the manifest (docker's "Pulling fs layer").
+    Layer { id: String },
+    /// Live download progress for a layer (`current`/`total` compressed bytes).
+    Downloading { id: String, current: u64, total: u64 },
+    /// A layer finished downloading.
+    DownloadComplete { id: String },
+    /// A layer's contents are being unpacked into the rootfs.
+    Extracting { id: String, current: u64, total: u64 },
+    /// A layer is fully pulled + unpacked.
+    PullComplete { id: String },
+}
+
+/// docker's short layer id: the first 12 hex chars after the `sha256:` prefix.
+pub fn layer_short(digest: &str) -> String {
+    digest.trim_start_matches("sha256:").chars().take(12).collect()
+}
+
 /// A registry session for one image: caches the bearer token across the manifest + blob requests.
 pub struct Client {
     image: ImageRef,
@@ -109,16 +133,28 @@ impl Client {
     pub fn new(image: ImageRef, creds: Credentials) -> Client { Client { image, creds, token: None } }
 
     /// Pull the image and unpack its layers into `rootfs` (created fresh). Picks the `linux/arm64`
-    /// variant of a multi-arch index, falling back to `linux/amd64`.
-    pub fn pull(&mut self, rootfs: &Path, want_archs: &[&str]) -> Result<Pulled, String> {
+    /// variant of a multi-arch index, falling back to `linux/amd64`. `progress` is invoked with a
+    /// [`PullEvent`] as each layer downloads/unpacks, so the caller can stream live progress to the
+    /// client; pass `&mut |_| {}` to ignore it.
+    pub fn pull(&mut self, rootfs: &Path, want_archs: &[&str], progress: &mut dyn FnMut(PullEvent)) -> Result<Pulled, String> {
         let manifest = self.resolve_manifest(want_archs)?;
         let config = self.config_blob(&manifest).unwrap_or_else(|_| json!({}));
         let layers = manifest["layers"].as_array().ok_or("manifest has no layers")?;
         if layers.is_empty() { return Err("manifest has no layers".into()); }
+        // Announce every layer up front (docker shows one "Pulling fs layer" line per blob), then pull
+        // them in order so each layer's download/extract progress streams live and in id order.
+        let metas: Vec<(String, u64, String)> = layers.iter().map(|layer| {
+            let digest = layer["digest"].as_str().unwrap_or_default().to_string();
+            let size = layer["size"].as_u64().unwrap_or(0);
+            let id = layer_short(&digest);
+            (digest, size, id)
+        }).collect();
+        for (_, _, id) in &metas { progress(PullEvent::Layer { id: id.clone() }); }
         reset_dir(rootfs)?;
-        for layer in layers {
-            let digest = layer["digest"].as_str().ok_or("layer missing digest")?;
-            self.unpack_layer(digest, rootfs)?;
+        for (digest, size, id) in &metas {
+            if digest.is_empty() { return Err("layer missing digest".into()); }
+            self.unpack_layer(digest, *size, id, rootfs, progress)?;
+            progress(PullEvent::PullComplete { id: id.clone() });
         }
         Ok(Pulled { image: self.image.clone(), config })
     }
@@ -168,10 +204,24 @@ impl Client {
         let bytes = self.get_blob_bytes(digest)?;
         serde_json::from_slice(&bytes).map_err(|e| e.to_string())
     }
-    fn unpack_layer(&mut self, digest: &str, rootfs: &Path) -> Result<(), String> {
+    /// Download one layer blob to a temp file (emitting live `Downloading` byte progress), then unpack it
+    /// into `rootfs` (emitting `Extracting`). Landing the compressed blob on disk first — rather than the
+    /// old `curl | tar` pipe — is what lets us poll the byte count and report real progress; the temp
+    /// file is removed afterwards regardless of outcome.
+    fn unpack_layer(&mut self, digest: &str, size: u64, id: &str, rootfs: &Path, progress: &mut dyn FnMut(PullEvent)) -> Result<(), String> {
         let token = self.authenticate("pull")?;
         let url = format!("{}/blobs/{digest}", self.image.base_url());
-        http::stream_into_tar(&url, token.as_deref(), rootfs)?;
+        let tmp = std::env::temp_dir().join(format!("dd-layer-{}-{id}.tar.gz", std::process::id()));
+        let out = (|| {
+            http::download_to_file(&url, token.as_deref(), &tmp, &mut |cur| {
+                progress(PullEvent::Downloading { id: id.to_string(), current: cur, total: size });
+            })?;
+            progress(PullEvent::DownloadComplete { id: id.to_string() });
+            progress(PullEvent::Extracting { id: id.to_string(), current: size, total: size });
+            http::extract_targz(&tmp, rootfs)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        out?;
         apply_whiteouts(rootfs)
     }
 
@@ -416,11 +466,36 @@ mod http {
         let _ = std::fs::remove_file(&tmp);
         r
     }
-    /// Stream a (gzipped-tar) blob straight into `rootfs` via `curl … | tar xz`.
-    pub fn stream_into_tar(url: &str, token: Option<&str>, rootfs: &Path) -> Result<(), String> {
-        let auth = token.map(|t| format!("-H 'Authorization: Bearer {t}'")).unwrap_or_default();
-        let cmd = format!("set -o pipefail; curl -sSL --max-time 600 {auth} '{url}' | tar xz -C '{}' 2>/dev/null",
-            rootfs.display());
+    /// Download a blob to `dest`, calling `progress` with the bytes-so-far while curl runs so the caller
+    /// can stream a live download bar. curl writes straight to disk (`-o`); we poll the file size every
+    /// ~150ms until the process exits, then report the final size. Landing the blob on disk (vs piping)
+    /// is what makes the byte count observable.
+    pub fn download_to_file(url: &str, token: Option<&str>, dest: &Path, progress: &mut dyn FnMut(u64)) -> Result<(), String> {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-sSL").arg("--max-time").arg("600");
+        if let Some(t) = token { cmd.arg("-H").arg(format!("Authorization: Bearer {t}")); }
+        cmd.arg("-o").arg(dest).arg(url);
+        let mut child = cmd.spawn().map_err(|e| format!("curl: {e}"))?;
+        let file_len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        loop {
+            match child.try_wait().map_err(|e| e.to_string())? {
+                Some(st) => {
+                    if !st.success() { return Err(format!("curl blob download failed ({st})")); }
+                    progress(file_len(dest)); // final, exact size
+                    return Ok(());
+                }
+                None => {
+                    progress(file_len(dest));
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        }
+    }
+    /// Unpack a gzipped-tar layer blob from `src` into `rootfs` (`tar xzf`). tar's stderr is muted because
+    /// OCI layers carry entries (device nodes, ownership) tar can't always recreate unprivileged — the
+    /// same tolerance the old `curl | tar xz 2>/dev/null` pipe had.
+    pub fn extract_targz(src: &Path, rootfs: &Path) -> Result<(), String> {
+        let cmd = format!("tar xzf '{}' -C '{}' 2>/dev/null", src.display(), rootfs.display());
         run("sh", &["-c", &cmd]).map(|_| ())
     }
 }

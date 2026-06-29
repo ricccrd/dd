@@ -278,15 +278,35 @@ static void service_local(struct cpu *c) {
             break;
         // FIONCLEX
         }
-        case 0x540f:
-            if (arg) *(int *)arg = (int)getpgrp();
+        // TIOCGPGRP -- tcgetpgrp(): report the terminal's REAL foreground process group when `fd` is a
+        // genuine tty (the daemon gives an interactive container a real controlling PTY via login_tty), so
+        // it stays consistent with the value TIOCSPGRP installs below. For a non-tty fd (the piped,
+        // non-interactive container path) fall back to getpgrp() exactly as before.
+        case 0x540f: {
+            if (arg) {
+                pid_t fg = isatty(fd) ? tcgetpgrp(fd) : -1;
+                *(int *)arg = (int)(fg > 0 ? fg : getpgrp());
+            }
             G_RET(c) = 0;
-            // TIOCGPGRP
             break;
-        // TIOCSPGRP
-        case 0x5410: G_RET(c) = 0; break;
-        // TIOCSCTTY
-        case 0x540e: G_RET(c) = 0; break;
+        }
+        // TIOCSPGRP -- tcsetpgrp() (bash job control). A linux guest's process groups ARE real host pgids
+        // (the JIT forks real host processes), so when `fd` is a real controlling terminal we install the
+        // foreground group for real -> Ctrl-C / fg/bg actually work. We ALWAYS report success though: the
+        // guest's terminal fd is valid (login_tty), but even if a pgid can't be set we must not surface the
+        // EBADF/EPERM that makes bash print "cannot set terminal process group ...: Bad file descriptor"
+        // and "no job control in this shell".
+        case 0x5410:
+            if (isatty(fd) && arg) { pid_t pg = *(int *)arg; if (pg > 0) (void)tcsetpgrp(fd, pg); }
+            G_RET(c) = 0;
+            break;
+        // TIOCSCTTY -- acquire the controlling terminal for real when `fd` is a tty (best effort; the
+        // login_tty in the daemon usually already did this for the session leader), then report success so
+        // an interactive shell's job-control setup never warns.
+        case 0x540e:
+            if (isatty(fd)) (void)ioctl(fd, TIOCSCTTY, 0);
+            G_RET(c) = 0;
+            break;
         // ENOTTY
         default: G_RET(c) = (uint64_t)(-25); break;
         }

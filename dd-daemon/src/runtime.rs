@@ -385,14 +385,36 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
     tokio::spawn(async move {
         let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1) as i64;
         if dbg { eprintln!("[live] {} exited code={code}", &cid[..12]); }
-        for h in io_handles { let _ = h.await; }
         *live.pty_master.lock().unwrap() = None;
+        // Signal the natural exit IMMEDIATELY — flip status + fire the exit watch the instant the guest's
+        // own process dies, so an interactive `docker run`/`ddcli mac` returns at once when the user types
+        // `exit`. CRITICAL: this must NOT be gated on draining the PTY/pipe reader tasks. A stray
+        // grandchild that inherited the slave/pipe fds can keep those readers from ever hitting EOF, and
+        // the previous code awaited them BEFORE flipping status — which made `exit` hang for as long as
+        // such a child lived (the daemon never told `docker run`/`/wait` the container was done). We drain
+        // the readers AFTER, with a bounded grace, purely to finalize the log snapshot.
         {
             let mut g = app.inner.lock().await;
             if let Some(cc) = g.containers.get_mut(&cid) {
                 cc.status = "exited".into();
                 cc.exit_code = code;
                 cc.finished_at = now_secs();
+            }
+            let (cname, cimage) = g.containers.get(&cid).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
+            crate::events::emit_event(&app.events, "container", "die", &cid, serde_json::json!({"exitCode": code.to_string(), "name": cname, "image": cimage}));
+            save_state(&g, &app.state_path);
+        }
+        let _ = live.exit.send(Some(code));
+        // Drain the reader tasks so the final output lands in the log buffer, but never block the reaper
+        // forever: a lingering child still holding the fds open would keep a reader from EOFing, so cap
+        // the wait. In the normal case (the guest's process tree fully exited) the slave/pipes close at
+        // once and each reader returns in well under this grace, so the snapshot below is complete.
+        for h in io_handles {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), h).await;
+        }
+        {
+            let mut g = app.inner.lock().await;
+            if let Some(cc) = g.containers.get_mut(&cid) {
                 // Finalize the per-stream snapshots downstream code reads (cc.stdout/cc.stderr) by
                 // filtering the ordered log by stream. The ordered log itself is LEFT INTACT on the
                 // retained Live so `docker logs` can still replay stdout/stderr interleaved after exit
@@ -404,11 +426,7 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
                 cc.stdout = so;
                 cc.stderr = se;
             }
-            let (cname, cimage) = g.containers.get(&cid).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
-            crate::events::emit_event(&app.events, "container", "die", &cid, serde_json::json!({"exitCode": code.to_string(), "name": cname, "image": cimage}));
-            save_state(&g, &app.state_path);
         }
-        let _ = live.exit.send(Some(code));
         // Exec cleanup: a `docker exec` runs through spawn_live with the EXEC id as `cid` (never a
         // `containers` entry). Record the exit code on the Exec, then drop ONLY its Live now that it has
         // exited — the Live's 8 MiB log buffer + channels are the real leak; without this every exec
