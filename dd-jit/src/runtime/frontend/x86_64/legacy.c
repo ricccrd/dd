@@ -68,6 +68,11 @@ static int x86_normalize(struct cpu *c) {
     case 282: r[10] = 0; r[0] = 289; return 0; // signalfd(fd,mask,sz) -> signalfd4(...,0)
     case 213: r[7] = 0; r[0] = 291; return 0; // epoll_create(size) -> epoll_create1(0)
     case 253: r[7] = 0; r[0] = 294; return 0; // inotify_init() -> inotify_init1(0)
+    // clone(flags,stack,ptid,ctid,tls): x86-64 orders the last two args ctid(r10),tls(r8), but the shared
+    // service is written against the canonical/aarch64 clone(flags,stack,ptid,tls,ctid) order (tls=a3=r10,
+    // ctid=a4=r8). Swap r10<->r8 so the canonical handler reads tls/ctid from the right slots; without this
+    // a CLONE_SETTLS thread gets tls=0 -> fs_base=0 -> the child faults on its first %fs TLS access.
+    case 56: { uint64_t t = r[10]; r[10] = r[8]; r[8] = t; return 0; }
     // --- fork/vfork -> clone(SIGCHLD): the shared clone host-forks when not CLONE_THREAD ---
     case 57:
     case 58:

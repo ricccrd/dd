@@ -64,13 +64,12 @@ static int elf_interp(const char *path, char *out, size_t n) {
 // [lo,hi) so a zero/small/already-mapped field is never disturbed. The module is located via the
 // runtime.firstmoduledata symbol and validated by the pclntab magic -> a no-op for a stripped image
 // or a non-Go ET_EXEC. Layout per Go runtime/symtab.go (verified against the go1.26 nats-server).
-static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64_t lo, uint64_t hi) {
+// Look up a symbol's st_value in the ELF .symtab (+ its linked string table). Returns 0 if absent.
+static uint64_t go_symval(const uint8_t *f, size_t fsz, const char *name) {
     uint64_t shoff = rd64(f + 0x28);
     int shnum = rd16(f + 0x3C), shent = rd16(f + 0x3A);
-    if (!shoff || !shent || (uint64_t)shoff + (uint64_t)shnum * shent > fsz) return;
-    // Find runtime.firstmoduledata in the symbol table (.symtab + its linked string table).
-    uint64_t md_va = 0;
-    for (int i = 0; i < shnum && !md_va; i++) {
+    if (!shoff || !shent || (uint64_t)shoff + (uint64_t)shnum * shent > fsz) return 0;
+    for (int i = 0; i < shnum; i++) {
         const uint8_t *sh = f + shoff + (uint64_t)i * shent;
         if (rd32(sh + 4) != 2) continue; // SHT_SYMTAB
         uint64_t symoff = rd64(sh + 0x18), symsz = rd64(sh + 0x20), syment = rd64(sh + 0x38);
@@ -82,13 +81,14 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
         for (uint64_t o = 0; o + syment <= symsz; o += syment) {
             const uint8_t *sym = f + symoff + o;
             uint32_t nameoff = rd32(sym);
-            if (nameoff >= strsz) continue;
-            if (strcmp((const char *)(f + stroff + nameoff), "runtime.firstmoduledata") == 0) {
-                md_va = rd64(sym + 8); // st_value
-                break;
-            }
+            if (nameoff < strsz && strcmp((const char *)(f + stroff + nameoff), name) == 0) return rd64(sym + 8);
         }
     }
+    return 0;
+}
+
+static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64_t lo, uint64_t hi) {
+    uint64_t md_va = go_symval(f, fsz, "runtime.firstmoduledata");
     if (!md_va || md_va < lo || md_va >= hi) return;
     uint8_t *md = (uint8_t *)(md_va + bias); // the mapped (biased) copy of firstmoduledata
     // Validate: field 0 is &pclntab, whose first u32 is the Go pclntab magic. Bail if not Go.
@@ -99,13 +99,21 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
     // Absolute pointer words of moduledata, in 8-byte units (Go 1.26 runtime/symtab.go). Slice headers
     // contribute only their .ptr word; len/cap follow and are skipped. The guard below also skips any
     // word that is zero or outside the link range, so unused fields cost nothing.
+    // Only the words that name CODE PCs / live read bases / GC segment bounds are rebased high: minpc/maxpc
+    // and text are compared against the high return-address PCs; the pcln tables, findfunctab, data/bss
+    // bounds and gc masks are dereferenced as mapped memory by findfunc/the GC. The type-system bases
+    // (types,etypes,rodata,gofunc -- words 37..40) are deliberately LEFT LOW: type/data pointers materialized
+    // by rip-relative lea are rewritten low (translate.c) to match the image's baked-absolute low pointers,
+    // so findmoduledatap's `types <= p < etypes` range check and resolveTypeOff must use the low bases too
+    // (rebasing them high made Go's type identity -- e.g. runtime.SetFinalizer's `fint == etyp` -- diverge).
+    // Any low type/data access is served by nonpie_fixup at +bias.
     static const int ptr_words[] = {
         0,                                  // pcHeader
         1, 4, 7, 10, 13, 16,                // funcnametab/cutab/filetab/pctab/pclntable/ftab slice ptrs
         19, 20, 21,                         // findfunctab, minpc, maxpc
         22, 23, 24, 25, 26, 27, 28, 29,     // text,etext,noptrdata,enoptrdata,data,edata,bss,ebss
         30, 31, 32, 33, 34, 35, 36,         // noptrbss,enoptrbss,covctrs,ecovctrs,end,gcdata,gcbss
-        37, 38, 39, 40, 41,                 // types,etypes,rodata,gofunc,epclntab
+        41,                                 // epclntab (types,etypes,rodata,gofunc = 37..40 stay low)
         42, 45, 48, 51,                     // textsectmap,typelinks,itablinks,ptab slice ptrs
         54, 56, 59, 62, 64,                 // pluginpath,pkghashes,inittasks,modulename,modulehashes ptrs
         69, 71, 72, 73,                     // gcdatamask.bytedata, gcbssmask.bytedata, typemap, next
@@ -126,10 +134,34 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
             if (cur >= lo && cur < hi) wr64(ba, cur + bias);
         }
     }
+    // W6A item 1: runtime.lastmoduledatap is a global *moduledata holding the baked-absolute (low) address
+    // of firstmoduledata. The runtime compares it against &firstmoduledata taken by a rip-relative lea --
+    // which materializes the HIGH mapped address (firstmoduledata is in the writable data segment, outside
+    // the type section, so its lea is NOT rewritten low). A low lastmoduledatap vs high &firstmoduledata
+    // makes runtime.main's `for md := &firstmoduledata; ...; md = md.next` loop overrun the single module
+    // (md never equals lastmoduledatap) and dereference md.next == nil -> SIGSEGV. Rebase the pointer the
+    // global holds to its high mapping so the identity holds. (modulesSlice entries stay low: they are only
+    // DEREFERENCED -- served by nonpie_fixup -- never compared against a lea.)
+    uint64_t lmdp_va = go_symval(f, fsz, "runtime.lastmoduledatap");
+    if (lmdp_va >= lo && lmdp_va < hi) {
+        uint8_t *slot = (uint8_t *)(lmdp_va + bias);
+        uint64_t cur = rd64(slot);
+        if (cur >= lo && cur < hi) wr64(slot, cur + bias);
+    }
+    // W6A item 1: publish the (left-low) type section [types, etypes) -- moduledata words 37,38, which are
+    // deliberately NOT rebased above. translate.c rewrites a rip-relative lea whose target lands here to the
+    // low link address so lea-built *_type pointers match the image's baked-absolute (low) type pointers and
+    // Go's type identity holds. Only set when both bounds are sane low link addresses.
+    uint64_t tlo = rd64(md + 37 * 8), thi = rd64(md + 38 * 8);
+    if (tlo >= lo && thi <= hi && tlo < thi) {
+        g_nonpie_types_lo = tlo;
+        g_nonpie_types_hi = thi;
+    }
     extern int g_diag;
     if (g_trace || g_diag || getenv("JT"))
-        fprintf(stderr, "[go-rebase] firstmoduledata@%llx +bias=%llx (magic=%x)\n", (unsigned long long)md_va,
-                (unsigned long long)bias, magic);
+        fprintf(stderr, "[go-rebase] firstmoduledata@%llx +bias=%llx (magic=%x) types=[%llx,%llx)\n",
+                (unsigned long long)md_va, (unsigned long long)bias, magic, (unsigned long long)g_nonpie_types_lo,
+                (unsigned long long)g_nonpie_types_hi);
 }
 
 static void load_elf(const char *path, struct loaded *out) {
@@ -189,6 +221,7 @@ static void load_elf(const char *path, struct loaded *out) {
         g_nonpie_lo = basepage;
         g_nonpie_hi = basepage + span;
         g_nonpie_bias = bias;
+        g_nonpie_types_lo = g_nonpie_types_hi = 0; // set by go_rebase_nonpie iff this is a Go image
     }
     for (int i = 0; i < phnum; i++) {
         uint8_t *ph = f + phoff + (uint64_t)i * phentsize;

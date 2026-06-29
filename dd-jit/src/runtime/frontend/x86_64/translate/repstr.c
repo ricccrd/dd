@@ -20,7 +20,16 @@ static int norep_disabled(void) {
 // be WRONG here -- so we replay it element-by-element at the guest element width `w`,
 // which reproduces the scalar loop's bytes exactly (byte-wise smear differs from a
 // w>1 element smear at sub-element overlap offsets).
+// W6A item 1 (non-PIE): a biased ET_EXEC's guest pointer may still carry its low link address (e.g. a
+// rip-relative lea into the type/rodata section); rebase it to the real high mapping so these bulk C string
+// helpers touch the mapped bytes (the single-access fault path nonpie_fixup cannot serve a libc memcpy).
+// Inert for PIE/static-PIE (g_nonpie_lo == 0).
+static inline uint64_t repstr_g2h(uint64_t a) {
+    return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
+}
 static void dd_rep_movs(uint8_t *dst, const uint8_t *src, uint64_t nbytes, int w) {
+    dst = (uint8_t *)repstr_g2h((uint64_t)dst);
+    src = (const uint8_t *)repstr_g2h((uint64_t)src);
     if (nbytes == 0) return;
     if (dst <= src || dst >= src + nbytes) { // disjoint, or forward-safe (dst before src)
         memcpy(dst, src, nbytes);
@@ -53,6 +62,7 @@ static void dd_rep_movs(uint8_t *dst, const uint8_t *src, uint64_t nbytes, int w
 
 // Host helper for `rep stos`: fill `n` elements of width `w` with `val` (AL/AX/EAX/RAX).
 static void dd_rep_stos(uint8_t *dst, uint64_t val, uint64_t n, int w) {
+    dst = (uint8_t *)repstr_g2h((uint64_t)dst);
     switch (w) {
     case 2: {
         uint16_t *p = (uint16_t *)dst, v = (uint16_t)val;

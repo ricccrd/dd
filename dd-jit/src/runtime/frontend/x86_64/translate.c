@@ -47,6 +47,14 @@ static void byte_wb(struct insn *I, int regnum, int val) {
     else
         e_bfi(regnum, val, 0, 8, 1);
 }
+// W6A item 1 (non-PIE): the link range + bias of a biased ET_EXEC image (defined in os/linux/container/vfs.c,
+// set in elf.c's load_elf -- both later in the unity TU), plus the Go type section [md.types, md.etypes) in
+// low link coords (set by elf.c's go_rebase_nonpie; the range whose lea-materialized *_type pointers are made
+// low so they match the image's baked-absolute type pointers and Go's type identity holds). Forward tentative
+// declarations so the rip-relative `lea` rewrite below can see them. All zero for PIE/static-PIE / non-Go
+// images -> the rewrite is inert.
+static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, g_nonpie_types_lo, g_nonpie_types_hi;
+
 // r/m operand: mem -> EA to x17, load value to x16 (returns 16); reg -> value reg.
 static void emit_ea(struct insn *I, uint64_t next_rip);
 static int rm_load(struct insn *I, uint64_t next, int w, int *mem) {
@@ -76,6 +84,98 @@ static void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already
             e_bfi(I->rm_reg, val, 0, 8 * w, 1);
     }
 }
+// RCL/RCR (group2 /2,/3): rotate the r/m operand THROUGH the x86 carry flag by a CONSTANT count -- the
+// by-1 (D0/D1) and immediate (C0/C1) forms; the by-CL form is left to defer (report_unimpl). The operand
+// and CF together form a (W+1)-bit value rotated by `ec`; only CF and -- for a 1-bit rotate -- OF are
+// affected, with SF/ZF/PF preserved. Carry-in is taken from cpu->nzcv (stored ARM C = NOT x86 CF; the
+// lazy-flag pre-pass has already materialized any pending producer), the result and the new CF/OF are
+// emitted with compile-time-constant shifts, and CF/OF are written back to cpu->nzcv. Scratch x19..x24.
+static void emit_rcl_rcr(struct insn *I, uint64_t next, int w, int rcr, int cnt_raw) {
+    int ssf = (w >= 4) ? (w == 8) : 1; // operate 64-bit for byte/word (operand is zero-extended)
+    int W = 8 * w, bw = ssf ? 64 : 32;
+    int ec = (w < 4) ? (cnt_raw % (W + 1)) : cnt_raw; // effective rotate through the (W+1)-bit value
+    int count1 = (cnt_raw == 1);                       // OF defined only for a single-bit rotate
+    int mem;
+    int raw = rm_load(I, next, w, &mem);
+    if (ec == 0) {                       // a 0-count rotate is a no-op and affects no flags
+        if (mem) e_store(w, raw, 17);
+        return;
+    }
+    if (w < 4)
+        e_uxt(19, raw, w); // x19 = zero-extended operand
+    else
+        e_mov_rr(19, raw, ssf);
+    // x24 = carry-in (x86 CF) = NOT(stored ARM C, nzcv bit 29)
+    e_ldr(20, 28, OFF_NZCV);
+    e_lsr_i(20, 20, 29, 1);
+    e_movconst(23, 1);
+    e_rrr(A_AND, 20, 20, 23, 0, 0);
+    e_rrr(A_EOR, 24, 20, 23, 0, 0);
+    // x21 = new x86 CF: RCR -> bit (ec-1) of operand, RCL -> bit (W-ec) of operand
+    e_lsr_i(21, 19, rcr ? ec - 1 : W - ec, ssf);
+    e_rrr(A_AND, 21, 21, 23, 0, 0);
+    // x16 = result (low W bits valid). Terms emitted only when non-trivial -> no out-of-range shifts.
+    if (rcr) {
+        if (ec < W)
+            e_lsr_i(16, 19, ec, ssf); // operand bits that fall straight down
+        else
+            e_movconst(16, 0);
+        if (W - ec == 0) // carry-in lands at result bit (W-ec)
+            e_rrr(A_ORR, 16, 16, 24, ssf, 0);
+        else {
+            e_lsl_i(20, 24, W - ec, ssf);
+            e_rrr(A_ORR, 16, 16, 20, ssf, 0);
+        }
+        if (ec >= 2) { // operand bits below carry wrap to the top: (operand & ((1<<(ec-1))-1)) << (W-ec+1)
+            e_lsl_i(20, 19, bw - (ec - 1), ssf);
+            e_lsr_i(20, 20, bw - (ec - 1), ssf);
+            e_lsl_i(20, 20, W - ec + 1, ssf);
+            e_rrr(A_ORR, 16, 16, 20, ssf, 0);
+        }
+    } else { // RCL
+        if (ec < W)
+            e_lsl_i(16, 19, ec, ssf);
+        else
+            e_movconst(16, 0);
+        if (ec - 1 == 0) // carry-in lands at result bit (ec-1)
+            e_rrr(A_ORR, 16, 16, 24, ssf, 0);
+        else {
+            e_lsl_i(20, 24, ec - 1, ssf);
+            e_rrr(A_ORR, 16, 16, 20, ssf, 0);
+        }
+        if (ec >= 2) { // top operand bits wrap to the bottom: (operand >> (W+1-ec)) keeping low (ec-1) bits
+            e_lsr_i(20, 19, W + 1 - ec, ssf);
+            e_lsl_i(20, 20, bw - (ec - 1), ssf);
+            e_lsr_i(20, 20, bw - (ec - 1), ssf);
+            e_rrr(A_ORR, 16, 16, 20, ssf, 0);
+        }
+    }
+    // OF (single-bit rotate only): RCL -> newCF ^ result_MSB ; RCR -> result top two bits XORed.
+    if (count1) {
+        e_lsr_i(20, 16, W - 1, ssf); // x20 = result MSB
+        if (rcr) {
+            e_lsr_i(19, 16, W - 2, ssf);
+            e_rrr(A_EOR, 22, 20, 19, ssf, 0);
+        } else
+            e_rrr(A_EOR, 22, 21, 20, ssf, 0);
+        e_rrr(A_AND, 22, 22, 23, 0, 0); // x22 = OF (0/1)  (x23 still == 1)
+    }
+    rm_store(I, w, 16);
+    // Write back CF (stored C = NOT newCF) and, for a 1-bit rotate, OF (V); preserve N/Z (and V otherwise).
+    e_ldr(20, 28, OFF_NZCV);
+    e_movconst(19, 1u << 29);
+    e_rrr(A_BIC, 20, 20, 19, 1, 0);  // clear stored C
+    e_rrr(A_EOR, 19, 21, 23, 0, 0);  // x19 = NOT newCF
+    e_rrr(A_ORR, 20, 20, 19, 1, 29); // stored C = (NOT newCF) << 29
+    if (count1) {
+        e_movconst(19, 1u << 28);
+        e_rrr(A_BIC, 20, 20, 19, 1, 0);  // clear V
+        e_rrr(A_ORR, 20, 20, 22, 1, 28); // V = OF
+    }
+    e_str(20, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 20); // sync live ARM nzcv
+}
+
 // Lazy flags (x86-perf PR1 + opt3): pending-finalizer record. Translate-time only -- no guest
 // state, never exists at runtime. A width-4/8 do_alu producer *defers* its NZCV materialization:
 // the LIVE ARM NZCV currently holds that op's result flags, and g_fl_pending names which finalizer
@@ -532,6 +632,23 @@ static void *translate_block(uint64_t gpc) {
             }
             // ---- lea (8D) ----
             if (op == 0x8D) {
+                // W6A item 1: a rip-relative lea that materializes a *_type pointer in a biased non-PIE Go
+                // image. The image maps high (+bias) but its baked-absolute type pointers keep their low link
+                // addresses, so a high lea result compared against a baked low type pointer (Go type identity:
+                // interface assertions, SetFinalizer's `fint == etyp`, itab keys) diverges. When the target
+                // lands in the type section [md.types, md.etypes) emit the low link address so every *_type
+                // pointer is low-consistent; the eventual low type-struct access is served by nonpie_fixup.
+                // The rewrite is confined to the type section so string/rodata pointers (used as bulk memory
+                // operands, e.g. by rep movs) and code/data pointers keep their high mapped addresses. Only
+                // the 64-bit form (sf). Inert for PIE/static-PIE and non-Go images (types range == 0).
+                if (sf && I.rip_rel && g_nonpie_types_lo) {
+                    uint64_t lo = (next - g_nonpie_bias) + (uint64_t)I.disp; // low link target
+                    if (lo >= g_nonpie_types_lo && lo < g_nonpie_types_hi) {
+                        e_movconst(I.reg, lo);
+                        gpc = next;
+                        continue;
+                    }
+                }
                 emit_ea(&I, next);
                 e_mov_rr(I.reg, 17, sf);
                 gpc = next;
@@ -667,10 +784,18 @@ static void *translate_block(uint64_t gpc) {
                 if (k == 6) k = 4; // SAL == SHL
                 int w = (op & 1) ? I.opsize : 1, mem;
                 int bycl = (op == 0xD2 || op == 0xD3), by1 = (op == 0xD0 || op == 0xD1);
+                // RCL(/2)/RCR(/3) through carry: the constant-count forms (by-1, immediate) are emitted here;
+                // the by-CL form still defers (caught by the unimpl check below).
+                if ((k == 2 || k == 3) && !bycl) {
+                    int cmask = (w == 8) ? 63 : 31;
+                    emit_rcl_rcr(&I, next, w, k == 3, by1 ? 1 : ((int)I.imm & cmask));
+                    gpc = next;
+                    continue;
+                }
                 if (k != 0 && k != 1 && k != 4 && k != 5 && k != 7) {
                     report_unimpl(gpc, &I);
                     break;
-                } // RCL/RCR defer
+                } // RCL/RCR by CL defer
                 int raw = rm_load(&I, next, w, &mem);
                 if ((k == 0 || k == 1) && w < 4) {        // 8/16-bit ROL/ROR -- rotate WITHIN the operand width
                     int width = 8 * w;                    // (a 64-bit ROR would wrap the wrong bits, e.g. rolw $8)
