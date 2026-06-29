@@ -129,6 +129,19 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     __uint128_t *V = uc->uc_mcontext->__ns.__v; // SIMD/FP register file
     int rt = insn & 0x1F;
 
+    // ---- DC ZVA (data-cache zero by VA): zero the DCZID_EL0-sized block containing the faulting addr.
+    //      glibc's memset streams large zero-fills through `dc zva`; on the non-PIE image's .bss this
+    //      faults at the low link address. The guest sized its loop from the host DCZID_EL0 (the frontend
+    //      emits the mrs verbatim), so re-derive the same block size here and zero it at +bias.
+    if ((insn & 0xFFFFFFE0u) == 0xD50B7420u) {
+        uint64_t dczid;
+        __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
+        uint64_t bs = 4ull << (dczid & 0xf);
+        memset((void *)(real & ~(bs - 1)), 0, (size_t)bs);
+        uc->uc_mcontext->__ss.__pc += 4;
+        return 1;
+    }
+
     // ---- Load/store PAIR (LDP/STP, GPR + SIMD; no-alloc / offset / pre / post). (insn&0x3a000000)==0x28000000.
     if ((insn & 0x3a000000u) == 0x28000000u) {
         int v = (insn >> 26) & 1;   // SIMD&FP pair
@@ -216,6 +229,41 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             uint64_t val = (rt == 31) ? 0 : X[rt];
             memcpy((void *)real, &val, (size_t)(1 << size));
             if (!o2 && rs != 31) X[rs] = 0; // store-exclusive status register: report success
+        }
+        uc->uc_mcontext->__ss.__pc += 4;
+        return 1;
+    }
+
+    // ---- AdvSIMD load/store MULTIPLE structures, contiguous (LD1/ST1, 1..4 consecutive vec regs).
+    //      glibc's NEON memcpy/memmove/memset stream the non-PIE image's absolute data through these.
+    //      Encoding: bit31=0, bits[29:24]=001100, bit23=post-index, bits[21:16]=Rm/0, opcode[15:12],
+    //      size[11:10], Rn[9:5], Rt[4:0]. opcode picks reg-count for LD1/ST1; the interleaving forms
+    //      LD2/LD3/LD4 (de-interleave on load) we leave to a clean abort. Q=bit30 -> 16B regs else 8B.
+    if ((insn & 0xBFBF0000u) == 0x0C000000u || (insn & 0xBFA00000u) == 0x0C800000u) {
+        int post = (insn >> 23) & 1, q = (insn >> 30) & 1, load = (insn >> 22) & 1, opc = (insn >> 12) & 0xF;
+        int regs;
+        switch (opc) {
+        case 0x7: regs = 1; break;
+        case 0xA: regs = 2; break;
+        case 0x6: regs = 3; break;
+        case 0x2: regs = 4; break;
+        default: return 0; // interleaved LD2/LD3/LD4 -> clean abort
+        }
+        int bytes = q ? 16 : 8;
+        for (int i = 0; i < regs; i++) {
+            int r = (rt + i) & 31;
+            if (load) {
+                __uint128_t z = 0;
+                memcpy(&z, (void *)(real + (size_t)i * bytes), (size_t)bytes);
+                V[r] = z;
+            } else {
+                __uint128_t s = V[r];
+                memcpy((void *)(real + (size_t)i * bytes), &s, (size_t)bytes);
+            }
+        }
+        if (post) { // post-index writeback: Xn = guest addr + (Rm==31 ? bytes transferred : Xm)
+            int rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
+            X[rn] = va + (rm == 31 ? (uint64_t)(regs * bytes) : X[rm]);
         }
         uc->uc_mcontext->__ss.__pc += 4;
         return 1;
