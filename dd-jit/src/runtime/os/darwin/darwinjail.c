@@ -20,6 +20,7 @@
 #include <sys/mount.h>
 #include <sys/mman.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -127,6 +128,13 @@ FILE *jail_fopen(const char*p,const char*m){ char b[1024]; return fopen(jail(p,b
 FILE *jail_freopen(const char*p,const char*m,FILE*s){ char b[1024]; return freopen(jail(p,b), m, s); }
 int jail_gethostname(char*name,size_t len){ if(g_hostname){ strlcpy(name,g_hostname,len); return 0; } return gethostname(name,len); }
 pid_t jail_getpid(void){ return g_pid1 ? 1 : getpid(); }
+// raise() on Darwin is pthread_kill(pthread_self(), sig) -- a THREAD-directed signal. The kqueue
+// EVFILT_SIGNAL knote lives on the process klist and only fires for PROCESS-directed signals (the
+// psignal path), so a self-raised signal is invisible to a guest's signal kqueue (libdispatch signal
+// sources, the kq-signal case). Redirect to a process-directed kill so the knote posts, matching the
+// BSD kqueue model. In a single-threaded guest this is equivalent to raise(); getpid() here is the
+// real pid (intra-dylib calls are not interposed, as jail_getpid itself relies on).
+int jail_raise(int sig){ return kill(getpid(), sig); }
 int jail_bind(int s,const struct sockaddr*a,socklen_t l){
     if(a && a->sa_family==AF_INET){ struct sockaddr_in in=*(struct sockaddr_in*)a; int p=ntohs(in.sin_port);
         for(int i=0;i<g_npub;i++) if(g_pub[i].cont==p){ in.sin_port=htons(g_pub[i].host); return bind(s,(struct sockaddr*)&in,l); } }
@@ -221,6 +229,7 @@ INTERPOSE(jail_statfs, statfs)     INTERPOSE(jail_utimes, utimes)      INTERPOSE
 INTERPOSE(jail_link, link)         INTERPOSE(jail_symlink, symlink)    INTERPOSE(jail_opendir, opendir)
 INTERPOSE(jail_fopen, fopen)       INTERPOSE(jail_freopen, freopen)
 INTERPOSE(jail_gethostname, gethostname) INTERPOSE(jail_bind, bind)    INTERPOSE(jail_getpid, getpid)
+INTERPOSE(jail_raise, raise)
 INTERPOSE(jail_execve, execve)     INTERPOSE(jail_posix_spawn, posix_spawn) INTERPOSE(jail_posix_spawnp, posix_spawnp)
 INTERPOSE(jail_mmap, mmap)         INTERPOSE(jail_sys_icache_invalidate, sys_icache_invalidate)
 INTERPOSE(jail_clear_cache, dj_clear_cache)
