@@ -1820,6 +1820,31 @@ static void *translate_block(uint64_t gpc) {
                         emit32(0x1E61C000u | (16 << 5) | 16);
                         fp_st(16, 0);
                     } // fsqrt
+                    else if (reg == 2 && rm == 0) { /* fnop */
+                    } else if (reg == 4 && rm == 4) {
+                        emit_ftst();
+                    } // ftst
+                    else if (reg == 6 && rm == 4) {
+                        emit_fxtract();
+                    } // fxtract
+                    else if (reg == 6 && rm == 5) {
+                        emit_fprem(1);
+                    } // fprem1
+                    else if (reg == 6 && rm == 6) {
+                        fp_settop(-1);
+                    } // fdecstp
+                    else if (reg == 6 && rm == 7) {
+                        fp_settop(1);
+                    } // fincstp
+                    else if (reg == 7 && rm == 0) {
+                        emit_fprem(0);
+                    } // fprem
+                    else if (reg == 7 && rm == 4) {
+                        emit_frndint();
+                    } // frndint
+                    else if (reg == 7 && rm == 5) {
+                        emit_fscale();
+                    } // fscale
                     else {
                         report_unimpl(gpc, &I);
                         break;
