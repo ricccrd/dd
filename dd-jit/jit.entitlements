@@ -2,7 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- The JIT uses MAP_JIT (allow-jit) AND a dual-mapped cache: a plain anon RW region with an RX
+       alias made executable via mach_vm_remap + mach_vm_protect(VM_PROT_EXECUTE) (see jit/cache.c
+       dualmap_alloc). That RX alias is non-MAP_JIT executable memory, so a full-security (hardened
+       runtime, e.g. real Sequoia) mac SIGKILLs the engine without these two — only relaxed/VM macs
+       tolerate it. Both are notarization-allowed runtime exceptions (standard for DBT/emulator JITs). -->
   <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-executable-page-protection</key>
   <true/>
 </dict>
 </plist>
