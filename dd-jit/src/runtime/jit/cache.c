@@ -73,17 +73,25 @@ static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 // >0 once a guest thread is spawned
 static int g_threaded;
 
+// gpc->host block map capacity. Sized so the 64MB CACHE_SZ arena fills (-> the dispatcher's wholesale
+// flush) LONG before this open-addressed table does: even all-minimum-size blocks (prologue + a one-insn
+// exit, ~90 host words ~360B) cap at ~186K live blocks in a full cache, so 2^19 slots keeps the load
+// factor under ~40% (short linear-probe chains) and guarantees map_put never silently fails mid-run. A
+// FULL table made map_put a no-op -> map_body() then returned NULL for a freshly-translated block, and
+// patch_links_to() back-patched a `b (NULL - slot)` wild branch (mongod, ~65K blocks of C++ static init,
+// crashed with SIGILL/SIGSEGV here). NOT the leaked container-state MAP_N (that one is unrelated, 64K).
+#define JIT_MAP_N (1u << 19)
 static struct {
     uint64_t gpc;
     void *host;
     void *body;
-} g_map[MAP_N];
+} g_map[JIT_MAP_N];
 static int map_idx(uint64_t gpc) {
     // hash shift is per-arch (frontend/<arch>/abi.h G_GPC_HASH_SHIFT): aarch64 PCs are 4-byte aligned
     // (>>2 spreads), x86 PCs are byte-granular (>>0). Pure tuning constant; aarch64 value is 2 (unchanged).
-    uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (MAP_N - 1);
-    for (int i = 0; i < MAP_N; i++) {
-        uint32_t j = (h + i) & (MAP_N - 1);
+    uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
+    for (int i = 0; i < JIT_MAP_N; i++) {
+        uint32_t j = (h + i) & (JIT_MAP_N - 1);
         if (g_map[j].host && g_map[j].gpc == gpc) return j;
         if (!g_map[j].host) return -1;
     }
@@ -98,9 +106,9 @@ static void *map_body(uint64_t gpc) {
     return i < 0 ? NULL : g_map[i].body;
 }
 static void map_put(uint64_t gpc, void *host, void *body) {
-    uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (MAP_N - 1);
-    for (int i = 0; i < MAP_N; i++) {
-        uint32_t j = (h + i) & (MAP_N - 1);
+    uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
+    for (int i = 0; i < JIT_MAP_N; i++) {
+        uint32_t j = (h + i) & (JIT_MAP_N - 1);
         if (!g_map[j].host) {
             g_map[j].gpc = gpc;
             g_map[j].host = host;
@@ -430,6 +438,10 @@ static void add_pend2(uint32_t *slot, uint64_t target, int is_bl) {
 }
 static void add_pend(uint32_t *slot, uint64_t target) { add_pend2(slot, target, 0); }
 static void patch_links_to(uint64_t gpc, void *body) {
+    // body == NULL means gpc has no live translation (e.g. map_put silently failed on a full map).
+    // Patching `b (body - slot)` would then bake a wild branch; leave the pends unresolved so they keep
+    // taking the safe dispatcher round-trip until gpc is (re)registered with a real body.
+    if (!body) return;
     for (int i = 0; i < g_npend;) {
         if (g_pend[i].target == gpc) {
             int64_t d = ((uint8_t *)body - (uint8_t *)g_pend[i].slot) / 4;
