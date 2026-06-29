@@ -909,7 +909,35 @@ static void *translate_block(uint64_t gpc) {
             if (op == 0xFE || op == 0xFF) {
                 int k = I.reg & 7, w = op == 0xFE ? 1 : I.opsize, mem;
                 if (k == 0 || k == 1) { // inc / dec: set N/Z/V (OF correct), PRESERVE CF
-                    int rmv = rm_load(&I, next, w, &mem);
+                    int rmv = rm_load(&I, next, w, &mem); // mem -> x16 (val), x17 (EA)
+                    if (I.lock && mem) {
+                        // LOCK inc/dec [mem] -> atomic RMW (e.g. glibc's spinlock `lock decl`): a plain
+                        // load-op-store races under contention and strands the lock with no owner -> hang.
+                        // LDADDAL of +1/-1 updates memory indivisibly and yields the old value for flags.
+                        e_movconst(19, k == 0 ? 1 : (uint64_t)-1); // delta (LSE size truncates to width w)
+                        e_lse(LSE_LDADD, w, 19, 20, 17);           // x20 = old; [x17] += delta (acq-rel)
+                        if (w >= 4) {
+                            if (k == 0)
+                                e_addi_s(21, 20, 1, sf);
+                            else
+                                e_subi_s(21, 20, 1, sf);
+                            e_nzcv_save_keepC();
+                            e_pf_save(21);
+                        } else { // byte/word: flags from the high bits (mirror the non-atomic path)
+                            int sh = 8 * (4 - w);
+                            e_lsl_i(21, 20, sh, 0);
+                            e_movconst(19, 1u << sh);
+                            if (k == 0)
+                                e_rrr(A_ADDS, 21, 21, 19, 0, 0);
+                            else
+                                e_rrr(A_SUBS, 21, 21, 19, 0, 0);
+                            e_nzcv_save_keepC();
+                            e_lsr_i(21, 21, sh, 0);
+                            e_pf_save(21);
+                        }
+                        gpc = next;
+                        continue;
+                    }
                     int o = mem ? 16 : I.rm_reg;
                     if (w >= 4) {
                         if (k == 0)
