@@ -1983,7 +1983,10 @@ static void service_local(struct cpu *c) {
     // wait4(pid, *status, opts, *rusage)
     case 260: {
         int st = 0;
-        pid_t r = wait4((pid_t)(int)a0, &st, (int)a2, (struct rusage *)a3);
+        pid_t r;
+        // SA_RESTART: a wait interrupted by a handler that asked to restart (e.g. a SIGCHLD reaper, or
+        // gcc's driver) must transparently retry instead of failing the guest with EINTR.
+        do { r = wait4((pid_t)(int)a0, &st, (int)a2, (struct rusage *)a3); } while (r < 0 && SVC_EINTR_RESTART(c));
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
@@ -2199,9 +2202,12 @@ static void service_local(struct cpu *c) {
         struct sockaddr_storage hss;
         socklen_t hsl = sizeof hss;
         int want_peer = (!pl && !pbr && a1);
-        int r = (pl || pbr)
+        int r;
+        do {
+            r = (pl || pbr)
                     ? accept(lfd, NULL, NULL)
                     : accept(lfd, want_peer ? (struct sockaddr *)&hss : NULL, want_peer ? &hsl : (socklen_t *)a2);
+        } while (r < 0 && SVC_EINTR_RESTART(c));
         if (r >= 0) {
             // Accepted connections are sockets too: make SIGPIPE suppression sticky on the new fd so a
             // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
@@ -2313,8 +2319,11 @@ static void service_local(struct cpu *c) {
         {
             struct sockaddr_storage ss;
             socklen_t hl = sa_l2m(sa, (socklen_t)a2, &ss);
-            int cr = (hl != (socklen_t)-1) ? connect((int)a0, (struct sockaddr *)&ss, hl)
+            int cr;
+            do {
+                cr = (hl != (socklen_t)-1) ? connect((int)a0, (struct sockaddr *)&ss, hl)
                                            : connect((int)a0, (void *)a1, (socklen_t)a2);
+            } while (cr < 0 && SVC_EINTR_RESTART(c));
             G_RET(c) = cr < 0 ? (uint64_t)(-errno) : 0;
         }
         break;
@@ -2396,7 +2405,8 @@ static void service_local(struct cpu *c) {
         socklen_t dhl = a4 ? sa_l2m((uint8_t *)a4, (socklen_t)a5, &dss) : (socklen_t)-1;
         const void *dst = (dhl != (socklen_t)-1) ? (void *)&dss : (void *)a4;
         socklen_t dl = (dhl != (socklen_t)-1) ? dhl : (socklen_t)a5;
-        ssize_t r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), dst, dl);
+        ssize_t r;
+        do { r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), dst, dl); } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -2405,8 +2415,12 @@ static void service_local(struct cpu *c) {
         struct sockaddr_storage hss;
         socklen_t hsl = sizeof hss;
         int want = a4 != 0;
-        ssize_t r = recvfrom((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
-                             want ? (struct sockaddr *)&hss : NULL, want ? &hsl : NULL);
+        ssize_t r;
+        do {
+            hsl = sizeof hss;
+            r = recvfrom((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
+                         want ? (struct sockaddr *)&hss : NULL, want ? &hsl : NULL);
+        } while (r < 0 && SVC_EINTR_RESTART(c));
         if (r >= 0 && want) {
             socklen_t gcap = a5 ? *(socklen_t *)a5 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a4, gcap);
@@ -2541,8 +2555,10 @@ static void service_local(struct cpu *c) {
             int on = 1;
             setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
         }
-        ssize_t r =
-            (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
+        ssize_t r;
+        do {
+            r = (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
+        } while (r < 0 && SVC_EINTR_RESTART(c));
         if (nr == 212 && r >= 0) {
             // recvmsg writes back name len + (host->guest) control + translated flags
             if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
@@ -2748,8 +2764,15 @@ static void service_local(struct cpu *c) {
         // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall.
         struct kevent *chg = opt ? g_ep_chg[ep] : NULL;
         int nchg = opt ? g_ep_chgn[ep] : 0;
-        int r = kevent(ep, chg, nchg, kv, maxev, tp);
-        ep_count();
+        int r;
+        // SA_RESTART: re-wait when interrupted by a restartable handler. kevent applies the changelist
+        // before blocking, so a restart re-waits only (changes already consumed -> pass none).
+        do {
+            r = kevent(ep, chg, nchg, kv, maxev, tp);
+            ep_count();
+            chg = NULL;
+            nchg = 0;
+        } while (r < 0 && SVC_EINTR_RESTART(c));
         if (opt) g_ep_chgn[ep] = 0; // consumed
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
@@ -2860,7 +2883,8 @@ static void service_local(struct cpu *c) {
             ts = *(struct timespec *)a4;
             tsp = &ts;
         }
-        int r = pselect((int)a0, (fd_set *)a1, (fd_set *)a2, (fd_set *)a3, tsp, NULL);
+        int r;
+        do { r = pselect((int)a0, (fd_set *)a1, (fd_set *)a2, (fd_set *)a3, tsp, NULL); } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -2869,7 +2893,8 @@ static void service_local(struct cpu *c) {
         // ppoll -> poll
         struct timespec *ts = (void *)a2;
         int tmo = ts ? (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000) : -1;
-        int r = poll(fds, (nfds_t)a1, tmo);
+        int r;
+        do { r = poll(fds, (nfds_t)a1, tmo); } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }

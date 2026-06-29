@@ -1,5 +1,34 @@
 // Extracted from service(): Signals syscalls. Returns 1 if nr was handled, 0 otherwise. Included by service.c
 // after service/helpers.c, before service() — same TU scope (globals + helpers).
+// Linux sigaction sa_flags bit (asm-generic, shared by x86-64 + aarch64): a handler installed with
+// SA_RESTART asks the kernel to transparently restart a slow syscall it interrupts, rather than failing
+// it with EINTR. We record the flag in g_sigact[sig].flags (rt_sigaction, case 134) and consult it here.
+#define SA_RESTART_L 0x10000000ull
+
+// Decide whether an interruptible host syscall that just returned EINTR (a host signal fired and
+// host_sigh raised a g_pending bit) should be auto-restarted for the guest. POSIX rule: restart iff
+// EVERY signal that is pending-and-deliverable now (has a real guest handler and is not blocked by the
+// thread mask) was installed with SA_RESTART; if any such handler lacks SA_RESTART the guest must see
+// EINTR. With nothing deliverable pending (a SIG_DFL/IGN that host_sigh already actioned, or a spurious
+// EINTR) we restart too -- there is no SA_RESTART-less handler whose contract we'd be breaking. The
+// awaited handler stays pending and is delivered by the dispatcher's maybe_deliver_signal once the
+// restarted syscall finally returns.
+static int syscall_should_restart(struct cpu *c) {
+    uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
+    for (int s = 1; s <= 64; s++) {
+        uint64_t bit = 1ull << s;
+        if (!(p & bit)) continue;
+        if (c->sigmask & (1ull << (s - 1))) continue; // blocked -> not delivered now
+        if (g_sigact[s].handler <= 1) continue;       // SIG_DFL/IGN -> no guest handler runs
+        if (!(g_sigact[s].flags & SA_RESTART_L)) return 0;
+    }
+    return 1;
+}
+// An interruptible host syscall failed: should the caller retry it? True iff it was interrupted (EINTR)
+// by a signal whose guest handler asked for SA_RESTART (syscall_should_restart). Use as the tail of a
+// do/while around the blocking host call so the result variable stays local to each call site.
+#define SVC_EINTR_RESTART(c) (errno == EINTR && syscall_should_restart(c))
+
 static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
     // ===================== Signals — Linux signal numbers -> macOS; kill/sigaction/sigreturn =====================
