@@ -50,6 +50,23 @@ use crate::volumes::*;
 use crate::networks::*;
 
 
+/// Read-only bundled starter-image dirs to discover ALONGSIDE the writable `images_dir`: the app
+/// bundle's `Resources/images`, a sibling of this daemon binary. We discover (not copy) them so an app
+/// update always serves the current starter images and `~/.dd` never needs a manual refresh. Empty in a
+/// dev/test tree (no such sibling exists next to the binary), so it can't perturb the matrix.
+fn bundled_image_dirs(images_dir: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("images");
+            if p.is_dir() && p.to_string_lossy() != images_dir {
+                out.push(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() {
     let images_dir = std::env::var("DD_IMAGES").unwrap_or_else(|_| "./images".into());
@@ -60,7 +77,18 @@ async fn main() {
     let _ = std::fs::create_dir_all(&volumes_dir);
 
     let mut inner = Inner::default();
-    inner.images = discover_images(&images_dir);
+    // Discover the writable user image store (DD_IMAGES = ~/.dd/images) PLUS any read-only bundled
+    // starter images shipped inside the app (Resources/images, beside this binary). Serving the bundled
+    // set straight from the bundle -- instead of copying it into ~/.dd -- means an app update always
+    // carries the current starter images and nothing in ~/.dd ever needs refreshing. User pulls win on
+    // a name clash.
+    let mut imgs = discover_images(&images_dir);
+    for d in bundled_image_dirs(&images_dir) {
+        for img in discover_images(&d) {
+            if !imgs.iter().any(|i| i.name == img.name) { imgs.push(img); }
+        }
+    }
+    inner.images = imgs;
     load_state(&mut inner, &state_path);
     if inner.networks.is_empty() {
         inner.networks = default_networks();
@@ -171,25 +199,36 @@ fn strip_api_version<B>(req: &mut hyper::Request<B>) {
     if let Some(rest) = pq.strip_prefix("/v1.") {
         if let Some(slash) = rest.find('/') { pq = rest[slash..].to_string(); }
     }
-    // collapse a multi-segment image reference to its bare name so the :name routes match. docker sends
-    // the canonical path, e.g. POST /images/docker.io/library/ubuntu/push -> /images/ubuntu/push.
+    // collapse a NAMESPACED image reference into a single path segment so the `:name` routes match.
+    // docker addresses image endpoints as /images/<ref>[/<verb>] where <ref> may embed slashes
+    // (registry/ns/name:tag), e.g. POST /images/docker.io/library/ubuntu/push.
     pq = normalize_image_path(&pq);
     if let Ok(uri) = pq.parse::<Uri>() { *req.uri_mut() = uri; }
 }
 
-/// `/images/<registry>/<ns>/<name>/<verb>` -> `/images/<name>/<verb>` (verb = push|tag|json); other
-/// paths pass through unchanged. The handlers further ref_name() the captured segment.
+/// Rewrite an image-reference path so axum's single-segment `:name` capture can match a NAMESPACED
+/// and/or tagged reference. docker addresses image endpoints as `/images/<ref>[/<verb>]` where `<ref>`
+/// may embed slashes (`registry/ns/name:tag`); `:name` only captures one segment, so we collapse the
+/// reference's internal slashes to `%2F` (axum's `Path` extractor percent-decodes them back to the full
+/// ref, and `matchit` matches `%2F` as literal chars rather than a separator). Verb sub-resources
+/// (`json`/`history`/`tag`/`push`) and the bare `DELETE /images/<ref>` are all handled; the fixed
+/// `/images/{json,create,get,load,search,prune}` endpoints carry no embedded ref and pass through.
 fn normalize_image_path(pq: &str) -> String {
     let (path, query) = pq.split_once('?').map(|(p, q)| (p, Some(q))).unwrap_or((pq, None));
     let rebuild = |p: String| match query { Some(q) => format!("{p}?{q}"), None => p };
     let Some(rest) = path.strip_prefix("/images/") else { return pq.to_string() };
-    let segs: Vec<&str> = rest.split('/').collect();
-    if segs.len() <= 2 { return pq.to_string(); } // already /images/<name>[/<verb>]
-    if let Some(verb @ ("push" | "tag" | "json")) = segs.last().copied() {
-        let name = segs[segs.len() - 2]; // bare image name sits right before the verb
-        return rebuild(format!("/images/{name}/{verb}"));
-    }
-    pq.to_string()
+    let mut segs: Vec<&str> = rest.split('/').collect();
+    // Peel off a trailing verb sub-resource; whatever remains is the (possibly multi-segment) reference.
+    let verb = matches!(segs.last().copied(), Some("json" | "history" | "tag" | "push"))
+        .then(|| segs.pop().unwrap());
+    let reference = segs.join("/");
+    // No reference means a fixed endpoint (`/images/json` list, `/images/create`, …) — leave it alone.
+    if reference.is_empty() { return pq.to_string(); }
+    let encoded = reference.replace('/', "%2F");
+    rebuild(match verb {
+        Some(v) => format!("/images/{encoded}/{v}"),
+        None => format!("/images/{encoded}"),
+    })
 }
 
 

@@ -390,14 +390,36 @@ pub(crate) async fn image_delete(State(a): State<App>, Path(name): Path<String>)
     let mut g = a.inner.lock().await;
     let bare = ref_name(&name).to_string();
     let untagged = g.images.iter().find(|i| ref_name(&i.name) == bare).map(|i| repo_tag(&i.name));
-    let before = g.images.len();
-    g.images.retain(|i| ref_name(&i.name) != bare);
-    if g.images.len() == before {
+    // The rootfs dirs of the images we're about to drop: a real `rmi` deletes the on-disk layers, not
+    // just the in-memory store entry.
+    let dropped: Vec<(String, String)> = g.images.iter()
+        .filter(|i| ref_name(&i.name) == bare)
+        .map(|i| (i.name.clone(), i.rootfs.clone())).collect();
+    if dropped.is_empty() {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
+    }
+    g.images.retain(|i| ref_name(&i.name) != bare);
+    // Delete each dropped image's on-disk directory, but only when it lives under the writable image
+    // store AND no surviving image still points at the same rootfs (a `docker tag` alias shares it).
+    for (nm, rootfs) in &dropped {
+        if nm == "macos" { continue; } // the host image's rootfs is the live `/` — never delete it
+        if g.images.iter().any(|i| &i.rootfs == rootfs) { continue; } // a remaining alias still uses it
+        remove_image_dir(&a.images_dir, rootfs);
     }
     crate::events::emit_event(&a.events, "image", "delete", &bare, json!({"name": bare}));
     let untagged = untagged.unwrap_or_else(|| format!("{bare}:latest"));
     Json(json!([{ "Untagged": untagged }, { "Deleted": format!("sha256:{}", fake_id(&bare)) }])).into_response()
+}
+
+/// Remove an image's on-disk directory (`<images_dir>/<safe>/`, the parent of its `rootfs/`). Guarded
+/// to the writable image store: a rootfs under a read-only bundled starter dir (or anywhere outside
+/// `images_dir`) is left untouched so `rmi` of a discovered alias can't wipe shipped images.
+fn remove_image_dir(images_dir: &str, rootfs: &str) {
+    let Some(dir) = std::path::Path::new(rootfs).parent() else { return };
+    let base = std::path::Path::new(images_dir);
+    if dir != base && dir.starts_with(base) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// POST /images/:name/push -- dd has no registry yet (images are local), so this is a clean no-op that
