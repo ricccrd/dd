@@ -8,7 +8,7 @@ website lives under `website/docs/`).
 
 ## Start here
 
-- **[PLAN.md](PLAN.md)** — THE plan. PART A = open bugs / what's missing or failing; PART B = the phased refactor. Read this first.
+- **[PLAN.md](PLAN.md)** — THE plan. PART A = open bugs / what's missing or failing; PART B = the phased refactor; PART C = capabilities & product roadmap (the other axis: features/testing/ops not yet built). Read this first.
 - **[STATUS.md](STATUS.md)** — live test-lane gap inventory: coverage gaps, xfail rechecks/clears, harness facts, bug protocol.
 
 ## Architecture & refactor
