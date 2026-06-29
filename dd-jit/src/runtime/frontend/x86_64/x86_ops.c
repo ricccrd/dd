@@ -3,8 +3,9 @@
 
 // ---- W4-C: rep cmps/scas idiom (R_REPSTR) -------------------------------------------------
 // One C round-trip does the entire (possibly REP/REPE/REPNE) compare/scan, then writes the exact
-// x86 end-state (RCX/RSI/RDI and ZF/SF/CF/OF) back to the cpu struct. DF assumed 0 (forward) --
-// matches the rest of the string-op path (std is still report_unimpl'd at translate time).
+// x86 end-state (RCX/RSI/RDI and ZF/SF/CF/OF) back to the cpu struct. The descriptor (cpu->divop)
+// carries the translate-time direction flag (DF, bit 11): DF=0 scans low->high (fast host
+// memcmp/memchr paths), DF=1 (after `std`) scans high->low via the generic per-element loop.
 static uint64_t repstr_rd(uint64_t p, int w) {
     switch (w) {
     case 1: return *(uint8_t *)p;
@@ -30,15 +31,16 @@ static uint64_t repstr_nzcv(uint64_t a, uint64_t b, int w) {
 static void do_repstr(struct cpu *c) {
     uint64_t d = c->divop;
     int w = (int)(d & 0xff);
-    int isscas = (d >> 8) & 1, isrepne = (d >> 9) & 1, isrep = (d >> 10) & 1;
+    int isscas = (d >> 8) & 1, isrepne = (d >> 9) & 1, isrep = (d >> 10) & 1, df = (d >> 11) & 1;
     uint64_t n = isrep ? c->r[RCX] : 1; // REP uses RCX; a bare cmps/scas does exactly one step
     if (n == 0) return;                 // REP with RCX==0: no element executed, flags+pointers UNCHANGED
     uint64_t rsi = c->r[RSI], rdi = c->r[RDI];
+    int64_t step = df ? -(int64_t)w : (int64_t)w; // DF=1 (std) scans high->low, DF=0 low->high
     uint64_t wmask = (w == 8) ? ~0ull : ((1ull << (8 * w)) - 1);
     uint64_t acc = c->r[RAX] & wmask;     // scas accumulator (AL/AX/EAX/RAX)
     int stop_on_equal = isrepne;          // REPNE stops at first equal; REPE stops at first not-equal
     uint64_t k = 0, av = 0, bv = 0;
-    if (!norepcmp() && isrep && w == 1) {  // ---- fast host scan (the lever) ----
+    if (!df && !norepcmp() && isrep && w == 1) {  // ---- fast host scan (the lever; forward only) ----
         if (!isscas) {                     // rep cmps byte  -> memcmp-style first-difference scan
             const uint8_t *pa = (const uint8_t *)rsi, *pb = (const uint8_t *)rdi;
             if (!stop_on_equal) {          // REPE: stop at first diff -> memcmp tests equality fast,
@@ -62,7 +64,7 @@ static void do_repstr(struct cpu *c) {
             }
             av = acc; bv = pb[k - 1];
         }
-    } else if (!norepcmp() && isrep && !isscas) { // rep cmps word/dword/qword
+    } else if (!df && !norepcmp() && isrep && !isscas) { // rep cmps word/dword/qword (forward)
         if (!stop_on_equal) {              // REPE: memcmp tests equality fast, then locate the element
             if (memcmp((void *)rsi, (void *)rdi, n * (size_t)w) == 0) k = n;
             else { size_t i = 0; while (repstr_rd(rsi + i * w, w) == repstr_rd(rdi + i * w, w)) i++; k = i + 1; }
@@ -71,16 +73,17 @@ static void do_repstr(struct cpu *c) {
             k = (i < n) ? i + 1 : n;
         }
         av = repstr_rd(rsi + (k - 1) * w, w); bv = repstr_rd(rdi + (k - 1) * w, w);
-    } else if (!norepcmp() && isrep) {            // rep scas word/dword/qword: typed loop
+    } else if (!df && !norepcmp() && isrep) {     // rep scas word/dword/qword: typed loop (forward)
         size_t i = 0;
         if (stop_on_equal) while (i < n && (repstr_rd(rdi + i * w, w) & wmask) != acc) i++;
         else               while (i < n && (repstr_rd(rdi + i * w, w) & wmask) == acc) i++;
         k = (i < n) ? i + 1 : n;
         av = acc; bv = repstr_rd(rdi + (k - 1) * w, w);
-    } else {                                       // naive per-element loop: NOREPCMP oracle + bare cmps/scas
-        for (;;) {
-            if (isscas) { av = acc; bv = repstr_rd(rdi + k * w, w); }
-            else        { av = repstr_rd(rsi + k * w, w); bv = repstr_rd(rdi + k * w, w); }
+    } else {                                       // generic per-element loop: NOREPCMP oracle, bare
+        for (;;) {                                 // cmps/scas, OR any DF=1 (backward) scan
+            uint64_t off = k * (uint64_t)step;     // signed stride (forward +w, backward -w), modular
+            if (isscas) { av = acc; bv = repstr_rd(rdi + off, w); }
+            else        { av = repstr_rd(rsi + off, w); bv = repstr_rd(rdi + off, w); }
             k++;
             int eq = ((av & wmask) == (bv & wmask));
             if (k >= n) break;
@@ -88,8 +91,8 @@ static void do_repstr(struct cpu *c) {
         }
     }
     if (isrep) c->r[RCX] = n - k;
-    if (!isscas) c->r[RSI] = rsi + k * (uint64_t)w;
-    c->r[RDI] = rdi + k * (uint64_t)w;
+    if (!isscas) c->r[RSI] = rsi + k * (uint64_t)step;
+    c->r[RDI] = rdi + k * (uint64_t)step;
     c->nzcv = repstr_nzcv(av, bv, w);
     g_repstr_n++;
     g_repstr_elems += k;

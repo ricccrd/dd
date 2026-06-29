@@ -467,11 +467,22 @@ static int lock_rmw(int k, int w, int rs) {
 
 // x86 condition (opcode low nibble) -> ARM cond, or -1 if unsupported (parity).
 static int x86cc_to_arm(int cc) {
-    // x86 PF (parity, idx 10/11) -> ARM V flag: our FP compares (comis*/fcomi) leave V=1 on
-    // unordered (NaN), which is exactly what `jp`/`jnp` after an FP compare test. (Integer
-    // parity is not modeled, but is essentially unused outside the FP-compare idiom.)
+    // Parity (idx 10/11, jp/jnp/setp/.../cmovp/...) is NOT routed here -- it reads the real PF lane
+    // (cpu->pf) via e_pf_compute, so its slots below (mapping onto ARM V) are dead. Everything else is
+    // a direct NZCV condition.
     static const int t[16] = {6, 7, 3, 2, 0, 1, 9, 8, 4, 5, 6, 7, 11, 10, 13, 12};
     return t[cc & 0xF];
+}
+
+// jp/jnp (parity jcc): spill any deferred flags to membank (this is a block boundary for the
+// successor blocks), then compute the real x86 PF lane into the live ARM Z flag and return the ARM
+// condition the branch machinery should test. Mirrors setp/setnp + cmovp/cmovnp, which already read
+// cpu->pf instead of the stale ARM V flag. `lo` is the opcode low nibble (0xA=jp, 0xB=jnp).
+static int emit_parity_jcc_cond(int lo) {
+    if (g_fl_pending) flags_materialize(); // spill the deferred producer to membank (boundary)
+    e_pf_compute(19);                      // x19 = x86 PF in {0,1} (scratch x16; x17/EA preserved)
+    e_rrr(A_SUBS, 31, 19, 31, 0, 0);       // live ARM Z = (PF == 0)
+    return (lo == 0xA) ? 1 /*NE: PF==1*/ : 0 /*EQ: PF==0*/;
 }
 
 #include "translate/trace.c"
@@ -885,6 +896,8 @@ static void *translate_block(uint64_t gpc) {
                     e_nzcv_save_setcf(19);
                 } else
                     e_nzcv_save();
+                // x86 PF: SHL/SHR/SAR set SF/ZF/PF from the result; rotates (ROL/ROR) leave PF unchanged.
+                if (k == 4 || k == 5 || k == 7) e_pf_save(16); // result low byte -> PF lane (x16 holds result)
                 rm_store(&I, w, 16);
                 gpc = next;
                 continue;
@@ -915,10 +928,11 @@ static void *translate_block(uint64_t gpc) {
                     // before rm_store (it broke `neg ebx`), so keep the original inline path there.
                     int rmv = rm_load(&I, next, w, &mem); // neg -> x16
                     if (w < 4) {
-                        do_alu(5, 16, 31, rmv, w); // x16 = 0 - rmv, x86 SUB flags at width w
+                        do_alu(5, 16, 31, rmv, w); // x16 = 0 - rmv, x86 SUB flags at width w (sets PF too)
                     } else {
                         e_rrr(A_SUBS, 16, 31, rmv, w == 8, 0);
                         e_nzcv_save();
+                        e_pf_save(16); // x86 PF source = result low byte (do_alu handles the w<4 path)
                     }
                     rm_store(&I, w, 16);
                     gpc = next;
@@ -1221,20 +1235,17 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
-            // ---- cmps (A6/A7) / scas (AE/AF): memcmp/memchr/strlen building blocks. DF=0 (fwd). ----
+            // ---- cmps (A6/A7) / scas (AE/AF): memcmp/memchr/strlen building blocks. ----
             // The whole (possibly REP/REPE/REPNE) compare+scan is done in ONE C round-trip (like cpuid/div):
-            // bit-exact RCX/RSI/RDI + ZF/SF/CF/OF end-state, fast host memcmp/memchr inside (gate NOREPCMP
-            // for the naive per-element oracle loop). Descriptor (width | isscas | isrepne | isrep) -> cpu->divop.
+            // bit-exact RCX/RSI/RDI + ZF/SF/CF/OF end-state, fast host memcmp/memchr inside on the forward
+            // path (gate NOREPCMP for the naive per-element oracle loop; DF=1 uses that loop with a
+            // decrementing stride). Descriptor (width | isscas | isrepne | isrep | df) -> cpu->divop.
             if (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF) {
-                if (g_df) { // do_repstr() only scans forward; backward cmps/scas isn't emitted by real code
-                    report_unimpl(gpc, &I);
-                    break;
-                }
                 int w = (op & 1) ? I.opsize : 1;
                 int isscas = (op == 0xAE || op == 0xAF);
                 int isrep = (I.rep || I.repne);
                 uint64_t desc = (uint64_t)w | ((uint64_t)isscas << 8) | ((uint64_t)(I.repne ? 1 : 0) << 9) |
-                                ((uint64_t)isrep << 10);
+                                ((uint64_t)isrep << 10) | ((uint64_t)(g_df ? 1 : 0) << 11);
                 e_movconst(16, desc);
                 e_str(16, 28, OFF_DIVOP);
                 emit_exit_const(next, R_REPSTR); // spills regs+flags; do_repstr() resumes at `next`
@@ -1287,25 +1298,35 @@ static void *translate_block(uint64_t gpc) {
             }
             // ---- jcc rel8 (70-7F) ----
             if (op >= 0x70 && op <= 0x7F) {
-                int cc = x86cc_to_arm(op & 0xF);
-                if (cc < 0) {
-                    if (g_fl_pending) flags_materialize(); // materialize before boundary
-                    report_unimpl(gpc, &I);
-                    break;
+                int lo = op & 0xF, parity = (lo == 0xA || lo == 0xB);
+                int cc;
+                if (parity) {
+                    cc = emit_parity_jcc_cond(lo); // jp/jnp: PF lane -> live ARM Z, branch off it
+                } else {
+                    cc = x86cc_to_arm(lo);
+                    if (cc < 0) {
+                        if (g_fl_pending) flags_materialize(); // materialize before boundary
+                        report_unimpl(gpc, &I);
+                        break;
+                    }
                 }
                 uint64_t taken = next + (uint64_t)I.imm;
                 // W5B tier-2: single-block self-loop (taken back-edge == block start). Detected BEFORE the
                 // flag handling / superblock stitch below so the self-loop owns the back-edge; emit the
                 // hotness counter (tier-1) or the folded back-edge (tier-2). g_fl_pending is still pending
-                // here -- emit_selfloop_x86 does the flag handling itself.
-                if (taken == start && !notier2x() && !loop_has_rmw_hazard((uint64_t)body, (uint64_t)g_cp)) {
+                // here -- emit_selfloop_x86 does the flag handling itself. Parity already set the live Z
+                // (and spilled any pending producer) above, so it skips this purely-NZCV-flag path.
+                if (!parity && taken == start && !notier2x() &&
+                    !loop_has_rmw_hazard((uint64_t)body, (uint64_t)g_cp)) {
                     int slot = g_tier2_build ? 0 : t2_slot(start);
                     if (g_tier2_build || slot >= 0) {
                         emit_selfloop_x86(cc, start, next, body, slot);
                         break;
                     }
                 }
-                if (g_fl_pending) {
+                if (parity) {
+                    // live ARM Z already holds (PF==0) from emit_parity_jcc_cond; flags spilled there.
+                } else if (g_fl_pending) {
                     // Fast path: live NZCV still holds the immediately-preceding width-4/8 producer's
                     // flags. flags_materialize() spills them to membank for the successor blocks (the
                     // exact finalizer bytes the producer deferred) AND leaves the live ARM NZCV
@@ -1379,7 +1400,9 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             } // fwait/wait -> nop (FPU sync)
-            // sahf (9E): AH -> flags. We map SF=AH.7, ZF=AH.6, CF=AH.0 into cpu->nzcv (N/Z/C).
+            // sahf (9E): AH -> flags. We map SF=AH.7, ZF=AH.6, CF=AH.0 into cpu->nzcv (N/Z/C) and
+            // restore PF=AH.2 into the PF lane (the consumer takes even-parity, so store NOT(PF) as the
+            // source byte: a 0 byte -> even popcount -> PF=1, a 1 byte -> odd -> PF=0).
             if (op == 0x9E) {
                 emit32(0x53083C00u | (RAX << 5) | 16); // ubfx w16, w_rax, #8, #8  (AH)
                 emit32(0x53000000u | (16 << 5) | 17);  // ubfx w17, w16, #0, #1  (CF)
@@ -1391,6 +1414,10 @@ static void *translate_block(uint64_t gpc) {
                 e_lsl_i(18, 18, 31, 0);
                 e_rrr(A_ORR, 17, 17, 18, 0, 0);
                 e_str(17, 28, OFF_NZCV);
+                emit32(0x53020800u | (16 << 5) | 19); // ubfx w19, w16, #2, #1  (PF)
+                e_movconst(20, 1);
+                e_rrr(A_EOR, 19, 19, 20, 0, 0); // PF source byte = NOT PF (parity-even <-> PF=1)
+                e_str(19, 28, OFF_PF);
                 gpc = next;
                 continue;
             }
@@ -2656,22 +2683,31 @@ static void *translate_block(uint64_t gpc) {
             }
             // jcc rel32 (0F 80-8F)
             if ((op & 0xF0) == 0x80) {
-                int cc = x86cc_to_arm(op & 0xF);
-                if (cc < 0) {
-                    if (g_fl_pending) flags_materialize(); // materialize before boundary
-                    report_unimpl(gpc, &I);
-                    break;
+                int lo = op & 0xF, parity = (lo == 0xA || lo == 0xB);
+                int cc;
+                if (parity) {
+                    cc = emit_parity_jcc_cond(lo); // jp/jnp: PF lane -> live ARM Z, branch off it
+                } else {
+                    cc = x86cc_to_arm(lo);
+                    if (cc < 0) {
+                        if (g_fl_pending) flags_materialize(); // materialize before boundary
+                        report_unimpl(gpc, &I);
+                        break;
+                    }
                 }
                 uint64_t taken = next + (uint64_t)I.imm;
                 // W5B tier-2: single-block self-loop (taken back-edge == block start). See jcc rel8.
-                if (taken == start && !notier2x() && !loop_has_rmw_hazard((uint64_t)body, (uint64_t)g_cp)) {
+                if (!parity && taken == start && !notier2x() &&
+                    !loop_has_rmw_hazard((uint64_t)body, (uint64_t)g_cp)) {
                     int slot = g_tier2_build ? 0 : t2_slot(start);
                     if (g_tier2_build || slot >= 0) {
                         emit_selfloop_x86(cc, start, next, body, slot);
                         break;
                     }
                 }
-                if (g_fl_pending) {
+                if (parity) {
+                    // live ARM Z already holds (PF==0) from emit_parity_jcc_cond; flags spilled there.
+                } else if (g_fl_pending) {
                     // Fast path (see jcc rel8): spill the deferred flags for successors AND leave
                     // the live NZCV canonical, then branch off it; drop the redundant e_nzcv_load.
                     flags_materialize();
