@@ -88,6 +88,17 @@ static int gpr_field_mask(uint32_t in) {
         // FMOV-to-GPR (110) takes it as Rd[4:0].
         return (opcode == 2 || opcode == 3 || opcode == 7) ? 2 : 1;
     }
+    // AdvSIMD "copy" group also crosses the SIMD/GPR boundary: UMOV/SMOV write a GENERAL-PURPOSE Rd from a
+    // vector lane, and DUP(general)/INS(general) read a GENERAL-PURPOSE Rn into a vector. They live in the
+    // SIMD box (so the test below would miss them); naming a stolen reg there -- e.g. glibc's `dup v31.2d,x28`
+    // -- would be emitted verbatim and read/clobber the engine's reserved x28=cpu pointer (silent data
+    // corruption). Group: bit31==0, bits[28:24]==01110, bit21==0, bit15==0, bit10==1; op==bit29, imm4==[14:11].
+    if ((in & 0x9F208400u) == 0x0E000400u) {
+        int op = (in >> 29) & 1, imm4 = (in >> 11) & 0xF;
+        if (!op && (imm4 == 5 || imm4 == 7)) return 1;     // SMOV/UMOV: GPR is Rd[4:0]
+        if (!op && (imm4 == 1 || imm4 == 3)) return 2;     // DUP(general)/INS(general): GPR is Rn[9:5]
+        return 0;                                          // DUP/INS(element): vector only
+    }
     // SIMD/FP data: V registers only
     return 0;
 }
@@ -100,10 +111,13 @@ static int uses_x18(uint32_t in, int mask) {
 // Emit a guest insn that references stolen reg(s): for each, a scratch S = cpu->x[stolen]; run the
 // insn with the stolen field(s) replaced by scratch(es); store back. Real x28 = cpu is the base;
 // scratch originals are spilled to cpu->mscratch (NOT the stack -- that would collide with the
-// guest's own stp/ldp frame stores + writeback). At most two distinct stolen regs in one insn.
+// guest's own stp/ldp frame stores + writeback). An instruction has up to FOUR register fields
+// (Rd/Rn/Rm/Ra of the 3-source madd/msub family), so up to four DISTINCT stolen regs can appear in
+// one insn (e.g. `madd x16,x17,x18,x28`); size both arrays for that (mscratch[8] backs the spill).
+// Undersizing them to 2 overflowed the stack on such an insn -> __stack_chk_fail abort (cc1/libc).
 static void emit_mangled_x18(uint32_t in, int mask) {
     static const int shifts[4] = {0, 5, 16, 10}, mbits[4] = {1, 2, 4, 8};
-    int stolen[2], ns = 0, used = 0;
+    int stolen[4], ns = 0, used = 0;
     for (int k = 0; k < 4; k++)
         if (mask & mbits[k]) {
             int rf = (in >> shifts[k]) & 0x1F;
@@ -115,7 +129,7 @@ static void emit_mangled_x18(uint32_t in, int mask) {
                 if (!seen) stolen[ns++] = rf;
             }
         }
-    int sc[2], nsc = 0;
+    int sc[4], nsc = 0;
     for (int r = 0; r <= 27 && nsc < ns; r++)
         if (!(used & (1 << r)) && !is_stolen(r)) sc[nsc++] = r;
     for (int i = 0; i < ns; i++)

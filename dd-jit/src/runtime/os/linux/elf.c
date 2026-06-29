@@ -234,36 +234,60 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         return 1;
     }
 
-    // ---- AdvSIMD load/store MULTIPLE structures, contiguous (LD1/ST1, 1..4 consecutive vec regs).
-    //      glibc's NEON memcpy/memmove/memset stream the non-PIE image's absolute data through these.
+    // ---- AdvSIMD load/store MULTIPLE structures (LD1/ST1 contiguous AND LD2/3/4 / ST2/3/4 interleaved).
+    //      glibc's NEON memcpy/memmove/memset/strlen stream the non-PIE image's absolute data through these.
     //      Encoding: bit31=0, bits[29:24]=001100, bit23=post-index, bits[21:16]=Rm/0, opcode[15:12],
-    //      size[11:10], Rn[9:5], Rt[4:0]. opcode picks reg-count for LD1/ST1; the interleaving forms
-    //      LD2/LD3/LD4 (de-interleave on load) we leave to a clean abort. Q=bit30 -> 16B regs else 8B.
+    //      size[11:10], Rn[9:5], Rt[4:0]. opcode selects the structure form + register count; the LDn/STn
+    //      (n>1) forms de-interleave/interleave by element. Q=bit30 -> 16B regs else 8B.
     if ((insn & 0xBFBF0000u) == 0x0C000000u || (insn & 0xBFA00000u) == 0x0C800000u) {
         int post = (insn >> 23) & 1, q = (insn >> 30) & 1, load = (insn >> 22) & 1, opc = (insn >> 12) & 0xF;
-        int regs;
+        int regs, interleave;
         switch (opc) {
-        case 0x7: regs = 1; break;
-        case 0xA: regs = 2; break;
-        case 0x6: regs = 3; break;
-        case 0x2: regs = 4; break;
-        default: return 0; // interleaved LD2/LD3/LD4 -> clean abort
+        case 0x7: regs = 1; interleave = 0; break; // LD1/ST1 x1
+        case 0xA: regs = 2; interleave = 0; break; // LD1/ST1 x2
+        case 0x6: regs = 3; interleave = 0; break; // LD1/ST1 x3
+        case 0x2: regs = 4; interleave = 0; break; // LD1/ST1 x4
+        case 0x8: regs = 2; interleave = 1; break; // LD2/ST2
+        case 0x4: regs = 3; interleave = 1; break; // LD3/ST3
+        case 0x0: regs = 4; interleave = 1; break; // LD4/ST4
+        default: return 0;                         // unallocated -> clean abort
         }
-        int bytes = q ? 16 : 8;
-        for (int i = 0; i < regs; i++) {
-            int r = (rt + i) & 31;
+        int regbytes = q ? 16 : 8;
+        if (!interleave) { // contiguous: whole registers back-to-back
+            for (int i = 0; i < regs; i++) {
+                int r = (rt + i) & 31;
+                if (load) {
+                    __uint128_t z = 0;
+                    memcpy(&z, (void *)(real + (size_t)i * regbytes), (size_t)regbytes);
+                    V[r] = z;
+                } else {
+                    __uint128_t s = V[r];
+                    memcpy((void *)(real + (size_t)i * regbytes), &s, (size_t)regbytes);
+                }
+            }
+        } else { // interleaved: element e of register r lives at memory slot (e*regs + r)
+            int esize = 1 << ((insn >> 10) & 3);
+            int nelem = regbytes / esize;
             if (load) {
-                __uint128_t z = 0;
-                memcpy(&z, (void *)(real + (size_t)i * bytes), (size_t)bytes);
-                V[r] = z;
+                __uint128_t acc[4] = {0, 0, 0, 0};
+                for (int e = 0; e < nelem; e++)
+                    for (int r = 0; r < regs; r++)
+                        memcpy((uint8_t *)&acc[r] + (size_t)e * esize,
+                               (void *)(real + (size_t)(e * regs + r) * esize), (size_t)esize);
+                for (int r = 0; r < regs; r++)
+                    V[(rt + r) & 31] = acc[r];
             } else {
-                __uint128_t s = V[r];
-                memcpy((void *)(real + (size_t)i * bytes), &s, (size_t)bytes);
+                for (int e = 0; e < nelem; e++)
+                    for (int r = 0; r < regs; r++) {
+                        __uint128_t s = V[(rt + r) & 31];
+                        memcpy((void *)(real + (size_t)(e * regs + r) * esize),
+                               (uint8_t *)&s + (size_t)e * esize, (size_t)esize);
+                    }
             }
         }
         if (post) { // post-index writeback: Xn = guest addr + (Rm==31 ? bytes transferred : Xm)
             int rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
-            X[rn] = va + (rm == 31 ? (uint64_t)(regs * bytes) : X[rm]);
+            X[rn] = va + (rm == 31 ? (uint64_t)(regs * regbytes) : X[rm]);
         }
         uc->uc_mcontext->__ss.__pc += 4;
         return 1;
