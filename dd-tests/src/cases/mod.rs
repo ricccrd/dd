@@ -8,10 +8,14 @@
 
 use crate::{darwin_libc, darwin_src, fixture, group, in_rootfs, port, src, Case, Engine, Group};
 
-/// Every group, in display order.
+pub mod ext;   // per-category basics expansion (one file per agent, appended below)
+
+/// Every group, in display order. Base groups here + the per-agent extension groups in `ext`.
 pub fn all() -> Vec<Group> {
-    vec![compat(), libc(), system(), net(), proc(), threads(), posix(), ipc(), clib(), linuxsys(),
-         heavy(), soak(), edge(), compile(), realsw(), containersw(), perf(), busybox(), container(), sandbox(), x86(), darwin()]
+    let mut g = vec![compat(), libc(), system(), net(), proc(), threads(), posix(), ipc(), clib(), linuxsys(),
+         heavy(), soak(), edge(), compile(), realsw(), containersw(), perf(), busybox(), container(), sandbox(), x86(), darwin()];
+    g.extend(ext::all());
+    g
 }
 
 /// Threads — mutex/condvar producer-consumer, 64-way contention, and thread-local storage. Portable
@@ -132,13 +136,13 @@ fn edge() -> Group {
     // (MSG_PEEK/MSG_DONTWAIT) is the only one that already matches Linux.
     let lin = &[Engine::LinuxAarch64, Engine::LinuxX86_64];
     group("edge", vec![
-        src("madvise", "edge_madvise.c").oracle().xfail(lin),       // MADV_DONTNEED must drop anon pages
-        src("renameat2", "edge_renameat2.c").oracle().xfail(lin),   // RENAME_NOREPLACE / RENAME_EXCHANGE
+        src("madvise", "edge_madvise.c").oracle(),       // MADV_DONTNEED must drop anon pages
+        src("renameat2", "edge_renameat2.c").oracle(),   // RENAME_NOREPLACE / RENAME_EXCHANGE
         src("scmrights", "edge_scmrights.c").oracle(),             // fd passing over AF_UNIX (SCM_RIGHTS) — FIXED (cmsg l2m/m2l)
-        src("fallocate", "edge_fallocate.c").oracle().xfail(lin),   // FALLOC_FL_PUNCH_HOLE sparse hole
-        src("lseekhole", "edge_lseekhole.c").oracle().xfail(lin),   // SEEK_HOLE / SEEK_DATA
+        src("fallocate", "edge_fallocate.c").oracle(),   // FALLOC_FL_PUNCH_HOLE sparse hole
+        src("lseekhole", "edge_lseekhole.c").oracle(),   // SEEK_HOLE / SEEK_DATA
         src("otmpfile", "edge_otmpfile.c").oracle().xfail(lin),     // O_TMPFILE unnamed file
-        src("pipepacket", "edge_pipepacket.c").oracle().xfail(lin), // pipe2(O_DIRECT) packet boundaries
+        src("pipepacket", "edge_pipepacket.c").oracle(), // pipe2(O_DIRECT) packet boundaries
         src("msgflags", "edge_msgpeek.c").oracle(),                 // recv MSG_PEEK + MSG_DONTWAIT — WORKS
         src("abstract", "edge_abstract.c").oracle(),               // abstract-namespace AF_UNIX — FIXED (DD_NETNS fs-socket map)
         src("pipesz", "edge_pipesz.c").oracle(),                    // F_SET/GETPIPE_SZ (shadow-table emulation) + dup3 self-dup — FIXED
@@ -152,7 +156,7 @@ fn edge() -> Group {
         src("sigpipe", "edge_sigpipe.c").has("survived=1 epipe=1"), // SO_NOSIGPIPE set on every guest socket at creation (socket/socketpair/accept) -> write/send to a broken socket returns EPIPE, never a fatal SIGPIPE
         src("procfd", "edge_procfd.c").has("resolves=1 enough_fds=1").xfail(lin), // /proc/self/fd
         // times(): tms_utime works on x86_64 but is 0 on aarch64 (clock() works on both) — engine split.
-        src("times", "edge_times.c").has("utime_ok=1 clock_ok=1 ret_ok=1").xfail(&[Engine::LinuxAarch64]),
+        src("times", "edge_times.c").has("utime_ok=1 clock_ok=1 ret_ok=1"),
         src("statfs", "edge_statfs.c").oracle().xfail(lin),                            // real fs geometry (not hardcoded)
     ])
 }
@@ -171,7 +175,7 @@ fn soak() -> Group {
         // self-modifying code: patch+flush+call an RWX page 200k times -> re-translation churn. aarch64
         // machine code, so Linux/aarch64 only (the real JIT path); diffed vs native. xfail: mmap(RWX)
         // is EPERM under macOS W^X (no MAP_JIT) -> guest-JIT runtimes can't get exec pages (see PLAN.md).
-        src("smc", "soak_smc.c").only(&[Engine::LinuxAarch64]).xfail(&[Engine::LinuxAarch64]).oracle(),
+        src("smc", "soak_smc.c").only(&[Engine::LinuxAarch64]).oracle(),
     ])
 }
 
