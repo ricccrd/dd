@@ -4,6 +4,45 @@
 // ---------------- the translator ----------------
 static void report_unimpl(uint64_t pc, struct insn *I);
 
+// MUL/IMUL (group3 F6/F7 /4,/5) set x86 CF=OF when the high half of the product is significant
+// (MUL: high half != 0; IMUL: high half != sign-extension of the low half); SF/ZF/AF/PF are
+// x86-undefined. cfreg holds the computed CF/OF as 0/1. Write the stored NZCV using the engine's
+// borrow convention (stored C = NOT x86 CF at bit 29, OF = V at bit 28) with N=Z=0; scratch x20/x23.
+static void e_mul_set_oc(int cfreg) {
+    e_movconst(23, 1);
+    e_rrr(A_EOR, 23, cfreg, 23, 0, 0);  // x23 = NOT cf (cf is 0/1)
+    e_movconst(20, 0);
+    e_rrr(A_ORR, 20, 20, 23, 1, 29);    // stored C (bit 29) = NOT x86 CF
+    e_rrr(A_ORR, 20, 20, cfreg, 1, 28); // V (bit 28) = OF = cf
+    e_str(20, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 20); // msr nzcv, x20 (sync live flags)
+}
+
+// imul reg<-a*b (two-/three-operand forms 0F AF, 69, 6B): truncated product into dst, and x86
+// CF=OF = (the full signed product differs from the sign-extension of the truncated result).
+// Scratch x21..x25 (x21 carries the 0/1 CF into e_mul_set_oc); callers must not pass a/b in those.
+static void e_imul2(int dst, int a, int b, int w) {
+    if (w == 8) {
+        e_smulh(24, a, b);               // x24 = signed high 64 bits of the product
+        e_mul(dst, a, b, 1);             // dst = low 64 (a,b already consumed by smulh)
+        e_asr_i(25, dst, 63, 1);         // x25 = sign-extension of the low half
+        e_rrr(A_SUBS, 22, 24, 25, 1, 0); // overflow iff high != sign(low)
+        e_cset(21, 1 /*NE*/, 1);
+    } else { // 32- or 16-bit: full signed product, overflow iff it != sxt of the truncated result
+        e_sxt(24, a, w);
+        e_sxt(25, b, w);
+        e_mul(22, 24, 25, 1); // x22 = full signed product (operands fit in 32, so 64 is exact)
+        e_sxt(23, 22, w);     // x23 = sign-extension of the low w bytes
+        e_rrr(A_SUBS, 25, 22, 23, 1, 0);
+        e_cset(21, 1 /*NE*/, 1);
+        if (w == 4)
+            e_mov_rr(dst, 22, 0);      // 32-bit dest: low 32, zero-extended
+        else
+            e_bfi(dst, 22, 0, 16, 1);  // 16-bit dest: insert low 16, preserve upper bits
+    }
+    e_mul_set_oc(21);
+}
+
 // ALU operation selector from the primary opcode group (00..3D) or group1 /digit.
 // returns: 0 ADD 1 OR 2 ADC 3 SBB 4 AND 5 SUB 6 XOR 7 CMP, or -1.
 static int alu_kind_primary(uint8_t op) {
@@ -1081,6 +1120,26 @@ static void *translate_block(uint64_t gpc) {
                         } // eax=lo32, edx=hi32
                         else
                             e_mov_rr(RAX, 19, 1);
+                        // x86 CF=OF: high half significant? (jc/jo/setc/seto consume these; e.g. glibc's
+                        // divide-by-constant idioms after a widening multiply). x19=full lo product, RDX=hi.
+                        if (k == 4) { // MUL: CF=OF = (high half != 0)
+                            if (w == 4)
+                                e_lsr_i(22, 19, 32, 1); // x22 = product[63:32]
+                            else
+                                e_mov_rr(22, RDX, 1); // x22 = umulh(rax, r/m)
+                            e_subi_s(23, 22, 0, 1);
+                            e_cset(21, 1 /*NE*/, 1); // cf = (x22 != 0)
+                        } else { // IMUL: CF=OF = (high half != sign-extension of low half)
+                            if (w == 4) {
+                                e_sxt(22, 19, 4);            // x22 = sign-extend product[31:0]
+                                e_rrr(A_SUBS, 23, 19, 22, 1, 0); // cmp full64, sxt(low32)
+                            } else {
+                                e_asr_i(22, 19, 63, 1);          // x22 = sign bits of low half
+                                e_rrr(A_SUBS, 23, RDX, 22, 1, 0); // cmp smulh(hi), sign(lo)
+                            }
+                            e_cset(21, 1 /*NE*/, 1);
+                        }
+                        e_mul_set_oc(21);
                         gpc = next;
                         continue;
                     }
@@ -1243,9 +1302,9 @@ static void *translate_block(uint64_t gpc) {
                 int mem;
                 int rmv = rm_load(&I, next, I.opsize, &mem);
                 e_movconst(19, (uint64_t)I.imm);
-                e_mul(I.reg, rmv, 19, sf);
+                e_imul2(I.reg, rmv, 19, I.opsize); // dst = r/m * imm, sets x86 CF/OF on overflow
                 gpc = next;
-                continue; // flags (CF/OF on overflow) approximate -> TODO
+                continue;
             }
             // ---- string ops: stos (AA/AB), movs (A4/A5), lods (AC/AD). DF assumed 0 (fwd). ----
             if (op == 0xAA || op == 0xAB || op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) {
@@ -2642,7 +2701,7 @@ static void *translate_block(uint64_t gpc) {
             if (op == 0xAF) {
                 int mem;
                 int rmv = rm_load(&I, next, I.opsize, &mem);
-                e_mul(I.reg, I.reg, rmv, sf);
+                e_imul2(I.reg, I.reg, rmv, I.opsize); // reg *= r/m, sets x86 CF/OF on overflow
                 gpc = next;
                 continue;
             }
@@ -2730,23 +2789,29 @@ static void *translate_block(uint64_t gpc) {
                     e_mov_rr(23, rmv, sf);
                     src = 23;
                 }
+                // Legacy bsf/bsr (no F3) compute the bit INDEX into x22 first: x86 leaves the
+                // DESTINATION UNCHANGED when src==0 (real-hw behavior that glibc memrchr relies on -- its
+                // not-found tail is `bsr; je; ret <dest>`), so the index is csel'd in only when src!=0.
+                // tzcnt/lzcnt (F3) instead DEFINE src==0 -> opsize and write the dest unconditionally.
+                int bdst = cnt ? I.reg : 22;
                 if (op == 0xBC) { // tzcnt / bsf: trailing zeros = RBIT+CLZ (same value; src==0 -> opsize)
-                    e_rbit(I.reg, src, sf);
-                    e_clz(I.reg, I.reg, sf);
+                    e_rbit(bdst, src, sf);
+                    e_clz(bdst, bdst, sf);
                 } else if (cnt) { // lzcnt: leading zeros = CLZ
                     e_clz(I.reg, src, sf);
                 } else { // bsr: (w-1) - clz
                     e_clz(16, src, sf);
                     e_movconst(19, sf ? 63 : 31);
-                    e_rrr(A_SUB, I.reg, 19, 16, sf, 0);
+                    e_rrr(A_SUB, 22, 19, 16, sf, 0);
                 }
                 if (cnt) { // tzcnt/lzcnt: x86 CF = (src==0), ZF = (result==0)
                     e_rrr(A_SUBS, 31, src, 31, sf, 0);
                     e_cset(19, 0 /*EQ*/, sf);               // x19 = (src==0) = x86 CF
                     e_rrr(A_ANDS, 31, I.reg, I.reg, sf, 0); // live N/Z from the result
                     e_nzcv_save_setcf(19);                  // store N/Z, stored C = NOT(src==0)
-                } else {                                    // bsf/bsr: ZF = (src==0)
-                    e_rrr(A_ANDS, 31, src, src, sf, 0);
+                } else {                                    // bsf/bsr: ZF = (src==0), dest UNCHANGED if src==0
+                    e_rrr(A_ANDS, 31, src, src, sf, 0);     // Z = (src == 0)
+                    e_csel(I.reg, I.reg, 22, 0 /*EQ*/, sf); // src==0 -> keep dest, else the computed index
                     e_nzcv_save();
                 }
                 gpc = next;
