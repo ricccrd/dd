@@ -522,19 +522,104 @@ pub(crate) async fn containers_prune(State(a): State<App>) -> Json<Value> {
     let dead: Vec<String> = g.containers.iter()
         .filter(|(_, c)| c.status != "running" && c.status != "paused")
         .map(|(id, _)| id.clone()).collect();
-    for id in &dead { g.containers.remove(id); g.live.remove(id); }
+    for id in &dead {
+        // Reclaim each pruned container's writable additions (mirrors `docker rm`; see discard_container_writes).
+        if let (Some(c), Some(base)) = (g.containers.get(id), g.diff_base.get(id)) {
+            discard_container_writes(&c.rootfs.clone(), &base.clone());
+        }
+        g.containers.remove(id); g.live.remove(id); g.diff_base.remove(id);
+    }
     save_state(&g, &a.state_path);
     Json(json!({"ContainersDeleted": dead, "SpaceReclaimed": 0}))
 }
 
-/// `GET /containers/{id}/changes` — `docker diff`. dd does not track rootfs diffs; report no changes
-/// (correct shape: an array of `{Path, Kind}`, or `null` for none).
-pub(crate) async fn containers_changes(State(a): State<App>, Path(id): Path<String>) -> Response {
-    let g = a.inner.lock().await;
-    match resolve_cid(&g, &id) {
-        Some(_) => Json(json!([])).into_response(),
-        None => no_such(&id),
+/// Recursively snapshot a rootfs into `path -> (mtime_nanos, size, is_dir)`, keyed by container-absolute
+/// path ("/etc/hostname"). Symlinks are recorded as leaves (not followed), matching `docker diff`, which
+/// reports a changed/added/deleted symlink rather than its target. Used as the baseline for `docker diff`.
+pub(crate) fn snapshot_rootfs(rootfs: &str) -> HashMap<String, (i64, u64, bool)> {
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut HashMap<String, (i64, u64, bool)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let Ok(md) = e.path().symlink_metadata() else { continue };
+            let name = e.file_name();
+            let path = format!("{prefix}/{}", name.to_string_lossy());
+            let is_dir = md.file_type().is_dir(); // is_dir() follows nothing for symlink_metadata
+            let mtime = md.modified().ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64).unwrap_or(0);
+            out.insert(path.clone(), (mtime, md.len(), is_dir));
+            if is_dir { walk(&e.path(), &path, out); }
+        }
     }
+    let mut out = HashMap::new();
+    walk(std::path::Path::new(rootfs), "", &mut out);
+    out
+}
+
+/// Discard the files a container added to its rootfs, given the baseline snapshot taken at start. dd
+/// shares the image rootfs with the container (no copy-on-write upper layer), so `docker rm` must
+/// reclaim the container's writable additions itself — otherwise each run permanently pollutes the
+/// image (e.g. a second `docker run alpine mkdir /x` would see "/x already exists"). Only entries the
+/// container *added* (present now, absent in the baseline) are removed, deepest path first so a created
+/// directory is empty before its `remove_dir`; pre-existing files it merely modified are left intact
+/// (we can't restore their prior content, and removing them would corrupt the image). A no-op when no
+/// baseline exists (an unstarted container, or one whose baseline didn't survive a daemon restart).
+pub(crate) fn discard_container_writes(rootfs: &str, base: &HashMap<String, (i64, u64, bool)>) {
+    let now = snapshot_rootfs(rootfs);
+    let mut added: Vec<&String> = now.keys().filter(|p| !base.contains_key(*p)).collect();
+    added.sort_by(|a, b| b.len().cmp(&a.len())); // deepest first
+    for p in added {
+        let full = format!("{rootfs}{p}");
+        let is_dir = now.get(p).map(|&(_, _, d)| d).unwrap_or(false);
+        let _ = if is_dir { std::fs::remove_dir(&full) } else { std::fs::remove_file(&full) };
+    }
+}
+
+/// `GET /containers/{id}/changes` — `docker diff`. dd shares the image rootfs with the container (no
+/// copy-on-write upper layer), so we diff the current rootfs against the snapshot taken at start
+/// (`Inner::diff_base`). Reports the Docker shape: an array of `{Path, Kind}` (0=modified, 1=added,
+/// 2=deleted), with each changed entry's ancestor directories also reported as modified, as docker does.
+/// A container that was never started (or whose baseline didn't survive a daemon restart) reports none.
+pub(crate) async fn containers_changes(State(a): State<App>, Path(id): Path<String>) -> Response {
+    let (rootfs, base) = {
+        let g = a.inner.lock().await;
+        let Some(full) = resolve_cid(&g, &id) else { return no_such(&id) };
+        let Some(rootfs) = g.containers.get(&full).map(|c| c.rootfs.clone()) else { return no_such(&id) };
+        (rootfs, g.diff_base.get(&full).cloned())
+    };
+    let Some(base) = base else { return Json(json!([])).into_response() };
+    let now = tokio::task::spawn_blocking(move || snapshot_rootfs(&rootfs)).await.unwrap_or_default();
+
+    // Kind per Docker: 0=Modified, 1=Added, 2=Deleted. A directory's content change isn't a "modify"
+    // (only its metadata/children matter), so dirs only ever appear as Added/Deleted or as a modified
+    // ancestor; regular files compare mtime+size.
+    let mut kinds: HashMap<String, u8> = HashMap::new();
+    for (path, &(mtime, size, is_dir)) in &now {
+        match base.get(path) {
+            None => { kinds.insert(path.clone(), 1); }
+            Some(&(bmt, bsz, bdir)) => {
+                if !is_dir && !bdir && (bmt != mtime || bsz != size) { kinds.insert(path.clone(), 0); }
+            }
+        }
+    }
+    for path in base.keys() {
+        if !now.contains_key(path) { kinds.insert(path.clone(), 2); }
+    }
+    // Mark every ancestor directory of a change as modified (docker reports `C /etc` for `D /etc/hostname`),
+    // without overriding a more specific Added/Deleted on that ancestor itself.
+    let leaves: Vec<String> = kinds.keys().cloned().collect();
+    for path in leaves {
+        let mut p = path.as_str();
+        while let Some(idx) = p.rfind('/') {
+            let parent = if idx == 0 { "/" } else { &p[..idx] };
+            kinds.entry(parent.to_string()).or_insert(0);
+            if idx == 0 { break; }
+            p = &p[..idx];
+        }
+    }
+    let mut out: Vec<Value> = kinds.into_iter().map(|(p, k)| json!({"Path": p, "Kind": k})).collect();
+    out.sort_by(|a, b| a["Path"].as_str().cmp(&b["Path"].as_str()));
+    Json(Value::Array(out)).into_response()
 }
 
 /// `POST /containers/{id}/update` — `docker update`. dd does not apply live resource limits; accept

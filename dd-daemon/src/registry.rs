@@ -293,7 +293,17 @@ impl Client {
         let url = format!("{}?service={}&scope={}", ch.realm, ch.service, scope);
         let creds = if self.creds.is_empty() { None } else { Some(&self.creds) };
         let resp = http::get_with_basic(&url, creds)?;
-        if resp.status != 200 { return Err(format!("token endpoint -> {}", resp.status)); }
+        if resp.status != 200 {
+            // A registry that refuses to mint a *push*-scoped token for an unauthenticated client is
+            // denying the push -- exactly `docker push` without `docker login`. Surface the conformant
+            // "denied" message whether the denial lands here at the token endpoint (401/403) or later at
+            // the blob-upload POST (see upload_blob), so callers get one stable error either way.
+            let action = scope.rsplit(':').next().unwrap_or("");
+            if action.contains("push") && (resp.status == 401 || resp.status == 403) {
+                return Err("denied: requested access to the resource is denied (run `docker login`)".into());
+            }
+            return Err(format!("token endpoint -> {}", resp.status));
+        }
         let v: Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
         v["token"].as_str().or_else(|| v["access_token"].as_str())
             .map(str::to_string).ok_or_else(|| "token response had no token".to_string())

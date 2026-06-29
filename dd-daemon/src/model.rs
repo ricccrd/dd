@@ -248,6 +248,11 @@ pub(crate) struct Inner {
     pub(crate) networks: Vec<Net>,
     pub(crate) live: HashMap<String, Arc<Live>>, // running containers' (and execs') IO plumbing (not persisted)
     pub(crate) execs: HashMap<String, Exec>,     // exec id -> its spec
+    /// Per-container rootfs baseline snapshot taken at start, so `docker diff` (GET /changes) can report
+    /// the files this run mutated. dd shares the image rootfs with the container (no copy-on-write upper
+    /// layer), so the pre-run snapshot is the only baseline to diff against. Keyed by full container id;
+    /// values map a container-absolute path -> (mtime_nanos, size, is_dir). Not persisted (like `live`).
+    pub(crate) diff_base: HashMap<String, HashMap<String, (i64, u64, bool)>>,
 }
 
 
