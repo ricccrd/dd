@@ -153,6 +153,55 @@ static void mq_maybe_free(int qi) {
         memset(q, 0, sizeof *q);
     }
 }
+// CPU topology: the number of CPUs to advertise to the guest (the host's online count, capped). glibc
+// and tcmalloc enumerate CPUs via sched_getaffinity and /sys/devices/system/cpu/{online,possible};
+// reporting only CPU 0 makes tcmalloc's NumPossibleCPUs() assert (`cpus.has_value()`) and mongod abort.
+static int dd_online_cpus(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    if (n > 64) n = 64; // matches /proc/cpuinfo's cap; one CPU bit fits in 8 bytes of mask
+    return (int)n;
+}
+// Build the "all online CPUs" bitmask into the caller's buffer (CPU i -> bit i, little-endian bytes).
+static void cpu_online_mask(uint8_t *m, size_t n) {
+    memset(m, 0, n);
+    int nc = dd_online_cpus();
+    for (int cpu = 0; cpu < nc; cpu++)
+        if ((size_t)(cpu / 8) < n) m[cpu / 8] |= (uint8_t)(1u << (cpu % 8));
+}
+// Current CPU-affinity mask (process-global; default = all online CPUs). sched_setaffinity records the
+// guest's chosen mask so sched_getaffinity round-trips it (pin-to-CPU0 then read back), while a fresh
+// process still advertises every online CPU so glibc/tcmalloc size their per-CPU tables correctly.
+static uint8_t g_affinity[128];
+static int g_affinity_set;
+static const uint8_t *affinity_mask(void) {
+    if (!g_affinity_set) {
+        cpu_online_mask(g_affinity, sizeof g_affinity);
+        g_affinity_set = 1;
+    }
+    return g_affinity;
+}
+// Back a short synthesized sysfs string with an anonymous temp fd (the same trick proc_open uses for
+// the macOS-has-no-/proc case). Returns a readable fd positioned at offset 0, or -1 on error.
+static int synth_str_fd(const char *s) {
+    char tn[] = "/tmp/.ddcpuXXXXXX";
+    int fd = mkstemp(tn);
+    if (fd < 0) return -1;
+    unlink(tn);
+    size_t len = strlen(s);
+    if (write(fd, s, len) < 0) {}
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+// Render the kernel's CPU-range format ("0" for a single CPU, else "0-N\n") for the cpu/{online,
+// possible,present} sysfs files that glibc __get_nprocs / tcmalloc NumPossibleCPUs parse.
+static void cpu_range_str(char *buf, size_t n) {
+    int nc = dd_online_cpus();
+    if (nc <= 1)
+        snprintf(buf, n, "0\n");
+    else
+        snprintf(buf, n, "0-%d\n", nc - 1);
+}
 static void service(struct cpu *c) {
     if (__builtin_expect(g_untrusted, 0)) {
         syscall_route(c);
@@ -958,6 +1007,18 @@ static void service_local(struct cpu *c) {
                     break;
                 }
             }
+            // CPU topology sysfs: glibc __get_nprocs and tcmalloc NumPossibleCPUs read these to size
+            // their per-CPU structures; an empty/missing file makes mongod abort.
+            if (rp && !strncmp(rp, "/sys/devices/system/cpu/", 24)) {
+                const char *leaf = rp + 24;
+                if (!strcmp(leaf, "online") || !strcmp(leaf, "possible") || !strcmp(leaf, "present")) {
+                    char rng[32];
+                    cpu_range_str(rng, sizeof rng);
+                    int d = synth_str_fd(rng);
+                    G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
+                    break;
+                }
+            }
             // device nodes -> host devices (rootfs has no real /dev)
             if (rp && !strncmp(rp, "/dev/", 5)) {
                 const char *hd = !strcmp(rp, "/dev/null")      ? "/dev/null"
@@ -1594,17 +1655,38 @@ static void service_local(struct cpu *c) {
     case 99: G_RET(c) = 0; break;
     // syslog
     case 116: G_RET(c) = 0; break;
-    // sched_setaffinity
-    case 122: G_RET(c) = 0; break;
+    // sched_setaffinity(pid, size, MASK=a2) -- record the requested mask (intersected with the online
+    // set) so a later getaffinity reflects the pin; -EINVAL if it selects no online CPU, as on Linux.
+    case 122: {
+        size_t n = (size_t)a1;
+        if (n > sizeof g_affinity) n = sizeof g_affinity;
+        if (a2 && n) {
+            uint8_t online[sizeof g_affinity];
+            cpu_online_mask(online, sizeof online);
+            uint8_t want[sizeof g_affinity];
+            int any = 0;
+            for (size_t i = 0; i < n; i++) {
+                want[i] = ((const uint8_t *)a2)[i] & online[i];
+                if (want[i]) any = 1;
+            }
+            if (!any) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            memset(g_affinity, 0, sizeof g_affinity);
+            memcpy(g_affinity, want, n);
+            g_affinity_set = 1;
+        }
+        G_RET(c) = 0;
+        break;
+    }
     case 123: {
         size_t n = (size_t)a1;
-        // sched_getaffinity(pid,size,MASK=a2!)
+        // sched_getaffinity(pid,size,MASK=a2!) -- return the current mask (all online CPUs by default),
+        // not just CPU 0, so CPU_COUNT() and tcmalloc's enumeration see the real width (mongod aborts).
         if (n > 128) n = 128;
-        if (a2 && n) {
-            memset((void *)a2, 0, n);
-            *(uint8_t *)a2 = 1;
-            // cpu 0 set; mask is a2 not a1
-        }
+        if (a2 && n) memcpy((void *)a2, affinity_mask(), n);
+        // Return the number of bytes the mask spans (glibc zeroes the remainder); 8 covers <=64 CPUs.
         G_RET(c) = n < 8 ? (uint64_t)n : 8;
         break;
     }
@@ -2902,6 +2984,30 @@ static void service_local(struct cpu *c) {
     case 293:
         G_RET(c) = (uint64_t)(-ENOSYS);
         // rseq -> ENOSYS (glibc falls back)
+        break;
+
+    // ===================== seccomp / sandboxing parity =====================
+    // Docker's default seccomp profile BLOCKS these with EPERM (they need elevated caps the container
+    // lacks); real Linux returns -EPERM, so a probe sees "Operation not permitted". We don't emulate
+    // the feature -- replicate the blocked-syscall result so guests that probe for it agree with Linux.
+    case 280: // bpf(2)            -- needs CAP_BPF/CAP_SYS_ADMIN
+    case 282: // userfaultfd(2)    -- blocked by default profile
+    case 425: // io_uring_setup(2) -- blocked by default profile
+        G_RET(c) = (uint64_t)(-EPERM);
+        break;
+    // seccomp(2): a guest installing its OWN allow-all filter (SECCOMP_SET_MODE_FILTER) self-sandboxes;
+    // accept the install as a no-op (we don't actually enforce a BPF filter) so the call SUCCEEDS like
+    // on Linux instead of failing with ENOSYS. SET_MODE_STRICT is likewise accepted but not enforced.
+    case 277: { // seccomp(op, flags, args)
+        unsigned op = (unsigned)a0;
+        G_RET(c) = (op == 0 /*STRICT*/ || op == 1 /*FILTER*/) ? 0 : (uint64_t)(-EINVAL);
+        break;
+    }
+    // ptrace(2): no real tracing under the JIT, but a guest calling PTRACE_TRACEME on itself (the
+    // common anti-debug / "am I traced?" primitive) just expects success. Accept TRACEME; deny the
+    // rest with -EPERM (the same result an unprivileged process gets when it cannot attach).
+    case 117: // ptrace(request, pid, addr, data)
+        G_RET(c) = (a0 == 0 /*PTRACE_TRACEME*/) ? 0 : (uint64_t)(-EPERM);
         break;
 
     case 279: { // memfd_create(name, flags) -> an anonymous file: a tmpfile, unlinked immediately
