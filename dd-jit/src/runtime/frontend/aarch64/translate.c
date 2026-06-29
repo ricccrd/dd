@@ -76,6 +76,18 @@ static int gpr_field_mask(uint32_t in) {
         //   logical/addsub-reg/cond-sel/2-source
         return 1 | 2 | 4;
     }
+    // Scalar FP <-> integer / fixed-point conversions read or write a GENERAL-PURPOSE register even though
+    // they sit in the scalar-FP encoding box (so the data-processing-register test above misses them).
+    // Without flagging that GPR operand, a conversion naming a stolen reg (e.g. `fcvtzs w28,d0`) would be
+    // emitted verbatim and clobber the engine's reserved x28=cpu pointer. The box is bits[30:24]==0011110;
+    // a conversion is bit21==0 (fixed-point) OR bit21==1 with bits[15:10]==0 (integer) -- the only scalar-FP
+    // forms with a zero opcode field there (FADD/FMOV/FCMP/... all have nonzero [15:10] when bit21==1).
+    if ((in & 0x5F000000u) == 0x1E000000u && (!(in & 0x200000u) || !(in & 0xFC00u))) {
+        int opcode = (in >> 16) & 7;
+        // SCVTF/UCVTF (010/011) and FMOV-from-GPR (111) take the GPR as Rn[9:5]; every FP->GPR convert and
+        // FMOV-to-GPR (110) takes it as Rd[4:0].
+        return (opcode == 2 || opcode == 3 || opcode == 7) ? 2 : 1;
+    }
     // SIMD/FP data: V registers only
     return 0;
 }
