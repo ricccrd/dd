@@ -169,8 +169,9 @@ impl Component for AppModel {
         };
         let widgets = ui::build(&root, &sender);
 
-        // Seed ~/.dd/images with the bundled starter image(s) so a novice has something to run.
-        seed_images();
+        // Bundled starter images (hello-dd) are discovered straight from the app bundle by the daemon
+        // (Resources/images), so an app update always serves the current set and nothing is copied into
+        // ~/.dd that could go stale.
 
         // One-shot update check on startup (off the UI thread).
         {
@@ -521,34 +522,6 @@ fn resolve_cli() -> Option<PathBuf> {
     }
     let dir = exe.parent()?;
     names.iter().map(|n| dir.join(n)).find(|p| p.exists())
-}
-
-/// Copy any bundled starter images into `~/.dd/images` (skipping ones already there).
-fn seed_images() {
-    let Some(src) = bundled_images_dir() else { return };
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let dest = PathBuf::from(home).join(".dd/images");
-    let _ = std::fs::create_dir_all(&dest);
-    let Ok(rd) = std::fs::read_dir(&src) else { return };
-    for e in rd.flatten() {
-        if e.path().is_dir() && !dest.join(e.file_name()).exists() {
-            let _ = std::process::Command::new("cp").arg("-R").arg(e.path()).arg(&dest).output();
-        }
-    }
-}
-
-/// The bundled images dir: `Contents/Resources/images`, or `assets/images` in dev.
-fn bundled_images_dir() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(contents) = exe.parent().and_then(|p| p.parent()) {
-            let p = contents.join("Resources/images");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    let dev = PathBuf::from("assets/images");
-    dev.exists().then_some(dev)
 }
 
 /// Fetch a container's logs off-thread and deliver them as `Cmd::Logs`.

@@ -13,10 +13,13 @@
 //! ])
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub mod cases;
+pub mod scenario;   // real-software surface: drive popular images through dd-daemon (Real-oracle vs Dd)
+pub mod scenarios;  // the scenario registry (one folder per category)
+pub mod diag;       // turn a failed run into an actionable JIT bug report (signals/buckets/crash details)
 
 /// A JIT engine = one guest target (OS × ISA) the runtime can execute.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -179,17 +182,88 @@ impl Ctx {
             cache, repo,
         }
     }
-    /// Resolve an image name to its rootfs path for the given arch (aarch64 today).
-    fn rootfs_path(&self, name: &str, _e: Engine) -> Option<String> {
-        let rd = std::fs::read_dir(&self.images).ok()?;
-        for ent in rd.flatten() {
-            let n = ent.file_name().to_string_lossy().to_string();
-            if n.contains(name) && ent.path().join("rootfs").is_dir() {
-                return Some(ent.path().join("rootfs").to_string_lossy().into_owned());
+    /// Resolve an image name to its rootfs path for the engine's guest arch.
+    ///
+    /// The image dirs hold prebuilt rootfses for different guest arches (e.g. an aarch64 `alpine` and an
+    /// x86-64 `nginx_alpine`), so a naive substring match could hand an x86-64 rootfs to the aarch64
+    /// engine — the guest would then exit 255 with empty output. We therefore (1) require the rootfs's
+    /// ELF arch to match `e.arch()`, and (2) prefer an EXACT image-name match over a mere substring one.
+    /// Among equal candidates the lowest sorted dir name wins, so selection is deterministic.
+    fn rootfs_path(&self, name: &str, e: Engine) -> Option<String> {
+        // Score candidates and keep the best (lowest) key. The key orders by:
+        //   tier — see image_name_tier (0 registry-encoded pull, 1 sidecar-name, 2 literal dir-name),
+        //          3 incidental substring match; a real pulled image (e.g. docker.io_library_alpine_latest,
+        //          which has /etc/hostname) thus beats a hand-rolled `alpine/` dir that merely shares the name.
+        //   arch — 0 if the rootfs's ELF arch matches the engine, 1 if undeterminable (arch MISMATCHES are
+        //          rejected outright, so we never feed an x86-64 rootfs to the aarch64 engine or vice-versa).
+        //   dir name — final tie-break so selection is deterministic.
+        let mut best: Option<(u8, u8, String, PathBuf)> = None;
+        for ent in std::fs::read_dir(&self.images).ok()?.flatten() {
+            let dir = ent.path();
+            let rootfs = dir.join("rootfs");
+            if !rootfs.is_dir() { continue; }
+            let dname = dir.file_name()?.to_string_lossy().to_string();
+            let tier = match image_name_tier(&dir, &dname, name) {
+                Some(t) => t,
+                None if dname.contains(name) => 3, // incidental substring — weakest match
+                None => continue,
+            };
+            let arch = match rootfs_machine(&rootfs) {
+                Some(m) if m == elf_machine(e) => 0,
+                Some(_) => continue,
+                None => 1,
+            };
+            let key = (tier, arch, dname, rootfs);
+            if best.as_ref().map_or(true, |b| key < *b) { best = Some(key); }
+        }
+        best.map(|(.., rootfs)| rootfs.to_string_lossy().into_owned())
+    }
+}
+
+/// EM_* value (ELF `e_machine`) for an engine's guest ISA.
+fn elf_machine(e: Engine) -> u16 {
+    match e.arch() {
+        "x86_64" => 0x3E, // EM_X86_64
+        _ => 0xB7,        // EM_AARCH64
+    }
+}
+
+/// Read the ELF `e_machine` of a rootfs by probing a few common executables; `None` if undeterminable.
+fn rootfs_machine(rootfs: &Path) -> Option<u16> {
+    for cand in ["bin/busybox", "bin/dash", "bin/bash", "bin/ls", "bin/cat", "bin/sh"] {
+        let p = rootfs.join(cand);
+        // Skip symlinks (e.g. sh -> dash): resolve only plain ELF files to keep this host-path safe.
+        if p.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(true) { continue; }
+        if let Ok(b) = std::fs::read(&p) {
+            if b.len() >= 20 && &b[0..4] == b"\x7fELF" {
+                return Some(u16::from_le_bytes([b[18], b[19]]));
             }
         }
-        None
     }
+    None
+}
+
+/// Exact-match tier for an image dir against a requested `name` (lower = stronger):
+///   0 — a `docker.io_<ns>_<repo>_<tag>` registry-encoded dir whose decoded repo matches: a REAL pulled
+///       image (these carry the full rootfs, e.g. `/etc/hostname`), so it beats a hand-built dir.
+///   1 — the `name`/`repo` recorded in the dir's `dd-image.json` sidecar matches (non-registry dir).
+///   2 — the dir is literally named `name` (hand-built bundle dirs like `gcc-bundle`).
+///   `None` — no exact match (the caller may still fall back to a substring match).
+fn image_name_tier(dir: &Path, dname: &str, name: &str) -> Option<u8> {
+    // Decode the docker dir encoding: docker.io_library_alpine_latest -> repo "alpine".
+    if let Some(rest) = dname.strip_prefix("docker.io_library_") {
+        if let Some((repo, _tag)) = rest.rsplit_once('_') {
+            if repo == name { return Some(0); }
+        }
+    }
+    if let Ok(json) = std::fs::read_to_string(dir.join("dd-image.json")) {
+        if let Some(img) = json.split("\"name\":\"").nth(1).and_then(|s| s.split('"').next()) {
+            // img is "repo:tag" (or "ns/repo:tag"); accept full match or the repo before ':'.
+            if img == name || img.split(':').next() == Some(name) { return Some(1); }
+        }
+    }
+    if dname == name { return Some(2); }
+    None
 }
 
 /// Compile a guest C source for a Linux engine. aarch64 = native gcc, x86_64 = the cross compiler; both

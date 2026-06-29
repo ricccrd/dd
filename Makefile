@@ -1,5 +1,5 @@
 # dd workspace.
-.PHONY: all jit fmt test test-ci test-docker test-docker-full test-compose test-docker-net test-macos test-realsw test-smoke coverage bench clean app dmg install uninstall mac-image mac-push
+.PHONY: all jit fmt test test-ci test-docker test-docker-full test-compose test-docker-net test-macos test-realsw test-smoke scenarios scenarios-real scenarios-long scenarios-count scenarios-clean coverage bench clean app dmg install uninstall mac-image mac-push
 # Version is the git tag (v0.2.0 -> 0.2.0); falls back to 0.0.0-dev with no tags. CI passes it too.
 TAG := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
 VERSION ?= $(or $(TAG),0.0.0-dev)
@@ -27,6 +27,22 @@ test-realsw: jit ## run REAL pulled software (redis/python/postgres/nats) with d
 test-smoke:     ## user-perspective: FRESH-PULL + run a real glibc distro on BOTH arches (the libc.so.6 guard; needs network, macOS)
 	cargo build --release -p dd-cli -p dd-daemon
 	bash dd-tests/scenarios/smoke-realimage.sh
+scenarios: jit  ## REAL software through dd-daemon (the SUT): popular images, both arches. CAT=databases TGT=arm to narrow
+	cargo run -q -p dd-tests --bin scenarios -- --backend dd $(if $(CAT),-c $(CAT)) $(if $(TGT),-t $(TGT))
+scenarios-real: ## same scenarios against the REAL docker oracle (mac Docker Desktop) — proves the tests are correct
+	cargo run -q -p dd-tests --bin scenarios -- --backend real --long $(if $(CAT),-c $(CAT)) $(if $(TGT),-t $(TGT))
+scenarios-long: jit ## full compatibility sweep against dd-daemon (pulls images, heavy workloads, both arches)
+	cargo run -q -p dd-tests --bin scenarios -- --backend dd --long $(if $(CAT),-c $(CAT))
+scenarios-count: ## list every scenario×target case + total (runs nothing) — proves the case count
+	cargo run -q -p dd-tests --bin scenarios -- --count $(if $(CAT),-c $(CAT))
+scenarios-clean: ## reap ONLY harness-spawned dd-daemons (by pidfile, mac-side) + remove scratch — keeps the host clean
+	@for pf in target/dd-scen/*/daemon.pid; do [ -f "$$pf" ] || continue; pid=$$(cat "$$pf"); \
+	  mac bash -lc "kill $$pid 2>/dev/null; true" </dev/null; echo "reaped $$pid"; done; \
+	  rm -rf target/dd-scen/dd-* target/dd-scen/real-* target/dd-scen/*.sh 2>/dev/null; echo "scratch cleaned"
+scenarios-prune: ## DISK reclaim: drop UNUSED images from the mac docker ORACLE (Docker Desktop). Removes anything no container uses; re-pulls on next run. Opt-in.
+	@echo "oracle disk BEFORE:"; mac docker system df </dev/null 2>&1 | head -2; \
+	  mac docker image prune -af </dev/null 2>&1 | tail -1; \
+	  echo "oracle disk AFTER:"; mac docker system df </dev/null 2>&1 | head -2
 coverage: jit  ## report unimplemented syscalls/opcodes (static switch-diff + dynamic corpus run); MODE=static|dynamic|all
 	bash dd-tests/tools/coverage.sh $(or $(MODE),all)
 bench: jit      ## speed: same Linux binary in the VM (native/qemu) vs through dd's JIT (no VM)
