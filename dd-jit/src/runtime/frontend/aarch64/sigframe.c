@@ -23,7 +23,11 @@ static void build_signal_frame(struct cpu *c, int sig) {
     for (int i = 0; i < 31; i++)
         *(uint64_t *)(mc + 8 + i * 8) = c->x[i];
     *(uint64_t *)(mc + 256) = c->sp;
-    *(uint64_t *)(mc + 264) = c->pc;
+    // The interrupted PC is GUEST-VISIBLE: the handler reads it (and Go looks it up in pclntab / rewrites it
+    // for async-preempt). A non-PIE ET_EXEC runs c->pc biased HIGH, but its pclntab is keyed on the LOW link
+    // vaddr -- a HIGH pc is "unknown pc" to the guest runtime. Hand over the UN-BIASED (low) pc; do_sigreturn
+    // reads it back and the dispatcher re-biases low->high on resume. pcrel_base is identity for PIE.
+    *(uint64_t *)(mc + 264) = pcrel_base(c->pc);
     *(uint64_t *)(mc + 272) = c->nzcv;
     // preserve NEON across the handler
     memcpy((void *)(mc + 280), c->v, sizeof c->v);
