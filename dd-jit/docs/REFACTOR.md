@@ -20,43 +20,135 @@ But **JIT is just one technique the runtime uses**, not the product:
   used as a syscall-interception point), while `darwinjail.c` is a pure **DYLD-interpose jail
   with no JIT at all**. Lumping both under "jit" hides that they are different domains.
 
+### The smell: `engine/emit_arm64.c` (host assembler ≠ engine)
+
+Correct instinct. `jit/emit_arm64.c` tangles **two layers**:
+- a **host ARM64 assembler** — `emit32`, `e_ldr`, `e_movz`, `e_movconst`, … (pure instruction
+  encoders, no engine/guest knowledge); AND
+- **engine block-ABI stubs** — `emit_prologue`, `emit_spill`, `emit_ibtc_miss`,
+  `emit_chain_exit` (the JIT's trampoline/IBTC semantics).
+
+Because the assembler is buried inside the engine and **named after the host ISA**, it can't
+be cleanly shared: the aarch64 frontend reaches into it, while the x86 frontend **duplicates
+it** (`frontend/x86_64/emit.c` has 81 `e_*` vs the engine's 25). That's the smell — a host
+primitive masquerading as engine logic, and duplicated as a result.
+
+Fix: extract the assembler into its OWN host layer below the engine. The engine then becomes
+**host-ISA-agnostic** (cache + dispatch loop) plus its block-ABI stubs that *call* the
+assembler. Both frontends use the one assembler → the x86 duplication collapses (only the
+x86-specific SSE/x87/flag emitters stay in the frontend).
+
+### Two axes: the matrix is (guest OS × guest ISA)
+
+The architecture has **two independent axes**. Naming + dirs must keep them independent so a
+new OS or a new ISA is an additive change, never a cross-cutting edit:
+
+```
+                 guest ISA  →  x86_64        aarch64       (riscv64 …)
+   guest OS ↓
+     linux              linux_x86_64   linux_aarch64
+     darwin             —              darwin_aarch64
+    (windows)           windows_x86_64 windows_aarch64   ← adding Windows = a new ROW
+```
+
+A **row** (guest OS) = one `os/<osname>/` personality. A **column** (guest ISA) = one
+`translate/<isa>/` + `include/cpu_<isa>.h`. A **cell** = one `targets/<os>_<isa>.c`. The
+engine + host assembler are shared by the whole grid.
+
 ### One word per domain (vocabulary — define once, use everywhere)
 
-| domain | what it does | current dir | proposed name | covers which targets |
+| domain | what it does | current dir | proposed | axis |
 |---|---|---|---|---|
-| **translate** | guest ISA → host ARM64 code | `frontend/` | `translate/` | x86_64 (true JIT), aarch64 (transliterate), darwin DBT |
-| **engine** | host execution core: code cache, dispatcher, ARM64 encoder | `jit/` | `engine/` | all (the actual JIT machinery) |
-| **syscalls** | guest-OS syscall emulation | `os/linux/service*` | `os/linux/syscall/` | linux |
-| **os** | the rest of the OS personality: threads, signals, loader | `os/linux/` | `os/linux/` (keep) | linux, darwin |
-| **container** | jail, overlay, netns, /proc synth | `os/linux/container/` | keep | linux (darwin reuses model) |
+| **host** | host primitives: the ARM64 **assembler** + MAP_JIT/mmap/icache (the README's `hal`) | inside `jit/` + inline | `host/arm64/` (`asm.c`) `host/darwin/` | host (fixed) |
+| **engine** | host-ISA-agnostic JIT machinery: code cache, dispatcher, block-ABI stubs | `jit/` | `engine/` | host (fixed) |
+| **translate** | guest ISA → host code | `frontend/` | `translate/<isa>/` | per guest ISA |
+| **os** | guest-OS personality: syscalls, threads, signals, loader | `os/linux/` | `os/<osname>/` | per guest OS |
+| **syscalls** | the syscall switch within a personality | `os/linux/service*` | `os/<os>/syscall/` | per guest OS |
+| **container** | jail, overlay, netns, /proc synth | `os/linux/container/` | keep | per guest OS (reusable) |
 | **isolation** | untrusted-guest sentry split | `os/linux/sentry.c` | keep | opt-in |
-| **jail** | DYLD-interpose native-macOS jail (no JIT) | `os/darwin/darwinjail.c` | `os/darwin/jail/` | darwin (lightweight path) |
-| **runtime** | per-target entry: compose slice, load, run | `targets/` | keep | all |
+| **jail** | DYLD-interpose native jail (no JIT) | `os/darwin/darwinjail.c` | `os/darwin/jail/` | darwin only |
+| **runtime** | per-target entry: compose slice, load, run | `targets/` | keep | per cell |
 
-Keep the crate brand **dd-jit**; rename the internal directory `jit/` → `engine/` so the
-component (engine) is no longer confused with the technique (jit) or the brand. This is a
-pure `git mv` + include-path update — low churn, big clarity win.
+Keep the crate brand **dd-jit**; rename `jit/` → `engine/` + lift the assembler to `host/`.
 
 ### Proposed domain-organized tree (target state)
 
 ```
 src/runtime/
-├─ include/         interfaces: cpu_<isa>.h  (+ the seams live next to each translator)
-├─ translate/       TRANSLATION — one subdir per guest ISA, shares only the cpu struct + engine API
-│  ├─ x86_64/       decode.c  translate/<class>.c  emit.c  avx.c  abi.h  dispatch_hooks.h …
-│  └─ aarch64/      translate.c  abi.h  dispatch_hooks.h …
-├─ engine/          ENGINE  (was jit/) — cache.c  dispatch.c  emit_arm64.c
-├─ os/
-│  ├─ linux/        OS personality: thread.c signal.c elf.c fscache.c sentry.c
-│  │  ├─ syscall/   SYSCALLS  (was service*) — dispatch.c + <family>.c (io/mem/signal/time/sysv)
-│  │  └─ container/ CONTAINER — vfs.c netns.c state.c  vfs/{resolve,overlay,gmap}.c
-│  └─ darwin/       jitdarwin.c (DBT) + jail/ (darwinjail — non-JIT)
-└─ targets/         RUNTIME — linux_aarch64.c  linux_x86_64.c  darwin_aarch64.c  (each → dd_run + main)
+├─ host/            HOST (fixed = arm64 macOS) — below the engine, used by engine + translate
+│  ├─ arm64/asm.c   the ARM64 assembler: emit32 + e_*  (the extracted primitive)
+│  └─ darwin/       MAP_JIT arena, mmap, sys_icache_invalidate, W^X flip
+├─ engine/          ENGINE (host-ISA-agnostic) — cache.c  dispatch.c (run_guest)  stubs.c (prologue/IBTC/trampoline)
+├─ include/         cpu_<isa>.h                         (one per guest ISA — the column key)
+├─ translate/       per guest ISA (the columns)
+│  ├─ x86_64/       decode.c  translate.c  translate/<class>.c  emit.c  avx.c  abi.h  dispatch_hooks.h
+│  └─ aarch64/      translate.c  abi.h  dispatch_hooks.h
+├─ os/              per guest OS (the rows)
+│  ├─ linux/        thread.c signal.c elf.c fscache.c sentry.c  syscall/  container/
+│  ├─ darwin/       jitdarwin.c  jail/
+│  └─ windows/      ← NEW ROW would live here: pe.c (PE/COFF loader)  syscall/ (NT)  …
+└─ targets/         one cell per built binary:  <os>_<isa>.c  → dd_run + main
 ```
 
-Each top-level dir = exactly one domain → a maintainer reads the path and knows the concern.
-The renames are mechanical and slot into the refactor order (engine/ rename + syscall/ move
-ride along with steps 0–2). Do them as isolated `git mv` commits, matrix green between each.
+Each top-level dir = one domain; each subdir = one axis value. A maintainer reads the path and
+knows OS-vs-ISA-vs-engine. Renames are mechanical `git mv` + include-path fixes (only the
+`targets/*.c` manifests change); do them as isolated commits, matrix green between each.
+
+### Canonical entrypoint per layer (same name everywhere)
+
+There are currently **no enforced naming conventions** — entry symbols diverge
+(`jit_run`/`jit86_run`), the assembler is mis-homed, and plurals/prefixes drift. Adopt ONE
+canonical entry file + symbol per layer so every engine looks identical:
+
+| layer | entry file (same name across the axis) | entry symbol | one per |
+|---|---|---|---|
+| runtime | `targets/<os>_<isa>.c` | `dd_run(rootfs, argc, argv)` + `main` | cell |
+| os personality | `os/<os>/syscall/dispatch.c` | `service(cpu)` | guest OS |
+| translate | `translate/<isa>/translate.c` | `translate_block(gpc)` | guest ISA |
+| engine | `engine/dispatch.c` | `run_guest(cpu)` | shared |
+| host asm | `host/arm64/asm.c` | `emit32` + `e_*` | shared |
+
+`translate_block`, `run_guest`, `service` are already uniform; the only fixes are `dd_run` and
+homing the assembler. After that, "where does engine X start?" has one answer per layer.
+
+### File-naming conventions (so the path/prefix tells the story)
+
+| thing | rule | example |
+|---|---|---|
+| directory | one domain (`host` `engine` `translate` `os`) or one axis value (`x86_64` `linux`) | `os/windows/` |
+| target file | `<guestos>_<guestisa>.c` | `windows_x86_64.c` |
+| seam macro | `G_*` (cross-layer contract) | `G_NR`, `G_DISPATCH_REASON` |
+| engine/host global | `g_*` | `g_cache`, `g_ibtc` |
+| container-config env | `DD_*` (see LAUNCH.md) | `DD_ROOTFS` |
+| engine tuning env | `DDJIT_*` | `DDJIT_PCACHE` |
+| syscall-family handler | `svc_<family>()` in `syscall/<family>.c` | `svc_io` |
+| instruction-class translator | `translate_<class>()` in `translate/<class>.c` | `translate_x87` |
+| ARM64 instruction emitter | `e_<mnemonic>` | `e_ldr` |
+| block-exit reason | `R_<NAME>` | `R_SYSCALL` |
+
+The prefix alone classifies any symbol: `G_`=contract, `g_`=engine state, `DD_`=user contract,
+`DDJIT_`=engine knob, `svc_`/`translate_`/`e_`/`R_` = its layer.
+
+### Adding a new guest is the test (worked example: Windows)
+
+The structure is correct iff a new OS/ISA is purely additive. Two cases:
+
+**New guest OS (Windows on x86_64)** = add ONE row, touch nothing existing:
+1. `os/windows/` — the personality: `pe.c` (PE/COFF loader, the ELF analogue), `syscall/`
+   (NT syscall dispatch, mirroring `os/linux/syscall/`), threads/signals as needed.
+2. `targets/windows_x86_64.c` — the cell: `#include translate/x86_64` + `engine/` + `host/` +
+   `os/windows/`, define `dd_run`/`main`. **Reuses the entire x86_64 translator and engine
+   unchanged** — translation doesn't care about the guest OS.
+3. The frontend already provides `abi.h` `G_*`; the Windows personality consumes the same seam
+   (it switches on its own syscall numbering via `G_NR`). No translate/ or engine/ edit.
+
+**New guest ISA (e.g. riscv64)** = add ONE column: `include/cpu_riscv64.h` +
+`translate/riscv64/` (decode/translate/emit/abi.h/dispatch_hooks.h) + a `<os>_riscv64.c` cell.
+Reuses every `os/` personality unchanged.
+
+This is why the two axes must stay decoupled: a guest-OS change must never force a translate/
+edit, and a guest-ISA change must never force an os/ edit. The `abi.h` G_* seam is exactly the
+joint that keeps them independent.
 
 ## Collision points (where edits step on each other today)
 
@@ -68,6 +160,7 @@ ride along with steps 0–2). Do them as isolated `git mv` commits, matrix green
 | C4 | **targets/*.c** unity includes | the include ORDER encodes the dependency graph (state→cache→emit→translate→service…); a wrong reorder = forward-ref breakage; it's the de-facto "linker script" | treat each `targets/*.c` as the **owned build manifest** for that target — comment each include with its layer, change order only deliberately. |
 | C5 | **sentry.c** (1747) + service.c | the untrusted-guest path (`syscall_route`/`g_untrusted`) is interleaved with the normal service path | keep the sentry split as its own module (already is); ensure the ONLY coupling is the `service()`→`syscall_route()` fwd-decl, not shared mutable state. |
 | C6 | **avx.c** (1703) | correctness-first block-exit emulation; large and self-contained but mixed VEX/EVEX/legacy-0F38 | already isolated behind `R_AVX`/`R_SSE3B`; fine as one file — split only if VEX vs EVEX start to collide. Low priority. |
+| C7 | **ARM64 assembler duplicated** (`jit/emit_arm64.c` 25 `e_*` vs `frontend/x86_64/emit.c` 81) | the host assembler is buried in the engine and named after the host ISA, so the x86 frontend re-implements it → a host-encoding fix must be made twice, and they can drift | extract `host/arm64/asm.c` (`emit32`+`e_*`); engine keeps only block-ABI stubs that call it; both frontends share the one assembler. |
 
 ## What to SHARE vs keep PER-ENGINE (the balance)
 
@@ -75,7 +168,8 @@ The right balance = **abstract the OS surface and the host engine; duplicate the
 
 | concern | decision | why |
 |---|---|---|
-| `jit/` engine (cache, dispatch, emit_arm64) | **SHARE** | host ISA is ARM64 for all targets; one engine, hooks for divergence |
+| host ARM64 assembler (`emit32`/`e_*`) | **SHARE** in `host/` | a pure encoder; both frontends + the engine emit host code through it (kills the C7 duplication) |
+| `engine/` (cache, dispatch, block-ABI stubs) | **SHARE** | host ISA is ARM64 for all targets; one engine, hooks for divergence |
 | os/linux personality (service, container, threads, signal, elf) | **SHARE** behind G_* | guest OS is the same Linux regardless of guest ISA |
 | `struct cpu` | **PER-ISA** (never merged) | register files genuinely differ (16 vs 31 GPRs, x87/AVX vs NEON) |
 | frontend decode/translate/emit | **PER-ISA, duplicated** | x86 decode and aarch64 transliteration share NOTHING real; coupling them would be false reuse. They meet ONLY at cpu struct + the emit/jit core. |
@@ -171,21 +265,28 @@ green after every step. No behavior change in any step.
 2. **Finish the service.c split (C1).** Move one syscall family at a time from the main
    switch into a new/existing `service/<family>.c` `svc_*()`. One family per commit; run the
    matrix between each. Highest isolation gain, lowest churn (the protocol exists).
-3. **Domain renames** (`git mv` only, then fix include paths): `jit/`→`engine/`,
+3. **Unify launch/env (LAUNCH.md):** add back-compat readers for the `DD_*` names in the
+   shared container parser, collapse the binding's os-branch, unify x86 onto `DD_GUEST_ENV`.
+   Behavior-preserving; makes the public contract uniform.
+4. **Domain renames** (`git mv` only, then fix include paths): `jit/`→`engine/`,
    `frontend/`→`translate/`, `os/linux/service*`→`os/linux/syscall/`,
    `os/darwin/darwinjail.c`→`os/darwin/jail/`. Each rename is one isolated commit; the unity
    TUs (`targets/*.c`) are the only files whose `#include` paths change. Pure naming → matrix
    must be byte-identical after.
-4. **Document the targets/*.c include order (C4)** as the build manifest (comments only) so
+5. **Extract the host assembler (C7):** `jit/emit_arm64.c` → `host/arm64/asm.c` (the `e_*`
+   encoders) + leave the engine block-ABI stubs in `engine/`. Then point `frontend/x86_64`
+   at the shared assembler and delete its duplicated base encoders. Mechanical move +
+   de-dup; matrix byte-identical.
+6. **Document the targets/*.c include order (C4)** as the build manifest (comments only) so
    later moves don't reorder by accident. (Doc step, not a code move.)
-5. **Split translate.c by instruction class (C2).** Extract one class (e.g. x87, then
+7. **Split translate.c by instruction class (C2).** Extract one class (e.g. x87, then
    string ops, then ALU) into `translate/<class>.c` (the dir already holds trace/x87/repstr),
    leaving a thin dispatch switch. One class per commit, matrix between.
-6. **(Later, larger) dedup the engines:** lift translate/x86_64’s remaining own pieces onto
+8. **(Later, larger) dedup the engines:** lift translate/x86_64’s remaining own pieces onto
    shared `engine/` where the register model allows, and lift `os/darwin` onto `engine/` + a
    darwin personality mirroring the os/linux split. This is the existing "dedup" roadmap — do
-   it ONLY after 1–5, because it touches the trampoline/register-model seam (#9), the riskiest.
+   it ONLY after 1–7, because it touches the trampoline/register-model seam (#9), the riskiest.
 
-Stop after step 5 for the "isolate collisions" goal; step 6 is the long-horizon convergence.
-Steps 0 + 3 (entrypoint + domain renames) are the "dead-clean naming" win and are the safest
-to do first — they change no behavior, only make the tree say what each part does.
+Stop after step 7 for the "isolate collisions" goal; step 8 is the long-horizon convergence.
+Steps 0 + 3 + 4 (entrypoint + launch + domain renames) are the "dead-clean naming" win and
+are the safest to do first — they change no behavior, only make the tree say what it does.

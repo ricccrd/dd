@@ -5,7 +5,7 @@ to host ARM64 macOS and emulates the guest OS in userspace — no VM. One C code
 three Mach-O executables (one per `(guest OS, guest ISA)` target).
 
 See also `../README.md` (Layout / Decomposition state). This doc is the **interface map**;
-`REFACTOR.md` is the **change plan**.
+`REFACTOR.md` is the **structure/change plan**; `LAUNCH.md` is the **launch/env contract**.
 
 ## Layer map
 
