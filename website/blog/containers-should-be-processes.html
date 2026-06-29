@@ -160,25 +160,19 @@
 
   <!-- WHAT -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">What you get today</h2>
-  <p class="mt-4 leading-relaxed text-muted">dd speaks the Docker Engine API, so it isn't a new tool to learn — it's a <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker context</code>. Your <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker run / ps / build</code> and existing images just work, and startup is a process spawn, not a boot:</p>
+  <p class="mt-4 leading-relaxed text-muted">It’s a single native macOS app. It runs the daemon in the background, shows your containers, images, networks and volumes at a glance, and lets you point Docker at dd from inside the app — no config files, no <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">sudo</code>.</p>
 
-  <div class="mt-5 overflow-hidden rounded-xl border border-edge bg-code">
-    <div class="flex items-center gap-1.5 border-b border-edge px-3 py-2.5"><span class="h-2.5 w-2.5 rounded-full bg-[#ff5f57]"></span><span class="h-2.5 w-2.5 rounded-full bg-[#febc2e]"></span><span class="h-2.5 w-2.5 rounded-full bg-[#28c840]"></span></div>
-<pre class="overflow-x-auto p-4 font-mono text-[13px] leading-relaxed text-[#d7e3fa]"><span class="text-slate-500"># warm container start (5 runs, real seconds)</span>
-<span class="text-emerald-400">$</span> for n in 1 2 3 4 5; do /usr/bin/time -p \
-    docker --context dd run --rm debian:stable-slim true; done
-0.02  0.02  0.02  0.02  0.02
+  <figure class="mt-6">
+    <img src="../assets/app-home.png" alt="The dd macOS app — Overview dashboard: running, containers, images and disk stats with a Get-started panel" class="block w-full rounded-xl border border-edge shadow-2xl" />
+    <figcaption class="mt-2 text-center text-sm text-muted2">The dd app — your containers at a glance, the daemon running in-app, no VM in sight.</figcaption>
+  </figure>
 
-<span class="text-slate-500"># one runtime, three worlds — Linux arm64, Linux x86-64, macOS — no VM in any of them</span>
-<span class="text-emerald-400">$</span> docker --context dd run --rm ubuntu uname -m                      <span class="text-slate-500"># linux/arm64 — native</span>
-aarch64
-<span class="text-emerald-400">$</span> docker --context dd run --rm --platform linux/amd64 alpine uname -m   <span class="text-slate-500"># linux/amd64 — JIT</span>
-x86_64
-<span class="text-emerald-400">$</span> ddcli mac uname -a                                          <span class="text-slate-500"># macOS arm64</span>
-Darwin m 25.3.0 ... arm64 Darwin</pre>
-  </div>
-
-  <p class="mt-4 leading-relaxed text-muted">That's the part I'm most happy with: <strong class="text-txt">dd runs three guest runtimes</strong> — Linux arm64 as native code, Linux x86-64 through the JIT, and macOS arm64 — all from the one engine, with no VM in any of them. Because the kernel is just userspace code, it isn't only a <em>Linux</em> kernel, so <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli mac</code> drops you into a real isolated macOS shell. Language runtimes that generate code at runtime (the JVM, Node/V8, .NET) run too — something macOS's write-xor-execute rules used to block.</p>
+  <p class="mt-6 leading-relaxed text-muted">After that, it’s the Docker you already know:</p>
+  <ul class="mt-3 space-y-2 leading-relaxed text-muted">
+    <li><strong class="text-txt">Pick the Docker context</strong> — choose <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">dd</code> right in the app, and your CLI talks to the no-VM runtime.</li>
+    <li><strong class="text-txt"><code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker</code> works as usual</strong> — <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker run / ps / build / compose</code> and your existing images, unchanged. dd is just a <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">docker context</code>, not a new tool to learn — and startup is a process spawn (~0.02s), not a boot. Run x86 images too with <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">--platform linux/amd64</code>.</li>
+    <li><strong class="text-txt"><code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli</code> for the terminal</strong> — install the CLI for scripts and CI; <code class="rounded bg-code px-1.5 py-0.5 font-mono text-[13px] text-blue1">ddcli mac</code> even drops you into a real isolated macOS shell — the kernel is just userspace code, not only a <em>Linux</em> one, so JVM / Node / .NET that JIT at runtime work too.</li>
+  </ul>
 
   <!-- HONEST TRADE-OFF -->
   <h2 class="mt-14 text-2xl font-bold tracking-tight md:text-3xl">The honest trade-off</h2>
@@ -193,6 +187,11 @@ Darwin m 25.3.0 ... arm64 Darwin</pre>
       <a href="https://github.com/ricccrd/dd" class="rounded-xl border border-edge bg-ink2 px-6 py-3 font-semibold text-txt hover:border-blue3">Star it on GitHub</a>
     </div>
     <p class="mx-auto mt-4 max-w-xl text-sm text-muted2">If you try one thing: install dd, run a container, and open Activity Monitor. There's no VM in the list — just your container, as a process.</p>
+  </div>
+
+  <!-- ALPHA NOTICE -->
+  <div class="mt-8 rounded-xl border border-edge bg-panel2 p-5">
+    <p class="text-sm leading-relaxed text-muted"><span class="mr-2 rounded-full border border-[#febc2e]/50 bg-[#febc2e]/15 px-2 py-0.5 text-xs font-bold uppercase tracking-wider text-[#febc2e]">Alpha</span>dd is early alpha software and <strong class="text-txt">expected to break</strong>. Some images run flaky run-to-run, syscall-heavy and server workloads are slower than a VM today, and features are still landing — use it for tinkering, dev environments and CI, not production. If something breaks (it will), please <a href="https://github.com/ricccrd/dd" class="text-blue2 hover:underline">open an issue</a>.</p>
   </div>
 
   <!-- signature -->
