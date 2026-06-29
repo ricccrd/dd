@@ -170,6 +170,43 @@ static void e_nzcv_save_keepC(void) { // inc/dec: take new N/Z/V, KEEP stored C 
     e_str(20, 28, OFF_NZCV);
     emit32(0xD51B4200u | 20); // sync live ARM nzcv
 }
+static void e_lsr_i(int rd, int rn, int sh, int sf); // defined below; used by the PF helpers here
+// COMISD/UCOMISD: x86 sets ZF=PF=CF=1 on unordered and SF=OF=0 always, but ARM FCMP encodes unordered
+// as N=0,Z=0,C=1,V=1. Our substrate maps x86 ZF->Z, x86 CF->NOT stored-C (borrow), x86 PF->V. So on
+// unordered we need stored Z=1 (Z|V), stored borrow-C=0 (C&~V, so x86 CF=1), V kept (=PF=1), and N=0
+// (x86 SF is always 0 here). The ordered cases (V=0) pass through unchanged except the N clear.
+static void e_nzcv_save_fcmp(void) {
+    emit32(0xD53B4200u | 20);       // mrs x20, nzcv  (N,Z,C,V from FCMP)
+    e_movconst(22, 1u << 28);       // V is bit 28
+    e_rrr(A_AND, 22, 20, 22, 1, 0); // x22 = V (at bit 28)
+    e_rrr(A_ORR, 20, 20, 22, 1, 2); // Z |= V   (V<<2 -> bit 30)
+    e_rrr(A_BIC, 20, 20, 22, 1, 1); // C &= ~V  (V<<1 -> bit 29)
+    e_movconst(22, 1u << 31);
+    e_rrr(A_BIC, 20, 20, 22, 1, 0); // N = 0 (x86 SF always 0 for COMISD)
+    e_str(20, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 20); // sync live ARM nzcv
+    // x86 PF = 1 on unordered. PF source byte: 0 (even popcount -> PF=1) if unordered (V=1), else 1.
+    e_lsr_i(22, 20, 28, 0);         // x22 = V (bit 28)
+    e_movconst(20, 1);
+    e_rrr(A_AND, 22, 22, 20, 0, 0); // x22 = V (0/1)
+    e_rrr(A_EOR, 22, 22, 20, 0, 0); // x22 = NOT V  -> PF source byte
+    e_str(22, 28, OFF_PF);
+}
+// x86 PF consumer: rd = x86 PF (even parity of the low byte of cpu->pf) in {0,1}. Scratch x16.
+static void e_pf_compute(int rd) {
+    e_ldr(rd, 28, OFF_PF);
+    e_movconst(16, 0xff);
+    e_rrr(A_AND, rd, rd, 16, 0, 0); // rd = low byte
+    e_lsr_i(16, rd, 4, 0);
+    e_rrr(A_EOR, rd, rd, 16, 0, 0);
+    e_lsr_i(16, rd, 2, 0);
+    e_rrr(A_EOR, rd, rd, 16, 0, 0);
+    e_lsr_i(16, rd, 1, 0);
+    e_rrr(A_EOR, rd, rd, 16, 0, 0); // rd bit0 = odd parity
+    e_movconst(16, 1);
+    e_rrr(A_AND, rd, rd, 16, 0, 0);
+    e_rrr(A_EOR, rd, rd, 16, 0, 0); // rd = PF (1 iff even popcount)
+}
 static void e_bcond(int cond, int32_t off19) {
     emit32(0x54000000u | (((uint32_t)off19 & 0x7FFFF) << 5) | (cond & 0xF));
 }
@@ -257,7 +294,7 @@ static void e_fmov_from_s(int wd, int vn) { emit32(0x1E260000u | (vn << 5) | wd)
 static void e_vmov(int vd, int vn) { emit32(0x4EA01C00u | (vn << 16) | (vn << 5) | vd); } // mov vd.16b, vn.16b (orr)
 static void e_vmov8(int vd, int vn) {
     emit32(0x0EA01C00u | (vn << 16) | (vn << 5) | vd);
-}                                                     // mov vd.8b, vn.8b (low 64, zero upper)
+} // mov vd.8b, vn.8b (low 64, zero upper)
 static void e_ins_d(int vd, int ld, int vn, int ls) { // ins vd.d[ld], vn.d[ls]
     emit32(0x6E000400u | ((unsigned)((ld << 4) | 8) << 16) | ((unsigned)(ls << 3) << 11) | (vn << 5) | vd);
 }
@@ -457,13 +494,13 @@ static void emit_fast_syscall(uint64_t next) {
     // ---- clock_gettime: rax == 228 ----
     e_subi_s(16, 0, 228, 1); // subs x16, x0, #228
     uint32_t *m1 = (uint32_t *)g_cp;
-    e_bcond(1, 0);           // b.ne -> gettimeofday
-    e_subi_s(16, 7, 1, 1);   // cmp clockid(rdi=x7), #1 (MONOTONIC)
+    e_bcond(1, 0);         // b.ne -> gettimeofday
+    e_subi_s(16, 7, 1, 1); // cmp clockid(rdi=x7), #1 (MONOTONIC)
     uint32_t *cs = (uint32_t *)g_cp;
-    e_bcond(1, 0);                  // b.ne -> check REALTIME
-    e_movconst(19, g_cal_mono_ns);  // base_ns = mono
+    e_bcond(1, 0);                 // b.ne -> check REALTIME
+    e_movconst(19, g_cal_mono_ns); // base_ns = mono
     uint32_t *jc = (uint32_t *)g_cp;
-    emit32(0x14000000u);            // b conv
+    emit32(0x14000000u); // b conv
     // check REALTIME:
     *cs = (*cs & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - cs) & 0x7FFFF) << 5);
     e_subi_s(16, 7, 0, 1); // cmp clockid, #0 (REALTIME)
@@ -472,19 +509,19 @@ static void emit_fast_syscall(uint64_t next) {
     e_movconst(19, g_cal_real_ns); // base_ns = real
     // conv:
     *jc = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - jc) & 0x3FFFFFF);
-    emit32(0xD53BE050u);                  // mrs x16, cntvct_el0
+    emit32(0xD53BE050u); // mrs x16, cntvct_el0
     e_movconst(20, g_cal_base_ticks);
-    e_rrr(A_SUB, 21, 16, 20, 1, 0);       // x21 = delta = ticks - base_ticks
+    e_rrr(A_SUB, 21, 16, 20, 1, 0); // x21 = delta = ticks - base_ticks
     e_movconst(20, g_cal_mult);
-    e_mul(22, 21, 20, 1);                 // lo = delta*mult
-    e_umulh(23, 21, 20);                  // hi
-    e_extr(24, 23, 22, FAST_SHIFT, 1);    // x24 = (hi:lo) >> 30 = ns_delta (128-bit safe)
-    e_rrr(A_ADD, 24, 19, 24, 1, 0);       // x24 = base_ns + ns_delta = total_ns
+    e_mul(22, 21, 20, 1);              // lo = delta*mult
+    e_umulh(23, 21, 20);               // hi
+    e_extr(24, 23, 22, FAST_SHIFT, 1); // x24 = (hi:lo) >> 30 = ns_delta (128-bit safe)
+    e_rrr(A_ADD, 24, 19, 24, 1, 0);    // x24 = base_ns + ns_delta = total_ns
     e_movconst(25, 1000000000ull);
-    e_udiv(26, 24, 25, 1);                // sec
-    e_msub(27, 26, 25, 24, 1);            // nsec = total - sec*1e9
-    e_str(26, 6, 0);                      // ts->tv_sec   (rsi=x6)
-    e_str(27, 6, 8);                      // ts->tv_nsec
+    e_udiv(26, 24, 25, 1);     // sec
+    e_msub(27, 26, 25, 24, 1); // nsec = total - sec*1e9
+    e_str(26, 6, 0);           // ts->tv_sec   (rsi=x6)
+    e_str(27, 6, 8);           // ts->tv_nsec
     emit_host_ptr(20, (uint64_t)&g_fast_count, PRELOC_HOSTGLOBAL);
     e_ldr(21, 20, 0);
     e_addi(21, 21, 1, 1);
@@ -496,11 +533,11 @@ static void emit_fast_syscall(uint64_t next) {
 
     // ---- gettimeofday: rax == 96 ----
     *m1 = (*m1 & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - m1) & 0x7FFFF) << 5);
-    e_subi_s(16, 0, 96, 1); // subs x16, x0, #96
+    e_subi_s(16, 0, 96, 1);                 // subs x16, x0, #96
     uint32_t *gtod_miss = (uint32_t *)g_cp; // W4F: rax!=96 -> fall into the W4F arms (was straight to slow)
-    e_bcond(1, 0);                 // b.ne -> W4F arms (or slow when g_siginline off)
-    e_movconst(19, g_cal_real_ns); // gettimeofday is REALTIME
-    emit32(0xD53BE050u);           // mrs x16, cntvct_el0
+    e_bcond(1, 0);                          // b.ne -> W4F arms (or slow when g_siginline off)
+    e_movconst(19, g_cal_real_ns);          // gettimeofday is REALTIME
+    emit32(0xD53BE050u);                    // mrs x16, cntvct_el0
     e_movconst(20, g_cal_base_ticks);
     e_rrr(A_SUB, 21, 16, 20, 1, 0);
     e_movconst(20, g_cal_mult);
@@ -550,59 +587,59 @@ static void emit_fast_syscall(uint64_t next) {
         e_ldr(21, 20, 0);       // x21 = g_pending
         e_subi_s(21, 21, 0, 1); // Z = (g_pending == 0)
         to_slow[nsl++] = (uint32_t *)g_cp;
-        e_bcond(1, 0);          // b.ne -> slow (a signal is pending: exact-timing path)
-        e_ldr(19, 28, OFF_SM);  // x19 = c->sigmask (old)
-        e_subi_s(20, 2, 0, 1);  // rdx == 0 ?  (no oldset)
+        e_bcond(1, 0);         // b.ne -> slow (a signal is pending: exact-timing path)
+        e_ldr(19, 28, OFF_SM); // x19 = c->sigmask (old)
+        e_subi_s(20, 2, 0, 1); // rdx == 0 ?  (no oldset)
         uint32_t *no_old = (uint32_t *)g_cp;
-        e_bcond(0, 0);          // b.eq -> skip oldset store
-        e_str(19, 2, 0);        // *(uint64_t*)oldset = old mask
+        e_bcond(0, 0);   // b.eq -> skip oldset store
+        e_str(19, 2, 0); // *(uint64_t*)oldset = old mask
         *no_old = (*no_old & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - no_old) & 0x7FFFF) << 5);
-        e_subi_s(20, 6, 0, 1);  // rsi == 0 ?  (no new set -> mask unchanged)
+        e_subi_s(20, 6, 0, 1); // rsi == 0 ?  (no new set -> mask unchanged)
         uint32_t *no_set = (uint32_t *)g_cp;
-        e_bcond(0, 0);          // b.eq -> store (writes old back: no-op, matches service())
-        e_ldr(22, 6, 0);        // x22 = set = *(uint64_t*)rsi
-        e_subi_s(20, 7, 0, 1);  // how == 0 (SIG_BLOCK) ?
+        e_bcond(0, 0);         // b.eq -> store (writes old back: no-op, matches service())
+        e_ldr(22, 6, 0);       // x22 = set = *(uint64_t*)rsi
+        e_subi_s(20, 7, 0, 1); // how == 0 (SIG_BLOCK) ?
         uint32_t *not_block = (uint32_t *)g_cp;
-        e_bcond(1, 0);          // b.ne -> check unblock
+        e_bcond(1, 0);                  // b.ne -> check unblock
         e_rrr(A_ORR, 19, 19, 22, 1, 0); // SIG_BLOCK: x19 = old | set
         uint32_t *d1 = (uint32_t *)g_cp;
-        emit32(0x14000000u);    // b -> store
+        emit32(0x14000000u); // b -> store
         *not_block = (*not_block & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - not_block) & 0x7FFFF) << 5);
-        e_subi_s(20, 7, 1, 1);  // how == 1 (SIG_UNBLOCK) ?
+        e_subi_s(20, 7, 1, 1); // how == 1 (SIG_UNBLOCK) ?
         uint32_t *not_unblock = (uint32_t *)g_cp;
-        e_bcond(1, 0);          // b.ne -> setmask
+        e_bcond(1, 0);                  // b.ne -> setmask
         e_rrr(A_BIC, 19, 19, 22, 1, 0); // SIG_UNBLOCK: x19 = old & ~set
         uint32_t *d2 = (uint32_t *)g_cp;
-        emit32(0x14000000u);    // b -> store
+        emit32(0x14000000u); // b -> store
         *not_unblock = (*not_unblock & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - not_unblock) & 0x7FFFF) << 5);
-        e_mov_rr(19, 22, 1);    // else SIG_SETMASK: x19 = set
+        e_mov_rr(19, 22, 1); // else SIG_SETMASK: x19 = set
         // store label (d1, d2, no_set all converge here):
         *d1 = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - d1) & 0x3FFFFFF);
         *d2 = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - d2) & 0x3FFFFFF);
         *no_set = (*no_set & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - no_set) & 0x7FFFF) << 5);
-        e_str(19, 28, OFF_SM);  // c->sigmask = x19
+        e_str(19, 28, OFF_SM); // c->sigmask = x19
         emit_host_ptr(20, (uint64_t)&g_sig_inline_count, PRELOC_HOSTGLOBAL);
         e_ldr(21, 20, 0);
         e_addi(21, 21, 1, 1);
-        e_str(21, 20, 0);       // g_sig_inline_count++
-        e_movconst(0, 0);       // rax = 0
-        emit32(0xD51B4211u);    // msr nzcv, x17  (restore guest flags)
+        e_str(21, 20, 0);    // g_sig_inline_count++
+        e_movconst(0, 0);    // rax = 0
+        emit32(0xD51B4211u); // msr nzcv, x17  (restore guest flags)
         after[na++] = (uint32_t *)g_cp;
-        emit32(0x14000000u);    // b L_after
+        emit32(0x14000000u); // b L_after
 
         // ---- sched_yield: rax == 24   (pure: returns 0, no state, no host work) ----
         *spm_miss = (*spm_miss & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - spm_miss) & 0x7FFFF) << 5);
         e_subi_s(16, 0, 24, 1); // subs x16, x0, #24
         to_slow[nsl++] = (uint32_t *)g_cp;
-        e_bcond(1, 0);          // b.ne -> slow
+        e_bcond(1, 0); // b.ne -> slow
         emit_host_ptr(20, (uint64_t)&g_yield_inline_count, PRELOC_HOSTGLOBAL);
         e_ldr(21, 20, 0);
         e_addi(21, 21, 1, 1);
-        e_str(21, 20, 0);       // g_yield_inline_count++
-        e_movconst(0, 0);       // rax = 0
-        emit32(0xD51B4211u);    // msr nzcv, x17
+        e_str(21, 20, 0);    // g_yield_inline_count++
+        e_movconst(0, 0);    // rax = 0
+        emit32(0xD51B4211u); // msr nzcv, x17
         after[na++] = (uint32_t *)g_cp;
-        emit32(0x14000000u);    // b L_after
+        emit32(0x14000000u); // b L_after
     } else {
         to_slow[nsl++] = gtod_miss; // W4F off (JIT86_NOSIGINLINE): gtod miss -> slow, exactly as S1
     }
@@ -655,34 +692,35 @@ static void emit_ibranch(void) {
     }
     // opt2: probe the IBTC. 2-way set-associative (default) vs the old direct-mapped 1-way (IBTC1WAY=1).
     // The two variants differ only in the probe; the MISS tail below is shared and patched per final way.
-    uint32_t *p_miss;                                                  // cbnz x20 -> Lmiss patch site (last way)
-    emit32(0xD3423800u | (16 << 5) | 17);                             // ubfx x17, x16, #2, #13  ((tgt>>2)&0x1FFF)
-    if (ibtc1way()) {                                                 // IBTC1WAY=1: exact prior 1-way probe (shared g_ibtc)
-        emit_host_ptr(19, (uint64_t)g_ibtc, PRELOC_IBTC);            // x19 = &g_ibtc  (3-insn materialize)
+    uint32_t *p_miss;                                     // cbnz x20 -> Lmiss patch site (last way)
+    emit32(0xD3423800u | (16 << 5) | 17);                 // ubfx x17, x16, #2, #13  ((tgt>>2)&0x1FFF)
+    if (ibtc1way()) {                                     // IBTC1WAY=1: exact prior 1-way probe (shared g_ibtc)
+        emit_host_ptr(19, (uint64_t)g_ibtc, PRELOC_IBTC); // x19 = &g_ibtc  (3-insn materialize)
         emit32(0x8B000000u | (17 << 16) | (4 << 10) | (19 << 5) | 19); // add x19, x19, x17, lsl #4   (16B slot)
-        e_ldr(20, 19, 0);                                            // x20 = slot.target
-        emit32(0xCB000000u | (16 << 16) | (20 << 5) | 20);           // sub x20, x20, x16  (NOT subs: keep nzcv)
+        e_ldr(20, 19, 0);                                              // x20 = slot.target
+        emit32(0xCB000000u | (16 << 16) | (20 << 5) | 20);             // sub x20, x20, x16  (NOT subs: keep nzcv)
         p_miss = (uint32_t *)g_cp;
         emit32(0); // cbnz x20, Lmiss
         e_ldr(21, 19, 8);
-        e_br(21); // HIT: x21 = slot.body -> jump (regs live)
-    } else {                                                         // opt2 default: 2-way probe, base from cpu->ibtc_base
-        e_ldr(19, 28, OFF_IBTC);                                     // x19 = cpu->ibtc_base  (1 insn, replaces movz/movk x3)
+        e_br(21);                // HIT: x21 = slot.body -> jump (regs live)
+    } else {                     // opt2 default: 2-way probe, base from cpu->ibtc_base
+        e_ldr(19, 28, OFF_IBTC); // x19 = cpu->ibtc_base  (1 insn, replaces movz/movk x3)
         emit32(0x8B000000u | (17 << 16) | (5 << 10) | (19 << 5) | 19); // add x19, x19, x17, lsl #5   (32B set)
-        e_ldr(20, 19, 0);                                           // x20 = way0.target
-        emit32(0xCB000000u | (16 << 16) | (20 << 5) | 20);          // sub x20, x20, x16  (NOT subs: keep nzcv)
+        e_ldr(20, 19, 0);                                              // x20 = way0.target
+        emit32(0xCB000000u | (16 << 16) | (20 << 5) | 20);             // sub x20, x20, x16  (NOT subs: keep nzcv)
         uint32_t *p_w1 = (uint32_t *)g_cp;
         emit32(0); // cbnz x20, Lway1
         e_ldr(21, 19, 8);
         e_br(21); // HIT way0: x21 = way0.body -> jump (regs live)
         uint32_t *Lway1 = (uint32_t *)g_cp;
-        e_ldr(20, 19, 16);                                          // x20 = way1.target
-        emit32(0xCB000000u | (16 << 16) | (20 << 5) | 20);         // sub x20, x20, x16
+        e_ldr(20, 19, 16);                                 // x20 = way1.target
+        emit32(0xCB000000u | (16 << 16) | (20 << 5) | 20); // sub x20, x20, x16
         p_miss = (uint32_t *)g_cp;
         emit32(0); // cbnz x20, Lmiss
         e_ldr(21, 19, 24);
         e_br(21); // HIT way1: x21 = way1.body -> jump (regs live)
-        *p_w1 = 0xB5000000u | (((uint32_t)(((uint8_t *)Lway1 - (uint8_t *)p_w1) / 4) & 0x7FFFF) << 5) | 20; // cbnz->Lway1
+        *p_w1 =
+            0xB5000000u | (((uint32_t)(((uint8_t *)Lway1 - (uint8_t *)p_w1) / 4) & 0x7FFFF) << 5) | 20; // cbnz->Lway1
     }
     uint32_t *miss = (uint32_t *)g_cp;
     e_str(16, 28, OFF_RIP);
@@ -693,5 +731,6 @@ static void emit_ibranch(void) {
     e_str(16, 28, OFF_ICMISS); // dispatcher fills the IBTC for cpu->rip
     emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
     e_br(16);
-    *p_miss = 0xB5000000u | (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_miss) / 4) & 0x7FFFF) << 5) | 20; // cbnz->Lmiss
+    *p_miss =
+        0xB5000000u | (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_miss) / 4) & 0x7FFFF) << 5) | 20; // cbnz->Lmiss
 }

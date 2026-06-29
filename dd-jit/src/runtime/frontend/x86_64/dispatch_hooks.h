@@ -52,7 +52,7 @@ static void smc_protect(uint64_t pc) {
     if (g_nosmc) return;
     uint64_t pg = pc & ~0x3FFFull; // 16KB macOS hardware page
     for (int i = 0; i < g_smc_n; i++)
-        if (g_smc_pg[i] == pg) return; // already protected
+        if (g_smc_pg[i] == pg) return;                        // already protected
     if (mprotect((void *)pg, 0x4000, PROT_READ) != 0) return; // code page -> read-only; writes trap
     if (g_smc_n < SMC_MAX) g_smc_pg[g_smc_n++] = pg;
 }
@@ -88,35 +88,36 @@ static int smc_on_write(uint64_t a) {
 // trace cap runaway guard, the malloc/avail-mask dumps, and the byte watchpoint. Verbatim from the old
 // frontend/x86_64/dispatch.c. A PLAIN brace block (NOT do/while(0)) so the trace-cap `break` reaches the
 // shared dispatcher while-loop -- the original broke the loop immediately, not just the macro.
-#define G_DISPATCH_DEBUG(c)                                                                                             \
-    {                                                                                                                   \
+#define G_DISPATCH_DEBUG(c)                                                                                            \
+    {                                                                                                                  \
         if (g_pending) maybe_deliver_signal(c); /* async signal pending -> redirect to guest handler */                \
-        g_prevpc = g_curpc;                                                                                             \
-        g_curpc = (c)->rip;                                                                                             \
-        g_disp_n++;                                                                                                     \
+        g_prevpc = g_curpc;                                                                                            \
+        g_curpc = (c)->rip;                                                                                            \
+        g_disp_n++;                                                                                                    \
         if (g_trace && g_tracecap && g_disp_n > g_tracecap) { /* bound trace output for runaway guests */              \
-            fprintf(stderr, "[jit86] trace cap %llu blocks reached -> stop\n", (unsigned long long)g_tracecap);         \
-            (c)->exited = 1;                                                                                            \
-            (c)->exit_code = 99;                                                                                        \
-            break;                                                                                                      \
-        }                                                                                                               \
+            fprintf(stderr, "[jit86] trace cap %llu blocks reached -> stop\n", (unsigned long long)g_tracecap);        \
+            (c)->exited = 1;                                                                                           \
+            (c)->exit_code = 99;                                                                                       \
+            break;                                                                                                     \
+        }                                                                                                              \
         if (g_nochain && g_loadbase && (c)->rip == g_loadbase + 0x2ee0) g_malloc_n++; /* __libc_malloc_impl entries */ \
-        if (g_nochain && g_loadbase) {                                                                                  \
-            uint64_t po = g_prevpc - g_loadbase; /* malloc first-handout: dump the new group's avail_mask (rbp=meta) */ \
-            if (po >= 0x32a0 && po <= 0x3340) {                                                                         \
-                uint64_t rbp = (c)->r[5], rax = (c)->r[0];                                                              \
-                uint32_t avail = (rbp > 0x10000) ? *(uint32_t *)(rbp + 0x1c) : 0;                                       \
-                fprintf(stderr, "[av] blk+%llx handout=%llx meta(rbp)=%llx avail_mask[rbp+1c]=%x freed[rbp+18]=%x\n",   \
-                        (unsigned long long)po, (unsigned long long)rax, (unsigned long long)rbp, avail,                \
-                        (rbp > 0x10000) ? *(uint32_t *)(rbp + 0x18) : 0);                                               \
-            }                                                                                                           \
-        }                                                                                                               \
+        if (g_nochain && g_loadbase) {                                                                                 \
+            uint64_t po =                                                                                              \
+                g_prevpc - g_loadbase; /* malloc first-handout: dump the new group's avail_mask (rbp=meta) */          \
+            if (po >= 0x32a0 && po <= 0x3340) {                                                                        \
+                uint64_t rbp = (c)->r[5], rax = (c)->r[0];                                                             \
+                uint32_t avail = (rbp > 0x10000) ? *(uint32_t *)(rbp + 0x1c) : 0;                                      \
+                fprintf(stderr, "[av] blk+%llx handout=%llx meta(rbp)=%llx avail_mask[rbp+1c]=%x freed[rbp+18]=%x\n",  \
+                        (unsigned long long)po, (unsigned long long)rax, (unsigned long long)rbp, avail,               \
+                        (rbp > 0x10000) ? *(uint32_t *)(rbp + 0x18) : 0);                                              \
+            }                                                                                                          \
+        }                                                                                                              \
         if (g_w8 && *g_w8 != g_w8v) { /* byte-watchpoint: report the block that just changed it */                     \
-            fprintf(stderr, "[w8] @%p %02x -> %02x  by block +%llx  malloc#=%llu  rsi=%llx\n", (void *)g_w8, g_w8v,     \
-                    *g_w8, (unsigned long long)(g_prevpc - g_loadbase), (unsigned long long)g_malloc_n,                 \
-                    (unsigned long long)(c)->r[6]);                                                                     \
-            g_w8v = *g_w8;                                                                                              \
-        }                                                                                                               \
+            fprintf(stderr, "[w8] @%p %02x -> %02x  by block +%llx  malloc#=%llu  rsi=%llx\n", (void *)g_w8, g_w8v,    \
+                    *g_w8, (unsigned long long)(g_prevpc - g_loadbase), (unsigned long long)g_malloc_n,                \
+                    (unsigned long long)(c)->r[6]);                                                                    \
+            g_w8v = *g_w8;                                                                                             \
+        }                                                                                                              \
     }
 
 // §B-equivalent on-flush engine reset. x86 has no shadow stack; instead, on a wholesale cache flush the
@@ -147,46 +148,46 @@ static int smc_on_write(uint64_t a) {
 
 // (5) Per-block JT trace dump. x86 register/flag layout (flags derived from cpu->nzcv; stored C = NOT
 // x86 CF). Verbatim from frontend/x86_64/dispatch.c.
-#define G_TRACE_DUMP(c)                                                                                                 \
-    if (g_trace) {                                                                                                      \
-        unsigned nz = (unsigned)(c)->nzcv;                                                                              \
-        int CF = !((nz >> 29) & 1), ZF = (nz >> 30) & 1, SF = (nz >> 31) & 1, OF = (nz >> 28) & 1;                      \
-        fprintf(stderr,                                                                                                 \
-                "[blk] rip=%llx rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx r8=%llx r9=%llx "        \
-                "r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx fl=C%dZ%dS%dO%d\n",                              \
-                (unsigned long long)(c)->rip, (unsigned long long)(c)->r[RAX], (unsigned long long)(c)->r[3],           \
-                (unsigned long long)(c)->r[RCX], (unsigned long long)(c)->r[RDX], (unsigned long long)(c)->r[RSI],      \
-                (unsigned long long)(c)->r[RDI], (unsigned long long)(c)->r[RBP], (unsigned long long)(c)->r[8],        \
-                (unsigned long long)(c)->r[9], (unsigned long long)(c)->r[10], (unsigned long long)(c)->r[11],          \
-                (unsigned long long)(c)->r[12], (unsigned long long)(c)->r[13], (unsigned long long)(c)->r[14],         \
-                (unsigned long long)(c)->r[15], CF, ZF, SF, OF);                                                        \
+#define G_TRACE_DUMP(c)                                                                                                \
+    if (g_trace) {                                                                                                     \
+        unsigned nz = (unsigned)(c)->nzcv;                                                                             \
+        int CF = !((nz >> 29) & 1), ZF = (nz >> 30) & 1, SF = (nz >> 31) & 1, OF = (nz >> 28) & 1;                     \
+        fprintf(stderr,                                                                                                \
+                "[blk] rip=%llx rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx r8=%llx r9=%llx "       \
+                "r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx fl=C%dZ%dS%dO%d\n",                             \
+                (unsigned long long)(c)->rip, (unsigned long long)(c)->r[RAX], (unsigned long long)(c)->r[3],          \
+                (unsigned long long)(c)->r[RCX], (unsigned long long)(c)->r[RDX], (unsigned long long)(c)->r[RSI],     \
+                (unsigned long long)(c)->r[RDI], (unsigned long long)(c)->r[RBP], (unsigned long long)(c)->r[8],       \
+                (unsigned long long)(c)->r[9], (unsigned long long)(c)->r[10], (unsigned long long)(c)->r[11],         \
+                (unsigned long long)(c)->r[12], (unsigned long long)(c)->r[13], (unsigned long long)(c)->r[14],        \
+                (unsigned long long)(c)->r[15], CF, ZF, SF, OF);                                                       \
     }
 
 // (1) IBTC miss fill. x86 keys off c->ic_miss (0/1), stores the PLAIN body (no body-8 stub; x16-x21 are
 // free scratch, no stash/restore), and is skipped under threads (the indirect probe reads g_ibtc/g_xibtc
 // unlocked -> a torn fill would dispatch the wrong body). IBTC1WAY=1 restores the old 1-way shared-g_ibtc
 // fill; otherwise opt2's 2-way set-associative g_xibtc insert. Verbatim from frontend/x86_64/dispatch.c.
-#define G_IBTC_FILL(c)                                                                                                  \
-    if ((c)->ic_miss) {                                                                                                 \
-        if (!g_threaded) {                                                                                              \
-            void *body = map_body((c)->rip);                                                                            \
-            if (body) {                                                                                                 \
+#define G_IBTC_FILL(c)                                                                                                 \
+    if ((c)->ic_miss) {                                                                                                \
+        if (!g_threaded) {                                                                                             \
+            void *body = map_body((c)->rip);                                                                           \
+            if (body) {                                                                                                \
                 if (ibtc1way()) { /* IBTC1WAY=1: exact prior 1-way shared-g_ibtc fill */                               \
                     uint32_t h = (uint32_t)(((c)->rip >> 2) & (IBTC_N - 1));                                           \
                     g_ibtc[h].target = (c)->rip;                                                                       \
                     g_ibtc[h].body = body;                                                                             \
                 } else { /* opt2: 2-way insert -> reuse the way already holding this target, else a free */            \
                     uint32_t s = (uint32_t)(((c)->rip >> 2) & (XIBTC_SETS - 1));                                       \
-                    int w0 = s * 2, w1 = s * 2 + 1;                                                                     \
-                    int w = (!g_xibtc[w0].target || g_xibtc[w0].target == (c)->rip) ? w0                               \
+                    int w0 = s * 2, w1 = s * 2 + 1;                                                                    \
+                    int w = (!g_xibtc[w0].target || g_xibtc[w0].target == (c)->rip)   ? w0                             \
                             : (!g_xibtc[w1].target || g_xibtc[w1].target == (c)->rip) ? w1                             \
                                                                                       : w0; /* way, else evict way0 */ \
                     g_xibtc[w].target = (c)->rip;                                                                      \
                     g_xibtc[w].body = body;                                                                            \
-                }                                                                                                       \
-                g_ibtc_fill++;                                                                                          \
-            }                                                                                                           \
-        }                                                                                                               \
+                }                                                                                                      \
+                g_ibtc_fill++;                                                                                         \
+            }                                                                                                          \
+        }                                                                                                              \
         (c)->ic_miss = 0;                                                                                              \
     }
 
@@ -196,76 +197,81 @@ static int smc_on_write(uint64_t a) {
 // service pc-advance -- the per-arch syscall tail convention lives here; aarch64 does pc += 4 instead).
 // Each non-syscall case `continue`s the shared while-loop (so the shared `if (reason==R_TIER2) ...`
 // tail line never re-fires for x86). Verbatim from frontend/x86_64/dispatch.c. `break` exits the loop.
-#define G_DISPATCH_REASON(c)                                                                                            \
-    if ((c)->reason == 99) {                                                                                            \
-        fprintf(stderr, "[jit86] aborting at rip marker %llx (unimplemented opcode)\n", (unsigned long long)(c)->rip);  \
-        if (g_trace) {                                                                                                  \
+#define G_DISPATCH_REASON(c)                                                                                           \
+    if ((c)->reason == 99) {                                                                                           \
+        fprintf(stderr, "[jit86] aborting at rip marker %llx (unimplemented opcode)\n", (unsigned long long)(c)->rip); \
+        if (g_trace) {                                                                                                 \
             for (int rr = 0; rr < 16; rr++) { /* dump heap-pointer regs (meta etc.) */                                 \
-                uint64_t v = (c)->r[rr];                                                                                \
+                uint64_t v = (c)->r[rr];                                                                               \
                 if (v > 0x100000000ull && v < 0x200000000ull && (v & 7) == 0) {                                        \
-                    fprintf(stderr, "  r%d=%llx:", rr, (unsigned long long)v);                                          \
-                    for (int i = 0; i < 5; i++) fprintf(stderr, " %016llx", (unsigned long long)((uint64_t *)v)[i]);    \
-                    fprintf(stderr, "\n");                                                                              \
-                }                                                                                                       \
-            }                                                                                                           \
-        }                                                                                                               \
-        (c)->exited = 1;                                                                                                \
-        (c)->exit_code = 70;                                                                                            \
-        break;                                                                                                          \
-    }                                                                                                                   \
+                    fprintf(stderr, "  r%d=%llx:", rr, (unsigned long long)v);                                         \
+                    for (int i = 0; i < 5; i++)                                                                        \
+                        fprintf(stderr, " %016llx", (unsigned long long)((uint64_t *)v)[i]);                           \
+                    fprintf(stderr, "\n");                                                                             \
+                }                                                                                                      \
+            }                                                                                                          \
+        }                                                                                                              \
+        (c)->exited = 1;                                                                                               \
+        (c)->exit_code = 70;                                                                                           \
+        break;                                                                                                         \
+    }                                                                                                                  \
     if ((c)->reason == R_TIER2) { /* W5B: hot self-loop back-edge fired; recompile+swap. rip = loop start */           \
-        tier2_promote((c)->rip);                                                                                        \
-        continue;                                                                                                       \
-    }                                                                                                                   \
-    if ((c)->reason == R_CPUID) {                                                                                       \
-        do_cpuid(c);                                                                                                    \
-        continue;                                                                                                       \
-    } /* rip already = next */                                                                                          \
+        tier2_promote((c)->rip);                                                                                       \
+        continue;                                                                                                      \
+    }                                                                                                                  \
+    if ((c)->reason == R_CPUID) {                                                                                      \
+        do_cpuid(c);                                                                                                   \
+        continue;                                                                                                      \
+    } /* rip already = next */                                                                                         \
     if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C; rip = the insn, do_avx advances it */              \
-        do_avx(c);                                                                                                      \
-        continue;                                                                                                       \
-    }                                                                                                                   \
-    if ((c)->reason == R_REPSTR) {                                                                                      \
-        do_repstr(c);                                                                                                   \
-        continue;                                                                                                       \
-    } /* W4-C rep cmps/scas idiom (rip already = next) */                                                               \
-    if ((c)->reason == R_X87FLD) {                                                                                      \
-        x87_fld_m80(c);                                                                                                 \
-        continue;                                                                                                       \
+        do_avx(c);                                                                                                     \
+        continue;                                                                                                      \
+    }                                                                                                                  \
+    if ((c)->reason == R_SSE3B) { /* legacy 0F38/0F3A insn: emulate in C; rip = the insn, do_sse3b advances it */      \
+        do_sse3b(c);                                                                                                   \
+        continue;                                                                                                      \
+    }                                                                                                                  \
+    if ((c)->reason == R_REPSTR) {                                                                                     \
+        do_repstr(c);                                                                                                  \
+        continue;                                                                                                      \
+    } /* W4-C rep cmps/scas idiom (rip already = next) */                                                              \
+    if ((c)->reason == R_X87FLD) {                                                                                     \
+        x87_fld_m80(c);                                                                                                \
+        continue;                                                                                                      \
     } /* fld m80 (rip already = next) */                                                                               \
-    if ((c)->reason == R_X87FSTP) {                                                                                     \
-        x87_fstp_m80(c);                                                                                                \
-        continue;                                                                                                       \
-    } /* fstp m80 */                                                                                                    \
+    if ((c)->reason == R_X87FSTP) {                                                                                    \
+        x87_fstp_m80(c);                                                                                               \
+        continue;                                                                                                      \
+    } /* fstp m80 */                                                                                                   \
     if ((c)->reason == R_DIV) { /* 128/64 unsigned div (rip already = next) */                                         \
         uint64_t d = (c)->divop;                                                                                       \
-        if (d == 0) {                                                                                                   \
-            fprintf(stderr, "[jit86] #DE divide-by-zero\n");                                                            \
-            (c)->exited = 1;                                                                                            \
-            (c)->exit_code = 136;                                                                                       \
-            break;                                                                                                      \
-        }                                                                                                               \
-        unsigned __int128 num = ((unsigned __int128)(c)->r[RDX] << 64) | (c)->r[RAX];                                   \
-        (c)->r[RAX] = (uint64_t)(num / d);                                                                              \
-        (c)->r[RDX] = (uint64_t)(num % d);                                                                              \
-        continue;                                                                                                       \
-    }                                                                                                                   \
+        if (d == 0) {                                                                                                  \
+            fprintf(stderr, "[jit86] #DE divide-by-zero\n");                                                           \
+            (c)->exited = 1;                                                                                           \
+            (c)->exit_code = 136;                                                                                      \
+            break;                                                                                                     \
+        }                                                                                                              \
+        unsigned __int128 num = ((unsigned __int128)(c)->r[RDX] << 64) | (c)->r[RAX];                                  \
+        (c)->r[RAX] = (uint64_t)(num / d);                                                                             \
+        (c)->r[RDX] = (uint64_t)(num % d);                                                                             \
+        continue;                                                                                                      \
+    }                                                                                                                  \
     if ((c)->reason == R_IDIV) { /* 128/64 signed idiv */                                                              \
-        int64_t d = (int64_t)(c)->divop;                                                                                \
-        if (d == 0) {                                                                                                   \
-            fprintf(stderr, "[jit86] #DE divide-by-zero\n");                                                            \
-            (c)->exited = 1;                                                                                            \
-            (c)->exit_code = 136;                                                                                       \
-            break;                                                                                                      \
-        }                                                                                                               \
-        __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                            \
-        (c)->r[RAX] = (uint64_t)(num / d);                                                                              \
-        (c)->r[RDX] = (uint64_t)(num % d);                                                                              \
-        continue;                                                                                                       \
-    }                                                                                                                   \
-    if ((c)->reason == R_SYSCALL) {                                                                                     \
-        service(c);                                                                                                     \
-        if ((c)->exited) break;                                                                                         \
+        int64_t d = (int64_t)(c)->divop;                                                                               \
+        if (d == 0) {                                                                                                  \
+            fprintf(stderr, "[jit86] #DE divide-by-zero\n");                                                           \
+            (c)->exited = 1;                                                                                           \
+            (c)->exit_code = 136;                                                                                      \
+            break;                                                                                                     \
+        }                                                                                                              \
+        __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                           \
+        (c)->r[RAX] = (uint64_t)(num / d);                                                                             \
+        (c)->r[RDX] = (uint64_t)(num % d);                                                                             \
+        continue;                                                                                                      \
+    }                                                                                                                  \
+    if ((c)->reason == R_SYSCALL) {                                                                                    \
+        service(c);                                                                                                    \
+        if ((c)->exited) break;                                                                                        \
         if ((c)->redirect) (c)->redirect = 0; /* else rip already = next (set at exit) */                              \
-    }                                                                                                                   \
+    }                                                                                                                  \
     /* R_BRANCH: c->rip already holds the target */

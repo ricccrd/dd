@@ -22,8 +22,8 @@ struct cpu {
     uint64_t ctid; // CLONE_CHILD_CLEARTID
     uint64_t sigmask;
     uint64_t alt_sp, alt_size, alt_flags; // sigaltstack (C-only; used by os/linux service)
-    uint64_t dbg_ibsrc; // debug: guest PC of the last indirect branch (ret/jmp/call reg)
-    uint64_t ic_miss;   // IBTC: set by an indirect-branch miss -> dispatcher fills g_ibtc for cpu->rip
+    uint64_t dbg_ibsrc;                   // debug: guest PC of the last indirect branch (ret/jmp/call reg)
+    uint64_t ic_miss; // IBTC: set by an indirect-branch miss -> dispatcher fills g_ibtc for cpu->rip
     // x87 FPU: a register stack ST(0..7) emulated at DOUBLE precision (enough for printf %f of
     // doubles; loses the 80-bit long-double tail). st[fptop&7]=ST(0). Grows downward (push=--top).
     double st[8];        // x87 stack slots
@@ -36,11 +36,17 @@ struct cpu {
     // AVX/AVX2/AVX-512 register file, emulated in avx.c (R_AVX). v[] above already holds xmm0..15 (= the
     // low 128 bits of zmm0..15), so legacy-SSE codegen that bakes OFF_V stays byte-identical; these hold
     // the extra width. ymm_n = v[2n..2n+1] ++ vhi[2n..2n+1]; zmm0..15 add vz[]; zmm16..31 live in vx[].
-    uint64_t vhi[32];  // bits[128:256) of ymm/zmm0..15
-    uint64_t vz[64];   // bits[256:512) of zmm0..15
-    uint64_t vx[128];  // zmm16..31 (full 512-bit each)
-    uint64_t kreg[8];  // AVX-512 opmask registers k0..k7
+    uint64_t vhi[32]; // bits[128:256) of ymm/zmm0..15
+    uint64_t vz[64];  // bits[256:512) of zmm0..15
+    uint64_t vx[128]; // zmm16..31 (full 512-bit each)
+    uint64_t kreg[8]; // AVX-512 opmask registers k0..k7
+    // x86 PF (parity) substrate. There is no real PF in the ARM-NZCV flag model, so flag-setting integer
+    // ops stash the low byte of their result here (FP compares stash a synthetic byte: 0 -> PF=1 unordered,
+    // 1 -> PF=0). The parity consumers (setp/setnp, cmovp/cmovnp) read it and compute even-parity = x86 PF.
+    // Added at the END of the struct so the baked OFF_* offsets above are unaffected.
+    uint64_t pf;
 };
+#define OFF_PF ((int)__builtin_offsetof(struct cpu, pf))
 #define OFF_IBSRC ((int)__builtin_offsetof(struct cpu, dbg_ibsrc))
 #define OFF_ICMISS ((int)__builtin_offsetof(struct cpu, ic_miss))
 #define OFF_ST ((int)__builtin_offsetof(struct cpu, st))
@@ -80,5 +86,9 @@ struct cpu {
 // reads/writes the v[]/vhi[]/vz[]/vx[]/kreg[] register file + guest memory, then advances rip past it.
 // Correctness-first (one block exit per AVX insn); the SSE/scalar fast paths are untouched.
 #define R_AVX 9
+// Legacy (non-VEX) 0F38/0F3A instruction (SSSE3/SSE4.1/SSE4.2/AES/SHA/PCLMUL/CRC32/MOVBE) -> exit the
+// block and emulate it in C (do_sse3b), which reads/writes the v[] xmm file + GPRs + memory, then advances
+// rip. Correctness-first (one block exit per insn), mirroring the R_AVX VEX path. See avx.c do_sse3b().
+#define R_SSE3B 10
 // x86 register encodings (== host reg numbers)
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };

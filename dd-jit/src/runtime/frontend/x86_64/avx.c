@@ -43,8 +43,10 @@ static uint64_t avx_ea(struct cpu *c, struct insn *I, uint64_t rip_after, int wb
     int64_t disp = I->disp;
     if (I->evex && I->mod == 1) disp *= wbytes ? wbytes : 1; // disp8*N, full-vector tuple
     a += (uint64_t)disp;
-    if (I->seg == 1) a += c->fs_base;
-    else if (I->seg == 2) a += c->gs_base;
+    if (I->seg == 1)
+        a += c->fs_base;
+    else if (I->seg == 2)
+        a += c->gs_base;
     return a;
 }
 // Read the r/m operand (register or memory) into buf as `wbytes` bytes.
@@ -72,7 +74,7 @@ static void do_avx(struct cpu *c) {
     struct insn I;
     decode(c->rip, &I);
     uint64_t next = c->rip + I.len;
-    int L = I.vex_l;            // 0=128,1=256,2=512
+    int L = I.vex_l;                            // 0=128,1=256,2=512
     int W = (L == 0) ? 16 : (L == 1) ? 32 : 64; // operation width in bytes
     int map = I.vex_map, op = I.op, pp = I.vex_pp;
     int rd = I.reg, vv = I.vvvv;
@@ -184,7 +186,7 @@ static void do_avx(struct cpu *c) {
             avx_put(c, rd, d, 16);
             goto done;
         }
-        case 0x7E: { // F3: vmovq xmm<-xmm/mem (zext); 66: vmovd/q xmm->gpr/mem
+        case 0x7E: {       // F3: vmovq xmm<-xmm/mem (zext); 66: vmovd/q xmm->gpr/mem
             if (pp == 2) { // F3 vmovq: reg <- rm (low 64), zero-extend
                 avx_get_rm(c, &I, next, 8, d);
                 avx_put(c, rd, d, 16);
@@ -221,7 +223,7 @@ static void do_avx(struct cpu *c) {
             avx_get_rm(c, &I, next, W, b);
             for (int i = 0; i < W; i++) {
                 uint8_t x = a[i], y = b[i];
-                d[i] = (op == 0xEF || op == 0x57) ? (x ^ y)
+                d[i] = (op == 0xEF || op == 0x57)   ? (x ^ y)
                        : (op == 0xEB || op == 0x56) ? (x | y)
                        : (op == 0xDB || op == 0x54) ? (x & y)
                                                     : (uint8_t)(~x & y); // andn
@@ -239,7 +241,10 @@ static void do_avx(struct cpu *c) {
         case 0xFA:
         case 0xFB: // vpsubb/w/d/q
         {
-            int es = (op == 0xFC || op == 0xF8) ? 1 : (op == 0xFD || op == 0xF9) ? 2 : (op == 0xFE || op == 0xFA) ? 4 : 8;
+            int es = (op == 0xFC || op == 0xF8)   ? 1
+                     : (op == 0xFD || op == 0xF9) ? 2
+                     : (op == 0xFE || op == 0xFA) ? 4
+                                                  : 8;
             int sub = (op >= 0xF8);
             avx_get(c, vv, a);
             avx_get_rm(c, &I, next, W, b);
@@ -344,7 +349,8 @@ static void do_avx(struct cpu *c) {
         case 0x59: { // vpbroadcastb/w/d/q: broadcast low element of rm across W
             int es = (op == 0x78) ? 1 : (op == 0x79) ? 2 : (op == 0x58) ? 4 : 8;
             avx_get_rm(c, &I, next, es, b);
-            for (int i = 0; i < W; i += es) memcpy(d + i, b, es);
+            for (int i = 0; i < W; i += es)
+                memcpy(d + i, b, es);
             avx_put(c, rd, d, W);
             goto done;
         }
@@ -352,7 +358,8 @@ static void do_avx(struct cpu *c) {
         case 0x19: { // vbroadcastss(4)/sd(8)
             int es = (op == 0x18) ? 4 : 8;
             avx_get_rm(c, &I, next, es, b);
-            for (int i = 0; i < W; i += es) memcpy(d + i, b, es);
+            for (int i = 0; i < W; i += es)
+                memcpy(d + i, b, es);
             avx_put(c, rd, d, W);
             goto done;
         }
@@ -382,7 +389,8 @@ static void do_avx(struct cpu *c) {
                 uint8_t t[32];
                 memcpy(t, b + lane, 16);
                 memcpy(t + 16, a + lane, 16);
-                for (int i = 0; i < 16; i++) d[lane + i] = (sh + i < 32) ? t[sh + i] : 0;
+                for (int i = 0; i < 16; i++)
+                    d[lane + i] = (sh + i < 32) ? t[sh + i] : 0;
             }
             avx_put(c, rd, d, W);
             goto done;
@@ -394,8 +402,8 @@ static void do_avx(struct cpu *c) {
 avx_unimpl:
     if (!g_avx_warned || getenv("CRASHDBG")) {
         g_avx_warned = 1;
-        fprintf(stderr, "[avx] UNIMPLEMENTED %s map=%d op=0x%02x pp=%d L=%d w=%d rip=%llx\n",
-                I.evex ? "EVEX" : "VEX", map, op, pp, L, I.vex_w, (unsigned long long)c->rip);
+        fprintf(stderr, "[avx] UNIMPLEMENTED %s map=%d op=0x%02x pp=%d L=%d w=%d rip=%llx\n", I.evex ? "EVEX" : "VEX",
+                map, op, pp, L, I.vex_w, (unsigned long long)c->rip);
     }
     c->exited = 1;
     c->exit_code = 70;
@@ -403,4 +411,790 @@ avx_unimpl:
 
 done:
     c->rip = next;
+}
+
+// ============================================================================================
+// Legacy (non-VEX) 0F38 / 0F3A emulation (R_SSE3B): SSSE3, SSE4.1, SSE4.2, AES-NI, SHA, PCLMUL,
+// CRC32 and MOVBE. Mirrors do_avx(): the translator exits the block at each such insn, this
+// re-decodes it at cpu->rip, emulates against the xmm file (v[]) / GPRs (r[]) / memory and
+// advances rip. Legacy SSE is destructive: ModRM.reg is both src1 and dst; ModRM.r/m is src2.
+// ============================================================================================
+
+static const uint8_t k_aes_sbox[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76, 0xca, 0x82, 0xc9,
+    0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0, 0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f,
+    0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15, 0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07,
+    0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75, 0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3,
+    0x29, 0xe3, 0x2f, 0x84, 0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58,
+    0xcf, 0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8, 0x51, 0xa3,
+    0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2, 0xcd, 0x0c, 0x13, 0xec, 0x5f,
+    0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73, 0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88,
+    0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb, 0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac,
+    0x62, 0x91, 0x95, 0xe4, 0x79, 0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a,
+    0xae, 0x08, 0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a, 0x70,
+    0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e, 0xe1, 0xf8, 0x98, 0x11,
+    0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf, 0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42,
+    0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16};
+static const uint8_t k_aes_isbox[256] = {
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb, 0x7c, 0xe3, 0x39,
+    0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb, 0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2,
+    0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e, 0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76,
+    0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25, 0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc,
+    0x5d, 0x65, 0xb6, 0x92, 0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d,
+    0x84, 0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06, 0xd0, 0x2c,
+    0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b, 0x3a, 0x91, 0x11, 0x41, 0x4f,
+    0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73, 0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85,
+    0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e, 0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62,
+    0x0e, 0xaa, 0x18, 0xbe, 0x1b, 0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd,
+    0x5a, 0xf4, 0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f, 0x60,
+    0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef, 0xa0, 0xe0, 0x3b, 0x4d,
+    0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61, 0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6,
+    0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d};
+
+static uint8_t aes_gfmul(uint8_t a, uint8_t b) {
+    uint8_t p = 0;
+    for (int i = 0; i < 8; i++) {
+        if (b & 1) p ^= a;
+        uint8_t hi = a & 0x80;
+        a <<= 1;
+        if (hi) a ^= 0x1b;
+        b >>= 1;
+    }
+    return p;
+}
+static void aes_subbytes(uint8_t s[16], const uint8_t box[256]) {
+    for (int i = 0; i < 16; i++) s[i] = box[s[i]];
+}
+// ShiftRows (inv=0) / InvShiftRows (inv=1). State is column-major: s[4*col+row].
+static void aes_shiftrows(const uint8_t in[16], uint8_t out[16], int inv) {
+    for (int col = 0; col < 4; col++)
+        for (int row = 0; row < 4; row++) {
+            int sc = inv ? ((col - row) & 3) : ((col + row) & 3);
+            out[4 * col + row] = in[4 * sc + row];
+        }
+}
+static void aes_mixcolumns(uint8_t s[16], int inv) {
+    for (int col = 0; col < 4; col++) {
+        uint8_t a0 = s[4 * col], a1 = s[4 * col + 1], a2 = s[4 * col + 2], a3 = s[4 * col + 3];
+        if (!inv) {
+            s[4 * col] = aes_gfmul(a0, 2) ^ aes_gfmul(a1, 3) ^ a2 ^ a3;
+            s[4 * col + 1] = a0 ^ aes_gfmul(a1, 2) ^ aes_gfmul(a2, 3) ^ a3;
+            s[4 * col + 2] = a0 ^ a1 ^ aes_gfmul(a2, 2) ^ aes_gfmul(a3, 3);
+            s[4 * col + 3] = aes_gfmul(a0, 3) ^ a1 ^ a2 ^ aes_gfmul(a3, 2);
+        } else {
+            s[4 * col] = aes_gfmul(a0, 14) ^ aes_gfmul(a1, 11) ^ aes_gfmul(a2, 13) ^ aes_gfmul(a3, 9);
+            s[4 * col + 1] = aes_gfmul(a0, 9) ^ aes_gfmul(a1, 14) ^ aes_gfmul(a2, 11) ^ aes_gfmul(a3, 13);
+            s[4 * col + 2] = aes_gfmul(a0, 13) ^ aes_gfmul(a1, 9) ^ aes_gfmul(a2, 14) ^ aes_gfmul(a3, 11);
+            s[4 * col + 3] = aes_gfmul(a0, 11) ^ aes_gfmul(a1, 13) ^ aes_gfmul(a2, 9) ^ aes_gfmul(a3, 14);
+        }
+    }
+}
+
+static inline uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+static inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+// CRC-32C (Castagnoli, reflected poly 0x82F63B78) -- the polynomial used by the x86 CRC32 instruction.
+static uint32_t crc32c_step(uint32_t crc, uint64_t v, int nbytes) {
+    for (int b = 0; b < nbytes; b++) {
+        crc ^= (uint8_t)(v >> (8 * b));
+        for (int i = 0; i < 8; i++)
+            crc = (crc >> 1) ^ (0x82F63B78u & (uint32_t)(-(int32_t)(crc & 1)));
+    }
+    return crc;
+}
+
+static double sse_round_d(double x, int mode) {
+    switch (mode & 3) {
+    case 1: return __builtin_floor(x);
+    case 2: return __builtin_ceil(x);
+    case 3: return __builtin_trunc(x);
+    default: return __builtin_rint(x); // round-to-nearest-even
+    }
+}
+static float sse_round_f(float x, int mode) {
+    switch (mode & 3) {
+    case 1: return __builtin_floorf(x);
+    case 2: return __builtin_ceilf(x);
+    case 3: return __builtin_truncf(x);
+    default: return __builtin_rintf(x);
+    }
+}
+
+static inline int sat_s16(int v) { return v < -32768 ? -32768 : v > 32767 ? 32767 : v; }
+static inline int sat_u16(int v) { return v < 0 ? 0 : v > 65535 ? 65535 : v; }
+static inline int sat_s8(int v) { return v < -128 ? -128 : v > 127 ? 127 : v; }
+
+// Read the 16-byte r/m operand (xmm register or m128) of a legacy SSE insn.
+static void sse_get_rm(struct cpu *c, struct insn *I, uint64_t next, uint8_t buf[16]) {
+    if (I->is_mem)
+        memcpy(buf, (void *)avx_ea(c, I, next, 16), 16);
+    else
+        memcpy(buf, &c->v[2 * I->rm_reg], 16);
+}
+
+static void do_sse3b(struct cpu *c) {
+    struct insn I;
+    decode(c->rip, &I);
+    uint64_t next = c->rip + I.len;
+    int map = I.map3, op = I.op;
+    uint8_t *D = (uint8_t *)&c->v[2 * I.reg]; // dst xmm == src1 (destructive)
+    uint8_t s[16], r[16];
+
+    // ---- CRC32 (F2 0F38 F0/F1) and MOVBE (no-F2 0F38 F0/F1): GENERAL-register / memory ops -----------
+    if (map == 2 && (op == 0xF0 || op == 0xF1)) {
+        if (I.repne) { // CRC32 r, r/m  (F0=r/m8, F1=r/m16/32/64 per operand size)
+            int nb = (op == 0xF0) ? 1 : I.opsize;
+            uint64_t v;
+            if (I.is_mem) {
+                uint64_t a = avx_ea(c, &I, next, nb);
+                v = 0;
+                memcpy(&v, (void *)a, nb);
+            } else {
+                v = c->r[I.rm_reg];
+            }
+            uint32_t crc = (uint32_t)c->r[I.reg];
+            crc = crc32c_step(crc, v, nb);
+            c->r[I.reg] = crc; // zero-extends into the 64-bit GPR (incl. the REX.W form)
+        } else {               // MOVBE: byte-swapping load (F0) / store (F1) of a memory operand
+            int nb = I.opsize;
+            uint64_t a = avx_ea(c, &I, next, nb);
+            if (op == 0xF0) { // MOVBE r, m  -> reg = bswap(load)
+                uint64_t v = 0;
+                memcpy(&v, (void *)a, nb);
+                uint64_t sw = 0;
+                for (int i = 0; i < nb; i++)
+                    sw |= ((v >> (8 * i)) & 0xff) << (8 * (nb - 1 - i));
+                if (nb == 2)
+                    c->r[I.reg] = (c->r[I.reg] & ~0xffffull) | (sw & 0xffff);
+                else
+                    c->r[I.reg] = sw; // 32-bit zero-extends, 64-bit full
+            } else {              // MOVBE m, r  -> [m] = bswap(reg)
+                uint64_t v = c->r[I.reg], sw = 0;
+                for (int i = 0; i < nb; i++)
+                    sw |= ((v >> (8 * i)) & 0xff) << (8 * (nb - 1 - i));
+                memcpy((void *)a, &sw, nb);
+            }
+        }
+        c->rip = next;
+        return;
+    }
+
+    // ---- PEXTR* / EXTRACTPS (0F3A 14/15/16/17): xmm -> GPR/memory -----------------------------------
+    if (map == 3 && (op == 0x14 || op == 0x15 || op == 0x16 || op == 0x17)) {
+        int imm = (int)I.imm;
+        uint64_t val;
+        int nb;
+        if (op == 0x14) {
+            nb = 1;
+            val = D[imm & 15];
+        } else if (op == 0x15) {
+            nb = 2;
+            uint16_t w;
+            memcpy(&w, D + 2 * (imm & 7), 2);
+            val = w;
+        } else if (op == 0x16) {
+            nb = I.rexW ? 8 : 4;
+            memcpy(&val, D + (I.rexW ? 8 * (imm & 1) : 4 * (imm & 3)), nb);
+        } else { // 0x17 extractps -> 32-bit float lane as raw dword
+            nb = 4;
+            uint32_t w;
+            memcpy(&w, D + 4 * (imm & 3), 4);
+            val = w;
+        }
+        if (I.is_mem) {
+            uint64_t a = avx_ea(c, &I, next, nb);
+            memcpy((void *)a, &val, nb);
+        } else if (nb == 8) {
+            c->r[I.rm_reg] = val;
+        } else {
+            c->r[I.rm_reg] = (uint32_t)val; // pextrb/w/d/extractps zero-extend into the GPR
+        }
+        c->rip = next;
+        return;
+    }
+
+    // ---- PINSR* / INSERTPS (0F3A 20/21/22): GPR/memory -> xmm ---------------------------------------
+    if (map == 3 && (op == 0x20 || op == 0x21 || op == 0x22)) {
+        int imm = (int)I.imm;
+        if (op == 0x20) { // pinsrb: r/m8 -> byte lane imm[3:0]
+            uint8_t v = I.is_mem ? *(uint8_t *)avx_ea(c, &I, next, 1) : (uint8_t)c->r[I.rm_reg];
+            D[imm & 15] = v;
+        } else if (op == 0x22) { // pinsrd/q: r/m32/64 -> dword/qword lane
+            if (I.rexW) {
+                uint64_t v = I.is_mem ? *(uint64_t *)avx_ea(c, &I, next, 8) : c->r[I.rm_reg];
+                memcpy(D + 8 * (imm & 1), &v, 8);
+            } else {
+                uint32_t v = I.is_mem ? *(uint32_t *)avx_ea(c, &I, next, 4) : (uint32_t)c->r[I.rm_reg];
+                memcpy(D + 4 * (imm & 3), &v, 4);
+            }
+        } else { // 0x21 insertps: select src dword, insert at dst lane, then zero per imm[3:0]
+            uint32_t src;
+            if (I.is_mem)
+                src = *(uint32_t *)avx_ea(c, &I, next, 4); // memory source: element 0
+            else
+                memcpy(&src, (uint8_t *)&c->v[2 * I.rm_reg] + 4 * ((imm >> 6) & 3), 4); // src dword via imm[7:6]
+            int dlane = (imm >> 4) & 3;
+            memcpy(D + 4 * dlane, &src, 4);
+            for (int i = 0; i < 4; i++)
+                if (imm & (1 << i)) memset(D + 4 * i, 0, 4);
+        }
+        c->rip = next;
+        return;
+    }
+
+    // ---- PCMPISTRI (0F3A 63): packed string compare, implicit-length -> index in ECX ---------------
+    if (map == 3 && op == 0x63) {
+        sse_get_rm(c, &I, next, s);
+        int imm = (int)I.imm;
+        int wordsz = (imm & 1) ? 2 : 1;       // element size: 0=byte,1=word
+        int n = 16 / wordsz;                   // element count
+        int agg = (imm >> 2) & 3;              // 0=equal-any,1=ranges,2=equal-each,3=equal-ordered
+        int neg = (imm >> 4) & 1;              // polarity bit (negate)
+        int neg_valid_only = (imm >> 5) & 1;   // masked negation
+        int msb = (imm >> 6) & 1;              // index select: 0=lsb,1=msb
+        int la = n, lb = n;                    // implicit lengths: first null element
+        for (int i = 0; i < n; i++) {
+            uint64_t e = 0;
+            memcpy(&e, D + i * wordsz, wordsz);
+            if (e == 0) { la = i; break; }
+        }
+        for (int i = 0; i < n; i++) {
+            uint64_t e = 0;
+            memcpy(&e, s + i * wordsz, wordsz);
+            if (e == 0) { lb = i; break; }
+        }
+        int res = 0;
+        for (int i = 0; i < n; i++) {
+            int bit = 0, bvalid = (i < lb);
+            uint64_t bi = 0;
+            memcpy(&bi, s + i * wordsz, wordsz);
+            if (agg == 0 || agg == 3) { // equal-any / equal-ordered: compare s[i] against a[]
+                for (int j = 0; j < n; j++) {
+                    int avalid = (j < la);
+                    uint64_t aj = 0;
+                    memcpy(&aj, D + j * wordsz, wordsz);
+                    if (agg == 0) { // equal-any: any a[j]==s[i]
+                        if (avalid && bvalid && aj == bi) { bit = 1; break; }
+                    }
+                }
+            } else if (agg == 2) { // equal-each: a[i]==s[i] with validity override
+                int avalid = (i < la);
+                uint64_t ai = 0;
+                memcpy(&ai, D + i * wordsz, wordsz);
+                if (avalid && bvalid)
+                    bit = (ai == bi);
+                else if (!avalid && !bvalid)
+                    bit = 1;
+                else
+                    bit = 0;
+            }
+            if (bit) res |= (1 << i);
+        }
+        if (neg) {
+            int mask = (1 << n) - 1;
+            if (neg_valid_only)
+                res ^= ((1 << lb) - 1); // negate only valid-element positions
+            else
+                res ^= mask;
+        }
+        int idx;
+        if (res == 0)
+            idx = n;
+        else if (msb)
+            idx = 31 - __builtin_clz(res);
+        else
+            idx = __builtin_ctz(res);
+        c->r[RCX] = idx; // flags (CF/ZF/SF/OF) are not consumed by any modelled path -> left as-is
+        c->rip = next;
+        return;
+    }
+
+    // ---- the remaining ops are xmm-destructive: load the r/m source, compute into r, write to D -----
+    sse_get_rm(c, &I, next, s);
+    memcpy(r, D, 16);
+
+    if (map == 2) {
+        switch (op) {
+        case 0x00: { // pshufb
+            uint8_t t[16];
+            memcpy(t, D, 16);
+            for (int i = 0; i < 16; i++)
+                r[i] = (s[i] & 0x80) ? 0 : t[s[i] & 0x0f];
+            break;
+        }
+        case 0x01:
+        case 0x02:
+        case 0x03:
+        case 0x05:
+        case 0x06:
+        case 0x07: { // phadd/phsub w/d (saturated for 03/07)
+            int sub = (op >= 0x05);
+            int sat = (op == 0x03 || op == 0x07);
+            if (op == 0x02 || op == 0x06) { // dword
+                int32_t a[4], b[4], o[4];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                o[0] = sub ? a[0] - a[1] : a[0] + a[1];
+                o[1] = sub ? a[2] - a[3] : a[2] + a[3];
+                o[2] = sub ? b[0] - b[1] : b[0] + b[1];
+                o[3] = sub ? b[2] - b[3] : b[2] + b[3];
+                memcpy(r, o, 16);
+            } else { // word
+                int16_t a[8], b[8], o[8];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 4; i++) {
+                    int va = sub ? a[2 * i] - a[2 * i + 1] : a[2 * i] + a[2 * i + 1];
+                    int vb = sub ? b[2 * i] - b[2 * i + 1] : b[2 * i] + b[2 * i + 1];
+                    o[i] = sat ? (int16_t)sat_s16(va) : (int16_t)va;
+                    o[i + 4] = sat ? (int16_t)sat_s16(vb) : (int16_t)vb;
+                }
+                memcpy(r, o, 16);
+            }
+            break;
+        }
+        case 0x08:
+        case 0x09:
+        case 0x0A: { // psign b/w/d
+            if (op == 0x08) {
+                int8_t a[16], b[16], o[16];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 16; i++) o[i] = b[i] < 0 ? -a[i] : b[i] == 0 ? 0 : a[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x09) {
+                int16_t a[8], b[8], o[8];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 8; i++) o[i] = b[i] < 0 ? -a[i] : b[i] == 0 ? 0 : a[i];
+                memcpy(r, o, 16);
+            } else {
+                int32_t a[4], b[4], o[4];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 4; i++) o[i] = b[i] < 0 ? -a[i] : b[i] == 0 ? 0 : a[i];
+                memcpy(r, o, 16);
+            }
+            break;
+        }
+        case 0x0B: { // pmulhrsw
+            int16_t a[8], b[8], o[8];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            for (int i = 0; i < 8; i++) o[i] = (int16_t)((((a[i] * b[i]) >> 14) + 1) >> 1);
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x1C:
+        case 0x1D:
+        case 0x1E: { // pabs b/w/d (single source: r/m)
+            if (op == 0x1C) {
+                int8_t a[16];
+                memcpy(a, s, 16);
+                for (int i = 0; i < 16; i++) r[i] = (uint8_t)(a[i] < 0 ? -a[i] : a[i]);
+            } else if (op == 0x1D) {
+                int16_t a[8], o[8];
+                memcpy(a, s, 16);
+                for (int i = 0; i < 8; i++) o[i] = a[i] < 0 ? -a[i] : a[i];
+                memcpy(r, o, 16);
+            } else {
+                int32_t a[4], o[4];
+                memcpy(a, s, 16);
+                for (int i = 0; i < 4; i++) o[i] = a[i] < 0 ? -a[i] : a[i];
+                memcpy(r, o, 16);
+            }
+            break;
+        }
+        case 0x20:
+        case 0x21:
+        case 0x22:
+        case 0x23:
+        case 0x24:
+        case 0x25: { // pmovsx (sign-extend)
+            int8_t b8[16];
+            int16_t w16[8];
+            int32_t d32[4];
+            memcpy(b8, s, 16);
+            memcpy(w16, s, 16);
+            memcpy(d32, s, 16);
+            if (op == 0x20) {
+                int16_t o[8];
+                for (int i = 0; i < 8; i++) o[i] = b8[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x21) {
+                int32_t o[4];
+                for (int i = 0; i < 4; i++) o[i] = b8[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x22) {
+                int64_t o[2];
+                for (int i = 0; i < 2; i++) o[i] = b8[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x23) {
+                int32_t o[4];
+                for (int i = 0; i < 4; i++) o[i] = w16[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x24) {
+                int64_t o[2];
+                for (int i = 0; i < 2; i++) o[i] = w16[i];
+                memcpy(r, o, 16);
+            } else {
+                int64_t o[2];
+                for (int i = 0; i < 2; i++) o[i] = d32[i];
+                memcpy(r, o, 16);
+            }
+            break;
+        }
+        case 0x30:
+        case 0x31:
+        case 0x32:
+        case 0x33:
+        case 0x34:
+        case 0x35: { // pmovzx (zero-extend)
+            uint8_t b8[16];
+            uint16_t w16[8];
+            uint32_t d32[4];
+            memcpy(b8, s, 16);
+            memcpy(w16, s, 16);
+            memcpy(d32, s, 16);
+            if (op == 0x30) {
+                uint16_t o[8];
+                for (int i = 0; i < 8; i++) o[i] = b8[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x31) {
+                uint32_t o[4];
+                for (int i = 0; i < 4; i++) o[i] = b8[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x32) {
+                uint64_t o[2];
+                for (int i = 0; i < 2; i++) o[i] = b8[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x33) {
+                uint32_t o[4];
+                for (int i = 0; i < 4; i++) o[i] = w16[i];
+                memcpy(r, o, 16);
+            } else if (op == 0x34) {
+                uint64_t o[2];
+                for (int i = 0; i < 2; i++) o[i] = w16[i];
+                memcpy(r, o, 16);
+            } else {
+                uint64_t o[2];
+                for (int i = 0; i < 2; i++) o[i] = d32[i];
+                memcpy(r, o, 16);
+            }
+            break;
+        }
+        case 0x28: { // pmuldq: signed (a.dword[0]*s.dword[0], a.dword[2]*s.dword[2]) -> 2 qwords
+            int32_t a[4], b[4];
+            int64_t o[2];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            o[0] = (int64_t)a[0] * (int64_t)b[0];
+            o[1] = (int64_t)a[2] * (int64_t)b[2];
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x29: { // pcmpeqq
+            uint64_t a[2], b[2], o[2];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            o[0] = (a[0] == b[0]) ? ~0ull : 0;
+            o[1] = (a[1] == b[1]) ? ~0ull : 0;
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x2B: { // packusdw: pack signed dword -> unsigned word (saturate); dst low, src high
+            int32_t a[4], b[4];
+            uint16_t o[8];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            for (int i = 0; i < 4; i++) o[i] = (uint16_t)sat_u16(a[i]);
+            for (int i = 0; i < 4; i++) o[i + 4] = (uint16_t)sat_u16(b[i]);
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x37: { // pcmpgtq (signed)
+            int64_t a[2], b[2];
+            uint64_t o[2];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            o[0] = (a[0] > b[0]) ? ~0ull : 0;
+            o[1] = (a[1] > b[1]) ? ~0ull : 0;
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x38:
+        case 0x39:
+        case 0x3A:
+        case 0x3B:
+        case 0x3C:
+        case 0x3D:
+        case 0x3E:
+        case 0x3F: { // pmin/pmax sb/sd/uw/ud/sb.../
+            if (op == 0x38 || op == 0x3C) { // signed byte min/max
+                int8_t a[16], b[16], o[16];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 16; i++) o[i] = (op == 0x38) ? (a[i] < b[i] ? a[i] : b[i]) : (a[i] > b[i] ? a[i] : b[i]);
+                memcpy(r, o, 16);
+            } else if (op == 0x3A || op == 0x3E) { // unsigned word min/max
+                uint16_t a[8], b[8], o[8];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 8; i++) o[i] = (op == 0x3A) ? (a[i] < b[i] ? a[i] : b[i]) : (a[i] > b[i] ? a[i] : b[i]);
+                memcpy(r, o, 16);
+            } else if (op == 0x39 || op == 0x3D) { // signed dword min/max
+                int32_t a[4], b[4], o[4];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 4; i++) o[i] = (op == 0x39) ? (a[i] < b[i] ? a[i] : b[i]) : (a[i] > b[i] ? a[i] : b[i]);
+                memcpy(r, o, 16);
+            } else { // 0x3B/0x3F unsigned dword min/max
+                uint32_t a[4], b[4], o[4];
+                memcpy(a, D, 16);
+                memcpy(b, s, 16);
+                for (int i = 0; i < 4; i++) o[i] = (op == 0x3B) ? (a[i] < b[i] ? a[i] : b[i]) : (a[i] > b[i] ? a[i] : b[i]);
+                memcpy(r, o, 16);
+            }
+            break;
+        }
+        case 0x40: { // pmulld: 32-bit low product
+            int32_t a[4], b[4], o[4];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            for (int i = 0; i < 4; i++) o[i] = a[i] * b[i];
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x10:
+        case 0x14:
+        case 0x15: { // pblendvb / blendvps / blendvpd -- mask is implicit xmm0
+            uint8_t *mask = (uint8_t *)&c->v[0];
+            if (op == 0x10) { // pblendvb: per-byte, mask = top bit of each byte
+                for (int i = 0; i < 16; i++) r[i] = (mask[i] & 0x80) ? s[i] : D[i];
+            } else if (op == 0x14) { // blendvps: per dword, top bit
+                for (int i = 0; i < 4; i++)
+                    memcpy(r + 4 * i, (mask[4 * i + 3] & 0x80) ? s + 4 * i : D + 4 * i, 4);
+            } else { // blendvpd: per qword
+                for (int i = 0; i < 2; i++)
+                    memcpy(r + 8 * i, (mask[8 * i + 7] & 0x80) ? s + 8 * i : D + 8 * i, 8);
+            }
+            break;
+        }
+        case 0xDB: // aesimc: dst = InvMixColumns(src)
+            memcpy(r, s, 16);
+            aes_mixcolumns(r, 1);
+            break;
+        case 0xDC: // aesenc
+        case 0xDD: // aesenclast
+        {
+            uint8_t t[16];
+            aes_shiftrows(D, t, 0);
+            aes_subbytes(t, k_aes_sbox);
+            if (op == 0xDC) aes_mixcolumns(t, 0);
+            for (int i = 0; i < 16; i++) r[i] = t[i] ^ s[i];
+            break;
+        }
+        case 0xDE: // aesdec
+        case 0xDF: // aesdeclast
+        {
+            uint8_t t[16];
+            aes_shiftrows(D, t, 1);
+            aes_subbytes(t, k_aes_isbox);
+            if (op == 0xDE) aes_mixcolumns(t, 1);
+            for (int i = 0; i < 16; i++) r[i] = t[i] ^ s[i];
+            break;
+        }
+        case 0xCB: { // sha256rnds2: dst,src, implicit xmm0 = WK0/WK1
+            uint32_t st1[4], st2[4], wk[4];
+            memcpy(st1, D, 16);  // C0=st1[3],D0=st1[2],G0=st1[1],H0=st1[0]
+            memcpy(st2, s, 16);  // A0=st2[3],B0=st2[2],E0=st2[1],F0=st2[0]
+            memcpy(wk, &c->v[0], 16);
+            uint32_t A = st2[3], B = st2[2], Cc = st1[3], Dd = st1[2];
+            uint32_t E = st2[1], F = st2[0], G = st1[1], H = st1[0];
+            for (int i = 0; i < 2; i++) {
+                uint32_t WK = wk[i];
+                uint32_t s1 = rotr32(E, 6) ^ rotr32(E, 11) ^ rotr32(E, 25);
+                uint32_t ch = (E & F) ^ (~E & G);
+                uint32_t s0 = rotr32(A, 2) ^ rotr32(A, 13) ^ rotr32(A, 22);
+                uint32_t maj = (A & B) ^ (A & Cc) ^ (B & Cc);
+                uint32_t t1 = H + s1 + ch + WK;
+                uint32_t An = t1 + s0 + maj;
+                uint32_t En = t1 + Dd;
+                H = G; G = F; F = E; E = En;
+                Dd = Cc; Cc = B; B = A; A = An;
+            }
+            uint32_t o[4] = {F, E, B, A}; // DEST: [31:0]=F2,[63:32]=E2,[95:64]=B2,[127:96]=A2
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0xCC: { // sha256msg1
+            uint32_t w[4], w4;
+            memcpy(w, D, 16);    // W0=w[0]..W3=w[3]
+            memcpy(&w4, s, 4);   // W4 = src[31:0]
+            uint32_t in[5] = {w[0], w[1], w[2], w[3], w4};
+            uint32_t o[4];
+            for (int i = 0; i < 4; i++) {
+                uint32_t x = in[i + 1];
+                uint32_t s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3);
+                o[i] = in[i] + s0;
+            }
+            memcpy(r, o, 16);
+            break;
+        }
+        default:
+            goto unimpl;
+        }
+        memcpy(D, r, 16);
+        c->rip = next;
+        return;
+    }
+
+    // ---- map == 3 (0F3A), the xmm-destructive imm8 forms ------------------------------------------
+    {
+        int imm = (int)I.imm;
+        switch (op) {
+        case 0x08:
+        case 0x09:
+        case 0x0A:
+        case 0x0B: { // roundps/pd/ss/sd, mode in imm[3:0] (bit2 set = use MXCSR, we treat as nearest)
+            int mode = (imm & 4) ? 0 : (imm & 3);
+            if (op == 0x08) { // roundps
+                float a[4], o[4];
+                memcpy(a, s, 16);
+                for (int i = 0; i < 4; i++) o[i] = sse_round_f(a[i], mode);
+                memcpy(r, o, 16);
+            } else if (op == 0x09) { // roundpd
+                double a[2], o[2];
+                memcpy(a, s, 16);
+                for (int i = 0; i < 2; i++) o[i] = sse_round_d(a[i], mode);
+                memcpy(r, o, 16);
+            } else if (op == 0x0A) { // roundss: low lane from src, rest from dst
+                float a;
+                memcpy(&a, s, 4);
+                a = sse_round_f(a, mode);
+                memcpy(r, &a, 4);
+            } else { // roundsd
+                double a;
+                memcpy(&a, s, 8);
+                a = sse_round_d(a, mode);
+                memcpy(r, &a, 8);
+            }
+            break;
+        }
+        case 0x0C: { // blendps (4 dwords)
+            for (int i = 0; i < 4; i++)
+                if (imm & (1 << i)) memcpy(r + 4 * i, s + 4 * i, 4);
+            break;
+        }
+        case 0x0D: { // blendpd (2 qwords)
+            for (int i = 0; i < 2; i++)
+                if (imm & (1 << i)) memcpy(r + 8 * i, s + 8 * i, 8);
+            break;
+        }
+        case 0x0E: { // pblendw (8 words)
+            for (int i = 0; i < 8; i++)
+                if (imm & (1 << i)) memcpy(r + 2 * i, s + 2 * i, 2);
+            break;
+        }
+        case 0x0F: { // palignr: (dst:src) >> imm8 bytes
+            uint8_t comb[32];
+            memcpy(comb, s, 16);
+            memcpy(comb + 16, D, 16);
+            for (int i = 0; i < 16; i++) r[i] = (imm + i < 32) ? comb[imm + i] : 0;
+            break;
+        }
+        case 0x40: { // dpps: packed-single dot product
+            float a[4], b[4];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            float sum = 0;
+            for (int i = 0; i < 4; i++)
+                if (imm & (0x10 << i)) sum += a[i] * b[i];
+            float o[4];
+            for (int i = 0; i < 4; i++) o[i] = (imm & (1 << i)) ? sum : 0.0f;
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x41: { // dppd: packed-double dot product
+            double a[2], b[2];
+            memcpy(a, D, 16);
+            memcpy(b, s, 16);
+            double sum = 0;
+            for (int i = 0; i < 2; i++)
+                if (imm & (0x10 << i)) sum += a[i] * b[i];
+            double o[2];
+            for (int i = 0; i < 2; i++) o[i] = (imm & (1 << i)) ? sum : 0.0;
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0x44: { // pclmulqdq: carryless multiply of selected 64-bit halves
+            uint64_t a64, b64;
+            memcpy(&a64, D + 8 * (imm & 1), 8);
+            memcpy(&b64, s + 8 * ((imm >> 4) & 1), 8);
+            unsigned __int128 prod = 0;
+            for (int i = 0; i < 64; i++)
+                if ((b64 >> i) & 1) prod ^= (unsigned __int128)a64 << i;
+            memcpy(r, &prod, 16);
+            break;
+        }
+        case 0xCC: { // sha1rnds4: 4 SHA-1 rounds, function/constant from imm[1:0]
+            uint32_t f_sel = imm & 3;
+            uint32_t K = (f_sel == 0)   ? 0x5A827999u
+                         : (f_sel == 1) ? 0x6ED9EBA1u
+                         : (f_sel == 2) ? 0x8F1BBCDCu
+                                        : 0xCA62C1D6u;
+            uint32_t st[4], w[4];
+            memcpy(st, D, 16); // D0=st[0],C0=st[1],B0=st[2],A0=st[3]
+            memcpy(w, s, 16);  // W3=w[0],W2=w[1],W1=w[2],W0=w[3]
+            uint32_t A = st[3], B = st[2], Cc = st[1], Dd = st[0];
+            uint32_t W[4] = {w[3], w[2], w[1], w[0]};
+            uint32_t E = 0;
+            for (int i = 0; i < 4; i++) {
+                uint32_t f = (f_sel == 0)   ? ((B & Cc) | (~B & Dd))
+                             : (f_sel == 2) ? ((B & Cc) | (B & Dd) | (Cc & Dd))
+                                            : (B ^ Cc ^ Dd);
+                uint32_t t = f + rotl32(A, 5) + W[i] + K + E;
+                E = Dd;
+                Dd = Cc;
+                Cc = rotl32(B, 30);
+                B = A;
+                A = t;
+            }
+            uint32_t o[4] = {Dd, Cc, B, A}; // DEST: [31:0]=D4,[63:32]=C4,[95:64]=B4,[127:96]=A4
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0xDF: { // aeskeygenassist: SubWord+RotWord+RCON on dwords 1 and 3
+            uint32_t x[4];
+            memcpy(x, s, 16);
+            uint32_t rcon = (uint32_t)(imm & 0xff);
+            uint32_t X1 = x[1], X3 = x[3];
+            uint32_t sub1 = (uint32_t)k_aes_sbox[X1 & 0xff] | ((uint32_t)k_aes_sbox[(X1 >> 8) & 0xff] << 8) |
+                            ((uint32_t)k_aes_sbox[(X1 >> 16) & 0xff] << 16) | ((uint32_t)k_aes_sbox[(X1 >> 24) & 0xff] << 24);
+            uint32_t sub3 = (uint32_t)k_aes_sbox[X3 & 0xff] | ((uint32_t)k_aes_sbox[(X3 >> 8) & 0xff] << 8) |
+                            ((uint32_t)k_aes_sbox[(X3 >> 16) & 0xff] << 16) | ((uint32_t)k_aes_sbox[(X3 >> 24) & 0xff] << 24);
+            uint32_t o[4];
+            o[0] = sub1;
+            o[1] = rotr32(sub1, 8) ^ rcon;
+            o[2] = sub3;
+            o[3] = rotr32(sub3, 8) ^ rcon;
+            memcpy(r, o, 16);
+            break;
+        }
+        default:
+            goto unimpl;
+        }
+        memcpy(D, r, 16);
+        c->rip = next;
+        return;
+    }
+
+unimpl:
+    if (!g_avx_warned || getenv("CRASHDBG")) {
+        g_avx_warned = 1;
+        fprintf(stderr, "[sse3b] UNIMPLEMENTED map=%d op=0x%02x p66=%d rep=%d repne=%d rip=%llx\n", map, op, I.p66,
+                I.rep, I.repne, (unsigned long long)c->rip);
+    }
+    c->exited = 1;
+    c->exit_code = 70;
 }

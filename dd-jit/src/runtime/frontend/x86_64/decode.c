@@ -10,6 +10,7 @@ struct insn {
     int seg;    // 0 none, 1 fs, 2 gs
     int lock, rep, repne;
     int two;    // 0F escape seen
+    int map3;   // legacy 3-byte escape: 2 = 0F 38, 3 = 0F 3A (0 otherwise). op holds the final byte.
     uint8_t op; // opcode byte after escape
     int has_modrm;
     uint8_t modrm;
@@ -68,12 +69,13 @@ static int op_imm_bytes(struct insn *I) {
     int two = I->two;
     uint8_t op = I->op;
     int os = I->opsize;
+    if (I->map3) return I->map3 == 3 ? 1 : 0; // legacy 0F3A carries an imm8; 0F38 carries none
     if (I->vex) {
         // VEX/EVEX immediates: the 0F3A map is almost entirely "...,imm8" forms; in the 0F map only the
         // shuffle/compare/insert group carries an imm8; the 0F38 map carries none. (vex_l/W never add bytes.)
         if (I->vex_map == 3) return 1;
-        if (I->vex_map == 1 && (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 || op == 0xC2 ||
-                                op == 0xC4 || op == 0xC5 || op == 0xC6))
+        if (I->vex_map == 1 && (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 || op == 0xC2 || op == 0xC4 ||
+                                op == 0xC5 || op == 0xC6))
             return 1;
         return 0;
     }
@@ -233,11 +235,15 @@ static int decode(uint64_t pc, struct insn *I) {
         if (op == 0x0F) {
             I->two = 1;
             op = p[n++];
+            if (op == 0x38 || op == 0x3A) { // legacy 3-byte escape (SSSE3/SSE4/AES/SHA/CRC32/MOVBE)
+                I->map3 = (op == 0x38) ? 2 : 3;
+                op = p[n++];
+            }
         }
     }
     I->op = op;
     // modrm + sib + disp. Every VEX/EVEX insn we handle carries a ModRM except vzeroupper/vzeroall (0F 77).
-    if (I->vex ? (op != 0x77) : op_has_modrm(I->two, op)) {
+    if (I->vex ? (op != 0x77) : (I->map3 ? 1 : op_has_modrm(I->two, op))) { // every 0F38/0F3A op has ModRM
         uint8_t m = p[n++];
         I->has_modrm = 1;
         I->modrm = m;
