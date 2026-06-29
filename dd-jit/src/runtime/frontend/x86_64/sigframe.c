@@ -78,3 +78,21 @@ static void sigframe_resume_dispatch(struct cpu *c, void *ucv) {
     uc->uc_mcontext->__ss.__x[28] = (uint64_t)c; // block_return reads &cpu from x28 (pinned through the block)
     uc->uc_mcontext->__ss.__pc = (uint64_t)block_return;
 }
+
+// Integer divide-by-zero (#DE) reaches the dispatcher as R_DIV/R_IDIV with divop==0. The host cannot
+// synthesize a real SIGFPE here -- on Apple Silicon udiv/0 quietly returns 0 and FP /0 traps as SIGILL --
+// so deliver it from C, mirroring deliver_guest_fault's queue-and-resume for a synchronous SIGSEGV/SIGBUS.
+// If the guest installed a SIGFPE handler, queue it with the Linux #DE siginfo (si_code=FPE_INTDIV,
+// si_addr = the faulting insn) and force it deliverable even if blocked; run_guest's maybe_deliver_signal
+// then builds the rt_sigframe and runs the handler (which typically siglongjmps out and recovers). Returns
+// 1 when queued (caller `continue`s the loop), 0 when no handler is installed (caller default-terminates).
+// cpu->rip already holds the architectural #DE PC set by the emitted block exit.
+static int raise_guest_de(struct cpu *c) {
+    if (g_sigact[8].handler <= 1) return 0; // SIG_DFL/SIG_IGN: caller applies the default #DE action
+    g_sigcode[8] = 1;                       // FPE_INTDIV
+    g_sigaddr[8] = c->rip;                  // si_addr = faulting instruction
+    c->sigmask &= ~(1ull << 7);             // a synchronous fault forces delivery even if SIGFPE was blocked
+    c->reason = R_BRANCH;                   // resume as a plain branch (no stale special-op handling)
+    __atomic_or_fetch(&g_pending, 1ull << 8, __ATOMIC_SEQ_CST);
+    return 1;
+}

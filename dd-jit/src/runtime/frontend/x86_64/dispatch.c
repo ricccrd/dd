@@ -186,6 +186,7 @@ static void run_guest(struct cpu *c) {
         if (c->reason == R_DIV) { // 128/64 unsigned div (rip already = next)
             uint64_t d = c->divop;
             if (d == 0) {
+                if (raise_guest_de(c)) continue; // #DE -> guest SIGFPE handler (queued; delivered at loop top)
                 fprintf(stderr, "[jit86] #DE divide-by-zero\n");
                 c->exited = 1;
                 c->exit_code = 136;
@@ -199,6 +200,7 @@ static void run_guest(struct cpu *c) {
         if (c->reason == R_IDIV) { // 128/64 signed idiv
             int64_t d = (int64_t)c->divop;
             if (d == 0) {
+                if (raise_guest_de(c)) continue; // #DE -> guest SIGFPE handler (queued; delivered at loop top)
                 fprintf(stderr, "[jit86] #DE divide-by-zero\n");
                 c->exited = 1;
                 c->exit_code = 136;
