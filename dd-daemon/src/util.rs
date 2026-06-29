@@ -221,7 +221,58 @@ pub(crate) fn discover_images(images_dir: &str) -> Vec<Image> {
         }
         out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env, entrypoint, workdir, created, ..Default::default() });
     }
-    out
+    dedup_images(out)
+}
+
+
+/// A coarse "richness" score for a discovered [`Image`], used to pick the best entry when several
+/// directories resolve to the same image (see [`dedup_images`] / [`find_image`]). A non-empty
+/// environment is the decisive signal: `poc/images` ships some images twice — a single-underscore
+/// dd-format dir whose sidecar recorded an empty `env`, AND a umoci bundle dir carrying the full OCI
+/// config — and the bundle one (real env) must win. The remaining run metadata break finer ties.
+pub(crate) fn image_score(img: &Image) -> i32 {
+    let mut s = 0;
+    if !img.env.is_empty() { s += 1000; }
+    if !img.entrypoint.is_empty() { s += 10; }
+    if !img.workdir.is_empty() { s += 5; }
+    s += img.labels.len() as i32;
+    // A recorded CMD beats the `/bin/sh` default the discovery fallback substitutes.
+    if img.cmd.len() != 1 || img.cmd[0] != "/bin/sh" { s += 1; }
+    s
+}
+
+/// Collapse images that resolve to the same `repository:tag` down to a single best entry so lookup is
+/// deterministic regardless of `read_dir` order. Without this, two on-disk dirs for one tag (the
+/// dd-format + umoci-bundle duplicates `poc/images` ships) would both enter the store and `docker
+/// inspect`/`run` would surface whichever the filesystem happened to list first — sometimes the
+/// empty-env one. Ranks by [`image_score`] (richest wins) and breaks exact ties on the name string so
+/// the survivor is stable across runs and machines.
+fn dedup_images(mut imgs: Vec<Image>) -> Vec<Image> {
+    // Best-first ordering (then name, for a deterministic tie-break); keep the first seen per tag.
+    imgs.sort_by(|a, b| image_score(b).cmp(&image_score(a)).then_with(|| a.name.cmp(&b.name)));
+    let mut seen = std::collections::HashSet::new();
+    imgs.retain(|i| seen.insert(repo_tag(&i.name)));
+    imgs
+}
+
+/// Pick the single best image matching a docker reference (`docker inspect ubuntu`, `docker run
+/// alpine`), deterministically. dd's lookup is lenient — a bare name matches any stored image with that
+/// repository regardless of tag (see [`ref_name`]) — so several images can match one query (e.g. an
+/// `ubuntu` and an `ubuntu:24.04`). Returning `Iterator::find`'s first hit made the result depend on
+/// insertion order; instead rank the candidates and return the best:
+///   1. an exact `repository:tag` match for the requested reference wins, then `<name>:latest`,
+///   2. then the richest metadata (a real environment beats an empty one — see [`image_score`]),
+///   3. then the name string (reversed so the lexicographically smallest wins) to settle any remainder.
+pub(crate) fn find_image<'a>(images: &'a [Image], reference: &str) -> Option<&'a Image> {
+    let want = ref_name(reference);
+    let want_rt = repo_tag(reference);
+    let want_latest = format!("{want}:latest");
+    images.iter()
+        .filter(|i| ref_name(&i.name) == want)
+        .max_by_key(|i| {
+            (repo_tag(&i.name) == want_rt, repo_tag(&i.name) == want_latest,
+             image_score(i), std::cmp::Reverse(i.name.clone()))
+        })
 }
 
 

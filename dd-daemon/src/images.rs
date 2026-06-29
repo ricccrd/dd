@@ -47,7 +47,7 @@ pub(crate) async fn images_json(State(a): State<App>) -> Json<Value> {
 /// report one synthetic layer.
 pub(crate) async fn image_history(State(a): State<App>, Path(name): Path<String>) -> Response {
     let g = a.inner.lock().await;
-    match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
+    match find_image(&g.images, &name) {
         Some(i) => Json(json!([{
             "Id": format!("sha256:{}", fake_id(&i.name)), "Created": i.created,
             "CreatedBy": "dd import", "Tags": [repo_tag(&i.name)],
@@ -81,11 +81,11 @@ pub(crate) async fn distribution_inspect(Path(name): Path<String>) -> Response {
 pub(crate) async fn image_inspect(State(a): State<App>, Path(name): Path<String>) -> Response {
     // On a miss, re-scan the images dir from disk before reporting 404: the image may be on disk
     // (freshly pulled/built) yet absent from the in-memory store.
-    if !a.inner.lock().await.images.iter().any(|i| ref_name(&i.name) == ref_name(&name)) {
+    if find_image(&a.inner.lock().await.images, &name).is_none() {
         rescan_images(&a).await;
     }
     let g = a.inner.lock().await;
-    match g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)) {
+    match find_image(&g.images, &name) {
         Some(i) => {
             let tag = repo_tag(&i.name);
             let size = image_size(&i.rootfs, &i.name);
@@ -369,7 +369,7 @@ pub(crate) struct TagQ { repo: Option<String>, tag: Option<String> }
 /// `repo` and `tag` query params (`docker tag src dst:v2` -> repo=dst, tag=v2).
 pub(crate) async fn image_tag(State(a): State<App>, Path(name): Path<String>, Query(q): Query<TagQ>) -> Response {
     let mut g = a.inner.lock().await;
-    let Some(src) = g.images.iter().find(|i| ref_name(&i.name) == ref_name(&name)).cloned() else {
+    let Some(src) = find_image(&g.images, &name).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {name}")}))).into_response();
     };
     // Keep the FULL target repository (registry + namespace), e.g. `huttarichard/ddmac` — NOT the bare

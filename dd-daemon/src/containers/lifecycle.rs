@@ -71,11 +71,11 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         if !present { drop(g); rescan_images(&a).await; }
     }
     let mut g = a.inner.lock().await;
-    let img = match g.images.iter()
-        .filter(|i| ref_name(&i.name) == ref_name(&image))
-        .find(|i| want_arch.map_or(true, |a| docker_arch(i.arch) == a))
-        .cloned()
-    {
+    // Restrict the store to the arch the user asked for (if any), then let `find_image` pick the single
+    // best match deterministically (richest metadata wins; never an order-dependent duplicate).
+    let candidates: Vec<Image> = g.images.iter()
+        .filter(|i| want_arch.map_or(true, |a| docker_arch(i.arch) == a)).cloned().collect();
+    let img = match find_image(&candidates, &image).cloned() {
         Some(i) => i,
         None => return (StatusCode::NOT_FOUND, Json(json!({"message": format!("No such image: {image}")}))).into_response(),
     };
