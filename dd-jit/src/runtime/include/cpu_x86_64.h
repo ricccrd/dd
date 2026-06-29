@@ -47,6 +47,7 @@ struct cpu {
     uint64_t pf;
 };
 #define OFF_PF ((int)__builtin_offsetof(struct cpu, pf))
+#define OFF_EXITED ((int)__builtin_offsetof(struct cpu, exited)) // int exited; int exit_code (the next word)
 #define OFF_IBSRC ((int)__builtin_offsetof(struct cpu, dbg_ibsrc))
 #define OFF_ICMISS ((int)__builtin_offsetof(struct cpu, ic_miss))
 #define OFF_ST ((int)__builtin_offsetof(struct cpu, st))

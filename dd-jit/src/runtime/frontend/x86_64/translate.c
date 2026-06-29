@@ -491,6 +491,43 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "translate/x87.c"
 
+// SSE2 variable-count packed shift (PSLLW/D/Q, PSRLW/D/Q, PSRAW/D by xmm/m): shift every
+// `esize`-bit lane of `vn` by the SCALAR count held in the low 64 bits of `vs`, result -> `vd`.
+// x86 saturates the count: any count >= esize yields 0 (logical) or the sign bit replicated
+// (arithmetic right). NEON USHL/SSHL take a per-lane signed amount from the low byte of each
+// lane, so we clamp the (unsigned) count to esize -- which is < 128, keeping the signed byte
+// valid -- and DUP it across all lanes (negated for a right shift).
+static void e_sse_var_shift(int vd, int vn, int vs, int esize, int left, int arith) {
+    uint32_t sz = esize == 16 ? 1u : esize == 32 ? 2u : 3u; // NEON element size field
+    uint32_t imm5 = esize == 16 ? 2u : esize == 32 ? 4u : 8u;
+    emit32(0x4E083C00u | (vs << 5) | 16);     // umov x16, vs.d[0]   (the 64-bit count)
+    e_movconst(19, esize);
+    e_rrr(A_SUBS, 31, 16, 19, 1, 0);          // cmp x16, esize
+    e_csel(16, 19, 16, 8 /*HI*/, 1);          // x16 = (count u> esize) ? esize : count
+    if (!left) e_rrr(A_SUB, 16, 31, 16, 1, 0); // right shift -> negative NEON amount (neg x16)
+    emit32(0x4E000C00u | (imm5 << 16) | (16 << 5) | 17);             // dup v17.<T>, w16/x16
+    uint32_t shl = (arith ? 0x4E204400u : 0x6E204400u) | (sz << 22); // SSHL (arith) / USHL
+    emit32(shl | (17 << 16) | (vn << 5) | vd);                       // [s|u]shl vd, vn, v17
+}
+
+// 0F 0B (UD2): an explicitly-undefined opcode that real software (e.g. ruby's unreachable/trap paths)
+// uses as a deliberate trap. On Linux it raises SIGILL; with no handler the process dies with shell
+// status 128+SIGILL = 132. We can't run a guest SIGILL handler from a block exit (that needs the
+// dispatcher), so terminate the guest cleanly with the Linux status -- the run_guest loop breaks on
+// c->exited. This is distinct from report_unimpl's "engine aborted" path (status 70), which would
+// mislabel a legitimate guest fault as an unimplemented-opcode bug of ours.
+static void emit_sigill(uint64_t pc) {
+    // Quiet by default: UD2 frequently sits on never-taken paths (compiler trap/unreachable slots) that get
+    // translated as block fall-through but never run; an unconditional message would falsely imply delivery.
+    if (getenv("CRASHDBG")) fprintf(stderr, "[jit86] #UD ud2 at rip=%llx -> SIGILL\n", (unsigned long long)pc);
+    emit_spill();
+    // one 64-bit store covers the two adjacent ints: exited (low word) = 1, exit_code (high word) = 132.
+    e_movconst(16, ((uint64_t)132 << 32) | 1u);
+    e_str(16, 28, OFF_EXITED);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
+    e_br(16);
+}
+
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
     uint64_t start = gpc;
@@ -887,17 +924,34 @@ static void *translate_block(uint64_t gpc) {
                     e_tst(21, 0);
                 } else
                     e_tst(16, sf);
-                if (want_cf) {
-                    int width = ssf ? 64 : 32, bit = (k == 4) ? (width - cnt) : (cnt - 1);
-                    if (bit > width - 1) bit = width - 1;
-                    e_lsr_i(19, 19, bit, ssf);
-                    e_movconst(23, 1);
-                    e_rrr(A_AND, 19, 19, 23, ssf, 0); // x19 = x86 CF bit
-                    e_nzcv_save_setcf(19);
-                } else
-                    e_nzcv_save();
-                // x86 PF: SHL/SHR/SAR set SF/ZF/PF from the result; rotates (ROL/ROR) leave PF unchanged.
-                if (k == 4 || k == 5 || k == 7) e_pf_save(16); // result low byte -> PF lane (x16 holds result)
+                if (bycl) {
+                    // x86 leaves ALL flags unchanged when the runtime count (CL masked to the operand width) is
+                    // 0 -- exactly when the emitted variable shift was a no-op. Capture the would-be flags, then
+                    // keep the OLD nzcv (and PF, for the SHL/SHR/SAR forms) if the masked count is zero.
+                    emit32(0xD53B4200u | 20);           // mrs x20, nzcv  (new N/Z from result; C/V from the tst)
+                    e_ldr(24, 28, OFF_NZCV);            // x24 = old nzcv
+                    e_movconst(19, ssf ? 63 : 31);
+                    e_rrr(A_ANDS, 31, RCX, 19, ssf, 0); // Z = ((CL & (width-1)) == 0)
+                    e_csel(20, 24, 20, 0 /*EQ: count==0*/, 1);
+                    e_str(20, 28, OFF_NZCV);
+                    if (k == 4 || k == 5 || k == 7) {   // SHL/SHR/SAR set PF from the result; rotates leave it
+                        e_ldr(25, 28, OFF_PF);          // old PF
+                        e_csel(23, 25, 16, 0, 1);       // EQ -> keep old PF, else result low byte (x16)
+                        e_pf_save(23);
+                    }
+                } else {
+                    if (want_cf) {
+                        int width = ssf ? 64 : 32, bit = (k == 4) ? (width - cnt) : (cnt - 1);
+                        if (bit > width - 1) bit = width - 1;
+                        e_lsr_i(19, 19, bit, ssf);
+                        e_movconst(23, 1);
+                        e_rrr(A_AND, 19, 19, 23, ssf, 0); // x19 = x86 CF bit
+                        e_nzcv_save_setcf(19);
+                    } else
+                        e_nzcv_save();
+                    // x86 PF: SHL/SHR/SAR set SF/ZF/PF from the result; rotates (ROL/ROR) leave PF unchanged.
+                    if (k == 4 || k == 5 || k == 7) e_pf_save(16); // result low byte -> PF lane (x16 holds result)
+                }
                 rm_store(&I, w, 16);
                 gpc = next;
                 continue;
@@ -1812,6 +1866,10 @@ static void *translate_block(uint64_t gpc) {
                 emit_exit_const(next, R_SYSCALL);
                 break;
             } // syscall
+            if (op == 0x0B) {
+                emit_sigill(gpc);
+                break;
+            } // ud2 -> guest SIGILL (terminate like real Linux), not an engine abort
             // ===== SSE / SSE2 (guest xmm0..15 == host v0..v15) =====
             // mandatory prefix selects the variant: 66=packed-int/double, F3=scalar-single,
             // F2=scalar-double, none=packed-single. reg/rm fields index xmm directly.
@@ -2069,6 +2127,70 @@ static void *translate_block(uint64_t gpc) {
                                  : op == 0xFA ? 0x6EA08400u
                                               : 0x6EE08400u;
                     e_v3(b, vd, vd, s);
+                } else if (op == 0xDC || op == 0xDD || op == 0xEC || op == 0xED || op == 0xD8 || op == 0xD9 ||
+                           op == 0xE8 || op == 0xE9) { // saturating add/sub: paddus/padds/psubus/psubs b/w
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    uint32_t b = op == 0xDC   ? 0x6E200C00u  // paddusb -> UQADD .16b
+                                 : op == 0xDD ? 0x6E600C00u  // paddusw -> UQADD .8h
+                                 : op == 0xEC ? 0x4E200C00u  // paddsb  -> SQADD .16b
+                                 : op == 0xED ? 0x4E600C00u  // paddsw  -> SQADD .8h
+                                 : op == 0xD8 ? 0x6E202C00u  // psubusb -> UQSUB .16b
+                                 : op == 0xD9 ? 0x6E602C00u  // psubusw -> UQSUB .8h
+                                 : op == 0xE8 ? 0x4E202C00u  // psubsb  -> SQSUB .16b
+                                              : 0x4E602C00u; // psubsw  -> SQSUB .8h
+                    e_v3(b, vd, vd, s);
+                } else if (op == 0xE0 || op == 0xE3) { // pavgb/pavgw: unsigned rounding average -> URHADD
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    e_v3(op == 0xE0 ? 0x6E201400u : 0x6E601400u, vd, vd, s); // .16b : .8h
+                } else if (op == 0xD5) { // pmullw: packed signed 16x16 -> low 16 bits -> MUL .8h
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    e_v3(0x4E609C00u, vd, vd, s);
+                } else if (op == 0xE5 || op == 0xE4) { // pmulhw(signed)/pmulhuw(unsigned): 16x16 -> high 16 bits
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    // widen-multiply the low/high 4 lanes to 32-bit products, then UZP2 picks the high 16 of each.
+                    uint32_t lo = op == 0xE5 ? 0x0E60C000u : 0x2E60C000u; // SMULL/UMULL  v18.4s, vd.4h, s.4h
+                    uint32_t hi = op == 0xE5 ? 0x4E60C000u : 0x6E60C000u; // SMULL2/UMULL2 v19.4s, vd.8h, s.8h
+                    emit32(lo | (s << 16) | (vd << 5) | 18);
+                    emit32(hi | (s << 16) | (vd << 5) | 19);
+                    emit32(0x4E405800u | (19 << 16) | (18 << 5) | vd); // uzp2 vd.8h, v18.8h, v19.8h
+                } else if (op == 0xF5) { // pmaddwd: signed 16x16, add adjacent pairs -> 32-bit lanes
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    emit32(0x0E60C000u | (s << 16) | (vd << 5) | 18); // smull  v18.4s, vd.4h, s.4h
+                    emit32(0x4E60C000u | (s << 16) | (vd << 5) | 19); // smull2 v19.4s, vd.8h, s.8h
+                    emit32(0x4EA0BC00u | (19 << 16) | (18 << 5) | vd); // addp  vd.4s, v18.4s, v19.4s
+                } else if (op == 0xF1 || op == 0xF2 || op == 0xF3 || op == 0xD1 || op == 0xD2 || op == 0xD3 ||
+                           op == 0xE1 || op == 0xE2) { // psll/psrl/psra w/d/q by xmm/m (variable count)
+                    int s = I.is_mem ? 16 : vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                    }
+                    int left = (op == 0xF1 || op == 0xF2 || op == 0xF3);
+                    int arith = (op == 0xE1 || op == 0xE2);
+                    int esize = (op == 0xF1 || op == 0xD1 || op == 0xE1)   ? 16
+                                : (op == 0xF2 || op == 0xD2 || op == 0xE2) ? 32
+                                                                          : 64;
+                    e_sse_var_shift(vd, vd, s, esize, left, arith);
                 } else if (op == 0x14 || op == 0x15) { // unpckl/hp{s,d}: interleave float lanes -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
