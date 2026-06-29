@@ -51,6 +51,30 @@ static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {
         abs->tv_nsec -= 1000000000;
     }
 }
+// FUTEX_WAIT_BITSET (op 9) passes an ABSOLUTE deadline, not a relative duration: against
+// CLOCK_REALTIME when FUTEX_CLOCK_REALTIME is set (e.g. glibc's pthread_cond_timedwait on a
+// CLOCK_REALTIME condvar) and CLOCK_MONOTONIC otherwise. That clock flag is masked off before
+// the syscall reaches us, so we recover the intended clock from the deadline itself: only one
+// of the two clocks leaves a sane remaining time -- the other is off by the decades-wide gap
+// between realtime (~now since 1970) and monotonic (~uptime), yielding a negative or absurdly
+// large value. Fills `rel` with the remaining time until the deadline, clamped at zero.
+static void futex_rel_from_abs(struct timespec *rel, const struct timespec *deadline) {
+    struct timespec rt, mono;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    int64_t drt = (int64_t)(deadline->tv_sec - rt.tv_sec) * 1000000000 + (deadline->tv_nsec - rt.tv_nsec);
+    int64_t dmono = (int64_t)(deadline->tv_sec - mono.tv_sec) * 1000000000 + (deadline->tv_nsec - mono.tv_nsec);
+    int64_t ns;
+    if (drt < 0)
+        ns = dmono; // deadline predates realtime "now" -> it must be a monotonic deadline
+    else if (dmono < 0)
+        ns = drt;
+    else
+        ns = drt < dmono ? drt : dmono; // both plausible: the true clock gives the smaller remainder
+    if (ns < 0) ns = 0;
+    rel->tv_sec = ns / 1000000000;
+    rel->tv_nsec = ns % 1000000000;
+}
 static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
     if (!g_futexq) {
         // ---- legacy single global queue ----
@@ -60,14 +84,17 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
                 pthread_mutex_unlock(&g_futex_m);
                 return -EAGAIN;
             }
+            int rc = 0;
             if (ts) {
-                struct timespec abs;
-                abs_from_rel(&abs, ts);
-                pthread_cond_timedwait(&g_futex_c, &g_futex_m, &abs);
+                struct timespec abs, rel;
+                // op 9 (FUTEX_WAIT_BITSET): ts is an absolute deadline; op 0: it is relative.
+                if (op == 9) futex_rel_from_abs(&rel, ts);
+                abs_from_rel(&abs, op == 9 ? &rel : ts);
+                rc = pthread_cond_timedwait(&g_futex_c, &g_futex_m, &abs);
             } else
                 pthread_cond_wait(&g_futex_c, &g_futex_m);
             pthread_mutex_unlock(&g_futex_m);
-            return 0;
+            return rc == ETIMEDOUT ? -ETIMEDOUT : 0;
         }
         if (op == 1 || op == 10) {
             pthread_mutex_lock(&g_futex_m);
@@ -93,15 +120,19 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
             pthread_mutex_unlock(&b->m);
             return -EAGAIN;
         }
+        int rc = 0;
         if (ts) {
-            struct timespec abs;
-            abs_from_rel(&abs, ts);
-            pthread_cond_timedwait(&b->c, &b->m, &abs);
+            struct timespec abs, rel;
+            // op 9 (FUTEX_WAIT_BITSET): ts is an absolute deadline; op 0: it is relative.
+            if (op == 9) futex_rel_from_abs(&rel, ts);
+            abs_from_rel(&abs, op == 9 ? &rel : ts);
+            rc = pthread_cond_timedwait(&b->c, &b->m, &abs);
         } else
             pthread_cond_wait(&b->c, &b->m);
         atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_seq_cst);
         pthread_mutex_unlock(&b->m);
-        return 0;
+        // A pure-timeout wait must report -ETIMEDOUT so the guest stops re-waiting.
+        return rc == ETIMEDOUT ? -ETIMEDOUT : 0;
     }
     // FUTEX_WAKE / WAKE_BITSET: wake up to `val` waiters on THIS address's bucket only
     if (op == 1 || op == 10) {
