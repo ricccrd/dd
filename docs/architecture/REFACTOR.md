@@ -131,7 +131,13 @@ The prefix alone classifies any symbol: `G_`=contract, `g_`=engine state, `DD_`=
 
 ### Adding a new guest is the test (worked example: Windows)
 
-The structure is correct iff a new OS/ISA is purely additive. Two cases:
+The structure is correct iff a new OS/ISA is purely additive. Two cases below.
+
+> **Illustrative only — NOT planned work.** Windows and riscv64 are *thought experiments*
+> used to prove the two axes are decoupled (a guest-OS change must not touch `translate/`;
+> a guest-ISA change must not touch `os/`). They are **not** on any roadmap. The real and
+> only intended targets are **linux/x86_64, linux/aarch64, darwin/aarch64**. Nothing in this
+> section is a commitment to build Windows or riscv64.
 
 **New guest OS (Windows on x86_64)** = add ONE row, touch nothing existing:
 1. `os/windows/` — the personality: `pe.c` (PE/COFF loader, the ELF analogue), `syscall/`
