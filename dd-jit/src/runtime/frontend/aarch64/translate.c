@@ -875,11 +875,21 @@ static void *translate_block(uint64_t gpc) {
             }
         // ldxr/stxr loop -> LSE
         }
-        if ((in & 0x3F400000u) == 0x08400000u)
-            // load-exclusive
+        // Load/store-exclusive family is bits[29:24]=001000. The o2 bit (bit23) distinguishes the
+        // EXCLUSIVE monitor variants (o2=0: LDXR/LDAXR/STXR/STLXR/LDXP/STXP) from the merely ORDERED
+        // load-acquire/store-release (o2=1: LDAR/LDLAR/STLR/STLLR), which are NOT part of an exclusive
+        // pair. Masking bit23 in (0x3FC00000) keeps a bare LDAR -- ubiquitous in C++ std::atomic and
+        // glibc -- from opening the region and leaving in_excl stuck on. L (bit22) selects load vs store.
+        if ((in & 0x3FC00000u) == 0x08400000u)
+            // load-exclusive (o2=0, L=1)
             in_excl = 1;
-        else if (in_excl && (in & 0x3F400000u) == 0x08000000u)
-            // store-exclusive
+        else if (in_excl && (in & 0x3FC00000u) == 0x08000000u)
+            // store-exclusive (o2=0, L=0)
+            in_excl = 0;
+        // Defensive: the deferred-branch table is fixed-size. If a region ever fills it (pathological
+        // or mis-decoded -- a real LDXR..STXR pair never holds this many conditional branches), end the
+        // region here so the branches below take the normal exit path instead of overflowing defer[].
+        if (in_excl && ndefer >= (int)(sizeof defer / sizeof defer[0]))
             in_excl = 0;
 
         // svc #0
