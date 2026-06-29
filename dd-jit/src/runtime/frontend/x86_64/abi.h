@@ -34,6 +34,9 @@
 // Zero the integer register file (execve). x86 = r[16].
 #define G_RESET_REGS(c) memset((c)->r, 0, sizeof (c)->r)
 
+// uname(2) `machine` field — per guest ISA, so an x86-64 guest reports "x86_64" (not the host "aarch64").
+#define G_UNAME_MACHINE "x86_64"
+
 // brk policy: x86 reports a fixed break so glibc uses its mmap allocator -- a brk heap the guest then
 // mmap/mprotects cannot be split on the macOS VM. (jit86 learned this the hard way.)
 #define G_BRK_GROWABLE 0

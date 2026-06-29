@@ -48,6 +48,9 @@
 // Zero the integer register file (execve). aarch64 = x[31].
 #define G_RESET_REGS(c) memset((c)->x, 0, sizeof (c)->x)
 
+// uname(2) `machine` field — per guest ISA, so an aarch64 guest reports "aarch64".
+#define G_UNAME_MACHINE "aarch64"
+
 // brk policy: aarch64 grows a real brk heap (works on macOS).
 #define G_BRK_GROWABLE 1
 
