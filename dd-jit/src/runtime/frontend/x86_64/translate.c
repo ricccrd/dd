@@ -462,6 +462,15 @@ static void *translate_block(uint64_t gpc) {
                             e_store(w, sv, 17);
                         }
                     }
+                } else if (w == 1) {
+                    // byte reg-to-reg (88/8A, mod=3): copy ONE byte, hi8-aware, preserving the dest's other
+                    // bits. The full-width e_mov_rr below was wrong here -- `mov bl,cl` copied all of ecx into
+                    // ebx (and high-byte src/dst like `mov al,dh` were garbage), only masked when the upper
+                    // bytes happened to be 0. That polluted icu's TinyStr niche math -> dropped 'n' in "en-US".
+                    int srcreg = to_reg ? I.rm_reg : I.reg;
+                    int dstreg = to_reg ? I.reg : I.rm_reg;
+                    int sv = byte_val(&I, srcreg, 16);
+                    byte_wb(&I, dstreg, sv);
                 } else {
                     if (to_reg)
                         e_mov_rr(I.reg, I.rm_reg, sf);
@@ -548,9 +557,13 @@ static void *translate_block(uint64_t gpc) {
                 if (!((k == 2 || k == 3) && w < 4)) {
                     e_movconst(16, (uint64_t)I.imm);
                     do_alu(k, k == 7 ? -1 : RAX, RAX, 16, w);
-                    gpc = next;
-                    continue;
+                } else { // byte/word ADC/SBB al/ax, imm -- do_alu is 32/64-only, mirror the group1 narrow path
+                    e_movconst(19, (uint64_t)I.imm);
+                    narrow_adcsbb(k == 2, 16, RAX, 19, w);
+                    e_bfi(RAX, 16, 0, 8 * w, 1); // write low w bytes into the accumulator, preserve upper
                 }
+                gpc = next;
+                continue;
             }
             // ---- group1 (80/81/83): ALU r/m, imm ----
             if (op == 0x80 || op == 0x81 || op == 0x83) {
@@ -708,15 +721,19 @@ static void *translate_block(uint64_t gpc) {
                     continue;
                 }
                 if (k == 3) {
-                    // neg r/m == 0 - r/m. Route through do_alu (SUB, a=xzr) so the x86 flags are computed at
-                    // the operand WIDTH: do_alu shifts byte/word operands into the ARM high bits, making N/Z/V
-                    // correct for w<4. A raw 32-bit SUBS got OF wrong for negb 0x80 / negw 0x8000 (the INT_MIN
-                    // overflow case) -- e.g. icu_locid's Option-niche PartialEq does `negb; jno` on the 0x80
-                    // None marker, so a stale OF made two equal LanguageIdentifiers compare unequal.
+                    // neg r/m == 0 - r/m. For byte/word, a raw 32-bit SUBS got OF wrong for negb 0x80 /
+                    // negw 0x8000 (the INT_MIN overflow case) -- e.g. icu_locid's Option-niche PartialEq does
+                    // `negb; jno` on the 0x80 None marker. do_alu shifts byte/word operands into the ARM high
+                    // bits so N/Z/V are width-correct. For 32/64-bit the direct SUBS flags are already exact,
+                    // and do_alu's deferred (FL_SUB) path would let flags_materialize clobber the x16 result
+                    // before rm_store (it broke `neg ebx`), so keep the original inline path there.
                     int rmv = rm_load(&I, next, w, &mem); // neg -> x16
-                    do_alu(5, 16, 31, rmv, w);            // x16 = 0 - rmv, x86 SUB flags at width w
-                    if (g_fl_pending)
-                        flags_materialize(); // result goes to r/m (not kept live in a reg); pin the flags now
+                    if (w < 4) {
+                        do_alu(5, 16, 31, rmv, w); // x16 = 0 - rmv, x86 SUB flags at width w
+                    } else {
+                        e_rrr(A_SUBS, 16, 31, rmv, w == 8, 0);
+                        e_nzcv_save();
+                    }
                     rm_store(&I, w, 16);
                     gpc = next;
                     continue;
@@ -734,6 +751,27 @@ static void *translate_block(uint64_t gpc) {
                         e_msub(22, 21, 20, 19, 0); // rem = dividend - quot*divisor
                         e_bfi(RAX, 21, 0, 8, 1);   // AL = quotient
                         e_bfi(RAX, 22, 8, 8, 1);   // AH = remainder
+                    }
+                    gpc = next;
+                    continue;
+                }
+                if (w == 2 && k >= 4) { // 16-bit mul/div (66 F7 /4../7) -- e.g. uutils `date` does `div si`
+                    int rmv = rm_load(&I, next, 2, &mem);
+                    if (k == 4 || k == 5) { // mul/imul r/m16: DX:AX = AX * r/m16 (32-bit product)
+                        if (k == 4) { e_uxt(19, RAX, 2); e_uxt(20, rmv, 2); } // AX + src zero-extended (uxth)
+                        else        { e_sxt(19, RAX, 2); e_sxt(20, rmv, 2); } // sign-extended (sxth)
+                        e_mul(21, 19, 20, 0);
+                        e_bfi(RAX, 21, 0, 16, 1); // AX = low 16
+                        e_lsr_i(21, 21, 16, 0);
+                        e_bfi(RDX, 21, 0, 16, 1); // DX = high 16
+                    } else {                      // div/idiv r/m16: AX = (DX:AX)/r/m16, DX = remainder
+                        e_uxt(19, RAX, 2);
+                        e_bfi(19, RDX, 16, 16, 0); // x19 = (DX<<16)|AX -- the 32-bit dividend
+                        if (k == 6) { e_uxt(20, rmv, 2); e_udiv(21, 19, 20, 0); }  // unsigned: divisor uxth
+                        else        { e_sxt(20, rmv, 2); e_sdiv(21, 19, 20, 0); }  // signed: x19 already the 32-bit pattern
+                        e_msub(22, 21, 20, 19, 0); // rem = dividend - quot*divisor
+                        e_bfi(RAX, 21, 0, 16, 1);  // AX = quotient
+                        e_bfi(RDX, 22, 0, 16, 1);  // DX = remainder
                     }
                     gpc = next;
                     continue;
