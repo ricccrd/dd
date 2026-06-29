@@ -18,9 +18,20 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <mach-o/loader.h>
+#include <mach-o/fat.h>
+#include <mach/machine.h>
+#include <libkern/OSByteOrder.h>
+#include <libkern/OSCacheControl.h>
 extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
+// libcompiler_rt symbol that __builtin___clear_cache lowers to (aliased to dodge the clang builtin,
+// whose address can't be taken); we interpose it to flip emulated-RWX pages executable.
+extern void dj_clear_cache(void *start, void *end) __asm__("___clear_cache");
 
 static const char *g_rootfs, *g_hostname; static int g_pid1;
 static char *g_low[8]; static int g_nlow;
@@ -121,13 +132,82 @@ int jail_bind(int s,const struct sockaddr*a,socklen_t l){
         for(int i=0;i<g_npub;i++) if(g_pub[i].cont==p){ in.sin_port=htons(g_pub[i].host); return bind(s,(struct sockaddr*)&in,l); } }
     return bind(s,a,l);
 }
+// The jail dylib is plain arm64; dyld refuses to insert it into an arm64e process (system binaries
+// under /usr/bin, /bin, … are arm64e) and aborts the child with "incompatible architecture". Such
+// binaries can't be path-jailed via DYLD interposition anyway, so for an arm64e target we strip
+// DYLD_INSERT_LIBRARIES from its environment and let it run un-jailed instead of crashing.
+static int is_arm64e_image(const char *path){
+    int fd = open(path, O_RDONLY);
+    if(fd < 0) return 0;
+    uint8_t hdr[4096];
+    ssize_t n = read(fd, hdr, sizeof hdr);
+    close(fd);
+    if(n < (ssize_t)sizeof(uint32_t)) return 0;
+    uint32_t magic = *(uint32_t*)hdr;
+    if(magic == MH_MAGIC_64 || magic == MH_MAGIC){               // thin Mach-O (host byte order)
+        struct mach_header_64 *mh = (void*)hdr;
+        return mh->cputype == CPU_TYPE_ARM64 && (mh->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E;
+    }
+    if(magic == FAT_MAGIC || magic == FAT_CIGAM || magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64){
+        int is64 = (magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64);      // fat: arch list is big-endian
+        uint32_t nfat = OSSwapBigToHostInt32(((struct fat_header*)hdr)->nfat_arch);
+        uint8_t *p = hdr + sizeof(struct fat_header), *end = hdr + n;
+        for(uint32_t i=0;i<nfat;i++){
+            cpu_type_t ct; cpu_subtype_t cs; size_t sz = is64 ? sizeof(struct fat_arch_64) : sizeof(struct fat_arch);
+            if(p + sz > end) break;
+            if(is64){ struct fat_arch_64 *fa=(void*)p; ct=OSSwapBigToHostInt32(fa->cputype); cs=OSSwapBigToHostInt32(fa->cpusubtype); }
+            else    { struct fat_arch    *fa=(void*)p; ct=OSSwapBigToHostInt32(fa->cputype); cs=OSSwapBigToHostInt32(fa->cpusubtype); }
+            // dyld prefers an arm64e slice on Apple Silicon, where our arm64-only dylib won't match.
+            if(ct == CPU_TYPE_ARM64 && (cs & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) return 1;
+            p += sz;
+        }
+    }
+    return 0;
+}
+static char **env_drop_dyld_insert(char *const env[]){            // malloc'd copy minus DYLD_INSERT_LIBRARIES
+    size_t n=0; while(env && env[n]) n++;
+    char **out = malloc((n+1)*sizeof *out);
+    if(!out) return (char**)env;
+    size_t j=0;
+    for(size_t i=0;i<n;i++) if(strncmp(env[i],"DYLD_INSERT_LIBRARIES=",22)) out[j++]=env[i];
+    out[j]=0;
+    return out;
+}
 // exec: jail the program path so a container PATH / a container-local binary resolves into the rootfs.
-// The child inherits DYLD_INSERT_LIBRARIES (env), so the jail re-arms in the new process.
-int jail_execve(const char*p,char*const a[],char*const e[]){ return execve(JAIL(p), a, e); }
+// The child inherits DYLD_INSERT_LIBRARIES (env), so the jail re-arms in the new process -- except for
+// an arm64e target, where the insert is dropped (see is_arm64e_image).
+int jail_execve(const char*p,char*const a[],char*const e[]){
+    const char *jp = JAIL(p);
+    if(is_arm64e_image(jp)) return execve(jp, a, env_drop_dyld_insert(e));
+    return execve(jp, a, e);
+}
 int jail_posix_spawn (pid_t*pid,const char*p,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const a[],char*const e[]){
-    return posix_spawn (pid, JAIL(p), fa, at, a, e); }
+    const char *jp = JAIL(p);
+    if(is_arm64e_image(jp)){ char **ne=env_drop_dyld_insert(e); int r=posix_spawn(pid,jp,fa,at,a,ne); free(ne); return r; }
+    return posix_spawn (pid, jp, fa, at, a, e); }
 int jail_posix_spawnp(pid_t*pid,const char*p,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const a[],char*const e[]){
+    if(p && p[0]=='/' && is_arm64e_image(p)){ char **ne=env_drop_dyld_insert(e); int r=posix_spawnp(pid,p,fa,at,a,ne); free(ne); return r; }
     return posix_spawnp(pid, p, fa, at, a, e); } // p is a name; PATH search uses interposed access()
+// macOS forbids a page that is simultaneously writable and executable (W^X), so a guest's plain
+// mmap(PROT_WRITE|PROT_EXEC) with no MAP_JIT -- the pattern guest JIT runtimes (JVM/V8/LuaJIT) use --
+// returns EPERM. Emulate RWX with the MAP_JIT mechanism: add MAP_JIT under the hood and leave the
+// region writable for this thread so the guest's code-write succeeds. The guest's mandatory icache
+// flush before executing the new code (interposed below) flips the region to executable -- the natural
+// W^X transition point, so write-then-execute works without the guest knowing about MAP_JIT.
+void *jail_mmap(void *addr,size_t len,int prot,int flags,int fd,off_t off){
+    if((prot & PROT_EXEC) && (flags & MAP_ANON) && !(flags & MAP_JIT)){
+        void *p = mmap(addr, len, prot, flags | MAP_JIT, fd, off);
+        if(p != MAP_FAILED) pthread_jit_write_protect_np(0);     // start writable so the guest can fill it
+        return p;
+    }
+    return mmap(addr, len, prot, flags, fd, off);
+}
+// The W^X transition for the emulated-RWX MAP_JIT regions above: a guest flushes the icache after
+// writing code and before executing it, so flip those regions back to executable, then flush as asked.
+// Both libcompiler_rt's __clear_cache (what __builtin___clear_cache lowers to) and a direct
+// sys_icache_invalidate land here; the toggle is harmless for guests that manage MAP_JIT themselves.
+void jail_sys_icache_invalidate(void *start,size_t len){ pthread_jit_write_protect_np(1); sys_icache_invalidate(start, len); }
+void jail_clear_cache(void *start,void *end){ pthread_jit_write_protect_np(1); sys_icache_invalidate(start, (char*)end-(char*)start); }
 
 #define INTERPOSE(repl,orig) __attribute__((used)) static struct { const void*r; const void*o; } \
   _ip_##orig __attribute__((section("__DATA,__interpose"))) = { (const void*)repl, (const void*)orig };
@@ -142,3 +222,5 @@ INTERPOSE(jail_link, link)         INTERPOSE(jail_symlink, symlink)    INTERPOSE
 INTERPOSE(jail_fopen, fopen)       INTERPOSE(jail_freopen, freopen)
 INTERPOSE(jail_gethostname, gethostname) INTERPOSE(jail_bind, bind)    INTERPOSE(jail_getpid, getpid)
 INTERPOSE(jail_execve, execve)     INTERPOSE(jail_posix_spawn, posix_spawn) INTERPOSE(jail_posix_spawnp, posix_spawnp)
+INTERPOSE(jail_mmap, mmap)         INTERPOSE(jail_sys_icache_invalidate, sys_icache_invalidate)
+INTERPOSE(jail_clear_cache, dj_clear_cache)
