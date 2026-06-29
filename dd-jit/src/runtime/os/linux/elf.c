@@ -77,7 +77,11 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     gmap_add((uint64_t)base, span); // track so execve() can reclaim the inherited image
     uint64_t bias = (uint64_t)base - basepage;
-    if (etype == 2) { g_nonpie_lo = basepage; g_nonpie_hi = basepage + span; g_nonpie_bias = bias; }
+    if (etype == 2) {
+        g_nonpie_lo = basepage;
+        g_nonpie_hi = basepage + span;
+        g_nonpie_bias = bias;
+    }
     for (int i = 0; i < phnum; i++) {
         uint8_t *ph = f + phoff + (uint64_t)i * phentsize;
         if (rd32(ph) != 1) continue;
@@ -149,7 +153,10 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         size_t klen = eq ? (size_t)(eq - g_guest_env[i]) + 1 : 0;
         int dup = 0;
         for (int j = 0; j < guest_envc && klen; j++)
-            if (strncmp((char *)envp_[j], g_guest_env[i], klen) == 0) { dup = 1; break; }
+            if (strncmp((char *)envp_[j], g_guest_env[i], klen) == 0) {
+                dup = 1;
+                break;
+            }
         if (dup) continue;
         size_t l = strlen(g_guest_env[i]) + 1;
         top -= l;
@@ -167,7 +174,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {3, lm->phdr},
         {4, (uint64_t)lm->phent},
         {5, (uint64_t)lm->phnum},
-        {6, 16384},
+        {6, 4096},
         {7, at_base},
         {8, 0},
         {9, lm->entry},
