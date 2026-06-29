@@ -157,16 +157,16 @@
           <table class="w-full border-collapse text-[13px] sm:text-sm">
             <thead><tr class="text-left text-xs uppercase tracking-wide text-muted2"><th class="p-3">Workload</th><th class="p-3">VM</th><th class="p-3 text-blue1">dd</th><th class="p-3">dd vs VM</th></tr></thead>
             <tbody class="[&>tr]:border-t [&>tr]:border-edge">
-              <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">0.74s</td><td class="p-3">0.54s</td><td class="p-3 font-semibold text-emerald-400">1.38× faster</td></tr>
+              <tr><td class="p-3 font-medium">int sieve</td><td class="p-3 text-muted">0.74s</td><td class="p-3">0.48s</td><td class="p-3 font-semibold text-emerald-400">1.55× faster</td></tr>
               <tr><td class="p-3 font-medium">mandelbrot</td><td class="p-3 text-muted">0.76s</td><td class="p-3">0.74s</td><td class="p-3 font-semibold text-emerald-400">1.03× faster</td></tr>
-              <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">0.77s</td><td class="p-3">0.77s</td><td class="p-3">~parity</td></tr>
-              <tr><td class="p-3 font-medium">matrix multiply</td><td class="p-3 text-muted">0.63s</td><td class="p-3">0.63s</td><td class="p-3">~parity</td></tr>
-              <tr><td class="p-3 font-medium">memcpy</td><td class="p-3 text-muted">0.53s</td><td class="p-3">0.55s</td><td class="p-3">~parity</td></tr>
-              <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">0.16s</td><td class="p-3">0.17s</td><td class="p-3">~parity</td></tr>
+              <tr><td class="p-3 font-medium">matrix multiply</td><td class="p-3 text-muted">0.63s</td><td class="p-3">0.64s</td><td class="p-3">~parity</td></tr>
+              <tr><td class="p-3 font-medium">memcpy</td><td class="p-3 text-muted">0.53s</td><td class="p-3">0.54s</td><td class="p-3">~parity</td></tr>
               <tr><td class="p-3 font-medium">base64</td><td class="p-3 text-muted">0.65s</td><td class="p-3">0.65s</td><td class="p-3">~parity</td></tr>
-              <tr><td class="p-3 font-medium">text scan</td><td class="p-3 text-muted">0.49s</td><td class="p-3">0.63s</td><td class="p-3 text-muted">1.29× slower</td></tr>
-              <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">0.79s</td><td class="p-3">1.36s</td><td class="p-3 text-muted">1.72× slower</td></tr>
-              <tr><td class="p-3 font-medium">SQLite 600k</td><td class="p-3 text-muted">0.35s</td><td class="p-3">0.66s</td><td class="p-3 text-muted">1.89× slower</td></tr>
+              <tr><td class="p-3 font-medium">float n-body</td><td class="p-3 text-muted">0.16s</td><td class="p-3">0.17s</td><td class="p-3">~parity</td></tr>
+              <tr><td class="p-3 font-medium">SHA-256</td><td class="p-3 text-muted">0.77s</td><td class="p-3">0.80s</td><td class="p-3">~parity</td></tr>
+              <tr><td class="p-3 font-medium">qsort</td><td class="p-3 text-muted">0.79s</td><td class="p-3">1.05s</td><td class="p-3 text-muted">1.33× slower</td></tr>
+              <tr><td class="p-3 font-medium">text scan</td><td class="p-3 text-muted">0.49s</td><td class="p-3">0.66s</td><td class="p-3 text-muted">1.35× slower</td></tr>
+              <tr><td class="p-3 font-medium">SQLite 600k</td><td class="p-3 text-muted">0.35s</td><td class="p-3">0.52s</td><td class="p-3 text-muted">1.48× slower</td></tr>
             </tbody>
           </table>
         </div>
