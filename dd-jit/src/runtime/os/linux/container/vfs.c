@@ -326,6 +326,25 @@ struct vol {
 };
 static struct vol g_vols[32];
 static int g_nvols;
+// Materialize a volume's mount point (and every ancestor) as empty dirs in the writable rootfs/upper, the
+// way Docker mkdir -p's each mount target inside the container rootfs. Without it a NESTED mount leaves its
+// parent absent: `-v H:/x/y` makes `/x/y` resolve to the host dir, but `ls /x` ENOENTs because `/x` exists
+// in no layer. Creating /x (and /x/y) in the upper lets the merged readdir list `/x` -> `y`; the mount
+// itself still wins in jail_pick(), so `/x/y` shows the host files, not the empty placeholder. The rootfs
+// is the per-container overlay upper (daemon) or the plain rootfs (manual) -- both writable & private.
+// No-op until the rootfs is known (the bridge sets DDVOL after container_init resolves g_rootfs_canon).
+static void vol_mkmountpoint(const char *guest) {
+    if (!g_rootfs_canon[0] || !guest || guest[0] != '/') return;
+    char mp[4300];
+    if ((size_t)snprintf(mp, sizeof mp, "%s%s", g_rootfs_canon, guest) >= sizeof mp) return;
+    for (char *s = mp + g_rootfs_canon_len + 1; *s; s++)
+        if (*s == '/') {
+            *s = 0;
+            mkdir(mp, 0755);
+            *s = '/';
+        }
+    mkdir(mp, 0755);
+}
 static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confined bind-mount volume
     if (g_nvols >= 32) return;
     // Optional read-only marker. A guest path always begins with '/', so a leading "ro:"/"rw:" token is
@@ -347,6 +366,7 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
     v->hlen = strlen(v->hcanon);
     if ((v->fd = open(v->hcanon, O_RDONLY | O_DIRECTORY)) < 0) return;
     g_nvols++;
+    vol_mkmountpoint(v->guest);
 }
 // Pick the jail (rootfs or a volume) for an absolute guest path; *rel = the path within that jail.
 static int jail_pick(const char *abs, const char **canon, size_t *clen, const char **rel) {

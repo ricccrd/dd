@@ -328,6 +328,44 @@ static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, 
         }
         closedir(d);
     }
+    // Bind-mount mount points: a volume is its own jail (in no layer), so a NESTED mount's parent dirs are
+    // invisible to the layer scan above -- and the empty placeholder we create in the writable upper can be
+    // served STALE by the host FS cache when the rootfs dir is held open for the container's lifetime.
+    // Synthesize each volume's immediate child under `gdir` straight from the volume table so a parent
+    // listing always shows the mount entry, exactly as Docker (which mkdir -p's every mount target). A bind
+    // target is always a directory from the guest's view; deduped against the real layer entries. (A volume
+    // dir fd lists via plain readdir, never here -- see the jail_is_vol() guard at the openat site -- so a
+    // mount is never asked to enumerate itself.)
+    size_t glen = strlen(gdir);
+    int at_root = glen == 1 && gdir[0] == '/';
+    for (int i = 0; i < g_nvols && nout < max; i++) {
+        const char *rest;
+        if (at_root)
+            rest = g_vols[i].guest + 1; // "/data" -> "data", "/x/y" -> "x/y"
+        else if (!strncmp(g_vols[i].guest, gdir, glen) && g_vols[i].guest[glen] == '/')
+            rest = g_vols[i].guest + glen + 1;
+        else
+            continue; // not under gdir
+        if (!*rest) continue;
+        char child[256];
+        size_t k = 0;
+        while (rest[k] && rest[k] != '/' && k < sizeof child - 1) {
+            child[k] = rest[k];
+            k++;
+        }
+        child[k] = 0;
+        int dup = 0;
+        for (int j = 0; j < ns; j++)
+            if (!strcmp(seen[j], child)) {
+                dup = 1;
+                break;
+            }
+        if (dup) continue;
+        if (ns < 1024) snprintf(seen[ns++], 256, "%s", child);
+        snprintf(names[nout], 256, "%s", child);
+        types[nout] = DT_DIR;
+        nout++;
+    }
     return nout;
 }
 static void overlay_whiteout(const char *guest) {

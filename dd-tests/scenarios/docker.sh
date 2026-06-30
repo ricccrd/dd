@@ -134,6 +134,29 @@ has "volume-listed" "$(d volume ls --format '{{.Name}}')" "scen-vol"
 d volume rm scen-vol >/dev/null
 ok "volume-removed" "$(d volume ls --format '{{.Name}}' | grep -c scen-vol)" "0"
 
+echo "== bind-mount volumes (-v): plain, nested-parent, cwd -- on BOTH guest arches =="
+# alpine is an arm64 image (arm64 engine), ubuntu an x86-64 image (jit86) -> these cover both translators.
+# The volume source lives under $ROOT, which is shared with the mac side at the SAME path, so the JIT can
+# realpath() it. A nested mount (`-v H:/x/y`) must make the PARENT `/x` listable (Docker mkdir -p's it).
+vdir="$ROOT/scen-vol-data"; rm -rf "$vdir"; mkdir -p "$vdir"
+printf 'VOL-FILE-OK\n' > "$vdir/marker.txt"
+# (a) engine selection: the rootfs of each image lists its own /etc (proves the right guest ran)
+has "ls-root-alpine"          "$(d run --rm alpine ls /)" "etc"
+has "ls-root-ubuntu"          "$(d run --rm ubuntu ls /)" "etc"
+# (d) basic cwd: default is /, and -w sets it
+ok  "pwd-default"             "$(d run --rm alpine pwd)" "/"
+has "pwd-workdir"             "$(d run --rm -w /tmp alpine pwd)" "/tmp"
+# (b) plain mount (+ -w) shows the host files; the top-level mount point appears when listing /
+has "vol-mount-ls"           "$(d run --rm -v "$vdir":/data -w /data alpine ls)" "marker.txt"
+has "vol-mount-cat"          "$(d run --rm -v "$vdir":/data alpine cat /data/marker.txt)" "VOL-FILE-OK"
+has "vol-root-shows-data"    "$(d run --rm -v "$vdir":/data alpine ls /)" "data"
+# (c) THE BUG: a NESTED mount must make its parent listable, and the mount itself still serves the files
+has "vol-nested-parent-arm"  "$(d run --rm -v "$vdir":/x/y alpine ls /x)" "y"
+has "vol-nested-files-arm"   "$(d run --rm -v "$vdir":/x/y alpine ls /x/y)" "marker.txt"
+has "vol-nested-parent-x86"  "$(d run --rm -v "$vdir":/x/y ubuntu ls /x)" "y"
+has "vol-nested-files-x86"   "$(d run --rm -v "$vdir":/x/y ubuntu cat /x/y/marker.txt)" "VOL-FILE-OK"
+rm -rf "$vdir"
+
 echo "== networks =="
 d network create scen-net >/dev/null
 has "network-listed" "$(d network ls --format '{{.Name}}')" "scen-net"
