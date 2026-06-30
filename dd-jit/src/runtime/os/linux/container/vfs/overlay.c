@@ -263,6 +263,34 @@ static void abs_guest(int dirfd, const char *raw, char *out, size_t n) {
         // AT_FDCWD-relative -> guest cwd
         snprintf(out, n, "%s/%s", g_cwd, raw ? raw : "");
 }
+// Map a canonical HOST directory path back to its GUEST path. The guest cwd is a guest-visible path, but
+// chdir/fchdir only have the host path the dir actually resolved to -- which, under the overlay, may sit in
+// the writable upper (g_rootfs_canon), in any read-only lower (the image), or in a bind-mount volume. Strip
+// whichever jail prefix backs it so the guest cwd is tracked correctly regardless of layer (the bare
+// "strip g_rootfs_canon" form silently left g_cwd stale for a dir that lives only in a lower). Boundary
+// check ('/' or end) avoids a prefix collision between sibling layer roots. Unknown -> "/" (fail safe).
+static void guest_from_host(const char *host, char *out, size_t n) {
+    if (g_rootfs && !strncmp(host, g_rootfs_canon, g_rootfs_canon_len) &&
+        (host[g_rootfs_canon_len] == '/' || host[g_rootfs_canon_len] == 0)) {
+        const char *g = host + g_rootfs_canon_len;
+        snprintf(out, n, "%s", g[0] ? g : "/");
+        return;
+    }
+    for (int i = 0; i < g_nlower; i++)
+        if (!strncmp(host, g_lower[i].canon, g_lower[i].clen) &&
+            (host[g_lower[i].clen] == '/' || host[g_lower[i].clen] == 0)) {
+            const char *g = host + g_lower[i].clen;
+            snprintf(out, n, "%s", g[0] ? g : "/");
+            return;
+        }
+    for (int i = 0; i < g_nvols; i++)
+        if (!strncmp(host, g_vols[i].hcanon, g_vols[i].hlen) &&
+            (host[g_vols[i].hlen] == '/' || host[g_vols[i].hlen] == 0)) {
+            snprintf(out, n, "%s%s", g_vols[i].guest, host + g_vols[i].hlen);
+            return;
+        }
+    snprintf(out, n, "/");
+}
 // Overlay whiteout for a delete: remove the upper copy (if any) and drop a .wh.NAME marker in the upper.
 // Merged readdir across layers (upper first, then lowers). Higher layer wins; a .wh.NAME hides NAME
 // in all lower layers; .wh.* markers are not emitted. Fills names[]/types[], returns count.

@@ -528,10 +528,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        if (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) {
-            const char *g = p + g_rootfs_canon_len;
-            snprintf(g_cwd, sizeof g_cwd, "%s", g[0] ? g : "/");
-        }
+        // Track the guest cwd from the host path the dir resolved to (handles the upper, any lower, or a
+        // volume) -- relative/"."/AT_FDCWD resolution joins g_cwd, so a stale value sends `ls` to the wrong dir.
+        if (g_rootfs) guest_from_host(p, g_cwd, sizeof g_cwd);
         G_RET(c) = 0;
         break;
     }
@@ -541,11 +540,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
             // fchdir (tracks guest cwd)
         }
-        if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0]) {
-            const char *g = g_fdpath[(int)a0];
-            if (g_rootfs && !strncmp(g, g_rootfs_canon, g_rootfs_canon_len)) g += g_rootfs_canon_len;
-            snprintf(g_cwd, sizeof g_cwd, "%s", g[0] ? g : "/");
-        }
+        if (g_rootfs && (int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0])
+            guest_from_host(g_fdpath[(int)a0], g_cwd, sizeof g_cwd);
         G_RET(c) = 0;
         break;
     }
