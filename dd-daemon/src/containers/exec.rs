@@ -13,13 +13,27 @@ use super::*;
 /// starts producing before the upgrade completes.
 pub(crate) fn spawn_hijack_io(on_upgrade: hyper::upgrade::OnUpgrade, live: Arc<Live>, tty: bool) {
     let mut rx = live.out.subscribe();
-    let mut exit_rx = live.exit_rx.clone();
+    // Close on `out_done` (set once the pumps have flushed ALL output), NOT on the immediate `exit`:
+    // `exit` fires the instant the guest dies, while its final bytes may still be in-flight in the pump
+    // tasks -- breaking on `exit` raced the pumps and dropped a fast-exiting command's last output.
+    let mut out_done_rx = live.out_done_rx.clone();
     let live_in = live.clone();
     tokio::spawn(async move {
         let Ok(upgraded) = on_upgrade.await else { return };
         let (mut rd, mut wr) = tokio::io::split(TokioIo::new(upgraded));
         let writer = tokio::spawn(async move {
+            // The guest may have already exited (and been fully drained) before the upgrade completed --
+            // e.g. attaching to a retained, exited container -- so check the flag before blocking.
+            let mut done = *out_done_rx.borrow();
             loop {
+                if done {
+                    // Output is complete: every byte is buffered in `out`. Flush it all, then end.
+                    while let Ok((kind, chunk)) = rx.try_recv() {
+                        let f = if tty { chunk } else { log_frame(kind, &chunk) };
+                        let _ = wr.write_all(&f).await;
+                    }
+                    break;
+                }
                 tokio::select! {
                     biased;
                     m = rx.recv() => match m {
@@ -30,13 +44,7 @@ pub(crate) fn spawn_hijack_io(on_upgrade: hyper::upgrade::OnUpgrade, live: Arc<L
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
                     },
-                    _ = exit_rx.changed() => {
-                        while let Ok((kind, chunk)) = rx.try_recv() {
-                            let f = if tty { chunk } else { log_frame(kind, &chunk) };
-                            let _ = wr.write_all(&f).await;
-                        }
-                        break;
-                    }
+                    _ = out_done_rx.changed() => { done = true; }
                 }
             }
             let _ = wr.flush().await;

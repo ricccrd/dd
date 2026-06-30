@@ -465,6 +465,10 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
         for h in io_handles {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(500), h).await;
         }
+        // The pumps have now flushed every byte into the `out` broadcast, so signal output-complete.
+        // Streaming consumers (attach/exec hijack, `logs -f`) wait on this -- NOT on the immediate `exit`
+        // above -- before closing, so a fast-exiting command's tail is never lost to the pump race.
+        let _ = live.out_done.send(true);
         {
             let mut g = app.inner.lock().await;
             if let Some(cc) = g.containers.get_mut(&cid) {
@@ -577,7 +581,10 @@ fn maybe_restart<'a>(app: &'a App, cid: &'a str, code: i64)
 pub(crate) async fn live_fail(app: &App, cid: &str, live: &Arc<Live>, msg: String) -> bool {
     let _ = live.out.send((2, format!("{msg}\n").into_bytes()));
     live.log_chunks.lock().await.push((now_secs(), 2, format!("{msg}\n").into_bytes()));
+    // No pumps run on the failure path, so the error line above is the last output -- signal both the
+    // exit and output-complete so a hijack/`logs -f` consumer drains the message and ends cleanly.
     let _ = live.exit.send(Some(127));
+    let _ = live.out_done.send(true);
     if let Some(cc) = app.inner.lock().await.containers.get_mut(cid) { cc.status = "exited".into(); cc.exit_code = 127; }
     false
 }

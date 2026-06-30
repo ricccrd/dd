@@ -250,7 +250,9 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
     // the replay and once live, i.e. dd favors never dropping output over a rare duplicate.
     let follow_live = follow && running && live.is_some();
     let out_sub = if follow_live { live.as_ref().map(|l| l.out.subscribe()) } else { None };
-    let exit_sub = live.as_ref().map(|l| l.exit_rx.clone());
+    // Follow ends on `out_done` (pumps fully drained), NOT the immediate `exit`, so a fast-exiting
+    // guest's final lines aren't lost to the pump race (mirrors the attach/exec hijack writer).
+    let exit_sub = live.as_ref().map(|l| l.out_done_rx.clone());
 
     // Buffered output, as the single chronological record `(emit-secs, stream, bytes)`. While the Live
     // exists (running, or exited-but-retained for non-`--rm`) we read its ordered `log_chunks` directly,
@@ -297,13 +299,13 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
     // (draining any final buffered chunks first) or the client disconnects (the channel send fails).
     // `until`, when given, also ends the stream once wall-clock passes it.
     let mut out_rx = out_sub.unwrap();
-    let mut exit_rx = exit_sub.unwrap();
+    let mut done_rx = exit_sub.unwrap();
     let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
     tokio::spawn(async move {
         if !replay.is_empty() && tx.send(replay).await.is_err() { return; }
         let want = |kind: u8| (kind == 1 && want_out) || (kind == 2 && want_err);
-        // If the guest finished between the snapshot and here, the exit watch already holds Some(code).
-        let mut exited = exit_rx.borrow().is_some();
+        // If the guest finished AND drained between the snapshot and here, out_done already holds true.
+        let mut exited = *done_rx.borrow();
         loop {
             if exited {
                 // The broadcast Sender stays alive in the live map, so recv() would block forever after
@@ -329,7 +331,7 @@ pub(crate) async fn containers_logs(State(a): State<App>, Path(id): Path<String>
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
-                _ = exit_rx.changed() => { exited = true; }
+                _ = done_rx.changed() => { exited = true; }
             }
         }
     });

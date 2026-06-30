@@ -158,6 +158,14 @@ pub(crate) struct Live {
     pub(crate) log_chunks: Mutex<Vec<(i64, u8, Vec<u8>)>>,
     pub(crate) exit: watch::Sender<Option<i64>>, // Some(code) once exited
     pub(crate) exit_rx: watch::Receiver<Option<i64>>,
+    /// Fired `true` once NO more output will ever reach `out`: the reaper sets it only AFTER the
+    /// stdout/stderr pump tasks have fully drained the guest's pipes/PTY into the broadcast. `exit`
+    /// fires the instant the process dies (so `wait`/inspect/logs stay responsive), but at that moment
+    /// the pumps -- separate tasks -- may not have broadcast the final bytes yet. A streaming consumer
+    /// (attach/exec hijack, `logs -f`) that closed on `exit` alone would race the pumps and drop a
+    /// fast-exiting command's last output; closing on `out_done` instead guarantees a complete stream.
+    pub(crate) out_done: watch::Sender<bool>,
+    pub(crate) out_done_rx: watch::Receiver<bool>,
     pub(crate) started: std::sync::atomic::AtomicBool, // start() spawns the process exactly once
     pub(crate) stop_requested: std::sync::atomic::AtomicBool, // set by stop/kill/rm so the RestartPolicy supervisor won't auto-restart a deliberately-stopped container
     pub(crate) tty: bool,
@@ -169,9 +177,10 @@ impl Live {
     pub(crate) fn new(tty: bool) -> Arc<Self> {
         let (out, _) = broadcast::channel(1024);
         let (exit, exit_rx) = watch::channel(None);
+        let (out_done, out_done_rx) = watch::channel(false);
         let (stdin_tx, stdin_rx) = mpsc::channel(256);
         Arc::new(Live { out, stdin_tx, stdin_rx: Mutex::new(Some(stdin_rx)), log_chunks: Mutex::new(Vec::new()),
-            exit, exit_rx,
+            exit, exit_rx, out_done, out_done_rx,
             started: std::sync::atomic::AtomicBool::new(false),
             stop_requested: std::sync::atomic::AtomicBool::new(false), tty,
             pty_master: std::sync::Mutex::new(None), pid: std::sync::Mutex::new(None) })
