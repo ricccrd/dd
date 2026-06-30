@@ -58,12 +58,14 @@ static int elf_interp(const char *path, char *out, size_t n) {
 // rejects the pc (pc >= maxpc), findfunc() returns a nil funcInfo, and runtime.pcdatavalue derefs
 // it -> SIGSEGV at offset 0x1c. Fix: at load time, add g_nonpie_bias to every ABSOLUTE pointer word
 // of firstmoduledata so the comparisons line up with the biased PCs. The pclntab's own tables are
-// pc-DELTAS and text-RELATIVE offsets (and pcHeader.textStart no longer exists in Go 1.20+, it is a
-// reserved zero), so only the moduledata pointer words and the textsect baseaddr are rebased; slice
-// len/cap, relative offsets and flags are left untouched. Each rebase is guarded to the link range
-// [lo,hi) so a zero/small/already-mapped field is never disturbed. The module is located via the
-// runtime.firstmoduledata symbol and validated by the pclntab magic -> a no-op for a stripped image
-// or a non-Go ET_EXEC. Layout per Go runtime/symtab.go (verified against the go1.26 nats-server).
+// pc-DELTAS and text-RELATIVE offsets, EXCEPT pcHeader.textStart (Go 1.18+) which is an absolute
+// address that moduledataverify1 asserts equals moduledata.text -- so the moduledata pointer words,
+// pcHeader.textStart and the textsect baseaddr are all rebased; slice len/cap, relative offsets and
+// flags are left untouched. Each rebase is guarded to the link range [lo,hi) so a zero/small/already-
+// mapped field is never disturbed. The module is located via the runtime.firstmoduledata symbol, or
+// (a stripped image, e.g. etcd/traefik) by scanning the data sections for the &pcHeader signature, and
+// validated by the pclntab magic -> a no-op for a non-Go ET_EXEC. Layout per Go runtime/symtab.go
+// (verified against the go1.26 nats-server).
 // Look up a symbol's st_value in the ELF .symtab (+ its linked string table). Returns 0 if absent.
 static uint64_t go_symval(const uint8_t *f, size_t fsz, const char *name) {
     uint64_t shoff = rd64(f + 0x28);
@@ -87,8 +89,69 @@ static uint64_t go_symval(const uint8_t *f, size_t fsz, const char *name) {
     return 0;
 }
 
+// Find a section by name via the .shstrtab (e_shstrndx). Returns its header (and sh_addr/off/size out
+// params) or NULL. Section headers + names survive `-ldflags=-s -w` even though .symtab does not.
+static const uint8_t *go_section_by_name(const uint8_t *f, size_t fsz, const char *name, uint64_t *sh_addr,
+                                         uint64_t *sh_off, uint64_t *sh_size) {
+    uint64_t shoff = rd64(f + 0x28);
+    int shnum = rd16(f + 0x3C), shent = rd16(f + 0x3A), shstrndx = rd16(f + 0x3E);
+    if (!shoff || !shent || shstrndx >= shnum || (uint64_t)shoff + (uint64_t)shnum * shent > fsz) return NULL;
+    const uint8_t *strsh = f + shoff + (uint64_t)shstrndx * shent;
+    uint64_t stroff = rd64(strsh + 0x18), strsz = rd64(strsh + 0x20);
+    if (stroff + strsz > fsz) return NULL;
+    for (int i = 0; i < shnum; i++) {
+        const uint8_t *sh = f + shoff + (uint64_t)i * shent;
+        uint32_t nameoff = rd32(sh);
+        if (nameoff < strsz && strcmp((const char *)(f + stroff + nameoff), name) == 0) {
+            if (sh_addr) *sh_addr = rd64(sh + 0x10);
+            if (sh_off) *sh_off = rd64(sh + 0x18);
+            if (sh_size) *sh_size = rd64(sh + 0x20);
+            return sh;
+        }
+    }
+    return NULL;
+}
+
+// Locate firstmoduledata's link-time vaddr. Prefer the runtime.firstmoduledata symbol; for a STRIPPED
+// image (no .symtab -- the common production case: etcd, traefik, caddy build with `-s -w`) fall back to
+// scanning the data sections. firstmoduledata's first word is &pcHeader, which equals the .gopclntab
+// section base; a candidate is accepted only when minpc/maxpc lie in the link range and bracket text
+// (and, when pcHeader carries an absolute textStart, text matches it) -- a signature strong enough to
+// reject stray hits.
+static uint64_t go_find_moduledata(const uint8_t *f, size_t fsz, uint64_t lo, uint64_t hi) {
+    uint64_t md = go_symval(f, fsz, "runtime.firstmoduledata");
+    if (md >= lo && md < hi) return md;
+    uint64_t pcva = 0, pcoff = 0;
+    if (!go_section_by_name(f, fsz, ".gopclntab", &pcva, &pcoff, NULL) || !pcva || pcoff + 32 > fsz) return 0;
+    uint32_t magic = rd32(f + pcoff);
+    // pcHeader.textStart (offset 24, Go 1.18+) is the absolute text base on Go <=1.23 (etcd/traefik) but a
+    // reserved 0 on Go 1.24+ (caddy, go1.26). Only use it as a moduledata cross-check when it is a real
+    // in-range link address; a zero textStart just means we lean on the other signature fields.
+    uint64_t textstart = (magic == 0xfffffff0u || magic == 0xfffffff1u) ? rd64(f + pcoff + 24) : 0;
+    int ts_check = textstart >= lo && textstart < hi;
+    uint64_t shoff = rd64(f + 0x28);
+    int shnum = rd16(f + 0x3C), shent = rd16(f + 0x3A);
+    if (!shoff || !shent || (uint64_t)shoff + (uint64_t)shnum * shent > fsz) return 0;
+    for (int i = 0; i < shnum; i++) {
+        const uint8_t *sh = f + shoff + (uint64_t)i * shent;
+        if (rd32(sh + 4) != 1) continue; // SHT_PROGBITS (data with file content)
+        uint64_t sa = rd64(sh + 0x10), so = rd64(sh + 0x18), ssz = rd64(sh + 0x20);
+        if (!sa || so + ssz > fsz) continue;
+        for (uint64_t o = 0; o + 8 <= ssz; o += 8) {
+            if (rd64(f + so + o) != pcva) continue; // word 0 == &pcHeader
+            uint64_t coff = so + o;
+            if (coff + 23 * 8 > fsz) continue; // need words up to text(22)
+            uint64_t text = rd64(f + coff + 22 * 8), minpc = rd64(f + coff + 20 * 8), maxpc = rd64(f + coff + 21 * 8);
+            if (text >= lo && text < hi && minpc >= lo && maxpc <= hi && text <= minpc && minpc < maxpc &&
+                (!ts_check || text == textstart))
+                return sa + o;
+        }
+    }
+    return 0;
+}
+
 static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64_t lo, uint64_t hi) {
-    uint64_t md_va = go_symval(f, fsz, "runtime.firstmoduledata");
+    uint64_t md_va = go_find_moduledata(f, fsz, lo, hi);
     if (!md_va || md_va < lo || md_va >= hi) return;
     uint8_t *md = (uint8_t *)(md_va + bias); // the mapped (biased) copy of firstmoduledata
     // Validate: field 0 is &pclntab, whose first u32 is the Go pclntab magic. Bail if not Go.
@@ -96,6 +159,16 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
     if (pch < lo || pch >= hi) return;
     uint32_t magic = rd32((const uint8_t *)(pch + bias));
     if (magic != 0xfffffff0u && magic != 0xfffffff1u && magic != 0xfffffffau && magic != 0xfffffffbu) return;
+    // moduledataverify1 asserts pcHeader.textStart == moduledata.text. We rebase moduledata.text HIGH
+    // (ptr_word 22 below) so live PCs resolve via findfunc, so pcHeader.textStart -- an ABSOLUTE address
+    // baked at the link-time text base, at offset 24 of pcHeader (Go 1.18+, magic f0/f1; the older fa/fb
+    // pclntab predates the field) -- must move high in lockstep, else the runtime aborts with
+    // "invalid function symbol table" (pcHeader.textStart != text).
+    if (magic == 0xfffffff0u || magic == 0xfffffff1u) {
+        uint8_t *pchdr = (uint8_t *)(pch + bias);
+        uint64_t ts = rd64(pchdr + 24);
+        if (ts >= lo && ts < hi) wr64(pchdr + 24, ts + bias);
+    }
     // Absolute pointer words of moduledata, in 8-byte units (Go 1.26 runtime/symtab.go). Slice headers
     // contribute only their .ptr word; len/cap follow and are skipped. The guard below also skips any
     // word that is zero or outside the link range, so unused fields cost nothing.
