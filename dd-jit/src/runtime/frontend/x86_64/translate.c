@@ -136,8 +136,11 @@ static void emit_rcl_rcr(struct insn *I, uint64_t next, int w, int rcr, int cnt_
     int count1 = (cnt_raw == 1);                       // OF defined only for a single-bit rotate
     int mem;
     int raw = rm_load(I, next, w, &mem);
-    if (ec == 0) {                       // a 0-count rotate is a no-op and affects no flags
-        if (mem) e_store(w, raw, 17);
+    if (ec == 0) { // a 0-count rotate is a no-op and affects no flags
+        if (mem)
+            e_store(w, raw, 17);
+        else if (w == 4)
+            e_mov_rr(raw, raw, 0); // 32-bit register dest: value unchanged but bits 63:32 must be zeroed
         return;
     }
     if (w < 4)
@@ -329,6 +332,18 @@ static void e_nzcv_C_op(uint32_t alu_base) {
 // Stash the x86 PF source: the low byte of an integer op's result (the consumer computes even-parity).
 // A non-flag str -> leaves the live ARM NZCV untouched (safe to interleave with the lazy-flag path).
 static void e_pf_save(int reg) { e_str(reg, 28, OFF_PF); }
+// x86 AF (auxiliary carry) substrate. `reg` must hold a value whose BIT 4 is the carry out of bit 3:
+// for add/sub/adc/sbb/cmp that is (a ^ b ^ result); for inc/dec, (a ^ result) (the +/-1 operand only
+// flips bit 0, never bit 4). Logical ops store xzr (AF=0, matching qemu's CC_OP_LOGIC). The consumers
+// lahf/pushfq extract bit 4; popfq/sahf restore it.
+static void e_af_save(int reg) { e_str(reg, 28, OFF_AF); }
+// Compute x86 AF for an add/sub-class op: store (a ^ b ^ result) -- its bit 4 is the carry out of bit 3.
+// `tmp` is a scratch reg (clobbered). Read a/b/res before they may be reused (they are value regs).
+static void e_af_addsub(int a, int b, int res, int tmp) {
+    e_rrr(A_EOR, tmp, a, b, 0, 0);
+    e_rrr(A_EOR, tmp, tmp, res, 0, 0);
+    e_af_save(tmp);
+}
 // Width-correct ALU: dst = a <kind> b, set cpu->nzcv.  dst<0 => cmp/test (no write).
 // 4/8-byte: direct ARM op. 1/2-byte: operate in the HIGH bits (<<sh) so ARM NZCV matches
 // x86 byte/word flags exactly, then merge the low w bytes back (preserving upper bits).
@@ -364,8 +379,11 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
                 break;
             default: break;
             }
-            e_rrr(opc, out, a, b, sf, 0);         // adcs / sbcs off the live carry
+            e_rrr(A_EOR, 23, a, b, 0, 0);         // x23 = a ^ b, captured BEFORE the op (out aliases a;
+            e_rrr(opc, out, a, b, sf, 0);         //   x23 is never an operand reg, unlike x19=imm)
             e_pf_save(out);                       // x86 PF source = result low byte (incl. carry)
+            e_rrr(A_EOR, 23, 23, out, 0, 0);      // x23 = a ^ b ^ result -> bit 4 is x86 AF
+            e_af_save(23);
             g_fl_pending = adc ? FL_ADD : FL_SUB; // defer own flags (FL_ADC==FL_ADD, FL_SBB==FL_SUB)
             return;
         }
@@ -374,8 +392,11 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
             e_nzcv_load_ci(); // live ARM C = x86 CF
         else
             e_nzcv_load(); // live ARM C = stored borrow (= NOT x86 CF)
-        e_rrr(opc, out, a, b, sf, 0);
-        e_pf_save(out); // x86 PF source = result low byte (incl. carry)
+        e_rrr(A_EOR, 23, a, b, 0, 0); // x23 = a ^ b, captured BEFORE the op (out aliases a; x23 is never
+        e_rrr(opc, out, a, b, sf, 0); //   an operand reg, unlike x19=imm)
+        e_pf_save(out);                  // x86 PF source = result low byte (incl. carry)
+        e_rrr(A_EOR, 23, 23, out, 0, 0); // x23 = a ^ b ^ result -> bit 4 is x86 AF
+        e_af_save(23);
         if (lazyflags_on())
             g_fl_pending = adc ? FL_ADD : FL_SUB; // keep the chain alive: defer (same finalizer bytes)
         else if (adc)
@@ -391,6 +412,12 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
         uint32_t pfop = (kind == 0) ? A_ADD : (kind == 1) ? A_ORR : (kind == 6) ? A_EOR : (kind == 4) ? A_AND : A_SUB;
         e_rrr(pfop, 25, a, b, 0, 0);
         e_pf_save(25);
+        // x86 AF: add/sub/cmp -> bit 4 of (a ^ b ^ result); logical (and/or/xor/test) leave AF
+        // undefined, store 0 (matches qemu CC_OP_LOGIC). x25 already holds the (low) result.
+        if (logical)
+            e_af_save(31);
+        else
+            e_af_addsub(a, b, 25, 26);
     }
     if (w >= 4) {
         alu_core(ak, out, a, b, sf);
@@ -479,6 +506,7 @@ static void narrow_adcsbb(int adc, int dst, int a, int b, int w) {
     emit32(0xD51B4200u | 27);                 // msr nzcv, x27  (live N/Z/V)
     e_nzcv_save_setcf(20);                    // store N/Z/V, set stored C = NOT new-CF
     e_pf_save(24);                            // x86 PF source = result low byte
+    e_af_addsub(21, 22, 24, 19);              // x86 AF = bit 4 of (a ^ b ^ result)  (x19 free here)
     if (dst >= 0) e_bfi(dst, 24, 0, bits, 1); // merge low w bytes into dst
 }
 
@@ -788,13 +816,29 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             } // pop
-            // ---- movsxd (0x63): r64 = sign-extend r/m32 ----
+            // ---- movsxd (0x63): operand-size governed. REX.W -> sign-extend r/m32 to r64; no REX.W ->
+            // a 32-bit move (zero-extend r/m32 to 64); 0x66 -> a 16-bit move (insert low 16, keep 63:16).
             if (op == 0x63) {
-                if (I.is_mem) {
-                    emit_ea(&I, next);
-                    e_ldrs(4, I.reg, 17);
-                } else
-                    e_sxt(I.reg, I.rm_reg, 4);
+                if (I.opsize == 8) { // REX.W: sign-extend 32 -> 64
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldrs(4, I.reg, 17);
+                    } else
+                        e_sxt(I.reg, I.rm_reg, 4);
+                } else if (I.opsize == 2) { // 0x66: 16-bit move, preserve bits 63:16
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_load(2, 16, 17);
+                        e_bfi(I.reg, 16, 0, 16, 1);
+                    } else
+                        e_bfi(I.reg, I.rm_reg, 0, 16, 1);
+                } else { // no REX.W: 32-bit move, zero-extend to 64
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_load(4, I.reg, 17);
+                    } else
+                        e_mov_rr(I.reg, I.rm_reg, 0);
+                }
                 gpc = next;
                 continue;
             }
@@ -974,7 +1018,14 @@ static void *translate_block(uint64_t gpc) {
                     e_shv(b, 16, src, RCX, ssf);
                 } else {
                     if (cnt == 0) {
-                        if (mem) e_store(w, raw, 17);
+                        // x86: a 0 effective count changes NO flags and leaves the value unchanged --
+                        // but a 32-bit register destination is still written, so bits 63:32 must be
+                        // zeroed (a 32-bit op zero-extends). w==8/16/8 register dests keep their bits;
+                        // a memory dest is rewritten unchanged.
+                        if (mem)
+                            e_store(w, raw, 17);
+                        else if (w == 4)
+                            e_mov_rr(raw, raw, 0);
                         gpc = next;
                         continue;
                     } // no flags change
@@ -1057,7 +1108,8 @@ static void *translate_block(uint64_t gpc) {
                     } else {
                         e_rrr(A_SUBS, 16, 31, rmv, w == 8, 0);
                         e_nzcv_save();
-                        e_pf_save(16); // x86 PF source = result low byte (do_alu handles the w<4 path)
+                        e_pf_save(16);                // x86 PF source = result low byte (do_alu handles the w<4 path)
+                        e_af_addsub(31, rmv, 16, 19); // x86 AF = bit 4 of (0 ^ rmv ^ result)
                     }
                     rm_store(&I, w, 16);
                     gpc = next;
@@ -1134,38 +1186,51 @@ static void *translate_block(uint64_t gpc) {
                 if (w == 4 || w == 8) {
                     if (k == 4 || k == 5) { // mul / imul (rdx:rax = rax * r/m)
                         int rmv = rm_load(&I, next, w, &mem);
-                        // zero/sign-extend operands to 64, full product, lo->rax hi->rdx
-                        if (k == 4) {
-                            e_mul(19, RAX, rmv, 1);
-                            e_umulh(RDX, RAX, rmv);
-                        } // unsigned (assumes w==8); for w==4 see below
-                        else {
-                            e_mul(19, RAX, rmv, 1);
-                            e_smulh(RDX, RAX, rmv);
-                        }
                         if (w == 4) {
-                            e_lsr_i(RDX, 19, 32, 1);
-                            e_mov_rr(RAX, 19, 0);
-                        } // eax=lo32, edx=hi32
+                            // 32-bit: the operands are EAX and the 32-bit r/m. Mask (mul) or sign-extend
+                            // (imul) them to 32 bits FIRST so dirty upper halves of the host regs can't
+                            // corrupt the product; the 64-bit result lands in edx:eax. (Before this, the
+                            // full 64-bit regs were multiplied -> wrong product on a dirty upper half, and
+                            // the imul high half came out unsigned.)
+                            if (k == 4) {
+                                e_uxt(20, RAX, 4);
+                                e_uxt(21, rmv, 4);
+                            } else {
+                                e_sxt(20, RAX, 4);
+                                e_sxt(21, rmv, 4);
+                            }
+                            e_mul(19, 20, 21, 1);    // x19 = 64-bit product
+                            e_lsr_i(RDX, 19, 32, 1); // edx = product[63:32]
+                            e_mov_rr(RAX, 19, 0);    // eax = product[31:0]
+                            if (k == 4) {            // MUL: CF=OF = (high half != 0)
+                                e_lsr_i(22, 19, 32, 1);
+                                e_subi_s(23, 22, 0, 1);
+                                e_cset(21, 1 /*NE*/, 1);
+                            } else { // IMUL: CF=OF = (full product != sxt of low 32)
+                                e_sxt(22, 19, 4);
+                                e_rrr(A_SUBS, 23, 19, 22, 1, 0);
+                                e_cset(21, 1 /*NE*/, 1);
+                            }
+                            e_mul_set_oc(21);
+                            gpc = next;
+                            continue;
+                        }
+                        // w == 8: the operands are the full 64-bit registers, lo->rax hi->rdx.
+                        e_mul(19, RAX, rmv, 1);
+                        if (k == 4)
+                            e_umulh(RDX, RAX, rmv);
                         else
-                            e_mov_rr(RAX, 19, 1);
+                            e_smulh(RDX, RAX, rmv);
+                        e_mov_rr(RAX, 19, 1);
                         // x86 CF=OF: high half significant? (jc/jo/setc/seto consume these; e.g. glibc's
                         // divide-by-constant idioms after a widening multiply). x19=full lo product, RDX=hi.
                         if (k == 4) { // MUL: CF=OF = (high half != 0)
-                            if (w == 4)
-                                e_lsr_i(22, 19, 32, 1); // x22 = product[63:32]
-                            else
-                                e_mov_rr(22, RDX, 1); // x22 = umulh(rax, r/m)
+                            e_mov_rr(22, RDX, 1);
                             e_subi_s(23, 22, 0, 1);
-                            e_cset(21, 1 /*NE*/, 1); // cf = (x22 != 0)
+                            e_cset(21, 1 /*NE*/, 1);
                         } else { // IMUL: CF=OF = (high half != sign-extension of low half)
-                            if (w == 4) {
-                                e_sxt(22, 19, 4);            // x22 = sign-extend product[31:0]
-                                e_rrr(A_SUBS, 23, 19, 22, 1, 0); // cmp full64, sxt(low32)
-                            } else {
-                                e_asr_i(22, 19, 63, 1);          // x22 = sign bits of low half
-                                e_rrr(A_SUBS, 23, RDX, 22, 1, 0); // cmp smulh(hi), sign(lo)
-                            }
+                            e_asr_i(22, 19, 63, 1);           // x22 = sign bits of low half
+                            e_rrr(A_SUBS, 23, RDX, 22, 1, 0); // cmp smulh(hi), sign(lo)
                             e_cset(21, 1 /*NE*/, 1);
                         }
                         e_mul_set_oc(21);
@@ -1218,10 +1283,12 @@ static void *translate_block(uint64_t gpc) {
                                 e_addi_s(21, 20, 1, sf);
                             else
                                 e_subi_s(21, 20, 1, sf);
-                            e_nzcv_save_keepC();
+                            e_af_addsub(20, 21, 31, 19); // x86 AF = bit 4 of (old ^ result) -- x20=old
+                            e_nzcv_save_keepC();         // (must precede keepC, which clobbers x20)
                             e_pf_save(21);
                         } else { // byte/word: flags from the high bits (mirror the non-atomic path)
                             int sh = 8 * (4 - w);
+                            e_mov_rr(26, 20, 0); // save old before keepC clobbers x20
                             e_lsl_i(21, 20, sh, 0);
                             e_movconst(19, 1u << sh);
                             if (k == 0)
@@ -1231,18 +1298,21 @@ static void *translate_block(uint64_t gpc) {
                             e_nzcv_save_keepC();
                             e_lsr_i(21, 21, sh, 0);
                             e_pf_save(21);
+                            e_af_addsub(26, 21, 31, 19); // x86 AF = bit 4 of (old ^ result)
                         }
                         gpc = next;
                         continue;
                     }
                     int o = mem ? 16 : I.rm_reg;
                     if (w >= 4) {
+                        e_mov_rr(26, rmv, sf); // save old (o aliases rmv for a register dest) for AF
                         if (k == 0)
                             e_addi_s(o, rmv, 1, sf);
                         else
                             e_subi_s(o, rmv, 1, sf);
                         e_nzcv_save_keepC();
                         e_pf_save(o); // x86 PF source = result low byte
+                        e_af_addsub(26, o, 31, 19); // x86 AF = bit 4 of (old ^ result)
                         rm_store(&I, w, o);
                     } else { // byte/word: flags from the high bits
                         int sh = 8 * (4 - w);
@@ -1254,7 +1324,8 @@ static void *translate_block(uint64_t gpc) {
                             e_rrr(A_SUBS, 21, 21, 19, 0, 0);
                         e_nzcv_save_keepC();
                         e_lsr_i(21, 21, sh, 0);
-                        e_pf_save(21); // x86 PF source = result low byte
+                        e_pf_save(21);              // x86 PF source = result low byte
+                        e_af_addsub(rmv, 21, 31, 19); // x86 AF = bit 4 of (old ^ result)
                         rm_store(&I, w, 21);
                     }
                     gpc = next;
@@ -1318,13 +1389,19 @@ static void *translate_block(uint64_t gpc) {
             }
             // ---- pop r/m (8F /0) ----
             if (op == 0x8F) {
-                e_load(8, 16, RSP);
-                e_addi(RSP, RSP, 8, 1);
                 if (I.is_mem) {
+                    // Pop into x19 (callee-saved) FIRST: emit_ea uses x16 as a scratch, so the popped
+                    // value can't live in x16 across the address computation. x86 also computes the
+                    // destination EA AFTER RSP is incremented (matters for an RSP-based destination).
+                    e_load(8, 19, RSP);
+                    e_addi(RSP, RSP, 8, 1);
                     emit_ea(&I, next);
-                    e_store(8, 16, 17);
-                } else
+                    e_store(8, 19, 17);
+                } else {
+                    e_load(8, 16, RSP);
+                    e_addi(RSP, RSP, 8, 1);
                     e_mov_rr(I.rm_reg, 16, 1);
+                }
                 gpc = next;
                 continue;
             }
@@ -1557,6 +1634,8 @@ static void *translate_block(uint64_t gpc) {
             if (op == 0x9E) {
                 emit32(0x53083C00u | (RAX << 5) | 16); // ubfx w16, w_rax, #8, #8  (AH)
                 emit32(0x53000000u | (16 << 5) | 17);  // ubfx w17, w16, #0, #1  (CF)
+                e_movconst(20, 1);
+                e_rrr(A_EOR, 17, 17, 20, 0, 0); // stored borrow-C = NOT x86 CF
                 e_lsl_i(17, 17, 29, 0);
                 emit32(0x53061800u | (16 << 5) | 18); // ubfx w18, w16, #6, #1  (ZF)
                 e_lsl_i(18, 18, 30, 0);
@@ -1565,32 +1644,42 @@ static void *translate_block(uint64_t gpc) {
                 e_lsl_i(18, 18, 31, 0);
                 e_rrr(A_ORR, 17, 17, 18, 0, 0);
                 e_str(17, 28, OFF_NZCV);
+                emit32(0xD51B4200u | 17);              // msr nzcv, x17 (sync live flags)
                 emit32(0x53020800u | (16 << 5) | 19); // ubfx w19, w16, #2, #1  (PF)
-                e_movconst(20, 1);
                 e_rrr(A_EOR, 19, 19, 20, 0, 0); // PF source byte = NOT PF (parity-even <-> PF=1)
                 e_str(19, 28, OFF_PF);
+                e_af_save(16); // AF from AH bit4 (cpu->af consumer extracts bit 4)
+                g_fl_pending = FL_NONE; // flags now live in cpu->nzcv (don't let a stale defer overwrite)
                 gpc = next;
                 continue;
             }
-            // lahf (9F): flags -> AH (SF,ZF,--,AF,--,PF,1,CF). We fill SF/ZF/CF + the always-1 bit.
+            // lahf (9F): flags -> AH (SF,ZF,0,AF,0,PF,1,CF). Fill SF/ZF/CF/AF/PF + the always-1 bit.
             if (op == 0x9F) {
+                if (g_fl_pending) flags_materialize(); // make cpu->nzcv current first
                 e_ldr(16, 28, OFF_NZCV);
                 emit32(0x53000000u | (31 << 16) | (31 << 10) | (16 << 5) | 17); // ubfx w17,w16,#31,#1 (N->SF)
                 e_lsl_i(17, 17, 7, 0);
                 emit32(0x53000000u | (30 << 16) | (30 << 10) | (16 << 5) | 18); // ubfx w18,w16,#30,#1 (Z->ZF)
                 e_lsl_i(18, 18, 6, 0);
                 e_rrr(A_ORR, 17, 17, 18, 0, 0);
-                emit32(0x53000000u | (29 << 16) | (29 << 10) | (16 << 5) | 18); // ubfx w18,w16,#29,#1 (C->CF)
-                e_rrr(A_ORR, 17, 17, 18, 0, 0);
+                emit32(0x53000000u | (29 << 16) | (29 << 10) | (16 << 5) | 18); // ubfx w18,w16,#29,#1 (stored borrow-C)
+                e_movconst(19, 1);
+                e_rrr(A_EOR, 18, 18, 19, 0, 0); // x86 CF = NOT stored borrow-C
+                e_rrr(A_ORR, 17, 17, 18, 0, 0); // -> bit0
                 e_movconst(18, 2);
                 e_rrr(A_ORR, 17, 17, 18, 0, 0); // bit1 reads as 1
+                e_pf_compute(18);               // x18 = x86 PF (0/1); clobbers x16
+                e_rrr(A_ORR, 17, 17, 18, 0, 2); // PF -> bit2
+                e_ldr(18, 28, OFF_AF);
+                emit32(0x53000000u | (4 << 16) | (4 << 10) | (18 << 5) | 18); // ubfx w18,w18,#4,#1 (AF)
+                e_rrr(A_ORR, 17, 17, 18, 0, 4);                               // AF -> bit4
                 e_bfi(RAX, 17, 8, 8, 1);
                 gpc = next;
                 continue; // AH = w17
             }
             // pushfq (9C): materialize x86 RFLAGS from the flag substrate and push it. Bits assembled in
             // x17: reserved bit1=1, IF(bit9)=1 (userspace), DF(bit10)=g_df (block-local), then CF/PF/ZF/
-            // SF/OF from cpu->nzcv + the PF lane. AF (bit4) is not modeled (read as 0).
+            // SF/OF from cpu->nzcv + the PF lane, and AF(bit4) from the cpu->af lane.
             if (op == 0x9C) {
                 if (g_fl_pending) flags_materialize(); // make cpu->nzcv current
                 e_ldr(16, 28, OFF_NZCV);               // x16 = ARM NZCV substrate
@@ -1604,6 +1693,9 @@ static void *translate_block(uint64_t gpc) {
                 e_bit_move(17, 16, 28, 11, 18); // OF: NZCV.V(28) -> bit11
                 e_pf_compute(18);               // x18 = x86 PF (0/1); clobbers x16
                 e_rrr(A_ORR, 17, 17, 18, 0, 2); // -> bit2
+                e_ldr(18, 28, OFF_AF);
+                emit32(0x53000000u | (4 << 16) | (4 << 10) | (18 << 5) | 18); // ubfx w18,w18,#4,#1 (AF)
+                e_rrr(A_ORR, 17, 17, 18, 0, 4);                               // AF -> bit4
                 e_subi(RSP, RSP, 8, 1);
                 e_store(8, 17, RSP);
                 gpc = next;
@@ -1630,6 +1722,7 @@ static void *translate_block(uint64_t gpc) {
                 e_movconst(19, 1);
                 e_rrr(A_EOR, 18, 18, 19, 0, 0); // PF lane source byte = NOT PF (consumer takes even-parity)
                 e_str(18, 28, OFF_PF);
+                e_af_save(16); // AF from popped RFLAGS bit4 (cpu->af consumer extracts bit 4)
                 g_fl_pending = FL_NONE; // flags now materialized directly into cpu->nzcv
                 gpc = next;
                 continue;
@@ -2007,9 +2100,10 @@ static void *translate_block(uint64_t gpc) {
             if (op == 0x98) {
                 if (sf)
                     e_sxt(RAX, RAX, 4); // cdqe: rax = sext32(eax)
-                else if (I.p66)
-                    emit32(0x13001C00u | (RAX << 5) | RAX); // cbw: ax = sext8(al) (sxtb Wd,Wn)
-                else
+                else if (I.p66) {
+                    emit32(0x13001C00u | (RAX << 5) | 16); // cbw: x16 = sext8(AL) (sxtb Wd,Wn)
+                    e_bfi(RAX, 16, 0, 16, 1);              // AX = low 16, PRESERVE bits 63:16
+                } else
                     emit32(0x13003C00u | (RAX << 5) | RAX); // cwde: eax = sext16(ax) (sxth Wd,Wn)
                 gpc = next;
                 continue;
@@ -3124,23 +3218,28 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
-            // movzx/movsx (0F B6/B7 zero, BE/BF sign), movsxd handled as 0x63 one-byte (TODO)
+            // movzx/movsx (0F B6/B7 zero, BE/BF sign). The dest operand size (I.opsize: 2/4/8) governs how
+            // the extended value lands: a 32-bit dest must extend to 32 and ZERO bits 63:32; a 64-bit dest
+            // extends to 64; a 16-bit dest (66 prefix) inserts the low 16 and preserves bits 63:16.
             if (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF) {
-                int w = (op & 1) ? 2 : 1; // B6/BE byte, B7/BF word
+                int w = (op & 1) ? 2 : 1; // source width: B6/BE byte, B7/BF word
                 int signd = (op >= 0xBE);
+                int dw = I.opsize;                // dest width 2/4/8
+                int dst = (dw == 2) ? 16 : I.reg; // 16-bit dest extends into scratch, then bfi-merges
                 if (I.is_mem) {
                     emit_ea(&I, next);
                     if (signd)
-                        e_ldrs(w, I.reg, 17);
+                        e_ldrs_w(w, dst, 17, dw == 8); // sign-extend; W form (dw<=4) clears bits 63:32
                     else
-                        e_load(w, I.reg, 17);
+                        e_load(w, dst, 17); // ldrb/ldrh zero-extend into the full register
                 } else {
                     int src = (w == 1) ? byte_val(&I, I.rm_reg, 16) : I.rm_reg; // byte source: ah/bh/ch/dh -> bits 8-15
                     if (signd)
-                        e_sxt(I.reg, src, w);
+                        e_sxt_to(dst, src, w, dw == 8); // sxtb/sxth into W (clears 63:32) or X
                     else
-                        e_uxt(I.reg, src, w);
+                        e_uxt(dst, src, w); // uxtb/uxth: 32-bit op clears bits 63:32
                 }
+                if (dw == 2) e_bfi(I.reg, 16, 0, 16, 1); // 16-bit dest: merge low 16, preserve bits 63:16
                 gpc = next;
                 continue;
             }

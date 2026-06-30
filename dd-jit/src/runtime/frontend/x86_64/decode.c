@@ -387,6 +387,9 @@ static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias) {
     } else {
         e_movconst(17, (uint64_t)I->disp); // absolute [disp]
     }
+    // 0x67 address-size override: the effective address is computed in 32 bits, so truncate the offset
+    // (base+index+disp) to its low 32 before the segment base is added and the non-PIE bias-fold runs.
+    if (I->addr32) e_uxt(17, 17, 4);
     if (I->seg) {
         e_ldr(16, 28, I->seg == 1 ? OFF_FS : OFF_GS);
         e_rrr(A_ADD, 17, 17, 16, 1, 0);
@@ -403,6 +406,7 @@ static int ea_imm_fold(struct insn *I, int w, int *rn, int *off) {
     // guest_base bias-fold: the direct [base+disp] fold uses the guest base register unbiased -> route
     // through emit_ea (which biases x17) instead, so a low image access is redirected to the high mapping.
     if (guestfold_on()) return 0;
+    if (I->addr32) return 0; // 0x67: needs the 32-bit EA truncation in emit_ea -> never fold
     if (!(I->m_hasbase && !I->m_hasindex && !I->seg && !I->rip_rel)) return 0;
     int64_t d = I->disp;
     *rn = I->m_base;

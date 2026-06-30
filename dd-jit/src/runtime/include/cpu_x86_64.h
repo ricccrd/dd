@@ -45,8 +45,14 @@ struct cpu {
     // 1 -> PF=0). The parity consumers (setp/setnp, cmovp/cmovnp) read it and compute even-parity = x86 PF.
     // Added at the END of the struct so the baked OFF_* offsets above are unaffected.
     uint64_t pf;
+    // x86 AF (auxiliary carry, EFLAGS bit 4) substrate. Like PF, there is no ARM-NZCV equivalent, so the
+    // add/sub/adc/sbb/inc/dec/neg paths stash (a ^ b ^ result) here -- AF is bit 4 of that value (the carry
+    // out of bit 3). Logical ops (AND/OR/XOR), where x86 leaves AF undefined, store 0 (matches qemu's
+    // CC_OP_LOGIC). The consumers (lahf/pushfq) extract bit 4; popfq/sahf write it back.
+    uint64_t af;
 };
 #define OFF_PF ((int)__builtin_offsetof(struct cpu, pf))
+#define OFF_AF ((int)__builtin_offsetof(struct cpu, af))
 #define OFF_EXITED ((int)__builtin_offsetof(struct cpu, exited)) // int exited; int exit_code (the next word)
 #define OFF_IBSRC ((int)__builtin_offsetof(struct cpu, dbg_ibsrc))
 #define OFF_ICMISS ((int)__builtin_offsetof(struct cpu, ic_miss))

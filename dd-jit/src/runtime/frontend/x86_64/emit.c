@@ -226,6 +226,24 @@ static void e_sxt(int rd, int rn, int w) { // sxtb/sxth/sxtw into X
     uint32_t b = w == 1 ? 0x93401C00u : w == 2 ? 0x93403C00u : 0x93407C00u;
     emit32(b | (rn << 5) | rd);
 }
+// Sign-extend a byte/word into either a 64-bit X (to_x=1) or a 32-bit W (to_x=0). The W form is
+// SBFM with sf=0, which zero-clears the upper 32 bits -- exactly an x86 movsx with a 32-bit dest
+// (sign-extend to 32, then zero bits 63:32). Used by movsx (0F BE/BF) per the dest operand size.
+static void e_sxt_to(int rd, int rn, int w, int to_x) {
+    if (to_x) {
+        e_sxt(rd, rn, w);
+        return;
+    }
+    uint32_t b = (w == 1) ? 0x13001C00u : 0x13003C00u; // sxtb/sxth Wd,Wn
+    emit32(b | (rn << 5) | rd);
+}
+// Sign-extending load of a byte/word from [rn] into a 64-bit X (to_x=1) or a 32-bit W (to_x=0).
+// The W form (opc=11) zero-clears bits 63:32 -- an x86 movsx mem,r32 zero-extends the high half.
+static void e_ldrs_w(int w, int rt, int rn, int to_x) {
+    uint32_t b = (w == 1) ? 0x39800000u : 0x79800000u; // ldrsb/ldrsh (to X)
+    if (!to_x) b |= 0x00400000u;                        // opc 10 -> 11: sign-extend into W
+    emit32(b | (rn << 5) | rt);
+}
 // shift by immediate (UBFM/SBFM). sh in [0,31] (32-bit) or [0,63] (64-bit).
 static void e_lsl_i(int rd, int rn, int sh, int sf) {
     int w = sf ? 64 : 32, immr = (w - sh) & (w - 1), imms = w - 1 - sh;
