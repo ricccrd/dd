@@ -1,5 +1,6 @@
 // frontend/x86_64/x86_ops.c -- x86-only block-exit helpers the dispatcher invokes: cpuid emulation
 // and the 80-bit x87 load/store (which need a C round-trip, not inline codegen).
+#include <math.h> // x87 transcendentals (x87_func) computed via host libm
 
 // ---- W4-C: rep cmps/scas idiom (R_REPSTR) -------------------------------------------------
 // One C round-trip does the entire (possibly REP/REPE/REPNE) compare/scan, then writes the exact
@@ -185,4 +186,65 @@ static void x87_fstp_m80(struct cpu *c) {
     }
     memcpy(ea, &sig, 8);
     memcpy(ea + 8, &se, 2);
+}
+
+// x87 transcendentals (R_X87FUNC): the D9 F0-FF subset has no ARM/SSE counterpart, so it is computed
+// here on the double-precision ST stack via host libm. cpu->x87_ea carries the X87_* selector. We
+// track no tag bits, so C1 (stack over/underflow) is cleared on success; C2 (argument out of range,
+// |x| >= 2^63) is set for the trig ops exactly as the hardware does, leaving the operand untouched.
+static void x87_push_d(struct cpu *c, double v) {
+    c->fptop = (c->fptop - 1) & 7;
+    c->st[c->fptop & 7] = v;
+}
+static void x87_func(struct cpu *c) {
+    double st0 = c->st[c->fptop & 7];
+    double st1 = c->st[(c->fptop + 1) & 7];
+    c->fpsw &= ~0x4700ull; // clear C0/C1/C2/C3 (bits 8/9/10/14)
+    switch (c->x87_ea) {
+    case X87_F2XM1: // ST0 = 2^ST0 - 1
+        c->st[c->fptop & 7] = exp2(st0) - 1.0;
+        break;
+    case X87_FYL2X: // ST1 = ST1 * log2(ST0); pop -> result in ST0
+        c->st[(c->fptop + 1) & 7] = st1 * log2(st0);
+        c->fptop = (c->fptop + 1) & 7;
+        break;
+    case X87_FPATAN: // ST1 = atan2(ST1, ST0); pop
+        c->st[(c->fptop + 1) & 7] = atan2(st1, st0);
+        c->fptop = (c->fptop + 1) & 7;
+        break;
+    case X87_FYL2XP1: // ST1 = ST1 * log2(ST0 + 1); pop
+        c->st[(c->fptop + 1) & 7] = st1 * log2(st0 + 1.0);
+        c->fptop = (c->fptop + 1) & 7;
+        break;
+    case X87_FPTAN: // ST0 = tan(ST0); push 1.0
+        if (fabs(st0) >= 0x1p63) {
+            c->fpsw |= 0x400;
+            break;
+        }
+        c->st[c->fptop & 7] = tan(st0);
+        x87_push_d(c, 1.0);
+        break;
+    case X87_FSINCOS: // ST0 = sin(ST0); push cos -> ST0=cos, ST1=sin
+        if (fabs(st0) >= 0x1p63) {
+            c->fpsw |= 0x400;
+            break;
+        }
+        c->st[c->fptop & 7] = sin(st0);
+        x87_push_d(c, cos(st0));
+        break;
+    case X87_FSIN:
+        if (fabs(st0) >= 0x1p63) {
+            c->fpsw |= 0x400;
+            break;
+        }
+        c->st[c->fptop & 7] = sin(st0);
+        break;
+    case X87_FCOS:
+        if (fabs(st0) >= 0x1p63) {
+            c->fpsw |= 0x400;
+            break;
+        }
+        c->st[c->fptop & 7] = cos(st0);
+        break;
+    }
 }

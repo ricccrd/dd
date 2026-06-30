@@ -111,5 +111,10 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 // block and emulate it in C (do_sse3b), which reads/writes the v[] xmm file + GPRs + memory, then advances
 // rip. Correctness-first (one block exit per insn), mirroring the R_AVX VEX path. See avx.c do_sse3b().
 #define R_SSE3B 10
+// x87 transcendental (D9 F0-FF subset: F2XM1/FYL2X/FPTAN/FPATAN/FYL2XP1/FSINCOS/FSIN/FCOS) -> exit the
+// block and compute it in C (x87_func) via host libm on the double-precision ST stack. These have no
+// ARM/SSE counterpart. cpu->x87_ea carries the X87_* selector below. See x86_ops.c x87_func().
+#define R_X87FUNC 11
+enum { X87_F2XM1, X87_FYL2X, X87_FPTAN, X87_FPATAN, X87_FYL2XP1, X87_FSINCOS, X87_FSIN, X87_FCOS };
 // x86 register encodings (== host reg numbers)
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };

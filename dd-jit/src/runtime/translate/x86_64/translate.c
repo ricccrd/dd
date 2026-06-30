@@ -1381,7 +1381,7 @@ static void *translate_block(uint64_t gpc) {
                             if (reg == 3) fp_settop(1);
                         } // fst/fstp
                         else if (reg == 7) {
-                            e_ldr(16, 28, OFF_FPSW);
+                            emit_fpsw_with_top();
                             emit32(0x79000000u | (19 << 5) | 16);
                         } // fnstsw m16
                         else {
@@ -1519,6 +1519,25 @@ static void *translate_block(uint64_t gpc) {
                     } else if (reg == 4 && rm == 4) {
                         emit_ftst();
                     } // ftst
+                    else if (reg == 4 && rm == 5) {
+                        emit_fxam();
+                    } // fxam
+                    else if (reg == 6 && rm == 0) {
+                        emit_x87func(X87_F2XM1, next);
+                        break;
+                    } // f2xm1
+                    else if (reg == 6 && rm == 1) {
+                        emit_x87func(X87_FYL2X, next);
+                        break;
+                    } // fyl2x
+                    else if (reg == 6 && rm == 2) {
+                        emit_x87func(X87_FPTAN, next);
+                        break;
+                    } // fptan
+                    else if (reg == 6 && rm == 3) {
+                        emit_x87func(X87_FPATAN, next);
+                        break;
+                    } // fpatan
                     else if (reg == 6 && rm == 4) {
                         emit_fxtract();
                     } // fxtract
@@ -1534,12 +1553,28 @@ static void *translate_block(uint64_t gpc) {
                     else if (reg == 7 && rm == 0) {
                         emit_fprem(0);
                     } // fprem
+                    else if (reg == 7 && rm == 1) {
+                        emit_x87func(X87_FYL2XP1, next);
+                        break;
+                    } // fyl2xp1
+                    else if (reg == 7 && rm == 3) {
+                        emit_x87func(X87_FSINCOS, next);
+                        break;
+                    } // fsincos
                     else if (reg == 7 && rm == 4) {
                         emit_frndint();
                     } // frndint
                     else if (reg == 7 && rm == 5) {
                         emit_fscale();
                     } // fscale
+                    else if (reg == 7 && rm == 6) {
+                        emit_x87func(X87_FSIN, next);
+                        break;
+                    } // fsin
+                    else if (reg == 7 && rm == 7) {
+                        emit_x87func(X87_FCOS, next);
+                        break;
+                    } // fcos
                     else {
                         report_unimpl(gpc, &I);
                         break;
@@ -1634,7 +1669,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xDF) {
                     if (reg == 4 && rm == 0) {
-                        e_ldr(16, 28, OFF_FPSW);
+                        emit_fpsw_with_top();
                         e_bfi(RAX, 16, 0, 16, 1);
                     } // fnstsw ax
                     else if (reg == 5 || reg == 6) {

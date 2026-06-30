@@ -243,6 +243,10 @@ static int smc_on_write(uint64_t a) {
         x87_fstp_m80(c);                                                                                               \
         continue;                                                                                                      \
     } /* fstp m80 */                                                                                                   \
+    if ((c)->reason == R_X87FUNC) {                                                                                    \
+        x87_func(c);                                                                                                  \
+        continue;                                                                                                      \
+    } /* x87 transcendental (rip already = next) */                                                                    \
     if ((c)->reason == R_DIV) { /* 128/64 unsigned div (rip already = next) */                                         \
         uint64_t d = (c)->divop;                                                                                       \
         if (d == 0) {                                                                                                  \

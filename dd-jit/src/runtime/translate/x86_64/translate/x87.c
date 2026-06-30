@@ -160,3 +160,58 @@ static void emit_ftst(void) {
     e_fmov_to_d(16, 16);    // d16 = 0.0
     e_fcom_setfpsw(18, 16); // ST0 : 0.0 -> C0/C2/C3
 }
+
+// FNSTSW / FSTSW: the x87 status word reports TOP-of-stack (cpu->fptop) in bits 11-13 ORed with the
+// condition codes held in cpu->fpsw -- qemu does the same, and code that follows FNSTSW with SAHF
+// relies on it. Result -> x16 (clobbers x17). The shadow top is materialized first so cpu->fptop is
+// current under the static-top optimization.
+static void emit_fpsw_with_top(void) {
+    fp_materialize();
+    e_ldr(16, 28, OFF_FPSW);
+    e_ldr(17, 28, OFF_FPTOP);
+    e_bfi(16, 17, 11, 3, 1); // status[13:11] = TOP
+}
+
+// FXAM: classify ST0 and set the FPSW condition codes (C1 = sign, {C3,C2,C0} = class), per the x87
+// spec. We keep no tag bits, so "empty" cannot be reported and every stored slot is read as its value;
+// cpu->st[] is double precision, so 80-bit unsupported/pseudo-denormal forms cannot arise. Class codes
+// {C3,C2,C0}: zero=100, NaN=001, Inf=011, denormal=110, normal=010. From the IEEE-754 fields this is
+// C0=(exp==max), C3=(exp==0), C2=!(zero|NaN). Scratch: x16/x17/x19/x21/x22, v18.
+static void emit_fxam(void) {
+    fp_ld(18, 0);
+    e_fmov_from_d(16, 18);          // x16 = bit pattern of ST0
+    e_lsr_i(21, 16, 63, 1);         // x21 = sign            -> C1
+    e_lsr_i(17, 16, 52, 1);
+    e_movconst(19, 0x7FF);
+    e_rrr(A_AND, 17, 17, 19, 1, 0); // x17 = exponent field
+    e_movconst(19, (1ull << 52) - 1);
+    e_rrr(A_AND, 16, 16, 19, 1, 0); // x16 = mantissa field
+    e_subi_s(31, 17, 0, 1);
+    e_cset(19, 0, 1);               // x19 = (exp == 0)      -> C3
+    e_subi_s(31, 17, 0x7FF, 1);
+    e_cset(17, 0, 1);               // x17 = (exp == max)    -> C0
+    e_subi_s(31, 16, 0, 1);
+    e_cset(16, 0, 1);               // x16 = (mantissa == 0)
+    e_rrr(A_AND, 22, 19, 16, 1, 0); // x22 = zero = exp0 & mant0
+    e_rrr(A_BIC, 16, 17, 16, 1, 0); // x16 = NaN  = expMax & ~mant0
+    e_rrr(A_ORR, 22, 22, 16, 1, 0); // x22 = zero | NaN
+    e_movconst(16, 1);
+    e_rrr(A_EOR, 22, 22, 16, 1, 0); // x22 = C2 = !(zero | NaN)
+    e_movconst(16, 0);
+    e_bfi(16, 17, 8, 1, 1);  // C0 (bit 8)
+    e_bfi(16, 21, 9, 1, 1);  // C1 (bit 9)
+    e_bfi(16, 22, 10, 1, 1); // C2 (bit 10)
+    e_bfi(16, 19, 14, 1, 1); // C3 (bit 14)
+    e_str(16, 28, OFF_FPSW);
+}
+
+// x87 transcendentals (the D9 F0-FF subset: F2XM1/FYL2X/FPTAN/FPATAN/FYL2XP1/FSINCOS/FSIN/FCOS) have
+// no ARM/SSE counterpart and need host libm, so they exit the block to the C helper x87_func(), which
+// computes the op on the double-precision ST stack. cpu->x87_ea carries the X87_* selector. The block
+// ends here (like the m80 fld/fstp helpers); the caller breaks out of translation afterwards.
+static void emit_x87func(int fn, uint64_t next) {
+    fp_drop(); // the helper reads/writes cpu->st[] and cpu->fptop directly -> spill the shadow top
+    e_movconst(16, (uint64_t)fn);
+    e_str(16, 28, OFF_X87EA);
+    emit_exit_const(next, R_X87FUNC);
+}
