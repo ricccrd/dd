@@ -36,8 +36,8 @@
 #include <stdatomic.h>
 
 #include "../include/cpu_aarch64.h"
-#include "../frontend/aarch64/abi.h"       // the cpu interface os/linux/ is written against
-#include "../frontend/aarch64/fill_stat.c" // the per-arch struct-stat layout os/linux/ fills
+#include "../translate/aarch64/abi.h"       // the cpu interface os/linux/ is written against
+#include "../translate/aarch64/fill_stat.c" // the per-arch struct-stat layout os/linux/ fills
 
 // container/ns config state + parsers (early globals)
 #include "../os/linux/container/state.c"
@@ -46,12 +46,12 @@
 // aarch64 host emitters + IBTC/IC
 #include "../engine/emit_arm64.c"
 // transliterate + mangle + §B + LSE + depth-gate
-#include "../frontend/aarch64/translate.c"
+#include "../translate/aarch64/translate.c"
 // clone/futex/threads (declares run_guest)
 #include "../os/linux/thread.c"
 // signal delivery
 #include "../os/linux/signal.c"
-#include "../frontend/aarch64/sigframe.c" // per-arch rt_sigframe build/restore (uses signal.c state)
+#include "../translate/aarch64/sigframe.c" // per-arch rt_sigframe build/restore (uses signal.c state)
 // path jail + overlay + /proc synth
 #include "../os/linux/container/vfs.c"
 // termios + NET-ns loopback

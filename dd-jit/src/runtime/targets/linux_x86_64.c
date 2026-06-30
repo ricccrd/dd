@@ -57,31 +57,31 @@
 #include <libkern/OSCacheControl.h>
 
 #include "../include/cpu_x86_64.h"
-#include "../frontend/x86_64/abi.h"          // cpu-interface seam (G_* contract + sysmap + normalize)
-#include "../frontend/x86_64/dispatch_hooks.h" // x86 dispatch seam for the SHARED engine/dispatch.c (engine-dedup)
-#include "../frontend/x86_64/fill_stat.c"    // per-arch struct-stat layout os/linux fills
+#include "../translate/x86_64/abi.h"          // cpu-interface seam (G_* contract + sysmap + normalize)
+#include "../translate/x86_64/dispatch_hooks.h" // x86 dispatch seam for the SHARED engine/dispatch.c (engine-dedup)
+#include "../translate/x86_64/fill_stat.c"    // per-arch struct-stat layout os/linux fills
 
 #include "../os/linux/container/state.c"     // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
-#include "../frontend/x86_64/engine_glue.c"  // x86-only engine globals (trace/diag) the shared cache.c omits
+#include "../translate/x86_64/engine_glue.c"  // x86-only engine globals (trace/diag) the shared cache.c omits
 #include "../engine/cache.c"                     // SHARED engine: code cache + block map (hash via G_GPC_HASH_SHIFT)
-#include "../frontend/x86_64/emit.c"         // x86 engine: arm64 emitters + SSE + x87
-#include "../frontend/x86_64/decode.c"       // x86-64 decoder
-#include "../frontend/x86_64/translate.c"    // x86-64 translate_block + trampolines
-#include "../frontend/x86_64/pcache.c"       // opt8: persistent translated-code cache (DDJIT_PCACHE=1)
+#include "../translate/x86_64/emit.c"         // x86 engine: arm64 emitters + SSE + x87
+#include "../translate/x86_64/decode.c"       // x86-64 decoder
+#include "../translate/x86_64/translate.c"    // x86-64 translate_block + trampolines
+#include "../translate/x86_64/pcache.c"       // opt8: persistent translated-code cache (DDJIT_PCACHE=1)
 #include "../os/linux/thread.c"              // SHARED: clone->pthread, per-thread cpu, futex
 #include "../os/linux/signal.c"              // SHARED: signal delivery driver + translation
-#include "../frontend/x86_64/sigframe.c"     // x86-64 rt_sigframe build/restore (uses signal.c state)
-#include "../frontend/x86_64/legacy.c"       // x86 legacy-syscall -> *at normalization (G_NORMALIZE)
+#include "../translate/x86_64/sigframe.c"     // x86-64 rt_sigframe build/restore (uses signal.c state)
+#include "../translate/x86_64/legacy.c"       // x86 legacy-syscall -> *at normalization (G_NORMALIZE)
 #include "../os/linux/container/vfs.c"       // SHARED: rootfs jail, overlay, /proc synth, stat
 #include "../os/linux/container/netns.c"     // SHARED: sockets, loopback netns, termios
 #include "../os/linux/fscache.c"             // SHARED: fd/path cache
 #include "../os/linux/syscall/dispatch.c"             // SHARED: the canonical syscall layer
 #include "../os/linux/sentry.c"              // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
-#include "../frontend/x86_64/x86_ops.c"        // x86 cpuid + x87 m80 block-exit helpers
-#include "../frontend/x86_64/avx.c"            // AVX/AVX2/AVX-512 (VEX/EVEX) emulation (R_AVX block-exit)
+#include "../translate/x86_64/x86_ops.c"        // x86 cpuid + x87 m80 block-exit helpers
+#include "../translate/x86_64/avx.c"            // AVX/AVX2/AVX-512 (VEX/EVEX) emulation (R_AVX block-exit)
 #include "../engine/dispatch.c"                  // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
                                               // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
-#include "../frontend/x86_64/elf.c"      // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
+#include "../translate/x86_64/elf.c"      // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
 
 // ---- entry + main ----
 // ---------------- entry ----------------
@@ -318,7 +318,7 @@ int jit86_run(const char *rootfs, int argc, char *const argv[]) {
     return ec;
 }
 
-#include "../frontend/x86_64/forkserver.c" // W3D: resident ddjitd fork-server (server/client/worker)
+#include "../translate/x86_64/forkserver.c" // W3D: resident ddjitd fork-server (server/client/worker)
 
 #ifndef JIT86_LIB
 int main(int argc, char **argv) {
