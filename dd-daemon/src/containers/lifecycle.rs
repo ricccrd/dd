@@ -187,6 +187,15 @@ pub(crate) async fn containers_stop(State(a): State<App>, Path(id): Path<String>
     do_stop(&a, &id, sig, t).await
 }
 
+/// Signal a container's whole process group. The JIT leader is its own group leader (setpgid at spawn
+/// in runtime.rs), so the host processes the guest forks inherit that pgid; `kill(-pgid, sig)` (killpg,
+/// pgid == leader pid) reaches the leader AND every forked child, so a multi-process container dies
+/// completely instead of leaving orphans. Only if the group signal fails (e.g. the leader is mid-
+/// teardown) do we fall back to the leader pid alone. Mirrors freeze()'s group-signal pattern.
+fn kill_group(pid: i32, sig: i32) {
+    unsafe { if libc::kill(-pid, sig) != 0 { libc::kill(pid, sig); } }
+}
+
 /// POST /containers/:id/kill?signal=SIG -- default signal SIGKILL, delivered immediately.
 pub(crate) async fn containers_kill(State(a): State<App>, Path(id): Path<String>, Query(q): Query<KillQ>) -> Response {
     let mut g = a.inner.lock().await;
@@ -194,7 +203,7 @@ pub(crate) async fn containers_kill(State(a): State<App>, Path(id): Path<String>
     let sig = q.signal.as_deref().map(|s| parse_signal(s, libc::SIGKILL)).unwrap_or(libc::SIGKILL);
     if let Some(l) = g.live.get(&full) {
         l.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst); // deliberate stop: no auto-restart
-        if let Some(pid) = *l.pid.lock().unwrap() { unsafe { libc::kill(pid as i32, sig); } } // mirror of freeze()'s libc::kill
+        if let Some(pid) = *l.pid.lock().unwrap() { kill_group(pid as i32, sig); } // whole group, not just the leader
     }
     if let Some(c) = g.containers.get_mut(&full) { c.status = "exited".into(); c.finished_at = now_secs(); }
     let (cname, cimage) = g.containers.get(&full).map(|c| (c.name.clone(), c.image.clone())).unwrap_or_default();
@@ -252,7 +261,7 @@ pub(crate) async fn freeze(a: App, id: String, pause: bool) -> Response {
         let pid = pid as i32;
         let sig = if pause { libc::SIGSTOP } else { libc::SIGCONT };
         // pid is the group leader, so -pid is the container's process group id (pgid == leader pid).
-        unsafe { if libc::kill(-pid, sig) != 0 { libc::kill(pid, sig); } }
+        kill_group(pid, sig);
     }
     if let Some(c) = g.containers.get_mut(&full) { c.status = if pause { "paused".into() } else { "running".into() }; }
     save_state(&g, &a.state_path);
@@ -323,7 +332,7 @@ pub(crate) async fn containers_delete(State(a): State<App>, Path(id): Path<Strin
     // container we also SIGKILL the live process so the reaper doesn't resurrect/dangle it.
     if let Some(l) = g.live.get(&full) {
         l.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
-        if force && running { if let Some(pid) = *l.pid.lock().unwrap() { unsafe { libc::kill(pid as i32, libc::SIGKILL); } } }
+        if force && running { if let Some(pid) = *l.pid.lock().unwrap() { kill_group(pid as i32, libc::SIGKILL); } } // whole group, not just the leader
     }
     if let Some(dc) = g.containers.remove(&full) {
         crate::events::emit_event(&a.events, "container", "destroy", &full, json!({"name": dc.name, "image": dc.image}));
