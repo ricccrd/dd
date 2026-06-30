@@ -477,15 +477,38 @@ static void patch_links_to(uint64_t gpc, void *body) {
 #define STW_MAXTHREAD 4096
 // Registry of live guest threads: every thread that runs run_guest registers on entry and unregisters on
 // exit, so a flusher can enumerate the peers to quiesce. `used` is atomic so peers_live()/the flusher see
-// a consistent snapshot; the reg lock serializes slot allocation.
+// a consistent snapshot; the reg lock serializes slot allocation. `exec_gen` is the generation of the code
+// cache this thread is currently executing in (published once per block by the dispatcher); the reclaimer
+// uses it to free a retired cache only once no thread is still running in it. See reclaim_retired().
 static struct {
     _Atomic int used;
     pthread_t th;
+    _Atomic uint64_t exec_gen;
 } g_stw_threads[STW_MAXTHREAD];
 static pthread_mutex_t g_stw_reg_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int g_stw_active; // 1 while a flush is in progress -> parked peers spin until cleared
 static _Atomic int g_stw_parked; // # of peers currently parked at the safepoint
 static uint64_t g_stw_flushes;   // PROF: stop-the-world flushes performed
+
+// ---- peer-refcounted retired-cache reclamation ----
+// Each stop-the-world flush switches to a FRESH cache and RETIRES the old one. A retired cache of
+// generation G must stay mapped until no guest thread can still execute in it: a peer parked mid-block (in
+// the STW signal handler) resumes into the cache that was current when it parked, and only drifts onto the
+// fresh cache at its next dispatcher round-trip. We give every cache a generation number (g_cache_gen,
+// bumped on each flush-to-fresh) and have each thread publish the generation it is executing
+// (g_stw_threads[].exec_gen, one relaxed store per block in the dispatcher, threaded-only). A retired
+// cache is reclaimed (unmapped) once no live thread's exec_gen still names its generation. This bounds
+// retained VA (no per-flush 64MB leak) AND removes the old unsafe reuse-in-place-on-alloc-failure path
+// that corrupted parked peers.
+static uint64_t g_cache_gen;                          // generation of the CURRENT cache (g_cache)
+static __thread _Atomic uint64_t *g_my_exec_gen;      // this thread's exec_gen slot (NULL until registered)
+#define STW_RETIRED_MAX (STW_MAXTHREAD + 8)
+static struct {
+    uint8_t *rw;     // RW base of the retired mapping
+    ptrdiff_t rw2rx; // RX-RW delta (0 for the single-mapping MAP_JIT fallback)
+    uint64_t gen;    // generation this cache served
+} g_retired[STW_RETIRED_MAX];
+static int g_nretired;
 
 // Park safepoint handler -- async-signal-safe (atomics + nanosleep only). A peer caught here is, by
 // definition, no longer executing a translated block (it is on its host stack in this handler), so the
@@ -515,10 +538,14 @@ static void stw_register(void) {
     sigemptyset(&unb);
     sigaddset(&unb, STW_SIG);
     pthread_sigmask(SIG_UNBLOCK, &unb, NULL);
+    // A flush holds g_stw_reg_lock for its whole duration, so while we hold it g_cache_gen is stable and
+    // this thread will next execute the CURRENT cache -> seed exec_gen to that generation.
     pthread_mutex_lock(&g_stw_reg_lock);
     for (int i = 0; i < STW_MAXTHREAD; i++)
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed)) {
             g_stw_threads[i].th = pthread_self();
+            atomic_store_explicit(&g_stw_threads[i].exec_gen, g_cache_gen, memory_order_relaxed);
+            g_my_exec_gen = &g_stw_threads[i].exec_gen;
             atomic_store_explicit(&g_stw_threads[i].used, 1, memory_order_release);
             break;
         }
@@ -548,31 +575,72 @@ static int stw_peers_live(void) {
     return n;
 }
 
-// Switch to a brand-new cache and drop every cross-block link (map / IBTC / pending chains). The OLD
-// cache is left mapped and UNMODIFIED (its blocks may still be reached by parked peers and by baked-in
-// chains/inline ICs), so it is retained for the process lifetime; flushes are rare, so the retained
-// memory is bounded by the few times a fully-threaded 64MB cache fills. MUST run with all peers quiesced
+// Unmap a retired cache's mapping(s): the RW base, plus the RX alias when dual-mapped (delta != 0).
+static void cache_unmap(uint8_t *rw, ptrdiff_t rw2rx) {
+    munmap(rw, CACHE_SZ);
+    if (rw2rx) munmap(rw + rw2rx, CACHE_SZ);
+}
+// True if some live guest thread is still executing in generation `gen`. Caller holds g_stw_reg_lock;
+// during a flush all peers are quiesced at the safepoint, so the exec_gen snapshot is stable.
+static int gen_in_use(uint64_t gen) {
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
+            atomic_load_explicit(&g_stw_threads[i].exec_gen, memory_order_relaxed) == gen)
+            return 1;
+    return 0;
+}
+// Reclaim (unmap) every retired cache no live thread is still executing in. Caller holds BOTH g_jit_lock
+// (so no peer can transition into a new block) and g_stw_reg_lock (so the registry is stable). Called from
+// jit_flush_to_fresh before the fresh allocation, so freed VA is available to it.
+static void reclaim_retired(void) {
+    for (int i = 0; i < g_nretired;) {
+        if (!gen_in_use(g_retired[i].gen)) {
+            cache_unmap(g_retired[i].rw, g_retired[i].rw2rx);
+            g_retired[i] = g_retired[--g_nretired]; // swap-remove
+        } else
+            i++;
+    }
+}
+// Record the CURRENT cache as retired (its blocks may still be reached by parked peers / baked-in chains)
+// so a later reclaim_retired() frees it once every thread has drifted off its generation.
+static void retire_current(void) {
+    if (g_nretired < STW_RETIRED_MAX) {
+        g_retired[g_nretired].rw = g_cache;
+        g_retired[g_nretired].rw2rx = g_rw2rx;
+        g_retired[g_nretired].gen = g_cache_gen;
+        g_nretired++;
+    }
+}
+// A fresh cache could not be allocated and the peers are quiesced IN / parked ON the current cache, so
+// reusing it in place would corrupt them on resume. Reclamation has already freed everything safe to free,
+// so we cannot proceed -- abort cleanly rather than corrupt guest state.
+static void cache_oom_abort(void) {
+    static const char msg[] = "dd: JIT code cache exhausted (out of VA for a fresh cache under threads)\n";
+    write(2, msg, sizeof msg - 1);
+    _exit(70);
+}
+
+// Retire the current cache, switch to a brand-new one, and drop every cross-block link (map / IBTC /
+// pending chains). The OLD cache is left mapped and UNMODIFIED (its blocks may still be reached by parked
+// peers and by baked-in chains/inline ICs); reclaim_retired() unmaps it once no thread is in its
+// generation, so retained VA stays bounded (no per-flush leak). MUST run with all peers quiesced
 // (stw_flush) and the dispatcher holding g_jit_lock.
 static void jit_flush_to_fresh(void) {
+    reclaim_retired(); // free retired caches no peer is still in -> bound VA + free space for the new alloc
     if (g_dualmap) {
         uint8_t *rw;
         ptrdiff_t d;
-        if (dualmap_alloc(&rw, &d) == 0) {
-            g_cache = g_cp = rw;
-            g_rw2rx = d;
-        } else {
-            g_cp = g_cache; // fresh map unavailable: reuse in place (safe here -- peers are quiesced off it)
-        }
+        if (dualmap_alloc(&rw, &d) != 0) cache_oom_abort();
+        retire_current();
+        g_cache = g_cp = rw;
+        g_rw2rx = d;
     } else {
         uint8_t *nc = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-        if (nc != MAP_FAILED) {
-            g_cache = g_cp = nc;
-        } else {
-            jit_wprot(0);
-            g_cp = g_cache;
-            jit_wprot(1);
-        }
+        if (nc == MAP_FAILED) cache_oom_abort();
+        retire_current(); // rw2rx == 0 in this fallback -> reclaim unmaps the single RWX region
+        g_cache = g_cp = nc;
     }
+    g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
     memset(g_map, 0, sizeof g_map);
     memset(g_ibtc, 0, sizeof g_ibtc);
     g_npend = 0;
@@ -624,7 +692,9 @@ static void stw_after_fork(void) {
     for (int i = 0; i < STW_MAXTHREAD; i++)
         atomic_store_explicit(&g_stw_threads[i].used, 0, memory_order_relaxed);
     g_stw_threads[0].th = pthread_self();
+    atomic_store_explicit(&g_stw_threads[0].exec_gen, g_cache_gen, memory_order_relaxed);
     atomic_store_explicit(&g_stw_threads[0].used, 1, memory_order_relaxed);
+    g_my_exec_gen = &g_stw_threads[0].exec_gen;
 }
 
 // fork() COWs the RW and RX aliases independently, so after a guest fork the child's two views of the
@@ -635,6 +705,11 @@ static void stw_after_fork(void) {
 // Must run in the child after fork(), before its next run_block.
 static void jit_after_fork(void) {
     stw_after_fork(); // single-threaded child: shed the inherited thread registry (also for the MAP_JIT path)
+    // The child inherited the parent's retired-cache list as COW copies but will never resume a parent peer
+    // into them; drop the bookkeeping and unmap them so the child does not carry the parent's retired VA.
+    for (int i = 0; i < g_nretired; i++)
+        cache_unmap(g_retired[i].rw, g_retired[i].rw2rx);
+    g_nretired = 0;
     if (!g_dualmap) return;
     uint8_t *old_rw = g_cache, *old_rx = (uint8_t *)J_RX(g_cache);
     uint8_t *rw;
