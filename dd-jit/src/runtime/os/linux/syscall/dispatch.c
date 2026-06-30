@@ -30,15 +30,15 @@ int g_rwx_guest;
 #ifndef RENAME_EXCL
 #define RENAME_EXCL 0x00000004 // fail if dst exists <- Linux RENAME_NOREPLACE(1)
 #endif
-#include "service/helpers.c"
-#include "service/sysv.c"
-#include "service/mem.c"
-#include "service/signal.c"
-#include "service/time.c"
-#include "service/io.c"
-#include "service/net.c"
-#include "service/event.c"
-#include "service/misc.c"
+#include "helpers.c"
+#include "sysv.c"
+#include "mem.c"
+#include "signal.c"
+#include "time.c"
+#include "io.c"
+#include "net.c"
+#include "event.c"
+#include "misc.c"
 // --- untrusted-guest isolation seam (subsystem #3: the sentry process-split) --------------------
 // The dispatcher's syscall boundary (run_guest -> service(c)) is the entire guest->host authority
 // crossing. We interpose a one-branch router so an UNTRUSTED guest's fs/net/proc syscalls can be
@@ -270,9 +270,9 @@ static int proc_self_exe(const char *p, char *tgt, size_t cap) {
 // this file's local helpers (overlay_*/proc_self_exe/synth_str_fd for fs; nonpie_p/cpu_online_mask/
 // affinity_mask for proc; svc_adjtimex/pidfd_*/mq_* for rare) defined just above, so they must be
 // included AFTER them.
-#include "service/fs.c"
-#include "service/proc.c"
-#include "service/rare.c"
+#include "fs.c"
+#include "proc.c"
+#include "rare.c"
 static void service(struct cpu *c) {
     if (__builtin_expect(g_untrusted, 0)) {
         syscall_route(c);

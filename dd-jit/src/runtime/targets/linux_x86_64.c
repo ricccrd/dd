@@ -75,7 +75,7 @@
 #include "../os/linux/container/vfs.c"       // SHARED: rootfs jail, overlay, /proc synth, stat
 #include "../os/linux/container/netns.c"     // SHARED: sockets, loopback netns, termios
 #include "../os/linux/fscache.c"             // SHARED: fd/path cache
-#include "../os/linux/service.c"             // SHARED: the canonical syscall layer
+#include "../os/linux/syscall/dispatch.c"             // SHARED: the canonical syscall layer
 #include "../os/linux/sentry.c"              // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../frontend/x86_64/x86_ops.c"        // x86 cpuid + x87 m80 block-exit helpers
 #include "../frontend/x86_64/avx.c"            // AVX/AVX2/AVX-512 (VEX/EVEX) emulation (R_AVX block-exit)

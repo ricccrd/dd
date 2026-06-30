@@ -59,7 +59,7 @@
 // ELF fwd-decls + FS-metadata cache
 #include "../os/linux/fscache.c"
 // the syscall layer (service())
-#include "../os/linux/service.c"
+#include "../os/linux/syscall/dispatch.c"
 // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted; OFF by default)
 #include "../os/linux/sentry.c"
 // host trampoline + run_guest
