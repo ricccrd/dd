@@ -819,8 +819,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         ac_evict(gpa);
                     }
                 }
-                if (r < 1024) snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gp);
-                // remember guest path for merged getdents
+                // remember guest path for merged getdents -- but NOT for a bind-mount volume: a volume is
+                // its own jail (not in the upper/lowers), so its dir must list via plain readdir of the
+                // host fd; tagging it overlay -> overlay_readdir misses it -> an empty `ls` on the mount.
+                if (r < 1024 && !jail_is_vol(gp)) snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gp);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
             break;

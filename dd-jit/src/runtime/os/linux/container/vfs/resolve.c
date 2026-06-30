@@ -13,6 +13,17 @@ static int jail_ro(const char *abs) {
             return 1;
     return 0;
 }
+// 1 if the absolute guest path falls under ANY bind-mount volume (rw or ro). A volume is its OWN jail
+// root, not the overlay rootfs/lowers, so a volume directory must be listed via plain readdir of its
+// host fd -- the overlay merged-readdir only knows the image lowers + the upper and would return empty.
+// openat uses this to NOT tag a volume dir fd as an overlay dir (else getdents shows an empty mount).
+static int jail_is_vol(const char *abs) {
+    for (int i = 0; i < g_nvols; i++)
+        if (!strncmp(abs, g_vols[i].guest, g_vols[i].glen) &&
+            (abs[g_vols[i].glen] == '/' || abs[g_vols[i].glen] == 0))
+            return 1;
+    return 0;
+}
 // Convenience: resolve a (dirfd, raw) target to its guest abs path (same as abs_guest) and test RO.
 static int jail_ro_at(int dirfd, const char *raw) {
     if (g_nvols == 0) return 0; // no volumes -> skip work; behavior identical to before
