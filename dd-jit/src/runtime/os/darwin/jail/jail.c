@@ -29,7 +29,7 @@
 #include <mach/machine.h>
 #include <libkern/OSByteOrder.h>
 #include <libkern/OSCacheControl.h>
-#include "../container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
+#include "../../container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
 extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 // libcompiler_rt symbol that __builtin___clear_cache lowers to (aliased to dodge the clang builtin,
 // whose address can't be taken); we interpose it to flip emulated-RWX pages executable.
