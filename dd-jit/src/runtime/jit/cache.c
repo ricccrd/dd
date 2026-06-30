@@ -585,12 +585,22 @@ static void stw_flush(void) {
     atomic_store_explicit(&g_stw_active, 1, memory_order_seq_cst);
     pthread_t me = pthread_self();
     int target = 0;
+    // Hold g_stw_reg_lock for the WHOLE flush (not just the enumeration). stw_unregister() -- the only
+    // place a guest thread clears its `used` slot and then terminates -- also takes this lock, so while we
+    // hold it an exiting peer is pinned in stw_unregister and cannot terminate. That closes a lost-signal
+    // hang: if the lock were dropped right after enumeration, a peer we just pthread_kill'd could unregister
+    // and exit before its STW_SIG was ever delivered (the kernel discards a directed signal posted to a
+    // thread that has already terminated). Its park would then never happen, g_stw_parked would never reach
+    // `target`, and this flusher -- holding g_jit_lock -- would spin forever, stalling every guest thread
+    // (the rustc/Go "blocks at exit, 0% CPU" hang). Pinned in stw_unregister, the peer instead takes the
+    // pending STW_SIG (the park handler runs on top of the blocked pthread_mutex_lock), parks, and is
+    // counted. Lock order is always g_jit_lock -> g_stw_reg_lock (matches stw_peers_live), so no deadlock;
+    // the park handler itself takes no lock, so parking peers never need this lock to make progress.
     pthread_mutex_lock(&g_stw_reg_lock);
     for (int i = 0; i < STW_MAXTHREAD; i++)
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
             !pthread_equal(g_stw_threads[i].th, me))
             if (pthread_kill(g_stw_threads[i].th, STW_SIG) == 0) target++;
-    pthread_mutex_unlock(&g_stw_reg_lock);
     // Wait until every signaled peer has reached the safepoint (so none is executing in the cache).
     while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) < target) {
         struct timespec ts = {0, 50000};
@@ -603,6 +613,7 @@ static void stw_flush(void) {
         struct timespec ts = {0, 50000};
         nanosleep(&ts, NULL);
     }
+    pthread_mutex_unlock(&g_stw_reg_lock);
 }
 // fork(): drop the inherited (parent-only) thread registry -- host fork() duplicates only the calling
 // thread -- so a later flush in the child never signals a dead handle. Re-register the child's own thread.
