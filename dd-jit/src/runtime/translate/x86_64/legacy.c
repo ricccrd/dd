@@ -80,6 +80,23 @@ static int x86_normalize(struct cpu *c) {
         else { pts.tv_sec = ms / 1000; pts.tv_nsec = (ms % 1000) * 1000000L; r[2] = (uint64_t)&pts; }
         r[10] = 0; r[0] = 271; return 0; // -> x86 ppoll (271), which canon_x86 maps to canonical 73
     }
+    // select(nfds, readfds, writefds, exceptfds, timeval*) -> pselect6(nfds, rd, wr, ex, timespec*, NULL):
+    // nfds + the three fd_set pointers already sit in the pselect6 arg slots (rdi/rsi/rdx/r10), and the
+    // fd_set byte-layout is identical x86<->arm, so only the timeout differs -- x86 select's arg5 is a
+    // `struct timeval` (sec+usec) but pselect6 wants a `struct timespec` (sec+nsec), so synthesize one
+    // here. NOTE: Linux select writes the *remaining* time back into the timeval on return; pselect6 (and
+    // the host pselect that backs the canonical handler) don't report it, so the guest timeval is left
+    // unchanged -- portable code re-inits the timeout each call, and the select users we care about
+    // (socat, apr's select-based sleep) do.
+    case 23: {
+        static __thread struct timespec sts;
+        if (r[8]) { // non-NULL timeout: timeval -> timespec
+            struct timeval *tv = (struct timeval *)r[8];
+            sts.tv_sec = tv->tv_sec; sts.tv_nsec = (long)tv->tv_usec * 1000L;
+            r[8] = (uint64_t)&sts;
+        } // else r[8]==0 (NULL) -> block forever, pass through
+        r[9] = 0; r[0] = 270; return 0; // pselect6 arg6 sigmask = NULL; -> x86 pselect6 (270) -> canonical 72
+    }
     case 232: r[8] = 0; r[0] = 281; return 0; // epoll_wait(epfd,ev,max,timeout) -> epoll_pwait(...,NULL sigmask)
     // --- flag-arg variants (append a 0 flags) ---
     case 22: r[6] = 0; r[0] = 293; return 0;  // pipe(fds) -> pipe2(fds,0)
