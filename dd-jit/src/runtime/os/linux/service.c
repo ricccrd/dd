@@ -38,6 +38,7 @@ int g_rwx_guest;
 #include "service/io.c"
 #include "service/net.c"
 #include "service/event.c"
+#include "service/misc.c"
 // --- untrusted-guest isolation seam (subsystem #3: the sentry process-split) --------------------
 // The dispatcher's syscall boundary (run_guest -> service(c)) is the entire guest->host authority
 // crossing. We interpose a one-branch router so an UNTRUSTED guest's fs/net/proc syscalls can be
@@ -391,6 +392,7 @@ static void service_local(struct cpu *c) {
     if (svc_io(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_net(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_event(c, nr, a0, a1, a2, a3, a4, a5)) return;
+    if (svc_misc(c, nr, a0, a1, a2, a3, a4, a5)) return;
     switch (nr) {
 
     // ===================== Filesystem — open/stat/dir/link/perm/xattr/cwd, all path-confined to the rootfs jail
@@ -2172,47 +2174,6 @@ static void service_local(struct cpu *c) {
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }
-
-    // ===================== Misc — uname/sysinfo/getrandom/hostname =====================
-    case 160: {
-        char *u = (char *)a0;
-        // uname
-        memset(u, 0, 6 * 65);
-        strcpy(u, "Linux");
-        strcpy(u + 65, g_hostname[0] ? g_hostname : "jit");
-        strcpy(u + 130, "6.1.0");
-        strcpy(u + 195, "#1 jit");
-        strcpy(u + 260, G_UNAME_MACHINE); // per guest ISA: "x86_64" on jit86, "aarch64" on the arm engine
-        G_RET(c) = 0;
-        break;
-    }
-    case 161: {
-        int n = (int)a1;
-        if (n > 64) n = 64;
-        if (n > 0) {
-            memcpy(g_hostname, (void *)a0, n);
-            g_hostname[n] = 0;
-            // sethostname (UTS ns)
-        }
-        G_RET(c) = 0;
-        break;
-    }
-    // setdomainname -> ignore
-    case 162: G_RET(c) = 0; break;
-    case 179:
-        memset((void *)a0, 0, 112);
-        G_RET(c) = 0;
-        // sysinfo
-        break;
-    case 278:
-        arc4random_buf((void *)a0, (size_t)a1);
-        G_RET(c) = a1;
-        // getrandom
-        break;
-    case 293:
-        G_RET(c) = (uint64_t)(-ENOSYS);
-        // rseq -> ENOSYS (glibc falls back)
-        break;
 
     // ===================== seccomp / sandboxing parity =====================
     // Docker's default seccomp profile BLOCKS these with EPERM (they need elevated caps the container
