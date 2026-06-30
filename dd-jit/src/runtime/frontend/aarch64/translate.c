@@ -312,6 +312,117 @@ static void emit_fold_mem(uint32_t in) {
     e_ldr(T2, CPUREG, M + 48);
 }
 
+// ---- AdvSIMD load/store STRUCTURE bias-fold (ld1/st1 .. ld4/st4, single & multiple, ld1r/ld2r/...) ----
+// is_foldable_mem deliberately omits these (their effective address is a bare base Xn with no offset or
+// index), so without this they fall to the nonpie_fixup safety net -- a SIGSEGV per access. glibc's NEON
+// strlen/memcpy stream the image's LOW absolute pointers through `ld1 {v0.16b},[x1]`, which then traps once
+// per 16 bytes (gcc -shared spins). Fold them exactly like emit_fold_mem: materialize the base in a scratch,
+// add g_nonpie_bias iff it lands in the image span [lo,hi), and run the access against the biased scratch.
+// The EA of a structure op IS the base (no immediate, no index), so the < image-span test on Xn is exact.
+// Identifier: bit31=0, bits[29:25]=00110; bit24 = single(1)/multiple(0), bit23 = post-index writeback. Rt is
+// a V register (no GP mangle needed) -- only the base Xn[9:5] and a register post-index Rm[20:16] are GP.
+static int is_advsimd_struct(uint32_t in) { return (in & 0xBE000000u) == 0x0C000000u; }
+
+// Bytes transferred by an AdvSIMD structure op -- the implicit increment of an immediate post-index (Rm==31).
+static int advsimd_struct_bytes(uint32_t in) {
+    int q = (in >> 30) & 1;
+    if (!((in >> 24) & 1)) { // load/store MULTIPLE structures: register count from opcode[15:12]
+        int regs;
+        switch ((in >> 12) & 0xF) {
+        case 0x0: case 0x2: regs = 4; break; // LD4/ST4, LD1 x4
+        case 0x4: case 0x6: regs = 3; break; // LD3/ST3, LD1 x3
+        case 0x8: case 0xA: regs = 2; break; // LD2/ST2, LD1 x2
+        case 0x7: regs = 1; break;           // LD1 x1
+        default: regs = 0; break;            // unallocated (never reached: the access would have faulted)
+        }
+        return regs * (q ? 16 : 8);
+    }
+    // load/store SINGLE structure: selem consecutive elements, each (1<<scale) bytes.
+    int opcode = (in >> 13) & 7, R = (in >> 21) & 1, size = (in >> 10) & 3;
+    int scale = (opcode >> 1) & 3, selem = (((opcode & 1) << 1) | R) + 1;
+    if (scale == 3) scale = size; // LD#R replicate: element width is `size`
+    return selem * (1 << scale);
+}
+
+// Fold an AdvSIMD load/store structure op (see is_advsimd_struct). Mirrors emit_fold_mem's range-gated bias
+// (flag-safe: NZCV saved across the compares) but is simpler -- the EA is just the base, and Rt names a V
+// register so it never needs mangling. The access is rebased onto the biased scratch as the no-offset form;
+// any post-index writeback (immediate or register increment) is then applied to the LOW guest base, matching
+// nonpie_fixup's writeback semantics. Caller gates on guestbase_on() && !in_excl && base != SP.
+static void emit_fold_advsimd_struct(uint32_t in) {
+    int base = (in >> 5) & 31, post = (in >> 23) & 1;
+    int rm = post ? (int)((in >> 16) & 31) : 31; // post-index increment register (31 = immediate form)
+    // Scratch set: Sb (biased base / effective addr), T (compares + temps), T2 (saved NZCV / wb temp). The
+    // only GP operands to avoid are the base and, for a register post-index, Rm.
+    unsigned usedmask = (1u << base) | (rm != 31 ? (1u << rm) : 0u);
+    int sc[3], n = 0;
+    for (int r = 0; r <= 30 && n < 3; r++)
+        if (!(usedmask & (1u << r)) && !is_stolen(r)) sc[n++] = r;
+    int Sb = sc[0], T = sc[1], T2 = sc[2];
+    // Spill scratch originals to cpu->mscratch[4..6] (disjoint from emit_mangled_x18's [0..3]); NOT the stack,
+    // since the fold runs on a hot memory op where an async host signal would clobber a [sp,#-N] red-zone slot.
+    int M = (int)OFF_MSCRATCH;
+    e_str(Sb, CPUREG, M + 32);
+    e_str(T, CPUREG, M + 40);
+    e_str(T2, CPUREG, M + 48);
+    if (is_stolen(base))
+        e_ldr(Sb, CPUREG, base * 8); // guest base from cpu->x[base]
+    else
+        e_movr(Sb, base); // guest base from the live host reg
+    // Bias iff Sb is in [g_nonpie_lo, g_nonpie_hi); a >= 4GiB base is never the low image -> skip with no flag
+    // traffic. The compares clobber NZCV, so save/restore the guest flags. (Same discriminator as emit_fold_mem.)
+    emit32(0xD360FC00u | (Sb << 5) | T); // lsr T, Sb, #32
+    uint32_t *p_hi = (uint32_t *)g_cp;
+    emit32(0);                              // cbnz T, Lhi   (>= 4GiB -> skip, flags untouched)
+    emit32(0xD53B4200u | T2);               // mrs T2, nzcv  (save guest flags)
+    e_movconst(T, g_nonpie_lo);
+    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, lo
+    uint32_t *p_lo1 = (uint32_t *)g_cp;
+    emit32(0);                              // b.lo Llo   (Sb < lo -> not image)
+    e_movconst(T, g_nonpie_hi);
+    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, hi
+    uint32_t *p_lo2 = (uint32_t *)g_cp;
+    emit32(0);                              // b.hs Llo   (Sb >= hi -> not image)
+    e_movconst(T, g_nonpie_bias);
+    emit32(0x8B000000u | (T << 16) | (Sb << 5) | Sb); // add Sb, Sb, bias
+    uint8_t *Llo = g_cp;
+    emit32(0xD51B4200u | T2);               // msr nzcv, T2  (restore guest flags)
+    uint8_t *Lhi = g_cp;
+    *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
+    *p_lo1 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3; // b.lo
+    *p_lo2 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2; // b.hs
+    // De-index to the no-offset form against Sb: clear post-index (bit23) and Rm[20:16], rebase Xn -> Sb. The
+    // V-register list, opcode, R, and size fields are untouched, so the transfer is identical -- only its
+    // address is now the biased high pointer.
+    emit32((in & ~(1u << 23) & ~(0x1Fu << 16) & ~(0x1Fu << 5)) | ((unsigned)Sb << 5));
+    if (post) { // writeback the LOW guest base: Xn += (Rm==31 ? bytes transferred : Xm)
+        if (rm == 31) {
+            unsigned inc = (unsigned)advsimd_struct_bytes(in);
+            if (is_stolen(base)) {
+                e_ldr(T, CPUREG, base * 8);
+                e_addi(T, T, inc);
+                e_str(T, CPUREG, base * 8);
+            } else
+                e_addi(base, base, inc);
+        } else {
+            int idx = rm;
+            if (is_stolen(rm)) {
+                e_ldr(T, CPUREG, rm * 8); // increment from cpu->x[rm]
+                idx = T;
+            }
+            if (is_stolen(base)) { // T2's original is spilled -> free as the base temp (T2 != idx always)
+                e_ldr(T2, CPUREG, base * 8);
+                emit32(0x8B000000u | ((unsigned)idx << 16) | (T2 << 5) | T2); // add T2, T2, idx
+                e_str(T2, CPUREG, base * 8);
+            } else
+                emit32(0x8B000000u | ((unsigned)idx << 16) | (base << 5) | base); // add base, base, idx
+        }
+    }
+    e_ldr(Sb, CPUREG, M + 32); // restore scratch originals
+    e_ldr(T, CPUREG, M + 40);
+    e_ldr(T2, CPUREG, M + 48);
+}
+
 // For instructions that WRITE x18 via a special path (adr/ldr-literal/mrs): save x0,x1 to
 // the red zone, x1 := cpu. The case then computes a value into x0 and stores it to
 // cpu->x[18]; x18_epilog restores x0,x1.
@@ -1434,11 +1545,20 @@ static void *translate_block(uint64_t gpc) {
 
         // guest_base bias-fold: a non-PIE image's LOW absolute load/store -> +bias (the high mapping), no
         // fault. Only outside an exclusive monitor region (the fold spills scratch to memory, which would
-        // clear the monitor) and only for a non-SP base (the stack is always high). Inert for PIE.
-        if (guestbase_on() && !in_excl && ((in >> 5) & 31) != 31 && is_foldable_mem(in)) {
-            emit_fold_mem(in);
-            gpc += 4;
-            continue;
+        // clear the monitor) and only for a non-SP base (the stack is always high). The AdvSIMD load/store
+        // structure family (ld1/st1.., ld1r) has no offset/index so is_foldable_mem omits it -- fold it via
+        // its own emitter (else glibc's NEON strlen/memcpy trap once per access on the image). Inert for PIE.
+        if (guestbase_on() && !in_excl && ((in >> 5) & 31) != 31) {
+            if (is_foldable_mem(in)) {
+                emit_fold_mem(in);
+                gpc += 4;
+                continue;
+            }
+            if (is_advsimd_struct(in)) {
+                emit_fold_advsimd_struct(in);
+                gpc += 4;
+                continue;
+            }
         }
         // everything else: verbatim,
         int mask = gpr_field_mask(in);
