@@ -179,8 +179,16 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             g_sigact[sig].handler = h;
             g_sigact[sig].flags = *(uint64_t *)(a1 + 8);
             g_sigact[sig].mask = *(uint64_t *)(a1 + 16);
-            // can't touch SIGKILL/SIGSTOP (Linux nums)
-            if (sig != 9 && sig != 19) {
+            // Synchronous CPU faults (SIGILL/FPE/TRAP/SEGV/BUS) ALWAYS stay on the engine's own host guard
+            // (installed at startup): it intercepts the hardware fault and either delivers it to the guest
+            // handler recorded in g_sigact above (deliver_guest_fault) or applies the default action
+            // (decline -> re-raise). We therefore never forward the guest's disposition to the real host
+            // for these -- doing so would UNINSTALL the guard, so a later CPU-feature probe that traps an
+            // unsupported instruction (OpenSSL SM3/SM4 + a SIGILL handler) would fault fatally instead of
+            // reaching its handler. The bug surfaced across execve: a non-PIE parent (rustup) restoring
+            // SIGILL to SIG_DFL left the host guard uninstalled for the exec'd child (cargo). Only ASYNC
+            // signals touch the real host disposition. (SIGKILL/SIGSTOP are unmaskable.)
+            if (sig != 9 && sig != 19 && !sig_is_sync(sig)) {
                 // host(macOS) signo to install on
                 int ms = sig_l2m(sig);
                 if (h == 0)
@@ -188,8 +196,8 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 else if (h == 1)
                     // honor SIG_IGN (e.g. SIGPIPE)
                     signal(ms, SIG_IGN);
-                // async: flag pending, deliver in dispatcher
-                else if (!sig_is_sync(sig)) {
+                else {
+                    // async: flag pending, deliver in dispatcher
                     struct sigaction sa;
                     memset(&sa, 0, sizeof sa);
                     sa.sa_handler = host_sigh;
