@@ -16,7 +16,7 @@
 // byte-identically to a standalone run. COW gives isolation: a worker's translations / data writes
 // never touch the parent or sibling workers.
 //
-// This file is #included by targets/linux_x86_64.c AFTER jit86_run / run_loaded / load_program.
+// This file is #included by targets/linux_x86_64.c AFTER dd_run / run_loaded / load_program.
 //
 // NOTE vs the W3D research diff: that diff carried the loaded-image span in a new `span` field on
 // `struct loaded` (set in elf.c). To keep this change inside the x86 frontend (no edits to the
@@ -174,7 +174,7 @@ static void ddjitd_worker(int conn, int *fds, int nfd, int argc, char **argv) {
         // Cold: no matching prewarm. Pay a full per-launch load + translate in the worker (still no
         // spawn/dyld/engine-init -- those were paid by the resident parent). Translations are
         // COW-private to this worker and discarded on exit.
-        rc = jit86_run(g_srv_rootfs[0] ? g_srv_rootfs : NULL, argc, argv);
+        rc = dd_run(g_srv_rootfs[0] ? g_srv_rootfs : NULL, argc, argv);
     }
     if (getenv("DDJITD_DIAG")) { // W3D: report fresh translation done by THIS worker (0 == fully warm)
         FILE *df = fopen("/tmp/ddjitd-worker.log", "a");

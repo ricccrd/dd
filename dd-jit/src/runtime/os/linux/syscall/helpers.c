@@ -102,7 +102,7 @@ static void dirs_drop(int fd) {
 // begins with "#!", fills `interp` (size ni) with the interpreter path and `arg` (size na) with the
 // optional single argument (arg[0]==0 when there is none) and returns 1. Returns 0 when it is not a
 // shebang script, -1 when the file can't be opened/read. Shared by execve (case 221) and the initial
-// program loader (jit_run): both then rewrite argv to [interp, (arg), scriptpath, args...] and load the
+// program loader (dd_run): both then rewrite argv to [interp, (arg), scriptpath, args...] and load the
 // INTERPRETER instead of the script. load_elf has no ELF-magic/#! check, so the script bytes would
 // otherwise be parsed as a bogus ELF and fault.
 static int parse_shebang(const char *host_path, char *interp, size_t ni, char *arg, size_t na) {

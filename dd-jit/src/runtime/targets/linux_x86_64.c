@@ -85,12 +85,12 @@
 
 // ---- entry + main ----
 // ---------------- entry ----------------
-// W3D fork-server refactor: the original jit86_run inlined (1) container init, (2) engine init
+// W3D fork-server refactor: the original dd_run inlined (1) container init, (2) engine init
 // (pthread key + MAP_JIT arena + signal handlers + trace env), and (3) per-launch load+run. The
 // resident ddjitd parent must pay (1)+(2) ONCE and share them COW with every forked worker, so
 // those two phases are factored into container_init()/engine_global_init(). engine_global_init()
 // is idempotent (g_engine_inited) so the standalone path is byte-for-byte unchanged: standalone
-// jit86_run() composes container_init -> engine_global_init -> load_program -> run_loaded in the
+// dd_run() composes container_init -> engine_global_init -> load_program -> run_loaded in the
 // exact original order, with the identical operations in each phase.
 static int g_engine_inited;
 
@@ -266,9 +266,9 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 }
 
 // W3D: fresh per-launch guest run from a loaded image. Allocates a private heap + stack + cpu and
-// runs from `jump`. Shared by jit86_run (standalone/cold) and the warm worker (which restores a
+// runs from `jump`. Shared by dd_run (standalone/cold) and the warm worker (which restores a
 // pristine COW image first, then calls this against the parent-preloaded base). Body is the original
-// jit86_run tail verbatim (incl. the committed s1_calibrate + the fastsys/prof prints), so standalone
+// dd_run tail verbatim (incl. the committed s1_calibrate + the fastsys/prof prints), so standalone
 // behavior is byte-identical.
 static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t jump, uint64_t at_base) {
     uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -294,7 +294,7 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     return c.exit_code;
 }
 
-int jit86_run(const char *rootfs, int argc, char *const argv[]) {
+int dd_run(const char *rootfs, int argc, char *const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return 2;
     // opt8 persistent translated-code cache: OPT-IN via DDJIT_PCACHE (default OFF -> byte-identical to the
     // baseline; the cross-engine matrix never sets it, so it is unaffected). Read once.
@@ -364,6 +364,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]);
         return 2;
     }
-    return jit86_run(rootfs, argc - ai, argv + ai);
+    return dd_run(rootfs, argc - ai, argv + ai);
 }
 #endif

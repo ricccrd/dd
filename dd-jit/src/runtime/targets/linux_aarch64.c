@@ -2,7 +2,7 @@
 //
 // A same-ISA aarch64->aarch64 JIT services the guest's Linux syscalls in userspace (no VM). This TU
 // pulls in the engine (jit/), the aarch64 guest frontend (frontend/aarch64/), the Linux personality +
-// container layer (os/linux/), and defines jit_run() (the Rust binding's entry) + main(). The x86-64
+// container layer (os/linux/), and defines dd_run() (the Rust binding's entry) + main(). The x86-64
 // guest reuses os/linux/ + jit/ with frontend/x86_64/ (see ddjit_x86_64.c).
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,7 +168,7 @@ static void install_mach_exc(void) {
     pthread_create(&t, NULL, exc_thread, NULL);
 }
 // DD_FAULTCOUNT=1: measurement-only wrapper around nonpie_guard that tallies served low-address faults
-// (the guest_base bias-fold's whole point is to drive this to ~0). Per-process; printed at jit_run exit.
+// (the guest_base bias-fold's whole point is to drive this to ~0). Per-process; printed at dd_run exit.
 static volatile uint64_t g_nonpie_faults;
 static volatile uint64_t g_fhist[16];
 static const char *g_fhname[16] = {"uoff", "unscaled", "wb",    "regoff", "ldp",   "ldp_wb", "excl", "lse",
@@ -208,7 +208,7 @@ static void nonpie_guard_count(int sig, siginfo_t *si, void *uc) {
     }
     nonpie_guard(sig, si, uc);
 }
-int jit_run(const char *rootfs, int argc, char *const argv[]) {
+int dd_run(const char *rootfs, int argc, char *const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return 2;
     // PID ns: only containers (rootfs) get PID 1
     if (rootfs) g_init_hostpid = getpid();
@@ -489,6 +489,6 @@ int main(int argc, char **argv) {
                 argv[0]);
         return 2;
     }
-    return jit_run(rootfs, argc - ai, argv + ai);
+    return dd_run(rootfs, argc - ai, argv + ai);
 }
 #endif
