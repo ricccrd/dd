@@ -4,11 +4,26 @@
 // Linux aarch64 rt_sigframe: siginfo(128) then ucontext{flags,link,stack(24),
 // sigmask@40,...,mcontext@168}; sigcontext{fault,regs[31]@8,sp@256,pc@264,
 // pstate@272,reserved@280}. We stash the guest V-regs in the reserved area.
+// Linux sigaltstack: SA_ONSTACK asks the kernel to run the handler on the alternate signal stack;
+// ss_flags SS_DISABLE(2) means no alt stack is configured.
+#define SA_ONSTACK_L 0x08000000u
+#define SS_DISABLE_L 2u
 static void build_signal_frame(struct cpu *c, int sig) {
     if (g_trace)
         fprintf(stderr, "[sig] deliver %d sp=%llx handler=%llx\n", sig, (unsigned long long)c->sp,
                 (unsigned long long)g_sigact[sig].handler);
-    uint64_t frame = (c->sp - 4688) & ~15ull;
+    // SA_ONSTACK: build the frame on the alternate signal stack, not the interrupted (guest) stack. Runtimes
+    // that manage their own threads install handlers with SA_ONSTACK + a per-thread signal stack and then
+    // VERIFY the handler ran on it -- Go's adjustSignalStack treats a handler that ran off its gsignal stack
+    // as a signal on a foreign (cgo) thread and calls needm(), which in a no-cgo program spins forever in
+    // lockextra waiting for an "extra M" that is never created (the go-build/go-run hang). Mirror the kernel:
+    // switch to the alt stack only when SA_ONSTACK is set, an alt stack exists, and we are not ALREADY on it
+    // (a nested handler keeps growing the same stack), so the interrupted SP saved below stays truthful.
+    uint64_t base = c->sp;
+    if ((g_sigact[sig].flags & SA_ONSTACK_L) && c->alt_sp && !(c->alt_flags & SS_DISABLE_L) &&
+        !(c->sp >= c->alt_sp && c->sp < c->alt_sp + c->alt_size))
+        base = c->alt_sp + c->alt_size; // alt stack top; the frame grows down from here
+    uint64_t frame = (base - 4688) & ~15ull;
     uint8_t *f = (uint8_t *)frame;
     memset(f, 0, 4688);
     // siginfo.si_signo

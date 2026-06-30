@@ -270,8 +270,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 176:
     // getgid/getegid
     case 177: G_RET(c) = (uint64_t)cgid(); break;
-    // gettid
-    case 178: G_RET(c) = (uint64_t)container_pid(); break;
+    // gettid -- a UNIQUE per-thread id (unlike getpid, which is the shared tgid). The init thread keeps
+    // c->tid==0 and reports the container pid (==1, where tid==tgid as on Linux); each spawned thread
+    // carries its own id (spawn_thread). A correct gettid is load-bearing for runtimes that key thread
+    // state on it (e.g. Go stores it in m.procid and tgkill()s it to preempt) -- collapsing every thread
+    // to tid 1 makes their cross-thread signalling target the wrong thread and live-lock.
+    case 178: G_RET(c) = (uint64_t)(c->tid ? c->tid : container_pid()); break;
     // clone(flags,stack,ptid,tls,ctid)
     case 220: {
         // CLONE_THREAD: stack arg IS the top

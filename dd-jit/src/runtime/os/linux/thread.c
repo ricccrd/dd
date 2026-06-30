@@ -242,6 +242,58 @@ static void futex_wake_addr(uint64_t uaddr) {
 }
 
 static volatile int g_next_tid = 1000;
+
+// ---------------- live-thread registry (for thread-directed signals: tkill/tgkill) ----------------
+// A tgkill()/tkill() names a specific guest tid; to deliver to THAT thread (and only it) we must map the
+// tid back to its struct cpu and host pthread. Each thread (init + every spawned one) registers on entry
+// to run_guest and unregisters when it leaves. Small fixed table guarded by a mutex; a lookup miss (target
+// already gone, or table full) just drops the signal, exactly as Linux drops a tgkill to a dead tid.
+#define THREAD_REG_MAX 4096
+static struct {
+    struct cpu *c;
+    pthread_t th;
+} g_threg[THREAD_REG_MAX];
+static pthread_mutex_t g_threg_m = PTHREAD_MUTEX_INITIALIZER;
+// The guest tid this cpu answers gettid() with (see proc.c case 178): its own id, or the init's pid 1.
+static int cpu_tid(const struct cpu *c) { return c->tid ? c->tid : container_pid(); }
+static void thread_register(struct cpu *c) {
+    pthread_mutex_lock(&g_threg_m);
+    for (int i = 0; i < THREAD_REG_MAX; i++)
+        if (!g_threg[i].c) {
+            g_threg[i].c = c;
+            g_threg[i].th = pthread_self();
+            break;
+        }
+    pthread_mutex_unlock(&g_threg_m);
+}
+static void thread_unregister(struct cpu *c) {
+    pthread_mutex_lock(&g_threg_m);
+    for (int i = 0; i < THREAD_REG_MAX; i++)
+        if (g_threg[i].c == c) {
+            g_threg[i].c = NULL;
+            break;
+        }
+    pthread_mutex_unlock(&g_threg_m);
+}
+// Deliver signal `sig` to the guest thread `tid`: set that thread's per-thread pending bit so it (and not
+// some other thread) runs the handler at its next dispatcher safepoint. A thread that is preempted while
+// running translated code (e.g. Go's sysmon tgkill'ing a worker with SIGURG to stop-the-world) crosses a
+// dispatcher boundary continuously, so the per-thread pending is observed promptly without poking the host
+// thread. Returns 1 if the target was found and flagged, 0 if no live thread carries that tid (caller then
+// falls back to process semantics, as Linux drops a tgkill to a dead tid).
+static int thread_target_signal(int tid, int sig) {
+    int found = 0;
+    pthread_mutex_lock(&g_threg_m);
+    for (int i = 0; i < THREAD_REG_MAX; i++)
+        if (g_threg[i].c && cpu_tid(g_threg[i].c) == tid) {
+            __atomic_or_fetch(&g_threg[i].c->tpending, 1ull << sig, __ATOMIC_SEQ_CST);
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&g_threg_m);
+    return found;
+}
+
 static void *thread_trampoline(void *p) {
     struct cpu *child = (struct cpu *)p;
     // sets its own TSD, runs to thread exit
@@ -274,6 +326,8 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     // CLONE_SETTLS
     if (flags & 0x00080000) G_TLS(child) = tls;
     int tid = __sync_add_and_fetch(&g_next_tid, 1);
+    // This thread's gettid() identity (see proc.c case 178): a unique id, distinct from the init's pid 1.
+    child->tid = tid;
     // CLONE_PARENT_SETTID
     if ((flags & 0x00100000) && ptid) *(int *)ptid = tid;
     // CLONE_CHILD_SETTID

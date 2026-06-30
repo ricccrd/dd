@@ -29,6 +29,18 @@ static int syscall_should_restart(struct cpu *c) {
 // do/while around the blocking host call so the result variable stays local to each call site.
 #define SVC_EINTR_RESTART(c) (errno == EINTR && syscall_should_restart(c))
 
+// Route a thread-directed signal (tkill/tgkill at `tid`). If it names ANOTHER live thread and the signal
+// has a real guest handler, deliver it to exactly that thread (its cpu->tpending) -- a process-wide
+// g_pending would let any thread (typically the sender) consume it, which breaks Go's stop-the-world
+// preemption (sysmon tgkill's a worker with SIGURG and must stop THAT worker). Otherwise -- self-signal,
+// default/ignore disposition, or an unknown/dead tid -- fall back to the existing process-directed path on
+// the caller (raise_guest_signal applies the default/ignore action or coalesces into g_pending as before).
+static void thread_kill(struct cpu *c, int tid, int sig) {
+    if (sig >= 1 && sig <= 64 && tid != cpu_tid(c) && g_sigact[sig].handler > 1 && thread_target_signal(tid, sig))
+        return;
+    raise_guest_signal(c, sig);
+}
+
 static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
     // ===================== Signals — Linux signal numbers -> macOS; kill/sigaction/sigreturn =====================
@@ -43,14 +55,14 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             G_RET(c) = kill((pid_t)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
         break;
     case 130:
-        raise_guest_signal(c, (int)a1);
+        // tkill(tid, sig)
+        thread_kill(c, (int)a0, (int)a1);
         G_RET(c) = 0;
-        // tkill(tid,sig)
         break;
     case 131:
-        raise_guest_signal(c, (int)a2);
+        // tgkill(tgid, tid, sig)
+        thread_kill(c, (int)a1, (int)a2);
         G_RET(c) = 0;
-        // tgkill(tgid,tid,sig)
         break;
     case 138: { // rt_sigqueueinfo(tgid, sig, siginfo): carry si_code + si_value to the handler's siginfo
         int sig = (int)a1;

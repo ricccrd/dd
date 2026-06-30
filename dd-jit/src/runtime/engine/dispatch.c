@@ -83,6 +83,9 @@ static void run_guest(struct cpu *c) {
     // (and so we are enumerated when WE flush). Unregistered after the loop -> an exited thread is never
     // signalled.
     stw_register();
+    // Join the tid->thread registry so a tkill()/tgkill() to this thread can find it (thread-directed
+    // signal delivery via cpu->tpending); left at loop exit so a dead thread is never targeted.
+    thread_register(c);
     // Frontend hook: one-time per-thread entry setup (x86 publishes the 2-way IBTC base; empty on aarch64).
     G_DISPATCH_ENTER(c);
     while (!c->exited) {
@@ -184,9 +187,10 @@ static void run_guest(struct cpu *c) {
         // handles R_TIER2 itself (with `continue`), so for the x86 engine this line is never reached;
         // it remains the aarch64 path. Both arches define tier2_promote (per-arch).
         if (c->reason == R_TIER2) tier2_promote(G_PC(c));
-        // async signal -> guest handler
-        if (g_pending) maybe_deliver_signal(c);
+        // async signal -> guest handler (process-directed g_pending OR thread-directed cpu->tpending)
+        if (g_pending || c->tpending) maybe_deliver_signal(c);
     }
-    // Leave the stop-the-world registry: this thread will never execute in the cache again.
+    // Leave the registries: this thread will never execute in the cache again, nor be a signal target.
+    thread_unregister(c);
     stw_unregister();
 }

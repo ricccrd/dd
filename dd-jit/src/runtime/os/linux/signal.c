@@ -59,18 +59,26 @@ static void do_sigreturn(struct cpu *c);
 static int sigframe_capture_fault(struct cpu *c, void *ucv);
 static void sigframe_resume_dispatch(struct cpu *c, void *ucv);
 static void maybe_deliver_signal(struct cpu *c) {
-    uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
+    // Two sources: g_pending (process-directed -- any thread may take it) and c->tpending (thread-directed
+    // via tkill/tgkill -- only THIS thread). Consider both; coalescing a process- and thread-directed
+    // instance of the same (non-realtime) signal into one delivery is the correct Linux semantics.
+    uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
     for (int sig = 1; sig <= 64; sig++) {
         uint64_t bit = 1ull << sig;
         // sigmask is sigset_t (bit N-1)
         if (!(p & bit) || (c->sigmask & (1ull << (sig - 1)))) continue;
         uint64_t h = g_sigact[sig].handler;
         if (h <= 1) {
+            // DFL/IGN: a process-directed one was already actioned by the host; a thread-directed one is a no-op.
             __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST);
+            __atomic_and_fetch(&c->tpending, ~bit, __ATOMIC_SEQ_CST);
             continue;
-        // DFL/IGN: host did it
         }
-        if (__atomic_fetch_and(&g_pending, ~bit, __ATOMIC_SEQ_CST) & bit) {
+        // Claim from both queues (clear unconditionally so the coalesced signal is delivered exactly once),
+        // then run the guest handler on this thread.
+        uint64_t had_t = __atomic_fetch_and(&c->tpending, ~bit, __ATOMIC_SEQ_CST) & bit;
+        uint64_t had_p = __atomic_fetch_and(&g_pending, ~bit, __ATOMIC_SEQ_CST) & bit;
+        if (had_t || had_p) {
             build_signal_frame(c, sig);
             return;
         }

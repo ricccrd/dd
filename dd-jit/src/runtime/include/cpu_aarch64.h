@@ -47,6 +47,14 @@ struct cpu {
     uint64_t alt_sp, alt_size;
     // sigaltstack (per-thread)
     uint32_t alt_flags;
+    // gettid()/tgkill() identity: the guest thread id this cpu runs as. 0 on the initial (init) thread,
+    // which reports container_pid() (==1); each spawned thread gets a unique id. Appended after the
+    // baked-offset fields so the emitted-code offsets above are unaffected.
+    int tid;
+    // Thread-DIRECTED pending signals (1<<signo), the per-thread analogue of the process-wide g_pending.
+    // A tgkill()/tkill() to THIS thread sets a bit here so the signal is delivered by this thread alone
+    // (a process-directed signal in g_pending may be taken by any thread). Drained by maybe_deliver_signal.
+    volatile uint64_t tpending;
 };
 #define OFF_V 384
 #define OFF_HOSTV 896
