@@ -63,7 +63,7 @@ fn main() {
 
     // darwinjail: the DYLD-interposing jail dylib for native macOS containers (`ddcli mac`). Runs the
     // host's arm64 binaries jailed -- no DBT. arm64 only (matches the userland); exported as DDJAIL_*.
-    let djc = runtime.join("os/darwin/darwinjail.c");
+    let djc = runtime.join("os/darwin/jail/jail.c");
     let djdylib = out.join("darwinjail.dylib");
     let mut jail_built = false;
     if djc.exists() {
