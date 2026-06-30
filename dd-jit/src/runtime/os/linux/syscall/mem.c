@@ -179,6 +179,31 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         void *r =
             mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
+        // Past-EOF tail zero-fill. A file mmap whose length runs past the file's end leaves the trailing
+        // WHOLE pages with no backing: macOS SIGBUSes on any read of them. ld.so does exactly this -- it maps
+        // a .so's WHOLE vaddr span from the FIRST segment, so the inter-segment bytes become such past-EOF
+        // pages. On Linux they are equally unbacked, but ld.so PROT_NONEs / replaces that region and never
+        // reads it; with macOS's 16 KB pages, though, a later 4 KB-granular segment map (x86_64 .so p_align
+        // 0x1000) shares its low host page with one of those past-EOF pages, so a stray access SIGBUSes where
+        // Linux stayed quiet (julia's libdl/libjulia abort here). Re-map the genuinely-past-EOF whole-page
+        // tail as anonymous zero -- the inaccessible-but-quiet region Linux effectively presents -- so such a
+        // shared host page reads back zero instead of faulting. The partial page straddling EOF keeps macOS's
+        // file bytes + zero-fill, a later MAP_FIXED segment map overwrites whatever it needs, and a fully
+        // file-backed mapping (valid_end >= a1) is left byte-identical. RW only (an ANON PROT_EXEC map hits
+        // macOS W^X EPERM; the JIT never executes guest pages anyway). MAP_PRIVATE only: a MAP_SHARED file
+        // map past EOF can be made valid later by ftruncate-extending the file (sqlite/lmdb), so its tail
+        // must stay the real shared mapping; ld.so's .so segments are all MAP_PRIVATE, so julia is covered.
+        if (r != MAP_FAILED && (a3 & 0x02) && !(a3 & 0x20) && (int)a4 >= 0 && a1) {
+            struct stat st;
+            if (fstat((int)a4, &st) == 0) {
+                uint64_t avail = (uint64_t)st.st_size > a5 ? (uint64_t)st.st_size - (uint64_t)a5 : 0;
+                size_t hp = (size_t)getpagesize();
+                uint64_t valid_end = (avail + hp - 1) & ~(uint64_t)(hp - 1); // first host page wholly past EOF
+                if (valid_end < a1)
+                    mmap((char *)r + valid_end, (size_t)(a1 - valid_end), PROT_READ | PROT_WRITE,
+                         MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            }
+        }
         // 16 KB-vs-4 KB MAP_FIXED reconciliation. macOS arm64 mmap REQUIRES a 16 KB-aligned address for
         // MAP_FIXED, but x86_64 .so PT_LOAD segments are only p_align=0x1000 (4 KB), so ld.so's MAP_FIXED
         // mapping of e.g. libc's text segment at a 4 KB- (not 16 KB-) aligned guest address returns EINVAL
@@ -196,8 +221,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // The low page may also hold the tail of the previous PT_LOAD (a0 sits mid-16 KB-page). The ANON
             // MAP_FIXED below zeros that whole page, so snapshot the neighbour's bytes FIRST and restore them
             // after -- they were already written (prev segment / ld.so's reservation) and must survive. (The
-            // HIGH edge needs no save: bytes past a0+a1 belong to the NEXT segment, which refills them via
-            // its own map, or are this segment's BSS, which must read as zero anyway.)
+            // past-EOF tail fill above guarantees the head is now readable -- a real neighbour byte or quiet
+            // zero -- never a SIGBUSing hole. The HIGH edge needs no save: bytes past a0+a1 belong to the
+            // NEXT segment, which refills them via its own map, or are this segment's BSS -> read as zero.)
             void *hsave = head ? malloc(head) : NULL;
             if (hsave) memcpy(hsave, (void *)lo, head);
             // RW only: the JIT never executes guest pages, and an ANON PROT_EXEC map hits macOS W^X EPERM.
