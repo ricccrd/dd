@@ -15,6 +15,10 @@ file after each batch).
 - [ ] **#123 `docker run node node -e …` → "open: No such file"** — bash/uname run from the pulled
   node:latest rootfs but the `node` binary itself won't start (curated node_alpine runs `node -e` fine).
   Loader/interp path or V8 startup specific to the real image.
+- [ ] **#124 postgres bring-up: find_my_exec self-path resolution** — `initdb` can't resolve its own
+  absolute path when launched via PATH (`could not resolve path … to absolute form`) so it can't find
+  the sibling `postgres` binary; blocks full postgres cluster bring-up (and pg_ctl/pg_dump). Binary loads
+  fine (`postgres --version` → 16.14). Engine realpath/readlink or /proc/self/exe for a PATH-launched binary.
 - [ ] **#117 flaky PIE fork+exec SIGSEGV** — post-fork execve ld.so faults on a GOT pointer relocated
   against the wrong base; ASLR-dependent. Needs a deterministic collision-checked base for the execve
   image (`translate/x86_64/elf.c`).
