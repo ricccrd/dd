@@ -19,8 +19,21 @@ static uint64_t eflags_to_nzcv(uint64_t f) {
     if (f & (1u << 11)) nz |= 1u << 28; // SF, OF
     return nz;
 }
+#define SA_ONSTACK_L 0x08000000u
+#define SS_DISABLE_L 2u
 static void build_signal_frame(struct cpu *c, int sig) {
-    uint64_t sp = (c->r[4] - 2048) & ~15ull;                        // 16-aligned frame base; uc lives here
+    // SA_ONSTACK: build the frame on the alternate signal stack, not the interrupted (guest) stack. Runtimes
+    // that manage their own threads install handlers with SA_ONSTACK + a per-thread signal stack and then
+    // VERIFY the handler ran on it -- Go's adjustSignalStack treats a handler that ran off its gsignal stack
+    // as a signal on a foreign (cgo) thread and calls needm(), which in a no-cgo program spins forever in
+    // lockextra waiting for an "extra M" that is never created (the go-build/go-run hang). Mirror the kernel:
+    // switch to the alt stack only when SA_ONSTACK is set, an alt stack exists, and we are not ALREADY on it
+    // (a nested handler keeps growing the same stack), so the interrupted RSP saved below stays truthful.
+    uint64_t base = c->r[4];
+    if ((g_sigact[sig].flags & SA_ONSTACK_L) && c->alt_sp && !(c->alt_flags & SS_DISABLE_L) &&
+        !(c->r[4] >= c->alt_sp && c->r[4] < c->alt_sp + c->alt_size))
+        base = c->alt_sp + c->alt_size; // alt stack top; the frame grows down from here
+    uint64_t sp = (base - 2048) & ~15ull;                          // 16-aligned frame base; uc lives here
     uint64_t uc = sp, mc = uc + 40, info = uc + 512, xs = uc + 768; // ucontext / mcontext(gregs) / siginfo / xmm save
     memset((void *)sp, 0, 2048);
     for (int i = 0; i < 16; i++)
