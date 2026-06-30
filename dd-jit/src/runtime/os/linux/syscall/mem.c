@@ -25,6 +25,16 @@ static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, cons
     return total;
 }
 
+// True if [addr,addr+len) lies entirely within a single tracked GUEST mapping (the gmap registry that
+// records every guest mmap). Used to confine the cage-hint honoring in case 222 to memory the guest
+// itself reserved -- never the engine's own internal allocations.
+static int gmap_contains(uint64_t addr, uint64_t len) {
+    uint64_t end = addr + len;
+    for (int i = 0; i < g_ngmap; i++)
+        if (g_gmap[i].addr <= addr && end <= g_gmap[i].addr + g_gmap[i].len) return 1;
+    return 0;
+}
+
 static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                    uint64_t a5) {
     switch (nr) {
@@ -200,6 +210,25 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 r = (void *)a0; // success: the mapping now lives at the requested fixed guest address
             }
             free(hsave);
+        }
+        // V8 pointer-compression cage placement. macOS treats a non-MAP_FIXED address as a weak hint: it
+        // lands AT the hint when that range is free (so node's randomly-based cage reservations work), but
+        // when the hint overlaps an existing mapping macOS RELOCATES the new map far away (e.g. to
+        // 0x70xx_xxxx). Linux instead honors the hint when a guest COMMITS fresh pages over its own
+        // reservation (V8's BoundedPageAllocator carving heap pages out of the pointer-compression cage);
+        // a guest that derives cage-relative (compressed) pointers from the hint faults when the page lands
+        // outside the cage. So when macOS diverged from a high hint whose whole requested range is still
+        // inside one of the guest's OWN tracked reservations, re-place the mapping AT the hint with
+        // MAP_FIXED -- committing the fresh anon pages exactly where the guest expects. Gated on a DIVERGENT
+        // result and on guest-owned coverage, so every already-correct placement (incl. all of node's, which
+        // macOS honors) and anything touching engine-internal memory is left byte-identical and untouched.
+        if (r != MAP_FAILED && a0 && (uint64_t)(uintptr_t)r != a0 && !(a3 & 0x10) && (a3 & 0x20) &&
+            a0 >= 0x100000000ull && gmap_contains(a0, (uint64_t)a1 + guard)) {
+            void *fr = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3) | MAP_FIXED, -1, 0);
+            if (fr != MAP_FAILED) {
+                munmap(r, (size_t)a1 + guard); // drop the relocated placement macOS chose
+                r = fr;                        // mapping now lives at the requested cage-relative hint
+            }
         }
         // refund
         if (r == MAP_FAILED && charge) atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
