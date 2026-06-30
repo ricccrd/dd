@@ -625,10 +625,5 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     default:
         return 0;
     }
-    // Boundary errno translation (mirrors service_local's trailing m2l_errno, which this early return
-    // bypasses): every case above set G_RET to a host(macOS) errno on error -> map it to the Linux errno
-    // the guest expects, so a divergent code (e.g. macOS EAGAIN=35 = Linux EDEADLK) never reaches the guest.
-    int64_t net_rv = (int64_t)G_RET(c);
-    if (net_rv < 0 && net_rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-net_rv)));
-    return 1;
+    return svc_done(c); // boundary errno xlate (host macOS -> Linux); see helpers.c svc_done
 }

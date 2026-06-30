@@ -1,8 +1,8 @@
 // Extracted from service(): Process & scheduling -- clone/fork/execve/wait/exit, pid/uid/gid identity,
 // prctl/futex/caps/sched/affinity. Returns 1 if nr was handled, 0 otherwise. Because its cases call
 // service.c-local helpers (nonpie_p/cpu_online_mask/affinity_mask), it is #included after them, before
-// service(). NOTE: execve sets c->redirect -> the boundary errno xlate below is guarded by !c->redirect
-// (verbatim from service_local's tail), so a redirect's already-Linux G_RET is never re-translated.
+// service(). NOTE: execve sets c->redirect; svc_done() (the shared tail) skips errno xlate when redirect
+// is set, so a redirect's already-Linux G_RET is never re-translated.
 
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
@@ -465,9 +465,5 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     default:
         return 0;
     }
-    if (!c->redirect) {
-        int64_t pr_rv = (int64_t)G_RET(c);
-        if (pr_rv < 0 && pr_rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-pr_rv)));
-    }
-    return 1;
+    return svc_done(c); // boundary errno xlate (host macOS -> Linux); see helpers.c svc_done
 }

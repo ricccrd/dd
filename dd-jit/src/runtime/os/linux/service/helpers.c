@@ -257,3 +257,16 @@ static void ep_fd_reset(int fd) {
     if (g_ep_chg[fd]) { free(g_ep_chg[fd]); g_ep_chg[fd] = NULL; } // if fd was an epoll fd, drop its pending changelist
     g_ep_chgn[fd] = g_ep_chgcap[fd] = 0;
 }
+// Shared boundary errno translation for every svc_<family>() module tail. Each family early-returns from
+// service_local (before its trailing m2l_errno), so each must map G_RET's host(macOS) errno to the Linux
+// errno the guest expects (e.g. macOS EAGAIN=35 = Linux EDEADLK). Skip when c->redirect is set: a redirect
+// (execve / sigreturn) leaves an already-Linux value in G_RET that must not be re-translated -- a no-op for
+// the families that never set redirect, so collapsing all tails onto this one helper is byte-identical.
+// Returns 1 so a handler can `return svc_done(c);`.
+static int svc_done(struct cpu *c) {
+    if (!c->redirect) {
+        int64_t rv = (int64_t)G_RET(c);
+        if (rv < 0 && rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-rv)));
+    }
+    return 1;
+}

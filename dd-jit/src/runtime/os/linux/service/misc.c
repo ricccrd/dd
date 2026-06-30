@@ -46,7 +46,5 @@ static int svc_misc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     default:
         return 0;
     }
-    int64_t mi_rv = (int64_t)G_RET(c);
-    if (mi_rv < 0 && mi_rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-mi_rv)));
-    return 1;
+    return svc_done(c); // boundary errno xlate (host macOS -> Linux); see helpers.c svc_done
 }

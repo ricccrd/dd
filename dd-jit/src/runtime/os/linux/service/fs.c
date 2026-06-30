@@ -1332,7 +1332,5 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     default:
         return 0;
     }
-    int64_t fs_rv = (int64_t)G_RET(c);
-    if (fs_rv < 0 && fs_rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-fs_rv)));
-    return 1;
+    return svc_done(c); // boundary errno xlate (host macOS -> Linux); see helpers.c svc_done
 }

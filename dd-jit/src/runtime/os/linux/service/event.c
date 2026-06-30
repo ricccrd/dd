@@ -340,8 +340,5 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     default:
         return 0;
     }
-    // Boundary errno translation (mirrors service_local's trailing m2l_errno that this early return bypasses).
-    int64_t ev_rv = (int64_t)G_RET(c);
-    if (ev_rv < 0 && ev_rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-ev_rv)));
-    return 1;
+    return svc_done(c); // boundary errno xlate (host macOS -> Linux); see helpers.c svc_done
 }
