@@ -269,7 +269,7 @@ static void abs_guest(int dirfd, const char *raw, char *out, size_t n) {
 // whichever jail prefix backs it so the guest cwd is tracked correctly regardless of layer (the bare
 // "strip g_rootfs_canon" form silently left g_cwd stale for a dir that lives only in a lower). Boundary
 // check ('/' or end) avoids a prefix collision between sibling layer roots. Unknown -> "/" (fail safe).
-static void guest_from_host(const char *host, char *out, size_t n) {
+static void guest_from_host_raw(const char *host, char *out, size_t n) {
     if (g_rootfs && !strncmp(host, g_rootfs_canon, g_rootfs_canon_len) &&
         (host[g_rootfs_canon_len] == '/' || host[g_rootfs_canon_len] == 0)) {
         const char *g = host + g_rootfs_canon_len;
@@ -290,6 +290,13 @@ static void guest_from_host(const char *host, char *out, size_t n) {
             return;
         }
     snprintf(out, n, "/");
+}
+// Map a canonical HOST dir to the GUEST path, then fold it into the active chroot frame: under a chroot,
+// chdir/fchdir resolve to a host dir whose rootfs-relative guest path includes the chroot prefix, but the
+// guest must see g_cwd in its OWN root, so strip the prefix. No-op (byte-identical) with no chroot.
+static void guest_from_host(const char *host, char *out, size_t n) {
+    guest_from_host_raw(host, out, n);
+    if (g_chroot[0]) chroot_strip(out, n);
 }
 // Overlay whiteout for a delete: remove the upper copy (if any) and drop a .wh.NAME marker in the upper.
 // Merged readdir across layers (upper first, then lowers). Higher layer wins; a .wh.NAME hides NAME

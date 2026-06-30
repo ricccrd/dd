@@ -72,7 +72,10 @@ static int jail_pick_idx(const char *abs, const char **rel, int *vi) {
 static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
     if (g_root_fd < 0) return -1;
     char gbuf[8192];
-    snprintf(gbuf, sizeof gbuf, "%s", guest);
+    if (g_chroot[0]) // re-root under the guest's chroot, still confined to g_root_fd by the walk below
+        chroot_apply(guest, gbuf, sizeof gbuf);
+    else
+        snprintf(gbuf, sizeof gbuf, "%s", guest);
     int xings = 0; // bounded volume-boundary crossings -- guards against a pathological mount stack
 restart:;
     const char *rel;

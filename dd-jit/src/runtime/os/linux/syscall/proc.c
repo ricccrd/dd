@@ -10,6 +10,39 @@
 #define G_FORK_PRESERVE(c) ((void)0)
 #endif
 
+// execve env forwarding: serialize the guest's envp array into DD_GUEST_ENV (the "K=V\nK=V..." string
+// build_stack reads when laying out the new process stack), so the guest's actual environment crosses the
+// re-exec. A NULL envp means the guest passed none -> leave DD_GUEST_ENV (the container defaults) intact.
+// Each pointer may be a low non-PIE address, so rebase the array base and every element with nonpie_p(),
+// exactly as the argv loop does. setenv() copies the buffer, so it survives the address-space teardown.
+static void exec_forward_env(uint64_t envp_guest) {
+    if (!envp_guest) return;
+    uint64_t *ev = (uint64_t *)nonpie_p(envp_guest);
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return;
+    buf[0] = 0;
+    for (int i = 0; ev[i]; i++) {
+        const char *e = (const char *)nonpie_p(ev[i]);
+        size_t el = strlen(e);
+        if (len + el + 2 > cap) {
+            cap = (len + el + 2) * 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) {
+                free(buf);
+                return;
+            }
+            buf = nb;
+        }
+        memcpy(buf + len, e, el);
+        len += el;
+        buf[len++] = '\n'; // DD_GUEST_ENV record separator (build_stack splits on '\n')
+        buf[len] = 0;
+    }
+    setenv("DD_GUEST_ENV", buf, 1);
+    free(buf);
+}
+
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -22,6 +55,31 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     // capset -> ok
     case 91: G_RET(c) = 0; break;
+    // chroot(path): re-root the guest WITHIN the rootfs jail. Resolve the target through the active jail to
+    // its host backing -- this validates it exists as a directory inside the rootfs and can NEVER name a
+    // host path -- then record it as the new chroot prefix. Subsequent absolute guest paths are walked
+    // under this prefix yet stay confined to g_root_fd, so the guest cannot escape to the real host fs.
+    case 51: {
+        char gabs[4200];
+        abs_guest(-100, (const char *)nonpie_p(a0), gabs, sizeof gabs); // (AT_FDCWD, path) -> guest-view abs
+        char hp[4200];
+        const char *h = xresolve_overlay(gabs, hp, sizeof hp); // host backing (honors any chroot already set)
+        struct stat st;
+        if (stat(h, &st) < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            G_RET(c) = (uint64_t)(-ENOTDIR);
+            break;
+        }
+        char nc[4200];
+        chroot_apply(gabs, nc, sizeof nc);                          // fold under any active chroot -> rootfs-abs
+        snprintf(g_chroot, sizeof g_chroot, "%s", nc[1] ? nc : ""); // chroot("/") clears (rootfs IS the root)
+        rc_reset(); // drop cached guest->host path mappings -- they predate the re-root
+        G_RET(c) = 0;
+        break;
+    }
     case 93:
         c->exited = 1;
         c->exit_code = (int)a0;
@@ -340,6 +398,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             ac++;
         }
         argv[ac] = NULL;
+        // Forward the guest's ACTUAL environment across the exec: build_stack rebuilds the new process env
+        // from DD_GUEST_ENV, so serialize envp (a2) into it NOW while guest memory is still mapped. A guest
+        // that set/modified env vars (FOO=bar, a tweaked PATH) thus sees them survive; a NULL envp keeps the
+        // container's DD_GUEST_ENV defaults (a2 is NOT rebased by the dispatch redirect, unlike a0/a1).
+        exec_forward_env(a2);
         // Capture the guest-absolute exec path NOW (a0 is still mapped) so /proc/self/exe can name the new
         // image after the teardown below. ld.so resolves a binary's $ORIGIN (DT_RUNPATH) via readlink of
         // /proc/self/exe; a stale value makes an exec'd dynamic binary fail to find its own libraries (e.g.

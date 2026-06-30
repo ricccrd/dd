@@ -50,6 +50,39 @@ static void confine(const char *p, char *out, size_t n) {
     if (o == 0 && n > 1) out[o++] = '/';
     out[o < n ? o : n - 1] = 0;
 }
+// Guest chroot(2) prefix: a rootfs-relative guest path ("" = none). chroot(2) re-roots the guest WITHIN
+// the existing rootfs jail -- its target is resolved through the jail first (so it can never name a host
+// path) and recorded here; every absolute guest path is then walked under this prefix yet STILL confined
+// to g_root_fd, so a guest can never reach the host fs (a `..` still clamps at the rootfs root). Inherited
+// across fork and preserved across execve, exactly as on Linux.
+static char g_chroot[4200];
+// Re-root an absolute guest path under the active chroot: clamp its `..` (after chroot the guest's own
+// root IS the chroot dir) and prepend the prefix. The result is still a rootfs-absolute guest path, which
+// the resolvers below confine to g_root_fd as usual. Callers invoke this only while a chroot is active.
+static void chroot_apply(const char *guest, char *out, size_t n) {
+    char norm[4200];
+    confine(guest ? guest : "/", norm, sizeof norm);
+    if (!g_chroot[0])
+        snprintf(out, n, "%s", norm);
+    else if (norm[1] == 0)
+        snprintf(out, n, "%s", g_chroot); // the chroot root itself
+    else
+        snprintf(out, n, "%s%s", g_chroot, norm);
+}
+// Strip the active chroot prefix from a rootfs-relative guest path, yielding the chroot-relative view the
+// guest sees (used to keep g_cwd in the guest's own frame after chdir under a chroot). No-op with no
+// chroot, or for a path that lies outside the chroot subtree (clamped to "/" -- the guest cannot be there).
+static void chroot_strip(char *guest, size_t n) {
+    if (!g_chroot[0] || !guest || guest[0] != '/') return;
+    size_t cl = strlen(g_chroot);
+    if (strncmp(guest, g_chroot, cl) == 0 && (guest[cl] == '/' || guest[cl] == 0)) {
+        char tmp[4200];
+        snprintf(tmp, sizeof tmp, "%s", guest[cl] ? guest + cl : "/");
+        snprintf(guest, n, "%s", tmp);
+    } else {
+        snprintf(guest, n, "/");
+    }
+}
 // realpath(g_rootfs) -- the true rootfs boundary
 static char g_rootfs_canon[4200];
 static size_t g_rootfs_canon_len;
@@ -454,6 +487,11 @@ static int secure_resolve(const char *guest, char *out, size_t n, int nofollow) 
     // volume. Routing the raw path would prefix-match "/x/y/.." to the volume and clamp `..` at the volume
     // root. confine() already collapses `..` lexically below (so this only changes WHICH jail is chosen,
     // not the symlink-via-realpath confinement) and never ascends past '/', so the result stays in rootfs.
+    char cr[4200];
+    if (g_chroot[0]) { // re-root under the guest's chroot first (no-op cost when no chroot is in effect)
+        chroot_apply(guest, cr, sizeof cr);
+        guest = cr;
+    }
     char norm[4200];
     confine(guest, norm, sizeof norm);
     const char *jcanon;
