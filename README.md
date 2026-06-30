@@ -250,7 +250,7 @@ prebuilt fixtures. Each case runs on every engine it has a guest for.
 
 ## Author
 
-**Richard Huttar** — [huttarichard@gmail.com](mailto:huttarichard@gmail.com)
+**Richard Hutta** — [huttarichard@gmail.com](mailto:huttarichard@gmail.com)
 
 ## License
 
