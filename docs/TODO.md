@@ -1,29 +1,40 @@
 # dd — todo
 
-Shipped through **v0.8.9**. The earlier triage's "~230 failures" was a stale-engine artifact —
-its biggest groups are all fixed. Remaining open work below.
+Shipped through **v0.9.0**. Open work below (fixed items are removed as they ship; update this
+file after each batch).
 
 > NOTE: the daemon resolves the engine via `resolve_bundled` → installed `/Applications/dd.app`
 > unless `DDJIT_DIR` is set. Install the new DMG for fixes to take effect.
 
 ## Open — `[ ] ID — issue — why`
-- [ ] **#104 + #113 guest-JIT codegen mistranslated** *(agent active — deepest, all JIT langs)* —
-  node V8 / .NET RyuJIT / java hot loops crash/miscompute (x86 1M-array truncates flaky; arm
-  `EXC_BAD_ACCESS fault=0x1`). Engine mistranslates code the guest JIT writes at runtime →
-  SMC / freshly-written code-page invalidation gap. Both arches.
-- [ ] **#115 x86 CPUID missing SSE2** *(agent active)* — java aborts "SSE2 not supported"; CPUID
-  feature leaf under-reports the mandatory x86-64 baseline.
-- [ ] **#101 PID-1 self-signal** *(agent active)* — mongosh/node hang at exit; init drops its own
-  re-raised SIGTERM (PID-1 ignores unhandled fatal signals).
-- [ ] **#117 flaky PIE fork+exec SIGSEGV** *(after guest-JIT frees elf.c)* — post-fork execve ld.so
-  faults on a GOT pointer relocated against the wrong base; ASLR-dependent. Needs a deterministic
-  collision-checked base for the execve image (`translate/x86_64/elf.c`).
+- [ ] **#104 + #113 guest-JIT codegen mistranslated** *(deepest — blocks java/.NET/node-opt/mongosh)* —
+  the engine mistranslates ONE core-path instruction that corrupts V8's Turboshaft `MachineLowering`
+  pass so it DROPS `Store` ops from OSR-optimized code. Deterministic repro:
+  `node --no-maglev --predictable -e 'let last=-1;for(let i=0;i<1000000;i++)last=i+1;console.log(last)'`
+  → `12236` (should be `1000000`). Not SMC/W^X. Fix via differential tracing (qemu oracle) to pin the opcode.
+- [ ] **#123 `docker run node node -e …` → "open: No such file"** — bash/uname run from the pulled
+  node:latest rootfs but the `node` binary itself won't start (curated node_alpine runs `node -e` fine).
+  Loader/interp path or V8 startup specific to the real image.
+- [ ] **#117 flaky PIE fork+exec SIGSEGV** — post-fork execve ld.so faults on a GOT pointer relocated
+  against the wrong base; ASLR-dependent. Needs a deterministic collision-checked base for the execve
+  image (`translate/x86_64/elf.c`).
+- [ ] **#119 mongosh 193MB node-SEA early crash** — `EXC_BAD_ACCESS fault=0x0` while loading the SEA
+  blob, before any eval (no longer hangs). Loader/mmap or V8-snapshot path.
+- [ ] **#120 RFLAGS ID flag (bit 21) not modeled** — pushfq emits ID=0 / popfq discards it, so the
+  toggle-ID CPUID-detection handshake fails for 32-bit guests/libs. Ready patch (needs cpu_x86_64.h field).
 
 ## Deferred / non-blocking
 - [ ] **#78** stage `/hello.c` into the gcc-bundle rootfs (test fixture)
 - [ ] **#93** host-asm encoder de-dup (riskiest refactor)
 - [ ] **#94** README benchmark numbers
 
+## Test-env notes (not code bugs)
+- Host `~/.docker/config.json` has bogus Hub creds (`nouser:bad`) → real Docker Hub pulls 401 unless
+  bypassed (`DOCKER_CONFIG=<empty dir>`).
+- Shared `poc/images/*` rootfs are mutated by concurrent agents → volume docker.sh tests flake under
+  parallel runs; confirm volume tests with a standalone docker.sh.
+- Daemon-using lanes (docker.sh, scenarios) share `dd-scenarios.sock` → cannot run concurrently.
+
 ## Process
-- [ ] Re-run the scenario triage on the fresh engine → confirm zero genuine failures; sweep residue.
-- [ ] Each fix: verify on the real path → batch → gate (basics both arches + docker.sh) → tag → push.
+- Each fix: verify on the real path → batch → gate (basics both arches + docker.sh) → tag → push.
+- Re-run the scenario triage on the fresh engine periodically to surface new real-software failures.
