@@ -1414,80 +1414,16 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
-            // ---- string ops: stos (AA/AB), movs (A4/A5), lods (AC/AD). DF assumed 0 (fwd). ----
-            if (op == 0xAA || op == 0xAB || op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) {
-                int w = (op & 1) ? I.opsize : 1;
-                int movs = (op == 0xA4 || op == 0xA5), lods = (op == 0xAC || op == 0xAD);
-                // opt5: `rep movs`/`rep stos` -> one optimized host memcpy/memset call (bit-exact
-                // with the scalar loop below). Fall back to that loop for:
-                //   - NOREP=1 (kill-switch),
-                //   - `lods` (its result is RAX = last element, not a bulk move),
-                //   - a segment override (I.seg) or 32-bit address size (I.addr32) -- the scalar
-                //     loop ignores both too, so behavior is identical, but stay conservative,
-                //   - DF=1 (g_df): the host helper only copies forward; the backward case takes the
-                //     per-element scalar loop below (decrementing stride) which matches x86 exactly.
-                if (I.rep && !lods && !I.seg && !I.addr32 && !g_df && (w == 1 || w == 2 || w == 4 || w == 8) &&
-                    !norep_disabled()) {
-                    int shift = w == 1 ? 0 : w == 2 ? 1 : w == 4 ? 2 : 3;
-                    emit_rep_string(movs, w, shift);
+            // ---- string ops: stos/movs/lods (AA/AB/A4/A5/AC/AD), cmps/scas (A6/A7/AE/AF), cld/std (FC/FD).
+            // Lifted into translate/repstr.c translate_string(); it returns how to steer this translate loop
+            // (TX_NEXT -> gpc=next;continue, TX_BREAK -> end the block, TX_FALL -> not a string op).
+            {
+                int s = translate_string(&I, next);
+                if (s == TX_NEXT) {
                     gpc = next;
                     continue;
                 }
-                uint32_t *cbz = NULL, *top = NULL;
-                if (I.rep) {
-                    top = (uint32_t *)g_cp;
-                    cbz = (uint32_t *)g_cp;
-                    emit32(0);
-                } // cbz RCX,done
-                // DF: forward (g_df==0) advances pointers by +w; backward (std) by -w.
-                void (*e_step)(int, int, unsigned, int) = g_df ? e_subi : e_addi;
-                if (movs) {
-                    e_load(w, 16, RSI);
-                    e_store(w, 16, RDI);
-                    e_step(RSI, RSI, w, 1);
-                    e_step(RDI, RDI, w, 1);
-                } else if (lods) {
-                    e_load(w, RAX, RSI);
-                    e_step(RSI, RSI, w, 1);
-                } else {
-                    e_store(w, RAX, RDI);
-                    e_step(RDI, RDI, w, 1);
-                } // stos
-                if (I.rep) {
-                    e_subi(RCX, RCX, 1, 1);
-                    int64_t back = (int64_t)(top - (uint32_t *)g_cp);
-                    emit32(0x14000000u | ((uint32_t)back & 0x3FFFFFFu)); // b top
-                    int64_t d = ((uint32_t *)g_cp - cbz);
-                    *cbz = 0xB4000000u | (((uint32_t)d & 0x7FFFF) << 5) | RCX; // cbz x_rcx,done
-                }
-                gpc = next;
-                continue;
-            }
-            // ---- cmps (A6/A7) / scas (AE/AF): memcmp/memchr/strlen building blocks. ----
-            // The whole (possibly REP/REPE/REPNE) compare+scan is done in ONE C round-trip (like cpuid/div):
-            // bit-exact RCX/RSI/RDI + ZF/SF/CF/OF end-state, fast host memcmp/memchr inside on the forward
-            // path (gate NOREPCMP for the naive per-element oracle loop; DF=1 uses that loop with a
-            // decrementing stride). Descriptor (width | isscas | isrepne | isrep | df) -> cpu->divop.
-            if (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF) {
-                int w = (op & 1) ? I.opsize : 1;
-                int isscas = (op == 0xAE || op == 0xAF);
-                int isrep = (I.rep || I.repne);
-                uint64_t desc = (uint64_t)w | ((uint64_t)isscas << 8) | ((uint64_t)(I.repne ? 1 : 0) << 9) |
-                                ((uint64_t)isrep << 10) | ((uint64_t)(g_df ? 1 : 0) << 11);
-                e_movconst(16, desc);
-                e_str(16, 28, OFF_DIVOP);
-                emit_exit_const(next, R_REPSTR); // spills regs+flags; do_repstr() resumes at `next`
-                break;                           // block ends here (helper runs, dispatcher continues)
-            }
-            if (op == 0xFC) {
-                g_df = 0; // cld: forward string ops
-                gpc = next;
-                continue;
-            }
-            if (op == 0xFD) {
-                g_df = 1; // std: backward string ops (consumed at translate time by the lowering below)
-                gpc = next;
-                continue;
+                if (s == TX_BREAK) break;
             }
             // ---- jmp rel (E9/EB) ----
             if (op == 0xE9 || op == 0xEB) {
