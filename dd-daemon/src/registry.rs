@@ -7,7 +7,7 @@
 //! shelling-out is confined to the small [`http`] helpers; everything above them is ordinary typed code.
 
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DOCKER_HUB: &str = "registry-1.docker.io";
@@ -340,15 +340,52 @@ fn reset_dir(p: &Path) -> Result<(), String> {
     std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))
 }
 
-/// Apply OCI whiteouts left by a just-extracted layer: `.wh.<name>` deletes `<name>`, `.wh..wh..opq`
-/// clears the directory's lower contents (we just drop the marker; we already flattened the layers).
+const WH_PREFIX: &str = ".wh.";
+const WH_OPAQUE: &str = ".wh..wh..opq";
+
+/// Apply OCI whiteouts left by a just-extracted layer: a `.wh.<name>` marker deletes the sibling
+/// `<name>`, and `.wh..wh..opq` clears the directory's lower contents (we just drop the marker — the
+/// layers are already flattened). Done with a plain filesystem walk rather than a `find | while …
+/// dirname/basename/rm` pipeline: a degenerate marker name can't make a shell utility error out
+/// ("sh failed: …") nor, worse, delete the wrong path (a bare `.wh.` made the old script run
+/// `rm -rf "$dir/"`, wiping the parent directory).
 fn apply_whiteouts(rootfs: &Path) -> Result<(), String> {
-    let script = format!(
-        "find '{0}' -name '.wh.*' 2>/dev/null | while IFS= read -r w; do \
-           d=$(dirname \"$w\"); b=$(basename \"$w\"); \
-           if [ \"$b\" = .wh..wh..opq ]; then rm -f \"$w\"; else rm -rf \"$d/${{b#.wh.}}\"; rm -f \"$w\"; fi; \
-         done", rootfs.display());
-    run("sh", &["-c", &script]).map(|_| ())
+    // Enumerate every marker first, then apply: a deletion can remove a whole subtree that itself
+    // holds further markers, so we must not mutate the tree while still walking it.
+    let mut markers = Vec::new();
+    collect_whiteouts(rootfs, &mut markers);
+    for marker in &markers {
+        let name = marker.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // The opaque marker has no sibling to delete; any other `.wh.<name>` hides the sibling `<name>`.
+        // A marker that is *only* the `.wh.` prefix (empty target) is malformed — drop it without
+        // deleting anything rather than removing its parent directory.
+        if name != WH_OPAQUE {
+            if let Some(target) = name.strip_prefix(WH_PREFIX).filter(|t| !t.is_empty()) {
+                if let Some(parent) = marker.parent() { remove_path(&parent.join(target)); }
+            }
+        }
+        let _ = std::fs::remove_file(marker);
+    }
+    Ok(())
+}
+
+/// Collect every `.wh.*` marker under `dir`, recursing into real subdirectories only (symlinks are not
+/// followed, so a layer can't redirect the walk outside the rootfs).
+fn collect_whiteouts(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(WH_PREFIX) { out.push(entry.path()); }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { collect_whiteouts(&entry.path(), out); }
+    }
+}
+
+/// Remove a path whether it's a file, a symlink, or a directory subtree; missing is success.
+fn remove_path(p: &Path) {
+    let _ = match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+        Ok(_) => std::fs::remove_file(p),
+        Err(_) => Ok(()),
+    };
 }
 
 /// `tar | gzip` a rootfs into `out`; returns (compressed digest, compressed size).
@@ -373,7 +410,11 @@ fn parse_sha256(sha256sum_out: &str) -> Result<String, String> {
 
 fn run(prog: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(prog).args(args).output().map_err(|e| format!("{prog}: {e}"))?;
-    if !out.status.success() { return Err(format!("{prog} failed: {}", String::from_utf8_lossy(&out.stderr))); }
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = if stderr.trim().is_empty() { format!("exited with {}", out.status) } else { stderr.trim().to_string() };
+        return Err(format!("{prog} {args:?} failed: {detail}"));
+    }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -525,6 +566,32 @@ mod tests {
         let l = ImageRef::parse("localhost:5000/img");
         assert_eq!((l.registry.as_str(), l.repository.as_str()), ("localhost:5000", "img"));
         assert!(is_local_registry(&l.registry));
+    }
+    #[test]
+    fn whiteouts() {
+        // A just-extracted layer: a normal whiteout, an opaque-dir marker, and two degenerate names
+        // that the old `find | … rm` shell mishandled (a bare `.wh.` wiped the parent dir; `.wh..`
+        // made `rm` error). After apply_whiteouts: targets gone, all markers gone, parents kept.
+        let root = std::env::temp_dir().join(format!("dd-wh-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join("keep"), b"x").unwrap();
+        std::fs::write(sub.join("gone"), b"x").unwrap(); // hidden by sub/.wh.gone
+        std::fs::write(sub.join(".wh.gone"), b"").unwrap();
+        std::fs::write(sub.join(".wh..wh..opq"), b"").unwrap();
+        std::fs::write(sub.join(".wh."), b"").unwrap(); // malformed: must NOT delete sub/
+        std::fs::write(sub.join(".wh.."), b"").unwrap(); // malformed: target "." must be ignored
+
+        apply_whiteouts(&root).unwrap();
+
+        assert!(root.join("keep").exists(), "unrelated file preserved");
+        assert!(sub.exists(), "parent dir must survive a bare .wh. marker");
+        assert!(!sub.join("gone").exists(), "whiteout deleted its target");
+        for m in [".wh.gone", ".wh..wh..opq", ".wh.", ".wh.."] {
+            assert!(!sub.join(m).exists(), "marker {m} removed");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn challenge() {
