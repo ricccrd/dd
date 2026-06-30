@@ -403,16 +403,12 @@ static void service_local(struct cpu *c) {
     if (svc_event(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_misc(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_rare(c, nr, a0, a1, a2, a3, a4, a5)) return;
-    switch (nr) {
-
     // ===================== unhandled =====================
-    default:
-        fprintf(stderr, "[jit] unhandled syscall %llu (a0=%llx a1=%llx) at pc=%llx\n", (unsigned long long)nr,
-                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)G_PC(c));
-        G_RET(c) = (uint64_t)(-ENOSYS);
-        // ENOSYS, keep going so we can see what's next
-        break;
-    }
+    // Every Linux syscall is now owned by one of the svc_*() family modules above; reaching here means no
+    // family claimed this number -> ENOSYS (keep going so we can see what the guest tries next).
+    fprintf(stderr, "[jit] unhandled syscall %llu (a0=%llx a1=%llx) at pc=%llx\n", (unsigned long long)nr,
+            (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)G_PC(c));
+    G_RET(c) = (uint64_t)(-ENOSYS);
     // Boundary errno translation: every case sets G_RET(c) to a host(macOS) errno on error
     // (-errno, saved e, helper returns, or a macOS E* constant). Map to the Linux errno the guest
     // expects. Skip redirect (sigreturn restored an already-Linux x0 from the signal frame).
