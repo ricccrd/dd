@@ -216,8 +216,11 @@ static void e_cset(int rd, int cond, int sf) { // cset rd, cond
 static void e_csel(int rd, int rn_t, int rm_f, int cond, int sf) {
     emit32((sf ? 0x9A800000u : 0x1A800000u) | (rm_f << 16) | ((cond & 0xF) << 12) | (rn_t << 5) | rd);
 }
-static void e_uxt(int rd, int rn, int w) { // uxtb/uxth (zero-extend reg)
-    emit32((w == 1 ? 0x12001C00u : 0x12003C00u) | (rn << 5) | rd);
+static void e_uxt(int rd, int rn, int w) { // uxtb/uxth/uxtw (zero-extend reg)
+    // w==1 -> uxtb, w==2 -> uxth, w>=4 -> uxtw (ubfm xd,xn,#0,#31). The uxtw case is needed by the
+    // 32-bit unsigned DIV path (e_uxt(.., rmv, 4)): a bare uxth truncated the divisor to 16 bits.
+    uint32_t b = w == 1 ? 0x12001C00u : w == 2 ? 0x12003C00u : 0xD3407C00u;
+    emit32(b | (rn << 5) | rd);
 }
 static void e_sxt(int rd, int rn, int w) { // sxtb/sxth/sxtw into X
     uint32_t b = w == 1 ? 0x93401C00u : w == 2 ? 0x93403C00u : 0x93407C00u;

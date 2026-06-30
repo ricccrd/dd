@@ -234,20 +234,25 @@ pub(crate) async fn containers_restart(State(a): State<App>, Path(id): Path<Stri
 }
 
 // ---- container control: pause / unpause / rename ----------------------------
-/// POST /containers/:id/(un)pause -- dd runs a container as one process group with no freezer cgroup;
-/// accept and no-op so the CLI verbs succeed.
+/// POST /containers/:id/(un)pause -- dd has no freezer cgroup, so it SIGSTOP/SIGCONTs the container's
+/// whole process group (see `freeze`) and flips the recorded status.
 pub(crate) async fn containers_pause(State(a): State<App>, Path(id): Path<String>) -> Response { freeze(a, id, true).await }
 
 pub(crate) async fn containers_unpause(State(a): State<App>, Path(id): Path<String>) -> Response { freeze(a, id, false).await }
 
-/// docker pause/unpause. macOS has no freezer cgroup, but SIGSTOP/SIGCONT on the container's JIT process
-/// freezes it (and its threads) just the same -- single-process / threaded containers (the common case)
-/// freeze fully; a guest that forked separate host processes pauses its main process (best-effort).
+/// docker pause/unpause. macOS has no freezer cgroup, but the container runs in its own process group
+/// (the JIT is the group leader; host processes the guest forks inherit that pgid -- see spawn_live), so
+/// a single SIGSTOP/SIGCONT to the GROUP freezes/resumes the WHOLE container -- the main process AND any
+/// forked children -- not just the leader. We signal the group via killpg (`kill(-pgid)`) and, only if
+/// that fails (e.g. the leader is mid-teardown), fall back to the leader pid alone.
 pub(crate) async fn freeze(a: App, id: String, pause: bool) -> Response {
     let mut g = a.inner.lock().await;
     let Some(full) = resolve_cid(&g, &id) else { return no_such(&id); };
     if let Some(pid) = g.live.get(&full).and_then(|l| *l.pid.lock().unwrap()) {
-        unsafe { libc::kill(pid as i32, if pause { libc::SIGSTOP } else { libc::SIGCONT }); }
+        let pid = pid as i32;
+        let sig = if pause { libc::SIGSTOP } else { libc::SIGCONT };
+        // pid is the group leader, so -pid is the container's process group id (pgid == leader pid).
+        unsafe { if libc::kill(-pid, sig) != 0 { libc::kill(pid, sig); } }
     }
     if let Some(c) = g.containers.get_mut(&full) { c.status = if pause { "paused".into() } else { "running".into() }; }
     save_state(&g, &a.state_path);

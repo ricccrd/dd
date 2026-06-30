@@ -158,6 +158,11 @@ static void run_guest(struct cpu *c) {
         // that was current under the lock -- so J_RX(code) must use the matching g_rw2rx. (Single-threaded
         // takes no lock and cannot race a flush; the computation is identical.)
         void *rxcode = J_RX(code);
+        // Publish the generation of the cache we are about to execute so a peer's stop-the-world flush can
+        // reclaim a retired cache only once no thread is still running in it (see reclaim_retired). Done
+        // under g_jit_lock (a flush holds it) so the value is consistent with g_cache_gen; threaded-only,
+        // so the single-thread hot path stays zero-overhead.
+        if (g_threaded) atomic_store_explicit(g_my_exec_gen, g_cache_gen, memory_order_relaxed);
         if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
         // Frontend hook: per-block JT trace dump (per-arch register/flag layout). See §A.3 (5th divergence).
         G_TRACE_DUMP(c);
