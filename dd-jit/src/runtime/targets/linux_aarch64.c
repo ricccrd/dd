@@ -43,8 +43,10 @@
 #include "../os/linux/container/state.c"
 // code cache + block map + chaining
 #include "../engine/cache.c"
-// aarch64 host emitters + IBTC/IC
-#include "../engine/emit_arm64.c"
+// host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
+#include "../host/arm64/asm.c"
+// engine block-ABI stubs: prologue/spill + IBTC/IC + exit/chain trampolines (built on the assembler above)
+#include "../engine/stubs.c"
 // transliterate + mangle + §B + LSE + depth-gate
 #include "../translate/aarch64/translate.c"
 // clone/futex/threads (declares run_guest)
