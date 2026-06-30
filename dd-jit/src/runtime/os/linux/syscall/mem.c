@@ -337,15 +337,29 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         G_RET(c) = (uint64_t)svc_vm_iov_copy((const struct iovec *)a3, (unsigned long)a4, (const struct iovec *)a1,
                                              (unsigned long)a2);
         break;
-    // membarrier: CMD_QUERY(0) returns the bitmask of supported commands; CMD_GLOBAL(1) issues a process-
-    // wide full memory barrier. The host is cache-coherent and a seq-cst fence orders all threads, so
-    // GLOBAL is satisfied by a single host barrier. We advertise (and implement) only CMD_GLOBAL=(1<<0).
+    // membarrier: CMD_QUERY(0) returns the bitmask of supported commands; the barrier commands issue a
+    // process-wide full memory barrier. The host is cache-coherent and a seq-cst fence orders all threads,
+    // so every (expedited or not, global or private) barrier is satisfied by a single host fence. The
+    // REGISTER_* commands only arm the kernel's per-mm expedited fast path -- there is nothing to register
+    // here, so they succeed as a no-op. SYNC_CORE variants additionally guarantee instruction-cache
+    // coherence for self-modifying code; the guest's own JIT already flushes via its code-patch path, so a
+    // fence suffices. glibc/Go/HAProxy probe QUERY, then REGISTER_PRIVATE_EXPEDITED(16) + PRIVATE_EXPEDITED(8).
     case 283:
         switch ((int)a0) {
-        case 0: G_RET(c) = 1u << 0; break; // CMD_QUERY -> supported = CMD_GLOBAL
-        case 1:                            // CMD_GLOBAL -> full memory barrier
+        case 0: // CMD_QUERY -> bitmask of supported commands (every command we accept below)
+            G_RET(c) = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6);
+            break;
+        case 1:        // CMD_GLOBAL
+        case 2:        // CMD_GLOBAL_EXPEDITED
+        case 8:        // CMD_PRIVATE_EXPEDITED
+        case 32:       // CMD_PRIVATE_EXPEDITED_SYNC_CORE
             atomic_thread_fence(memory_order_seq_cst);
             G_RET(c) = 0;
+            break;
+        case 4:        // CMD_REGISTER_GLOBAL_EXPEDITED
+        case 16:       // CMD_REGISTER_PRIVATE_EXPEDITED
+        case 64:       // CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+            G_RET(c) = 0; // arm the expedited fast path -> nothing to do in this coherent DBT
             break;
         default: G_RET(c) = (uint64_t)(-EINVAL); break;
         }
