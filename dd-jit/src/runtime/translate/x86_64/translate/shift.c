@@ -77,6 +77,9 @@ static int translate_shift(struct insn *I, uint64_t gpc, uint64_t next) {
                         return TX_NEXT;
                     }
                     uint32_t b = k == 4 ? S_LSLV : k == 5 ? S_LSRV : k == 7 ? S_ASRV : S_RORV;
+                    // SHL/SHR/SAR by CL: stash the ORIGINAL operand (x17) so the exact x86 CF (the last bit
+                    // shifted out) can be recovered after the destructive shift, below.
+                    if (w >= 4 && (k == 4 || k == 5 || k == 7)) e_mov_rr(17, src, ssf);
                     e_shv(b, 16, src, RCX, ssf);
                 } else {
                     if (cnt == 0) {
@@ -111,10 +114,30 @@ static int translate_shift(struct insn *I, uint64_t gpc, uint64_t next) {
                     // x86 leaves ALL flags unchanged when the runtime count (CL masked to the operand width) is
                     // 0 -- exactly when the emitted variable shift was a no-op. Capture the would-be flags, then
                     // keep the OLD nzcv (and PF, for the SHL/SHR/SAR forms) if the masked count is zero.
+                    int width = ssf ? 64 : 32;
                     emit32(0xD53B4200u | 20);           // mrs x20, nzcv  (new N/Z from result; C/V from the tst)
                     e_ldr(24, 28, OFF_NZCV);            // x24 = old nzcv
-                    e_movconst(19, ssf ? 63 : 31);
-                    e_rrr(A_ANDS, 31, RCX, 19, ssf, 0); // Z = ((CL & (width-1)) == 0)
+                    e_movconst(19, width - 1);
+                    e_rrr(A_ANDS, 22, RCX, 19, ssf, 0); // x22 = n = CL & (width-1); Z = (n == 0)
+                    if (w >= 4 && (k == 4 || k == 5 || k == 7)) {
+                        // Exact x86 CF = last bit shifted out of the ORIGINAL operand (x17): SHL -> bit
+                        // (width - n), SHR/SAR -> bit (n - 1) (n>0 here; the n==0 csel below discards this).
+                        // ARM tst left C=0; replace the stored borrow C with NOT CF. All ops below are
+                        // flag-free, so the ANDS's Z survives to the csel.
+                        if (k == 4) {
+                            e_movconst(19, width);
+                            e_rrr(A_SUB, 23, 19, 22, ssf, 0); // x23 = width - n
+                        } else {
+                            e_subi(23, 22, 1, ssf);           // x23 = n - 1
+                        }
+                        e_shv(S_LSRV, 23, 17, 23, ssf);       // x23 = orig >> bit
+                        e_movconst(19, 1);
+                        e_rrr(A_AND, 23, 23, 19, ssf, 0);     // x23 = x86 CF (0/1)
+                        e_rrr(A_EOR, 23, 23, 19, 0, 0);       // x23 = NOT CF
+                        e_movconst(19, 1u << 29);
+                        e_rrr(A_BIC, 20, 20, 19, 1, 0);       // clear stored borrow C (bit 29)
+                        e_rrr(A_ORR, 20, 20, 23, 1, 29);      // stored C = (NOT CF) << 29
+                    }
                     e_csel(20, 24, 20, 0 /*EQ: count==0*/, 1);
                     e_str(20, 28, OFF_NZCV);
                     if (k == 4 || k == 5 || k == 7) {   // SHL/SHR/SAR set PF from the result; rotates leave it
