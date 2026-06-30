@@ -1295,6 +1295,11 @@ static void service_local(struct cpu *c) {
             g_lo_port[cf] = 0;
             g_sock_stream[cf] = 0;
             g_sock_dgram[cf] = 0;
+            // SEQPACKET/O_DIRECT-pipe EOF: this end is backed by a DGRAM socket whose peer would otherwise
+            // never see EOF on macOS. Inject a zero-length datagram so a blocked peer recv wakes and returns
+            // 0 (it queues after any pending data, preserving order), then drop the marker. (See case 199.)
+            seq_send_eof(cf);
+            g_sock_seqpacket[cf] = 0;
             g_br_port[cf] = 0;
             g_br_ip[cf] = 0;
             g_eventfd_count[cf] = 0;
@@ -2190,6 +2195,7 @@ static void service_local(struct cpu *c) {
             if (r < 1024) {
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && (int)a0 == AF_INET);
                 g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM && (int)a0 == AF_INET);
+                g_sock_seqpacket[r] = 0;
                 g_lo_port[r] = 0;
                 g_br_port[r] = 0;
                 g_br_ip[r] = 0;
@@ -2214,6 +2220,15 @@ static void service_local(struct cpu *c) {
             setsockopt(sv[1], SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
             ((int *)a3)[0] = sv[0];
             ((int *)a3)[1] = sv[1];
+            // macOS AF_UNIX has no SEQPACKET, so a SEQPACKET pair is backed by SOCK_DGRAM (above) to keep
+            // message boundaries. But a connected DGRAM socket does NOT deliver EOF when its peer closes
+            // (a blocked recv never wakes; a fresh recv gets ECONNRESET) -- whereas Linux SEQPACKET recv
+            // returns 0 (EOF). Mark both ends so close() injects a zero-length EOF datagram and recv/read
+            // translate the peer-closed ECONNRESET to 0. (rustc's jobserver relies on this EOF to exit.)
+            if (lty == SOCK_SEQPACKET) {
+                if (sv[0] >= 0 && sv[0] < 1024) g_sock_seqpacket[sv[0]] = 1;
+                if (sv[1] >= 0 && sv[1] < 1024) g_sock_seqpacket[sv[1]] = 1;
+            }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
@@ -2559,6 +2574,9 @@ static void service_local(struct cpu *c) {
             r = recvfrom((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
                          want ? (struct sockaddr *)&hss : NULL, want ? &hsl : NULL);
         } while (r < 0 && SVC_EINTR_RESTART(c));
+        // SEQPACKET-as-DGRAM EOF: a peer-closed DGRAM recv reports ECONNRESET, but Linux SEQPACKET
+        // returns 0 (EOF). Translate so the guest sees the expected end-of-stream. (See case 199.)
+        if (r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
         if (r >= 0 && want) {
             socklen_t gcap = a5 ? *(socklen_t *)a5 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a4, gcap);
@@ -2697,6 +2715,8 @@ static void service_local(struct cpu *c) {
         do {
             r = (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         } while (r < 0 && SVC_EINTR_RESTART(c));
+        // SEQPACKET-as-DGRAM EOF: coerce a peer-closed recvmsg's ECONNRESET to 0 (EOF). (See case 199.)
+        if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
         if (nr == 212 && r >= 0) {
             // recvmsg writes back name len + (host->guest) control + translated flags
             if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
