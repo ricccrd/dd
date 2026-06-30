@@ -89,7 +89,14 @@ pub fn run(args: RunArgs) -> i32 {
         cmd.arg("--platform").arg(p);
     }
     cmd.arg(&args.image);
-    cmd.args(&args.command);
+    if args.command.is_empty() {
+        // No command given → an interactive shell. Prefer bash when the image has it (a nicer dev
+        // shell: history, line editing, completion), falling back to sh — resolved INSIDE the
+        // container since we can't see its filesystem from here.
+        cmd.args(["/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]);
+    } else {
+        cmd.args(&args.command);
+    }
 
     match cmd.status() {
         Ok(s) => s.code().unwrap_or(0),
