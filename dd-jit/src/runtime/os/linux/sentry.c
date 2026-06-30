@@ -100,14 +100,23 @@ static int g_sentry_sandbox = 0; // DDJIT_SANDBOX:   wrap the worker in a deny-d
 
 // Multiplexing windows (item 3): poll/ppoll pollfd array at buf[0] (8B/entry) + its timeout timespec in
 // the sockaddr tail window; pselect's three fd_sets at 0/128/256 + timeout at 384 (each fd_set <=128B);
-// epoll_pwait out-events at buf[0] (12B/entry). All sentry-owned fds, so the blocking call MUST run in
+// epoll_pwait out-events at buf[0] (SENTRY_EPEV_SZ/entry). All sentry-owned fds, so the blocking call MUST run in
 // the sentry (the fd lives there). fcntl flock / ioctl arg in/out windows reuse buf[0].
 #define SENTRY_PSEL_RD  0u
 #define SENTRY_PSEL_WR  128u
 #define SENTRY_PSEL_EX  256u
 #define SENTRY_PSEL_TMO 384u
 #define SENTRY_POLL_TMO SENTRY_SADDR_OFF        // ppoll timeout timespec (tail; clear of the pollfd array)
-#define SENTRY_EPEV_SZ  12u                     // packed Linux struct epoll_event {u32 events; u64 data}
+// struct epoll_event is per-arch: x86-64 forces __attribute__((packed)) -> 12 bytes (data@4); aarch64/
+// asm-generic leaves it naturally aligned -> 16 bytes (4 bytes pad, data@8). Same x86-vs-aarch64
+// discriminator (G_PROF_EXTRA) the rest of this file uses for G_RAWNR / SENTRY_STATSZ. We only marshal the
+// struct as an opaque blob (by SIZE) across the ring; the `data`-field offset is interpreted inside
+// service_local() (service.c's per-arch G_EPEV_DOFF), so the SIZE/stride is all the boundary needs here.
+#ifdef G_PROF_EXTRA
+#define SENTRY_EPEV_SZ 12u // x86-64 guest: packed struct epoll_event {u32 events; u64 data@4}
+#else
+#define SENTRY_EPEV_SZ 16u // aarch64 guest: aligned struct epoll_event {u32 events; pad; u64 data@8}
+#endif
 #define SENTRY_IOCTLCAP 256u                    // ioctl arg in/out window (winsize/int/termios all fit)
 #define SENTRY_FLOCKSZ  32u                     // Linux struct flock (fcntl F_GETLK/SETLK/SETLKW)
 
@@ -763,7 +772,7 @@ static void sentry_service_one(struct sentry_ring *R) {
         case 72:                   // pselect6: a0 = nfds -> (nfds+7)/8 <= 128B fits each fd_set window
             if (G_A0(&tmp) > 1024u) G_A0(&tmp) = 1024u;
             break;
-        case 22:                   // epoll_pwait: a2 = maxevents (12B/entry) into the out window [0,BUFSZ)
+        case 22:                   // epoll_pwait: a2 = maxevents (SENTRY_EPEV_SZ/entry) into the out window [0,BUFSZ)
             if (have[1] && G_A2(&tmp) > (uint64_t)(SENTRY_BUFSZ / SENTRY_EPEV_SZ)) G_A2(&tmp) = SENTRY_BUFSZ / SENTRY_EPEV_SZ;
             break;
         case 56: case 79: case 291: // openat / newfstatat / statx: force the in-path NUL-terminated within
@@ -1494,7 +1503,7 @@ static void syscall_route(struct cpu *c) {
         R->a[5] = 0;
         break;
     }
-    case 21: // epoll_ctl(epfd, op, fd, a3=event): in epoll_event (12B)
+    case 21: // epoll_ctl(epfd, op, fd, a3=event): in epoll_event (SENTRY_EPEV_SZ, per guest arch)
         if (G_A3(c)) { memcpy(R->buf, (const void *)G_A3(c), SENTRY_EPEV_SZ); R->redir[3] = 0; }
         break;
     case 22: // epoll_pwait(epfd, a1=events_out, maxevents, timeout, sigmask): reserve out window, drop sigmask
@@ -1677,7 +1686,7 @@ static void syscall_route(struct cpu *c) {
             if (G_A3(c)) memcpy((void *)G_A3(c), R->buf + SENTRY_PSEL_EX, fb);
         }
         break;
-    case 22: // epoll_pwait: ret ready events (12B each) landed at buf[0]
+    case 22: // epoll_pwait: ret ready events (SENTRY_EPEV_SZ each, per guest arch) landed at buf[0]
         if (ret > 0 && G_A1(c)) {
             uint32_t mx = (uint32_t)G_A2(c);
             uint32_t got = (uint32_t)ret < mx ? (uint32_t)ret : mx;
