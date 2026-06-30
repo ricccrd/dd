@@ -267,12 +267,35 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         memcpy(top, argv[i], l);
         argp[i] = (uint64_t)top;
     }
-    while (g_guest_env[envc])
-        envc++;
+    // The container's env arrives as DD_GUEST_ENV="K=V\nK=V\n…" (set by the daemon / forwarded across
+    // execve by exec_forward_env). Forward EXACTLY those FIRST so they override the built-in defaults; the
+    // defaults then fill ONLY the keys the container didn't set (match on the "KEY=" prefix). Mirrors the
+    // shared aarch64 build_stack (os/linux/elf.c) -- without this, x86 guests ignored the container env.
+    const char *estr[256];
+    char *ge = getenv("DD_GUEST_ENV"), *gecopy = NULL;
+    if (ge) {
+        gecopy = strdup(ge);
+        char *save = NULL;
+        for (char *ln = strtok_r(gecopy, "\n", &save); ln && envc < 250; ln = strtok_r(NULL, "\n", &save))
+            estr[envc++] = ln;
+    }
+    int guest_envc = envc;
+    for (int i = 0; g_guest_env[i] && envc < 255; i++) {
+        const char *eq = strchr(g_guest_env[i], '=');
+        size_t klen = eq ? (size_t)(eq - g_guest_env[i]) + 1 : 0;
+        int dup = 0;
+        for (int j = 0; j < guest_envc && klen; j++)
+            if (strncmp(estr[j], g_guest_env[i], klen) == 0) {
+                dup = 1;
+                break;
+            }
+        if (dup) continue;
+        estr[envc++] = g_guest_env[i];
+    }
     for (int i = 0; i < envc; i++) {
-        size_t l = strlen(g_guest_env[i]) + 1;
+        size_t l = strlen(estr[i]) + 1;
         top -= l;
-        memcpy(top, g_guest_env[i], l);
+        memcpy(top, estr[i], l);
         envp_[i] = (uint64_t)top;
     }
     top -= 8;
