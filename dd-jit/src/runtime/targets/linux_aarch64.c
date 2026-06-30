@@ -42,9 +42,9 @@
 // container/ns config state + parsers (early globals)
 #include "../os/linux/container/state.c"
 // code cache + block map + chaining
-#include "../jit/cache.c"
+#include "../engine/cache.c"
 // aarch64 host emitters + IBTC/IC
-#include "../jit/emit_arm64.c"
+#include "../engine/emit_arm64.c"
 // transliterate + mangle + §B + LSE + depth-gate
 #include "../frontend/aarch64/translate.c"
 // clone/futex/threads (declares run_guest)
@@ -63,7 +63,7 @@
 // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted; OFF by default)
 #include "../os/linux/sentry.c"
 // host trampoline + run_guest
-#include "../jit/dispatch.c"
+#include "../engine/dispatch.c"
 // ELF loader + initial stack
 #include "../os/linux/elf.c"
 

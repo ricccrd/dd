@@ -58,12 +58,12 @@
 
 #include "../include/cpu_x86_64.h"
 #include "../frontend/x86_64/abi.h"          // cpu-interface seam (G_* contract + sysmap + normalize)
-#include "../frontend/x86_64/dispatch_hooks.h" // x86 dispatch seam for the SHARED jit/dispatch.c (engine-dedup)
+#include "../frontend/x86_64/dispatch_hooks.h" // x86 dispatch seam for the SHARED engine/dispatch.c (engine-dedup)
 #include "../frontend/x86_64/fill_stat.c"    // per-arch struct-stat layout os/linux fills
 
 #include "../os/linux/container/state.c"     // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
 #include "../frontend/x86_64/engine_glue.c"  // x86-only engine globals (trace/diag) the shared cache.c omits
-#include "../jit/cache.c"                     // SHARED engine: code cache + block map (hash via G_GPC_HASH_SHIFT)
+#include "../engine/cache.c"                     // SHARED engine: code cache + block map (hash via G_GPC_HASH_SHIFT)
 #include "../frontend/x86_64/emit.c"         // x86 engine: arm64 emitters + SSE + x87
 #include "../frontend/x86_64/decode.c"       // x86-64 decoder
 #include "../frontend/x86_64/translate.c"    // x86-64 translate_block + trampolines
@@ -79,7 +79,7 @@
 #include "../os/linux/sentry.c"              // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../frontend/x86_64/x86_ops.c"        // x86 cpuid + x87 m80 block-exit helpers
 #include "../frontend/x86_64/avx.c"            // AVX/AVX2/AVX-512 (VEX/EVEX) emulation (R_AVX block-exit)
-#include "../jit/dispatch.c"                  // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
+#include "../engine/dispatch.c"                  // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
                                               // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../frontend/x86_64/elf.c"      // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
 

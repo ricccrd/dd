@@ -1,7 +1,7 @@
-// frontend/x86_64/engine_glue.c -- x86-only engine globals for the shared jit/cache.c lift (PR1).
+// frontend/x86_64/engine_glue.c -- x86-only engine globals for the shared engine/cache.c lift (PR1).
 //
 // When the x86 target swapped `#include "../frontend/x86_64/cache.c"` for the shared
-// `#include "../jit/cache.c"`, it lost the x86-only diagnostic/trace globals that the old
+// `#include "../engine/cache.c"`, it lost the x86-only diagnostic/trace globals that the old
 // per-arch cache.c carried (the shared cache.c only defines the engine-core globals:
 // g_cache/g_cp/g_emit_start, g_cpu_key, g_jit_lock/g_cache_lock, g_threaded, g_map+helpers,
 // g_ibtc, g_pend/g_npend, g_prof + the aarch64-shaped g_prof_* counters). These globals are
@@ -12,7 +12,7 @@
 // so behavior is unchanged. NOTE: g_diag is intentionally non-static (external linkage) because
 // frontend/x86_64/elf.c references it via `extern int g_diag;`.
 //
-// Must be #included AFTER os/linux/container/state.c and BEFORE jit/cache.c + emit.c in the TU.
+// Must be #included AFTER os/linux/container/state.c and BEFORE engine/cache.c + emit.c in the TU.
 
 static int g_trace, g_noibtc, g_itrace; // g_itrace: 1 instruction per block (per-insn register dump)
 static uint64_t g_disp_n, g_ibtc_fill;  // PROF: dispatcher round-trips, IBTC fills
@@ -26,7 +26,7 @@ static int norepcmp(void) {     // (the A/B kill-switch; also the bit-exact per-
 }
 
 // ---- opt2: x86-only 2-way set-associative IBTC (gate IBTC1WAY=1) ----
-// The x86 engine gets its OWN indirect-branch-target cache here, leaving the SHARED jit/cache.c g_ibtc
+// The x86 engine gets its OWN indirect-branch-target cache here, leaving the SHARED engine/cache.c g_ibtc
 // (used by the aarch64 host engine + the W5-C ibtc_ent restructure) byte-for-byte unchanged. A tree-walk
 // interpreter (busybox awk evaluate()) returns to a handful of call sites; a direct-mapped (1-way) table
 // thrashes when two hot targets alias one slot (~100% conflict misses). 2 ways let an A/B alternation
@@ -124,7 +124,7 @@ static int guestfold_on(void) {
 // ---- W5B adaptive tier-2 (x86 engine) — x86-only glue over the SHARED W4E substrate ----
 // The hotness counter table (g_t2cnt/g_t2gpc/g_t2n), the dedup slot allocator (t2_slot), the promotion
 // threshold (g_t2thresh, default 1000), the tier-2-build flag (g_tier2_build), the last-body handoff
-// (g_last_body) and the promotion counter (g_prof_t2) all live in the shared jit/cache.c (the W4E
+// (g_last_body) and the promotion counter (g_prof_t2) all live in the shared engine/cache.c (the W4E
 // substrate, #included right after this TU). We DON'T redeclare them here — that would be a redefinition
 // in the x86 unity build. The x86 engine only adds the two pieces the shared substrate does not carry:
 //
