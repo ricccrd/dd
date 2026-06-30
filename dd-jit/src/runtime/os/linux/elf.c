@@ -547,25 +547,17 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     uint8_t *top = stk + SZ;
     uint64_t argp[256], envp_[256];
     int envc = 0;
-    for (int i = 0; i < argc; i++) {
-        size_t l = strlen(argv[i]) + 1;
-        top -= l;
-        memcpy(top, argv[i], l);
-        argp[i] = (uint64_t)top;
-    }
-    // the container's env arrives as DD_GUEST_ENV="K=V\nK=V\n…" (set by the daemon) -- forward EXACTLY
-    // these to the guest FIRST so they override the defaults, NOT the daemon/host environment. Then the
-    // built-in defaults fill ONLY the keys the container didn't set.
-    char *ge = getenv("DD_GUEST_ENV");
+    // Resolve the env string list WITHOUT placing it yet (the placement order below is what matters). The
+    // container's env arrives as DD_GUEST_ENV="K=V\nK=V\n…" (set by the daemon) -- forward EXACTLY these to
+    // the guest FIRST so they override the defaults, NOT the daemon/host environment. Then the built-in
+    // defaults fill ONLY the keys the container didn't set.
+    const char *estr[256];
+    char *ge = getenv("DD_GUEST_ENV"), *gecopy = NULL;
     if (ge) {
-        char *copy = strdup(ge), *save = NULL;
-        for (char *ln = strtok_r(copy, "\n", &save); ln && envc < 250; ln = strtok_r(NULL, "\n", &save)) {
-            size_t l = strlen(ln) + 1;
-            top -= l;
-            memcpy(top, ln, l);
-            envp_[envc++] = (uint64_t)top;
-        }
-        free(copy);
+        gecopy = strdup(ge);
+        char *save = NULL;
+        for (char *ln = strtok_r(gecopy, "\n", &save); ln && envc < 250; ln = strtok_r(NULL, "\n", &save))
+            estr[envc++] = ln;
     }
     int guest_envc = envc; // [0..guest_envc) came from the container; the rest are defaults
     for (int i = 0; g_guest_env[i] && envc < 255; i++) {
@@ -576,16 +568,33 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         size_t klen = eq ? (size_t)(eq - g_guest_env[i]) + 1 : 0;
         int dup = 0;
         for (int j = 0; j < guest_envc && klen; j++)
-            if (strncmp((char *)envp_[j], g_guest_env[i], klen) == 0) {
+            if (strncmp(estr[j], g_guest_env[i], klen) == 0) {
                 dup = 1;
                 break;
             }
         if (dup) continue;
-        size_t l = strlen(g_guest_env[i]) + 1;
-        top -= l;
-        memcpy(top, g_guest_env[i], l);
-        envp_[envc++] = (uint64_t)top;
+        estr[envc++] = g_guest_env[i];
     }
+    // Place the arg/env strings top-down in the SAME memory order the Linux kernel uses, so that low->high
+    // addresses hold argv[0], argv[1], …, argv[argc-1], env[0], …, env[envc-1] -- i.e. argv[0] sits at the
+    // LOWEST address of the contiguous arg+env block, the last env string ends at the stack top. libuv
+    // (node's process-title setup, used during mongosh/node bootstrap) RELIES on this: it treats argv[0] as
+    // the block start and clears/overwrites FORWARD across the whole arg+env span. The naive top-down order
+    // (argv[0] highest) put argv[0] at the stack-mapping top, so that forward fill ran off the end of the
+    // mapping into unmapped memory -> SIGSEGV before any JS runs. Mirror the kernel: highest strings first.
+    for (int i = envc - 1; i >= 0; i--) {
+        size_t l = strlen(estr[i]) + 1;
+        top -= l;
+        memcpy(top, estr[i], l);
+        envp_[i] = (uint64_t)top;
+    }
+    for (int i = argc - 1; i >= 0; i--) {
+        size_t l = strlen(argv[i]) + 1;
+        top -= l;
+        memcpy(top, argv[i], l);
+        argp[i] = (uint64_t)top;
+    }
+    free(gecopy); // the DD_GUEST_ENV tokens (estr[..]) were copied onto the stack above; safe to release now
     top -= 8;
     memcpy(top, "aarch64", 8);
     uint64_t plat = (uint64_t)top;
