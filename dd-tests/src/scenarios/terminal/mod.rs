@@ -76,6 +76,13 @@ pub fn group() -> ScenGroup {
             .exec("set -m; (exit 7) & wait $!; echo rc=$?").has("rc=7").timeout(60),
         scen("terminal/jobctl-fgbg", "ubuntu:latest").tty()
             .exec("set -m; sleep 0.5 & disown -h %1 2>/dev/null; jobs -p | grep -q '[0-9]' && echo JOB-PID-OK").has("JOB-PID-OK").timeout(60),
+        // Foreground PIPELINE under interactive job control: the pipeline's group leader briefly sits in a
+        // background process group (between its setpgid and the shell's tcsetpgrp) and calls tcsetpgrp to grab
+        // the terminal -- it must NOT be SIGTTOU-stopped mid-handoff. Regression for the x86 "[1]+ Stopped
+        // ls | cat" hang where the leader froze before it could exec. `bash -ic` enables real job control on
+        // the PTY; the pipeline must complete and print its output (no "Stopped", no hang).
+        scen("terminal/jobctl-fg-pipeline", "ubuntu:latest").tty()
+            .exec("bash -ic 'ls / | cat >/dev/null && echo PIPE-OK' 2>&1 | tail -1").has("PIPE-OK").timeout(60),
         scen("terminal/setsid-newsession", "ubuntu:latest")
             .exec("setsid sh -c 'echo SETSID-OK' 2>&1 | head -1").has("SETSID-OK").timeout(60),
 

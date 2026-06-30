@@ -3,6 +3,23 @@
 // otherwise. Included by service.c AFTER its local helpers (overlay_*/proc_self_exe/synth_str_fd/
 // cpu_range_str it calls) and before service() -- same TU scope.
 
+// A terminal-control syscall (tcsetpgrp/tcsetattr) issued by a process that is in a BACKGROUND process
+// group raises SIGTTOU on the whole group; with the default disposition that STOPS it. During job-control
+// handoff a shell's pipeline child briefly sits in a background group between its setpgid() and the
+// parent's tcsetpgrp(), so a foreground command can be SIGTTOU-stopped before it even execs (the
+// "[1]+ Stopped  ls | cat" hang -- the engine's in-process children lose this race more readily than a
+// real kernel does). POSIX guarantees that when SIGTTOU is blocked the call simply succeeds and NO signal
+// is generated -- which is exactly what a correct shell does around these calls (bash's give_terminal_to).
+// So block SIGTTOU on the host for the duration of the REAL call: it never fakes the operation (the real
+// tcsetpgrp/tcsetattr still runs on the real pty) and is a no-op when the guest already blocked it.
+static void tty_ctl_block(sigset_t *saved) {
+    sigset_t blk;
+    sigemptyset(&blk);
+    sigaddset(&blk, SIGTTOU);
+    sigprocmask(SIG_BLOCK, &blk, saved);
+}
+static void tty_ctl_restore(const sigset_t *saved) { sigprocmask(SIG_SETMASK, saved, NULL); }
+
 static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                   uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -65,7 +82,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // TCSETS/W/F
             termios_l2m((const uint8_t *)arg, &t);
             int act = rq == 0x5402 ? TCSANOW : rq == 0x5403 ? TCSADRAIN : TCSAFLUSH;
+            sigset_t sv;
+            tty_ctl_block(&sv); // a bg-group tcsetattr would otherwise SIGTTOU-stop the caller
             G_RET(c) = tcsetattr(fd, act, &t) < 0 ? (uint64_t)(-errno) : 0;
+            tty_ctl_restore(&sv);
             break;
         }
         case 0x802c542a: {
@@ -90,7 +110,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             cfsetispeed(&t, *(uint32_t *)((const uint8_t *)arg + 36));
             cfsetospeed(&t, *(uint32_t *)((const uint8_t *)arg + 40));
             int act = rq == 0x402c542b ? TCSANOW : rq == 0x402c542c ? TCSADRAIN : TCSAFLUSH;
+            sigset_t sv;
+            tty_ctl_block(&sv); // a bg-group tcsetattr would otherwise SIGTTOU-stop the caller
             G_RET(c) = tcsetattr(fd, act, &t) < 0 ? (uint64_t)(-errno) : 0;
+            tty_ctl_restore(&sv);
             break;
         }
         case 0x5413:
@@ -142,8 +165,17 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 0x5410: { // tcsetpgrp
             pid_t pg = arg ? *(int *)arg : 0;
             if (pg == 1 && g_init_hostpid) pg = g_init_hostpid; // guest pgid 1 -> init's real host group
-            if (isatty(fd) && pg > 0) (void)tcsetpgrp(fd, pg);  // really install the fg group (kernel routes ^C)
-            G_RET(c) = 0;                                       // never surface an error -> bash never warns
+            if (isatty(fd) && pg > 0) {
+                // A pipeline leader calls tcsetpgrp while still in a background group (the parent shell sets
+                // the foreground group concurrently); without blocking SIGTTOU here the host kernel would
+                // STOP it mid-handoff -> the foreground command freezes ("[1]+ Stopped"). Block SIGTTOU so
+                // the real tcsetpgrp installs the fg group cleanly (kernel still routes ^C/^Z afterwards).
+                sigset_t sv;
+                tty_ctl_block(&sv);
+                (void)tcsetpgrp(fd, pg);
+                tty_ctl_restore(&sv);
+            }
+            G_RET(c) = 0; // never surface an error -> bash never warns
             break;
         }
         // TIOCSCTTY -- acquire the controlling terminal for real when `fd` is a tty (best effort; the
