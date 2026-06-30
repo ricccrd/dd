@@ -95,6 +95,13 @@
 static int g_engine_inited;
 
 static void container_init(const char *rootfs) {
+    // PID ns: only containers (rootfs) get PID 1. Record the init's real host pid so the shared Linux
+    // personality can virtualize just the init's identity (getpid()==1, host pgid<->guest pgid 1) and
+    // pass real child pids straight through -- this is what makes bash job control (setpgid / TIOCSPGRP)
+    // work on x86-64 the way it already does on aarch64. Without it g_init_hostpid stayed 0, getpid()
+    // returned the real host pid, and bash's setpgid(0,1)/tcsetpgrp targeted host pid 1 (launchd) -> the
+    // foreground command got SIGTTOU/SIGTTIN-stopped ("[N]+ Stopped  ls") instead of running.
+    if (rootfs) g_init_hostpid = getpid();
     if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
         g_rootfs = (char *)rootfs;
         if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
