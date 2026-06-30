@@ -454,7 +454,7 @@ static void emit_exit_const(uint64_t rip, uint64_t reason) {
 // then emit inline ARM64 at the guest `syscall` site that reads CNTVCT and converts to a Linux
 // timespec/timeval WITHOUT entering service() -- the guest's clock_gettime/gettimeofday never
 // trap. ns = base_ns + ((ticks-base_ticks)*mult)>>FAST_SHIFT (Q30, overflow-safe 128-bit).
-static int g_fastsys = 1;         // master switch (JIT86_NOFASTSYS=1 -> 0 = byte-identical old path)
+static int g_fastsys = 1;         // master switch (DDJIT_NOFASTSYS=1 -> 0 = byte-identical old path)
 static uint64_t g_fast_count;     // # of guest time syscalls satisfied inline (written by emitted code)
 static uint64_t g_cal_base_ticks; // CNTVCT at calibration
 static uint64_t g_cal_mono_ns;    // CLOCK_MONOTONIC ns at calibration
@@ -470,17 +470,17 @@ static uint64_t g_cal_mult;       // tick->ns multiplier (Q30): round(1e9 * 2^FA
 // address. Two `static` tentative defs of the same object coalesce into one (standard C) -- no
 // second storage, no link conflict; the bare-`static` real def in signal.c is unchanged.
 static volatile uint64_t g_pending;   // FORWARD decl; real (identical) def lives in os/linux/signal.c
-static int g_siginline = 1;           // W4F switch (JIT86_NOSIGINLINE=1 disables ONLY the W4F arms)
+static int g_siginline = 1;           // W4F switch (DDJIT_NOSIGINLINE=1 disables ONLY the W4F arms)
 static uint64_t g_sig_inline_count;   // # rt_sigprocmask served inline (written by emitted code)
 static uint64_t g_sig_slow_count;     // # rt_sigprocmask that reached service() (pending-signal fallback)
 static uint64_t g_yield_inline_count; // # sched_yield served inline
 static void s1_calibrate(void) {
-    const char *off = getenv("JIT86_NOFASTSYS");
+    const char *off = getenv("DDJIT_NOFASTSYS");
     if (off && off[0] && off[0] != '0') {
         g_fastsys = 0;
         return;
     }
-    const char *nosi = getenv("JIT86_NOSIGINLINE");
+    const char *nosi = getenv("DDJIT_NOSIGINLINE");
     if (nosi && nosi[0] && nosi[0] != '0') g_siginline = 0;
     uint64_t freq;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
@@ -662,7 +662,7 @@ static void emit_fast_syscall(uint64_t next) {
         after[na++] = (uint32_t *)g_cp;
         emit32(0x14000000u); // b L_after
     } else {
-        to_slow[nsl++] = gtod_miss; // W4F off (JIT86_NOSIGINLINE): gtod miss -> slow, exactly as S1
+        to_slow[nsl++] = gtod_miss; // W4F off (DDJIT_NOSIGINLINE): gtod miss -> slow, exactly as S1
     }
 
     // ---- slow path: restore guest flags, take the unchanged full R_SYSCALL exit ----

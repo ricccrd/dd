@@ -110,22 +110,22 @@ static void container_init(const char *rootfs) {
         if (g_uid < 0) g_uid = 0;
         if (g_gid < 0) g_gid = 0;
     }
-    if (!getenv("JIT86_NONETNS")) { // opt-out: leave g_netns empty -> 127/8 uses the REAL host TCP stack
-        const char *ns = getenv("JIT86_NETNS"); // private-loopback dir: inherit across exec, else create one
+    if (!getenv("DD_NONETNS")) { // opt-out: leave g_netns empty -> 127/8 uses the REAL host TCP stack
+        const char *ns = getenv("DD_NETNS"); // private-loopback dir: inherit across exec, else create one
         if (ns && ns[0])
             snprintf(g_netns, sizeof g_netns, "%s", ns);
         else {
             char tmpl[64];
-            snprintf(tmpl, sizeof tmpl, "/tmp/jit86-lo-%d", (int)getpid());
+            snprintf(tmpl, sizeof tmpl, "/tmp/dd-lo-%d", (int)getpid());
             if (mkdir(tmpl, 0700) == 0 || errno == EEXIST) {
                 snprintf(g_netns, sizeof g_netns, "%s", tmpl);
-                setenv("JIT86_NETNS", g_netns, 1);
+                setenv("DD_NETNS", g_netns, 1);
             }
         }
     }
     {
         const char *vs =
-            getenv("JIT86_VOL"); // bind-mount volumes (env path; bridge usually can't pass env, so --vol too)
+            getenv("DDVOL"); // bind-mount volumes (env path; bridge usually can't pass env, so --vol too)
         if (vs && vs[0]) {
             char tmp[2048];
             snprintf(tmp, sizeof tmp, "%s", vs);
@@ -135,11 +135,11 @@ static void container_init(const char *rootfs) {
         }
     }
     {
-        const char *pub = getenv("JIT86_PUBLISH");
+        const char *pub = getenv("DD_PUBLISH");
         if (pub && pub[0] && !g_nportmap) parse_publish(pub);
     } // docker -p (inherit across exec)
     {
-        const char *ls = getenv("JIT86_LOWER"); // overlay lower layers (inherit across exec)
+        const char *ls = getenv("DD_LOWER"); // overlay lower layers (inherit across exec)
         if (ls && ls[0] && !g_nlower) {
             char tmp[4096];
             snprintf(tmp, sizeof tmp, "%s", ls);
@@ -282,11 +282,11 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     c.rip = jump;
 
     s1_calibrate(); // S1: anchor CNTVCT vs host REALTIME/MONOTONIC for the inline time fast path
-                    // (also honors JIT86_NOFASTSYS=1 kill-switch -> byte-identical old syscall path)
+                    // (also honors DDJIT_NOFASTSYS=1 kill-switch -> byte-identical old syscall path)
     if (g_untrusted) sentry_init(); // fork the host-authority sentry + (optionally) confine the worker
     run_guest(&c);
     if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
-    if (getenv("JIT86_FASTSTAT") || g_fast_count)
+    if (getenv("DDJIT_FASTSTAT") || g_fast_count)
         fprintf(stderr, "[fastsys] enabled=%d inline-served=%llu\n", g_fastsys, (unsigned long long)g_fast_count);
     if (g_prof)
         fprintf(stderr, "[prof] dispatcher round-trips=%llu  IBTC fills=%llu  (IBTC %s)\n",
@@ -320,7 +320,7 @@ int dd_run(const char *rootfs, int argc, char *const argv[]) {
 
 #include "../translate/x86_64/forkserver.c" // W3D: resident ddjitd fork-server (server/client/worker)
 
-#ifndef JIT86_LIB
+#ifndef DDJIT_LIB
 int main(int argc, char **argv) {
     int ai = 1;
     const char *rootfs = NULL;
@@ -345,7 +345,7 @@ int main(int argc, char **argv) {
             ai += 2;
         } else if (strcmp(argv[ai], "--publish") == 0 || strcmp(argv[ai], "-p") == 0) { // docker -p H:C (port-map)
             parse_publish(argv[ai + 1]);
-            setenv("JIT86_PUBLISH", argv[ai + 1], 1);
+            setenv("DD_PUBLISH", argv[ai + 1], 1);
             ai += 2;
         } else if (strcmp(argv[ai], "--lower") == 0) {
             add_lower(argv[ai + 1]);

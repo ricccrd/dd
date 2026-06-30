@@ -632,7 +632,7 @@ static void emit_div_zero_check(int divreg, uint64_t next, int idiv) {
 static void emit_sigill(uint64_t pc) {
     // Quiet by default: UD2 frequently sits on never-taken paths (compiler trap/unreachable slots) that get
     // translated as block fall-through but never run; an unconditional message would falsely imply delivery.
-    if (getenv("CRASHDBG")) fprintf(stderr, "[jit86] #UD ud2 at rip=%llx -> SIGILL\n", (unsigned long long)pc);
+    if (getenv("CRASHDBG")) fprintf(stderr, "[dd] #UD ud2 at rip=%llx -> SIGILL\n", (unsigned long long)pc);
     emit_guest_trap(pc, 0x00000000u); // udf #0 -> host SIGILL
 }
 
@@ -2116,6 +2116,19 @@ static void *translate_block(uint64_t gpc) {
                     }
                     emit32(0x0F20A400u | (s << 5) | 16);  // SXTL v16.2d, vs.2s  (sign-extend the 2 int32)
                     emit32(0x4E61D800u | (16 << 5) | vd); // SCVTF vd.2d, v16.2d (int64 -> double)
+                } else if (op == 0xE6 && (I.p66 || I.repne)) {
+                    // cvttpd2dq (66, truncate) / cvtpd2dq (F2, round-to-nearest): 2 packed f64 -> 2 packed
+                    // s32 in the low 64 bits of dst; the high 64 bits are zeroed (SQXTN with Q=0).
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        e_ldr_q(16, 17, 0);
+                        s = 16;
+                    }
+                    uint32_t cvt = I.p66 ? 0x4EE1B800u   // FCVTZS v16.2d, vs.2d (toward zero)
+                                         : 0x4E61A800u;  // FCVTNS v16.2d, vs.2d (round to nearest even)
+                    emit32(cvt | (s << 5) | 16);
+                    emit32(0x0EA14800u | (16 << 5) | vd); // SQXTN vd.2s, v16.2d (narrow s64->s32, hi 64 = 0)
                 } else if (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x6C || op == 0x68 || op == 0x69 ||
                            op == 0x6A || op == 0x6D) { // punpck l/h bw/wd/dq/qdq -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
@@ -2944,7 +2957,7 @@ static void tier2_promote(uint64_t gpc) {
 
 static void report_unimpl(uint64_t pc, struct insn *I) {
     const uint8_t *p = (const uint8_t *)pc;
-    fprintf(stderr, "[jit86] UNIMPL %s opcode 0x%02x at rip=%llx  bytes:", I->two ? "0F" : "1B", I->op,
+    fprintf(stderr, "[dd] UNIMPL %s opcode 0x%02x at rip=%llx  bytes:", I->two ? "0F" : "1B", I->op,
             (unsigned long long)pc);
     for (int i = 0; i < (I->len ? I->len : 8); i++)
         fprintf(stderr, " %02x", p[i]);

@@ -177,7 +177,7 @@ static void load_elf(const char *path, struct loaded *out) {
         perror("mmap elf");
         exit(1);
     }
-    if (rd16(f + 18) != 0x3E) fprintf(stderr, "[jit86] warning: e_machine=%u (want 62=x86-64)\n", rd16(f + 18));
+    if (rd16(f + 18) != 0x3E) fprintf(stderr, "[dd] warning: e_machine=%u (want 62=x86-64)\n", rd16(f + 18));
     uint64_t e_entry = rd64(f + 24), phoff = rd64(f + 32);
     int phnum = rd16(f + 56), phentsize = rd16(f + 54);
     uint64_t minv = ~0ull, maxv = 0;
