@@ -21,6 +21,23 @@ static int sig_is_sync(int s) {
     return s == 4 || s == 5 || s == 7 || s == 8 || s == 11;
 // ILL TRAP BUS FPE SEGV (Linux nums)
 }
+// Does signal `sig`'s DEFAULT action terminate the process (Term or Core)? False for the signals whose
+// default action is ignore (CHLD/CONT/URG/WINCH) or stop (STOP/TSTP/TTIN/TTOU); true for every other
+// deliverable signal (HUP/INT/QUIT/TERM/USRn/PIPE/ALRM/SEGV/... and the realtime signals 32..64).
+static int sig_default_terminates(int sig) {
+    switch (sig) {
+    case 17: // SIGCHLD  -- ignore
+    case 18: // SIGCONT  -- continue (no-op on delivery)
+    case 23: // SIGURG   -- ignore
+    case 28: // SIGWINCH -- ignore
+    case 19: // SIGSTOP  -- stop
+    case 20: // SIGTSTP  -- stop
+    case 21: // SIGTTIN  -- stop
+    case 22: // SIGTTOU  -- stop
+        return 0;
+    default: return sig >= 1 && sig <= 64;
+    }
+}
 // Signal numbers diverge: Linux SIGUSR1=10/CHLD=17/BUS=7/SYS=31/USR2=12/URG=23/IO=29/STOP=19/
 // CONT=18/TSTP=20 vs macOS 30/20/10/12/31/16/23/17/19/18. Translate at the host boundary.
 static int sig_l2m(int s) {
@@ -69,9 +86,21 @@ static void maybe_deliver_signal(struct cpu *c) {
         if (!(p & bit) || (c->sigmask & (1ull << (sig - 1)))) continue;
         uint64_t h = g_sigact[sig].handler;
         if (h <= 1) {
-            // DFL/IGN: a process-directed one was already actioned by the host; a thread-directed one is a no-op.
+            // No guest handler -- clear this pending instance from both queues.
             __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST);
             __atomic_and_fetch(&c->tpending, ~bit, __ATOMIC_SEQ_CST);
+            // A SIG_DFL signal whose default action TERMINATES, still pending at the container init, was NOT
+            // already actioned by the host: real Linux protects a PID-namespace init from an unhandled fatal
+            // signal, so it lingered (e.g. the guest blocked it inside its handler, reset the disposition to
+            // SIG_DFL, then re-raised it to exit -- exactly node's SignalExit / mongosh path). dd's init is
+            // just the container entrypoint, not an init that must survive, so take the default action and end
+            // the container with 128+signo (the code `docker run` reports for a PID 1 killed by a signal).
+            // SIG_IGN (h==1) and the default-ignore/stop signals stay dropped here.
+            if (h == 0 && container_pid() == 1 && sig_default_terminates(sig)) {
+                c->exited = 1;
+                c->exit_code = 128 + sig;
+                return;
+            }
             continue;
         }
         // Claim from both queues (clear unconditionally so the coalesced signal is delivered exactly once),
@@ -108,8 +137,19 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     }
     // SIGCHLD/CONT/URG/WINCH: ignore
     if (sig == 17 || sig == 18 || sig == 23 || sig == 28) return;
+    // Unhandled fatal signal aimed at the container init: real Linux would protect a PID-namespace init and
+    // drop it, but dd's init is just the entrypoint -- take the default action and end the container with
+    // 128+signo (what `docker run` reports for a PID 1 killed by a signal) rather than raising a real host
+    // signal that kills the engine BY the signal. The stop signals keep the host path below (job control
+    // mirrors them onto the host mask, so a real host stop is the correct default action).
+    if (container_pid() == 1 && sig_default_terminates(sig)) {
+        c->exited = 1;
+        c->exit_code = 128 + sig;
+        return;
+    }
     signal(sig_l2m(sig), SIG_DFL);
-    // default: die BY the signal (host signo)
+    // default: a non-init guest process IS the engine process -- a real host signal both terminates it and
+    // yields the correct WIFSIGNALED status to its parent's waitpid (host signo).
     raise(sig_l2m(sig));
     c->exited = 1;
     // fallback if raise returns / signo invalid on host
