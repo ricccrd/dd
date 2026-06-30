@@ -1083,7 +1083,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = l;
         } else {
             char pb[4200];
-            const char *rp = xlate(p, pb, sizeof pb);
+            // Resolve through atpath (overlay-aware, nofollow=read the link itself, dirfd-relative confined):
+            // a bare xlate() only consults the writable upper, so readlink of a lower-only path (e.g. a
+            // PATH-launched binary in a read-only image layer) hit a non-existent upper path and returned
+            // ENOENT instead of EINVAL -- breaking musl/glibc realpath(), which readlinks each path prefix
+            // and treats ENOENT as "no such path" (PostgreSQL find_my_exec: "could not resolve path ...").
+            const char *rp = atpath((int)a0, p, pb, sizeof pb, 1);
             int rc, len;
             if (rl_lookup(rp, &rc, buf, bs, &len)) {
                 G_RET(c) = rc < 0 ? (uint64_t)(int64_t)rc : (uint64_t)len;
