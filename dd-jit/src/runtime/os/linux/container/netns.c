@@ -190,6 +190,16 @@ static uint16_t g_lo_port[1024];
 static uint8_t g_sock_stream[1024];
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
 static uint8_t g_sock_dgram[1024];
+// fd -> 1 if this DGRAM socket emulates a connection-oriented endpoint that owes its peer an EOF on
+// close (a SEQPACKET socketpair or an O_DIRECT "packet" pipe). macOS DGRAM sockets never deliver EOF on
+// peer close, so close() injects a zero-length EOF datagram and recv/read coerce ECONNRESET -> 0 for these.
+static uint8_t g_sock_seqpacket[1024];
+static int seq_is(int fd) { return fd >= 0 && fd < 1024 && g_sock_seqpacket[fd]; }
+// Wake any peer blocked on this DGRAM endpoint with a zero-length EOF datagram (queued after pending data,
+// so order is preserved). Best-effort: a no-op for non-SEQPACKET fds and harmless if the peer is gone.
+static void seq_send_eof(int fd) {
+    if (seq_is(fd)) send(fd, "", 0, 0);
+}
 static int lo_on(void) { return g_netns[0] != 0; }
 static int lo_is(const uint8_t *sa, socklen_t l) {
     return sa && l >= 8 && *(uint16_t *)sa == AF_INET && sa[4] == 127;
@@ -266,6 +276,7 @@ static void fd_carry_sock(int dst, int src) {
     if (dst < 0 || dst >= 1024 || src < 0 || src >= 1024) return;
     g_sock_stream[dst] = g_sock_stream[src];
     g_sock_dgram[dst] = g_sock_dgram[src];
+    g_sock_seqpacket[dst] = g_sock_seqpacket[src];
     g_lo_port[dst] = g_lo_port[src];
     g_br_port[dst] = g_br_port[src];
     g_br_ip[dst] = g_br_ip[src];

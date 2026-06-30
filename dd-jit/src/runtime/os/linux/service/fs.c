@@ -912,6 +912,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             g_lo_port[cf] = 0;
             g_sock_stream[cf] = 0;
             g_sock_dgram[cf] = 0;
+            // SEQPACKET/O_DIRECT-pipe EOF: this end is backed by a DGRAM socket whose peer would otherwise
+            // never see EOF on macOS. Inject a zero-length datagram so a blocked peer recv wakes and returns
+            // 0 (it queues after any pending data, preserving order), then drop the marker. (See case 199.)
+            seq_send_eof(cf);
+            g_sock_seqpacket[cf] = 0;
             g_br_port[cf] = 0;
             g_br_ip[cf] = 0;
             g_eventfd_count[cf] = 0;

@@ -115,6 +115,25 @@ static uint64_t nonpie_cas(void *p, int size, uint64_t expected, uint64_t newv) 
     }
     }
 }
+// Software LL/SC monitor for the exclusive-MONITOR pair (LDXR/LDAXR .. STXR/STLXR) served at +bias. The
+// guest's verbatim ldxr/stxr execute the real exclusive monitor for HIGH (stack/heap/lib) addresses, but a
+// LOW non-PIE image address faults here -- and the two halves arrive as SEPARATE fault handler invocations,
+// so the hardware monitor cannot be carried between them. Emulate LL/SC in software, per thread: the load
+// records {addr,value}; the store-exclusive linearizes through an atomic CAS(addr, recorded, new) -> it
+// succeeds iff memory still holds the recorded value, exactly so two threads racing the same image lock
+// cannot both "succeed" (the non-atomic memcpy that preceded this deadlocked musl's threaded a_cas). Cleared
+// on any non-exclusive served store to the same granule so a stale reservation cannot wrongly succeed.
+static __thread struct {
+    uint64_t addr; // host (high) address reserved by the last LL, 0 = no reservation
+    uint64_t val;  // value observed by the LL (size-masked)
+    int size;      // access width log2 (0=B 1=H 2=W 3=X)
+} g_llsc;
+static int nonpie_sc(uint64_t real, int size, uint64_t newv, uint64_t *llval) {
+    // returns 1 if the store-exclusive succeeds (status 0), 0 if it fails (status 1).
+    if (g_llsc.addr != real || g_llsc.size != size) return 0;
+    g_llsc.addr = 0; // a store-exclusive always closes the reservation, success or fail
+    return nonpie_cas((void *)real, size, *llval, newv) == *llval;
+}
 // zero-extend a `size`-byte value to register width (matches W-register upper-32 clearing for size<8).
 static uint64_t nonpie_zext(uint64_t v, int size) { return size >= 3 ? v : (v & ((1ull << (8 << size)) - 1)); }
 
@@ -218,17 +237,36 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
 
     // ---- Load/store exclusive + ordered, single register: LDXR/STXR/LDAXR/STLXR/LDAR/STLR/LDLAR/STLLR.
     //      bits[29:24]==001000, o1(bit21)==0 (the CAS o1==1 forms are handled above; pair STXP/LDXP/CASP,
-    //      o1==1, are rare and left to clean-abort). Served non-atomically at +bias; STXR reports success. ----
+    //      o1==1, are rare and left to clean-abort). The monitor pair (o2==0) is served as a software LL/SC
+    //      (per-thread reservation + atomic CAS at +bias) so two threads racing the same low image lock can
+    //      never both succeed; the ordered o2==1 forms are a plain atomic load/store (no reservation). ----
     if ((insn & 0x3F200000u) == 0x08000000u) {
         int size = insn >> 30, o2 = (insn >> 23) & 1, load = (insn >> 22) & 1, rs = (insn >> 16) & 0x1F;
-        if (load) {
+        if (o2) { // LDAR/STLR/LDLAR/STLLR: ordered, NOT exclusive -> plain atomic load/store, no monitor.
+            if (load) {
+                uint64_t val = 0;
+                memcpy(&val, (void *)real, (size_t)(1 << size));
+                if (rt != 31) X[rt] = nonpie_zext(val, size);
+            } else {
+                uint64_t val = (rt == 31) ? 0 : X[rt];
+                memcpy((void *)real, &val, (size_t)(1 << size));
+            }
+        } else if (load) { // LDXR/LDAXR: open a software reservation on the granule.
             uint64_t val = 0;
-            memcpy(&val, (void *)real, (size_t)(1 << size));
-            if (rt != 31) X[rt] = val;
-        } else {
-            uint64_t val = (rt == 31) ? 0 : X[rt];
-            memcpy((void *)real, &val, (size_t)(1 << size));
-            if (!o2 && rs != 31) X[rs] = 0; // store-exclusive status register: report success
+            switch (size) {
+            case 0: val = __atomic_load_n((uint8_t *)real, __ATOMIC_ACQUIRE); break;
+            case 1: val = __atomic_load_n((uint16_t *)real, __ATOMIC_ACQUIRE); break;
+            case 2: val = __atomic_load_n((uint32_t *)real, __ATOMIC_ACQUIRE); break;
+            default: val = __atomic_load_n((uint64_t *)real, __ATOMIC_ACQUIRE); break;
+            }
+            g_llsc.addr = real;
+            g_llsc.val = val;
+            g_llsc.size = size;
+            if (rt != 31) X[rt] = nonpie_zext(val, size);
+        } else { // STXR/STLXR: close the reservation via an atomic CAS -> status 0 (ok) / 1 (fail).
+            uint64_t newv = (rt == 31) ? 0 : X[rt];
+            int ok = nonpie_sc(real, size, newv, &g_llsc.val);
+            if (rs != 31) X[rs] = ok ? 0 : 1;
         }
         uc->uc_mcontext->__ss.__pc += 4;
         return 1;

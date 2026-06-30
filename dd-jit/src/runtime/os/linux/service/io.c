@@ -155,6 +155,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         ssize_t r = read(rfd, (void *)a1, (size_t)a2);
+        // SEQPACKET/O_DIRECT-pipe EOF over a DGRAM backing: a peer-closed read reports ECONNRESET, but the
+        // emulated endpoint must return 0 (EOF) like the Linux original. (See netns.c / case 199 / pipe2.)
+        if (r < 0 && errno == ECONNRESET && seq_is(rfd)) r = 0;
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -434,6 +437,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         ((int *)a0)[0] = fds[0];
         ((int *)a0)[1] = fds[1];
+        // An O_DIRECT pipe is backed by a DGRAM socketpair (above). Like a real pipe it must report EOF
+        // when the write end closes, but macOS DGRAM sockets don't -- mark both ends so close() sends a
+        // zero-length EOF datagram and read() coerces the peer-closed ECONNRESET to 0. (See netns.c.)
+        if ((fl & G_O_DIRECT)) {
+            if (fds[0] >= 0 && fds[0] < 1024) g_sock_seqpacket[fds[0]] = 1;
+            if (fds[1] >= 0 && fds[1] < 1024) g_sock_seqpacket[fds[1]] = 1;
+        }
         G_RET(c) = 0;
         break;
     }
