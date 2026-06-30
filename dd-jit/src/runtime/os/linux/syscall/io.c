@@ -416,6 +416,20 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
+    case 29: {
+        // ioctl(fd, req, arg). Almost every request (termios/winsize/job-control) is owned by svc_fs below;
+        // we only claim FIOASYNC here. On a SOCKET/PIPE Linux's FIOASYNC toggles signal-driven I/O and
+        // returns 0, but svc_fs's terminal-centric handler answers ENOTTY for it -- and nginx's master arms
+        // ioctl(listenfd, FIOASYNC, &on) on its listen socket, so an ENOTTY aborts worker startup and every
+        // connection then hangs. Translate it to the O_ASYNC file-status flag (fcntl), exactly like Linux,
+        // and defer every other request to svc_fs by returning "not handled".
+        if (a1 != 0x5452) return 0; // not FIOASYNC -> let svc_fs handle it
+        int on = a2 ? *(int *)a2 : 0, fl = fcntl((int)a0, F_GETFL);
+        if (fl < 0) { G_RET(c) = (uint64_t)(-errno); break; }
+        fl = on ? (fl | O_ASYNC) : (fl & ~O_ASYNC);
+        G_RET(c) = fcntl((int)a0, F_SETFL, fl) < 0 ? (uint64_t)(-errno) : 0;
+        break;
+    }
     case 59: {
         // pipe2(fds, flags). O_DIRECT requests "packet mode": each write is a distinct record that reads
         // back whole, never coalesced. macOS pipes can't do this, but an AF_UNIX SOCK_DGRAM socketpair

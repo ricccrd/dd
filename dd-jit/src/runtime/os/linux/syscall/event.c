@@ -15,6 +15,41 @@
 #define G_EPEV_DOFF 8u
 #endif
 
+// Edge-triggered "prime" on registration. Linux reports an fd that is ALREADY readable/writable at
+// EPOLL_CTL_ADD/MOD time when it is registered EPOLLET -- the registration itself counts as the edge (this
+// is how Go's netpoller learns about an accepted connection whose request bytes are already buffered). A
+// macOS kqueue EV_CLEAR filter, by contrast, reports only a *subsequent* transition, so an already-ready fd
+// is never delivered and a Go HTTP server accepts the connection but never responds. So when we arm an edge
+// filter on a fd that currently polls ready, stash a synthetic readiness event here and deliver it on the
+// next epoll_wait -- once (edge semantics). Tables are indexed by epoll fd (<1024); larger fds use the
+// immediate path and simply don't get primed. Level-triggered fds need no prime (kqueue without EV_CLEAR
+// already reports current readiness), so only EPOLLET arms reach here -- level semantics are untouched.
+static struct kevent *g_ep_prime[1024];
+static int g_ep_primen[1024], g_ep_primecap[1024];
+
+static void ep_prime_push(int ep, uintptr_t ident, int16_t filt, void *udata) {
+    if (ep < 0 || ep >= 1024) return;
+    struct kevent *a = g_ep_prime[ep];
+    for (int i = 0; i < g_ep_primen[ep]; i++)
+        if (a[i].ident == ident && a[i].filter == filt) { a[i].udata = udata; return; }
+    if (g_ep_primen[ep] >= g_ep_primecap[ep]) {
+        int nc = g_ep_primecap[ep] ? g_ep_primecap[ep] * 2 : 8;
+        struct kevent *na = realloc(a, (size_t)nc * sizeof *na);
+        if (!na) return;
+        g_ep_prime[ep] = na; g_ep_primecap[ep] = nc; a = na;
+    }
+    EV_SET(&a[g_ep_primen[ep]++], ident, filt, 0, 0, 0, udata);
+}
+
+// If `fd` currently polls ready for the direction `filt` covers, record a one-shot prime on `ep`.
+static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
+    if (ep < 0 || ep >= 1024 || fd < 0) return;
+    short want = (filt == EVFILT_READ) ? POLLIN : POLLOUT;
+    struct pollfd pfd = {.fd = fd, .events = want, .revents = 0};
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (want | POLLHUP | POLLERR)))
+        ep_prime_push(ep, (uintptr_t)fd, filt, udata);
+}
+
 static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                      uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -54,6 +89,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         int r = kqueue();
         // EPOLL_CLOEXEC
         if (r >= 0 && (a0 & 0x80000)) fcntl(r, F_SETFD, FD_CLOEXEC);
+        // a reused fd number must start with an empty prime buffer (close() doesn't clear ours)
+        if (r >= 0 && r < 1024) g_ep_primen[r] = 0;
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -77,6 +114,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (want_rd) {
                 ep_push(ep, fd, EVFILT_READ, EV_ADD | xf, (void *)data);
                 g_ep_rd[fd] = 1;
+                if (xf & EV_CLEAR) ep_prime_if_ready(ep, fd, EVFILT_READ, (void *)data);
             } else if (g_ep_rd[fd]) {
                 ep_push(ep, fd, EVFILT_READ, EV_DELETE, (void *)data);
                 g_ep_rd[fd] = 0;
@@ -84,6 +122,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (want_wr) {
                 ep_push(ep, fd, EVFILT_WRITE, EV_ADD | xf, (void *)data);
                 g_ep_wr[fd] = 1;
+                if (xf & EV_CLEAR) ep_prime_if_ready(ep, fd, EVFILT_WRITE, (void *)data);
             } else if (g_ep_wr[fd]) {
                 ep_push(ep, fd, EVFILT_WRITE, EV_DELETE, (void *)data);
                 g_ep_wr[fd] = 0;
@@ -111,6 +150,11 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             kevent((int)a0, &kv[i], 1, NULL, 0, NULL);
             ep_count();
         }
+        // EPOLLET: prime an already-ready fd so its initial readiness is reported (see g_ep_prime).
+        if ((xf & EV_CLEAR) && op != 2) {
+            if (want_rd) ep_prime_if_ready((int)a0, fd, EVFILT_READ, (void *)data);
+            if (want_wr) ep_prime_if_ready((int)a0, fd, EVFILT_WRITE, (void *)data);
+        }
         G_RET(c) = 0;
         break;
     }
@@ -129,6 +173,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         uint8_t *out = (uint8_t *)a1;
         int ep = (int)a0;
         int opt = epopt_on() && ep >= 0 && ep < 1024;
+        // A pending edge-prime means some fd is ready *now*; don't sleep waiting for a fresh kqueue edge
+        // (a Go server's epoll_wait blocks with an infinite timeout) -- poll kqueue and merge the prime in.
+        struct timespec zts = {0, 0};
+        if (ep >= 0 && ep < 1024 && g_ep_primen[ep] > 0) tp = &zts;
         // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall.
         struct kevent *chg = opt ? g_ep_chg[ep] : NULL;
         int nchg = opt ? g_ep_chgn[ep] : 0;
@@ -190,6 +238,28 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 }
                 oi++;
             }
+        }
+        // Deliver edge-triggered primes that kqueue didn't surface (fds already ready at registration).
+        if (ep >= 0 && ep < 1024 && g_ep_primen[ep] > 0) {
+            int kept = 0;
+            for (int i = 0; i < g_ep_primen[ep]; i++) {
+                struct kevent *pk = &g_ep_prime[ep][i];
+                uint32_t pev = (pk->filter == EVFILT_READ) ? 0x1u : 0x4u;
+                int dup = 0;
+                for (int j = 0; j < oi; j++) {
+                    uint32_t jev;
+                    uint64_t ju;
+                    memcpy(&jev, out + (size_t)j * G_EPEV_SZ, 4);
+                    memcpy(&ju, out + (size_t)j * G_EPEV_SZ + G_EPEV_DOFF, 8);
+                    if (ju == (uint64_t)pk->udata && (jev & pev)) { dup = 1; break; }
+                }
+                if (dup) continue;                                        // kqueue already reported it
+                if (oi >= maxev) { g_ep_prime[ep][kept++] = *pk; continue; } // no room -> keep for next wait
+                *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = pev;
+                memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &pk->udata, 8);
+                oi++;
+            }
+            g_ep_primen[ep] = kept;
         }
         G_RET(c) = (uint64_t)oi;
         break;
