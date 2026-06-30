@@ -68,6 +68,20 @@ struct cpu {
 #define OFF_HOSTV 272
 #define OFF_V 400
 #define OFF_MM 656
+// Offset safety (C3): the baked numeric OFF_* above are duplicated into emitted machine code AND the
+// run_block/block_return asm. A struct edit that shifts any of them must fail the BUILD, not corrupt a
+// guest at runtime -- so assert each baked offset against the real field. (See REFACTOR.md "Offset safety".)
+_Static_assert(__builtin_offsetof(struct cpu, r) == 0, "OFF r[] (R_OFF base) drifted");
+_Static_assert(__builtin_offsetof(struct cpu, rip) == OFF_RIP, "OFF_RIP drifted");
+_Static_assert(__builtin_offsetof(struct cpu, nzcv) == OFF_NZCV, "OFF_NZCV drifted");
+_Static_assert(__builtin_offsetof(struct cpu, fs_base) == OFF_FS, "OFF_FS drifted");
+_Static_assert(__builtin_offsetof(struct cpu, gs_base) == OFF_GS, "OFF_GS drifted");
+_Static_assert(__builtin_offsetof(struct cpu, reason) == OFF_RSN, "OFF_RSN drifted");
+_Static_assert(__builtin_offsetof(struct cpu, host_sp) == OFF_HSP, "OFF_HSP drifted");
+_Static_assert(__builtin_offsetof(struct cpu, host_save) == OFF_HSAVE, "OFF_HSAVE drifted");
+_Static_assert(__builtin_offsetof(struct cpu, host_v) == OFF_HOSTV, "OFF_HOSTV drifted");
+_Static_assert(__builtin_offsetof(struct cpu, v) == OFF_V, "OFF_V drifted");
+_Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drifted");
 #define R_BRANCH 0
 #define R_SYSCALL 1
 #define R_CPUID 2

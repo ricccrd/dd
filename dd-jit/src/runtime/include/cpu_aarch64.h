@@ -58,6 +58,20 @@ struct cpu {
 #define OFF_RSN 272
 #define OFF_HSP 280
 #define OFF_HSAVE 288
+// Offset safety (C3): the baked numeric OFF_* above are duplicated into emitted machine code AND the
+// run_block/block_return asm. A struct edit that shifts any of them must fail the BUILD, not corrupt a
+// guest at runtime -- so assert each baked offset against the real field. (See REFACTOR.md "Offset safety".)
+_Static_assert(offsetof(struct cpu, x) == 0, "OFF x[] base drifted");
+_Static_assert(offsetof(struct cpu, sp) == OFF_SP, "OFF_SP drifted");
+_Static_assert(offsetof(struct cpu, pc) == OFF_PC, "OFF_PC drifted");
+_Static_assert(offsetof(struct cpu, tls) == OFF_TLS, "OFF_TLS drifted");
+_Static_assert(offsetof(struct cpu, reason) == OFF_RSN, "OFF_RSN drifted");
+_Static_assert(offsetof(struct cpu, host_sp) == OFF_HSP, "OFF_HSP drifted");
+_Static_assert(offsetof(struct cpu, host_save) == OFF_HSAVE, "OFF_HSAVE drifted");
+_Static_assert(offsetof(struct cpu, v) == OFF_V, "OFF_V drifted");
+_Static_assert(offsetof(struct cpu, host_v) == OFF_HOSTV, "OFF_HOSTV drifted");
+_Static_assert(offsetof(struct cpu, nzcv) == OFF_NZCV, "OFF_NZCV drifted");
+_Static_assert(offsetof(struct cpu, ic_site) == OFF_ICSITE, "OFF_ICSITE drifted");
 // §B shadow stack base (pairs)
 #define OFF_SSTK offsetof(struct cpu, sstk)
 #define OFF_SSP offsetof(struct cpu, ssp)
