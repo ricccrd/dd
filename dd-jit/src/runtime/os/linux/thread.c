@@ -1,5 +1,8 @@
 // dd/runtime/os/linux -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
+#include <mach/mach.h>
+#include <mach/mach_vm.h> // mach_vm_region: probe whether a guest address is still mapped (see cleartid)
+
 // ---------------- syscalls ----------------
 // ---------------- threads & futex ----------------
 // fwd: thread trampoline runs the dispatcher
@@ -76,6 +79,22 @@ static pthread_mutex_t g_futex_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_futex_c = PTHREAD_COND_INITIALIZER;
 // PROF: fast (no-lock) wakes, slow (locked) wakes, eagain pre-checks
 static uint64_t g_futex_wake_fast, g_futex_wake_slow, g_futex_wait_n;
+
+// True iff host virtual address `a` is currently mapped. mincore() is useless on macOS (returns 0 for ANY
+// address), so query the VM map directly: mach_vm_region returns the first region at-or-above `a`, and `a`
+// is mapped iff it falls inside [start, start+size). Same technique as the x86 loader's lazy_addr_mapped.
+// Used to mirror the kernel's fault-tolerant put_user() on the CLEARTID teardown path (futex_wake_addr).
+static int host_addr_mapped(uintptr_t a) {
+    mach_vm_address_t addr = a;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) !=
+        KERN_SUCCESS)
+        return 0; // nothing at/above -> unmapped
+    return a >= (uintptr_t)addr && a < (uintptr_t)addr + (uintptr_t)size;
+}
 
 static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {
     clock_gettime(CLOCK_REALTIME, abs);
@@ -199,7 +218,14 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
 }
 static void futex_wake_addr(uint64_t uaddr) {
     if (!uaddr) return;
-    // CLONE_CHILD_CLEARTID: zero then wake joiners (pthread_join FUTEX_WAITs on this word)
+    // CLONE_CHILD_CLEARTID: zero the word then wake joiners (pthread_join FUTEX_WAITs on this word). A
+    // DETACHED guest thread (e.g. musl's __unmapself) munmaps its OWN stack -- which also holds the thread
+    // descriptor with this CLEARTID word -- and only THEN issues the exit syscall, so by the time we run
+    // here the word can already be unmapped. Linux's clear_child_tid uses put_user() and silently swallows
+    // that fault; a raw store here would instead SIGSEGV/SIGBUS the whole process (the flaky rustc-at-exit
+    // teardown crash). Skip the store+wake when the address is gone -- a detached thread has no joiner to
+    // wake, and a joinable thread never unmaps its own stack so its ctid is always still live.
+    if (!host_addr_mapped((uintptr_t)uaddr)) return;
     *(int *)uaddr = 0;
     if (!g_futexq) {
         pthread_mutex_lock(&g_futex_m);
