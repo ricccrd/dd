@@ -511,7 +511,12 @@ static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
     char hb[4200];
     for (int i = 0; dirs[i]; i++) {
         snprintf(gbuf, n, "%s/%s", dirs[i], prog);
-        if (access(xresolve_exec(gbuf, hb, sizeof hb), X_OK) == 0) return gbuf;
+        // Search the FULL overlay (upper THEN lowers), not the upper alone: a fresh container's upper is
+        // empty and the program (e.g. python/node/ruby) lives only in a read-only image lower, so a bare
+        // xresolve_exec ENOENTs every PATH dir -> the fallback /bin/<prog> doesn't exist -> the loader
+        // reports "open: No such file". The ELF-loader sites already use the overlay resolver; this was the
+        // one missed call site. No-op with no lowers (flat rootfs): xresolve_overlay == xresolve_exec there.
+        if (access(xresolve_overlay(gbuf, hb, sizeof hb), X_OK) == 0) return gbuf;
     }
     snprintf(gbuf, n, "/bin/%s", prog); // not found anywhere: let the loader report the error against /bin
     return gbuf;
