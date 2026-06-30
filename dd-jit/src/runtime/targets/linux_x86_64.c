@@ -111,17 +111,20 @@ static void container_init(const char *rootfs) {
         if (g_gid < 0) g_gid = 0;
     }
     if (!getenv("DD_NONETNS")) { // opt-out: leave g_netns empty -> 127/8 uses the REAL host TCP stack
-        const char *ns = getenv("DD_NETNS"); // private-loopback dir: inherit across exec, else create one
+        // DD_NETNS is a short KEY (not a path) -- the SAME key netns.c derives the abstract-socket / IPC
+        // namespace dirs from (/tmp/.ddabs-<key>, ...) and that the daemon + aarch64 engine use. The
+        // private-loopback dir is derived FROM it. Inherit the key across exec / from the daemon, else
+        // mint one from our pid. (Setting DD_NETNS to the full loopback path put slashes in those derived
+        // dir names -> mkdir failed -> abstract-socket bind broke.)
+        const char *ns = getenv("DD_NETNS");
+        char key[40];
         if (ns && ns[0])
-            snprintf(g_netns, sizeof g_netns, "%s", ns);
-        else {
-            char tmpl[64];
-            snprintf(tmpl, sizeof tmpl, "/tmp/dd-lo-%d", (int)getpid());
-            if (mkdir(tmpl, 0700) == 0 || errno == EEXIST) {
-                snprintf(g_netns, sizeof g_netns, "%s", tmpl);
-                setenv("DD_NETNS", g_netns, 1);
-            }
-        }
+            snprintf(key, sizeof key, "%.39s", ns);
+        else
+            snprintf(key, sizeof key, "%d", (int)getpid());
+        snprintf(g_netns, sizeof g_netns, "/tmp/dd-lo-%s", key);
+        if ((mkdir(g_netns, 0700) == 0 || errno == EEXIST) && !(ns && ns[0]))
+            setenv("DD_NETNS", key, 1);
     }
     {
         const char *vs =
