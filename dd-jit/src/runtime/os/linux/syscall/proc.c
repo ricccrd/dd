@@ -43,6 +43,28 @@ static void exec_forward_env(uint64_t envp_guest) {
     free(buf);
 }
 
+// Fill a guest `struct rlimit { rlim_cur; rlim_max; }` for {get,set}rlimit/prlimit64 (cases 163/261).
+// Shared so both forms report identical limits. Most resources are unlimited, but a few MUST be finite or
+// guests size data structures off them: RLIMIT_STACK(3) reports the conventional 8MB main-stack size, and
+// RLIMIT_NOFILE(7) reports a finite fd cap (soft 1024 / hard 1048576, the typical Linux default) -- a guest
+// like memcached does calloc(rlim_cur, sizeof(conn)), which overflows if the soft limit is RLIM_INFINITY.
+static void svc_fill_rlimit(int resource, uint64_t *o) {
+    switch (resource) {
+    case 3: // RLIMIT_STACK
+        o[0] = 8ull << 20;
+        o[1] = ~0ull;
+        break;
+    case 7: // RLIMIT_NOFILE
+        o[0] = 1024;
+        o[1] = 1048576;
+        break;
+    default:
+        o[0] = ~0ull; // RLIM_INFINITY
+        o[1] = ~0ull;
+        break;
+    }
+}
+
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -469,6 +491,16 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         memset(g_ibtc, 0, sizeof g_ibtc);
         // execve: drop IBTC + §B shadow (old image)
         G_SHADOW_RESET(c);
+        // POSIX execve resets CAUGHT signal handlers to SIG_DFL (SIG_IGN stays ignored). Without this, a
+        // handler the calling shell installed (e.g. busybox sh's SIGCHLD job-control handler) survives into
+        // the new image and is later delivered to a now-garbage handler address -> crash (redis/valkey run
+        // via `sh -c …`). handler>1 == a real caught handler; 0=DFL, 1=IGN.
+        for (int s = 1; s < 65; s++)
+            if (g_sigact[s].handler > 1) {
+                g_sigact[s].handler = 0;
+                g_sigact[s].flags = 0;
+                g_sigact[s].mask = 0;
+            }
         uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         gmap_add((uint64_t)heap, 256u << 20);
         brk_lo = brk_cur = (uint64_t)heap;
@@ -511,10 +543,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 261: {
         if (a3) {
             // prlimit64(pid,res,new,OLD): old=a3!
-            uint64_t *o = (uint64_t *)a3;
-            // RLIMIT_STACK=8MB, else unlimited
-            o[0] = ((int)a1 == 3) ? (8ull << 20) : ~0ull;
-            o[1] = ~0ull;
+            svc_fill_rlimit((int)a1, (uint64_t *)a3);
         }
         G_RET(c) = 0;
         break;

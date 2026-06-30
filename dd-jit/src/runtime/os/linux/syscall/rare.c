@@ -358,17 +358,13 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    // getrlimit(resource, rlim) / setrlimit(resource, rlim): alias prlimit64 (case 261). RLIMIT_STACK(3)
-    // reports 8MB, everything else unlimited; setrlimit is accepted (no-op).
-    case 163: {
-        if (a1) {
-            uint64_t *o = (uint64_t *)a1;
-            o[0] = ((int)a0 == 3) ? (8ull << 20) : ~0ull; // rlim_cur
-            o[1] = ~0ull;                                 // rlim_max
-        }
+    // getrlimit(resource, rlim) / setrlimit(resource, rlim): alias prlimit64 (case 261, svc_fill_rlimit).
+    // RLIMIT_STACK(3) reports 8MB, RLIMIT_NOFILE(7) a finite fd cap, everything else unlimited; setrlimit is
+    // accepted (no-op).
+    case 163:
+        if (a1) svc_fill_rlimit((int)a0, (uint64_t *)a1);
         G_RET(c) = 0;
         break;
-    }
     case 164:
         G_RET(c) = 0;
         break; // setrlimit -> accepted

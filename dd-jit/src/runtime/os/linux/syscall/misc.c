@@ -29,11 +29,21 @@ static int svc_misc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     // setdomainname -> ignore
     case 162: G_RET(c) = 0; break;
-    case 179:
+    case 179: {
         memset((void *)a0, 0, 112);
+        // sysinfo: report a plausible FINITE machine. A zeroed struct gives totalram=0, which the JVM
+        // reads as "Too small maximum heap" -> abort. 64-bit struct sysinfo byte offsets: uptime@0,
+        // loads@8, totalram@32, freeram@40, procs@80, mem_unit@104.
+        char *si = (char *)a0;
+        *(unsigned long *)(si + 0) = 3600;        // uptime (s)
+        *(unsigned long *)(si + 32) = 8UL << 30;  // totalram = 8 GiB (mem_unit=1)
+        *(unsigned long *)(si + 40) = 6UL << 30;  // freeram
+        *(unsigned short *)(si + 80) = 64;        // procs
+        *(unsigned int *)(si + 104) = 1;          // mem_unit
         G_RET(c) = 0;
         // sysinfo
         break;
+    }
     case 278:
         arc4random_buf((void *)a0, (size_t)a1);
         G_RET(c) = a1;
