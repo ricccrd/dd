@@ -93,7 +93,9 @@ pub fn run(args: RunArgs) -> i32 {
         // No command given → an interactive shell. Prefer bash when the image has it (a nicer dev
         // shell: history, line editing, completion), falling back to sh — resolved INSIDE the
         // container since we can't see its filesystem from here.
-        cmd.args(["/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]);
+        // Fallback must be an ABSOLUTE path: in the macOS container (darwinjail) bare `sh` may not
+        // resolve on PATH, so `exec sh` died "sh not found". `/bin/sh` is the one we're already in.
+        cmd.args(["/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec /bin/sh"]);
     } else {
         cmd.args(&args.command);
     }
