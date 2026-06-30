@@ -4,6 +4,12 @@
 // service(). NOTE: execve sets c->redirect; svc_done() (the shared tail) skips errno xlate when redirect
 // is set, so a redirect's already-Linux G_RET is never re-translated.
 
+// Restore guest GPRs that a per-arch fork/vfork->clone normalization repurposed as clone arguments (the x86
+// frontend defines this in legacy.c; other frontends issue clone directly and need no fixup -> no-op).
+#ifndef G_FORK_PRESERVE
+#define G_FORK_PRESERVE(c) ((void)0)
+#endif
+
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -305,6 +311,9 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         // parent: pid, child: 0
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
+        // A fork/vfork that was normalized to clone repurposed the guest's arg registers; put them back so
+        // the syscall preserves every GPR but rax, as the real kernel does (no-op for a genuine clone).
+        G_FORK_PRESERVE(c);
         break;
     }
     // execve(path, argv, envp)

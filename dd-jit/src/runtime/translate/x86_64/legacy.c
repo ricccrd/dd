@@ -9,6 +9,26 @@
 //
 // x86-64 ABI reg map: rax=r[0], rdi=r[7], rsi=r[6], rdx=r[2], r10=r[10], r8=r[8], r9=r[9].
 #define ATFD ((uint64_t) - 100) // AT_FDCWD
+
+// fork/vfork register snapshot. The fork(57)/vfork(58) -> clone(SIGCHLD) rewrite below repurposes the
+// guest's argument registers, but glibc's __vfork/__fork asm wrappers keep LIVE state in them across the
+// syscall (the kernel ABI preserves every GPR but rax/rcx/r11). The shared clone handler restores them
+// post-fork via G_FORK_PRESERVE(), making the rewrite invisible to the guest. Per-thread + one-shot
+// (set only here, consumed in the clone case), so a real clone(56) call never triggers a restore.
+static __thread uint64_t g_x86_forksave[5];
+static __thread int g_x86_forksave_on;
+#define G_FORK_PRESERVE(c)                                                                                              \
+    do {                                                                                                               \
+        if (g_x86_forksave_on) {                                                                                       \
+            (c)->r[7] = g_x86_forksave[0];  /* rdi */                                                                  \
+            (c)->r[6] = g_x86_forksave[1];  /* rsi */                                                                  \
+            (c)->r[2] = g_x86_forksave[2];  /* rdx */                                                                  \
+            (c)->r[10] = g_x86_forksave[3]; /* r10 */                                                                  \
+            (c)->r[8] = g_x86_forksave[4];  /* r8  */                                                                  \
+            g_x86_forksave_on = 0;                                                                                     \
+        }                                                                                                              \
+    } while (0)
+
 static int x86_normalize(struct cpu *c) {
     uint64_t *r = c->r;
     switch (r[0]) {
@@ -74,8 +94,13 @@ static int x86_normalize(struct cpu *c) {
     // a CLONE_SETTLS thread gets tls=0 -> fs_base=0 -> the child faults on its first %fs TLS access.
     case 56: { uint64_t t = r[10]; r[10] = r[8]; r[8] = t; return 0; }
     // --- fork/vfork -> clone(SIGCHLD): the shared clone host-forks when not CLONE_THREAD ---
+    // Snapshot the registers we are about to repurpose as clone args; the clone handler restores them after
+    // the fork (G_FORK_PRESERVE). Without this, glibc's __vfork (`pop %rdi; syscall; push %rdi; ret`) returns
+    // through a clobbered rdi (== SIGCHLD = 0x11) -> jumps to 0x11 -> SIGSEGV: the fork-from-a-shell crash.
     case 57:
     case 58:
+        g_x86_forksave[0] = r[7]; g_x86_forksave[1] = r[6]; g_x86_forksave[2] = r[2];
+        g_x86_forksave[3] = r[10]; g_x86_forksave[4] = r[8]; g_x86_forksave_on = 1;
         r[7] = 17; r[6] = 0; r[2] = 0; r[10] = 0; r[8] = 0; r[0] = 56; return 0;
     // getpgrp() -> getpgid(0): x86-only (no aarch64 form, so sysmap leaves it unmapped -> the shared
     // service saw 0x10000|111 and aborted with "unhandled syscall 65647" during bash job-control setup).
