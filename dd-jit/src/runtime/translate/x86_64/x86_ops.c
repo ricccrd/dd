@@ -99,6 +99,11 @@ static void do_repstr(struct cpu *c) {
     g_repstr_elems += k;
 }
 
+// CPUID emulation. We advertise EXACTLY the feature set the engine actually translates (legacy-SSE in
+// emit.c + the 0F38/0F3A SSSE3/SSE4/AES/PCLMUL/SHA/CRC32/MOVBE and BMI lanes in avx.c do_sse3b/do_avx),
+// mirroring a real x86-64 baseline. We deliberately do NOT advertise AVX/AVX2/FMA/F16C/XSAVE/OSXSAVE: those
+// are gated on YMM state being enabled in XCR0, but our xgetbv reports only x87+SSE (translate.c), so a
+// conformant guest would correctly decline them anyway -- advertising them would only mislead.
 static void do_cpuid(struct cpu *c) {
     uint32_t leaf = (uint32_t)c->r[RAX], a = 0, b = 0, cc = 0, d = 0;
     switch (leaf) {
@@ -112,14 +117,15 @@ static void do_cpuid(struct cpu *c) {
         a = 0x000306c3; // family/model (Haswell-ish id, harmless)
         d = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 11) | (1u << 13) | (1u << 15) | (1u << 19) | (1u << 23) |
             (1u << 24) | (1u << 25) | (1u << 26); // FPU,TSC,CX8,SEP,PGE,CMOV,CLFSH,MMX,FXSR,SSE,SSE2
-        cc = 0;
-        break; // ecx=0: no SSE3/SSSE3/SSE4/AVX/CX16
+        // SSE3, PCLMULQDQ, SSSE3, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, AES-NI -- all backed by the
+        // legacy/0F38/0F3A lowerings; none need YMM state (XMM only, covered by xgetbv's SSE bit).
+        cc = (1u << 0) | (1u << 1) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) |
+             (1u << 25);
+        break;
     case 7:
-        a = 0;
-        b = 0;
-        cc = 0;
-        d = 0;
-        break; // no AVX2/BMI/etc
+        if ((uint32_t)c->r[RCX] == 0) // subleaf 0
+            b = (1u << 3) | (1u << 8) | (1u << 29); // BMI1, BMI2, SHA (GP-register / XMM ops, no YMM state)
+        break;
     case 0x80000000: a = 0x80000001; break;
     case 0x80000001:
         d = (1u << 11) | (1u << 29);
