@@ -226,21 +226,34 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
     // `bash`/`uname`/… is found at /profile/bin and execve()'d into the jail).
     if guest.os() == "darwin" {
         cfg.lowers = vec!["/".into()];
-        // Forward the image ENV (TLS cert bundle, LANG, HOME, …) as real process env so the native
-        // jailed binaries see it (the darwin jail inherits the spawn env; DD_GUEST_ENV is Linux-only).
+        // Forward the image ENV (PATH, TLS cert bundle, LANG, HOME, …) as real process env so the
+        // native jailed binaries see it (the darwin jail inherits the spawn env; DD_GUEST_ENV is
+        // Linux-only). PATH in particular MUST be forwarded — without it bare-name commands (ls, env,
+        // which) don't resolve in the jail. When the image set none, default to the nix toolset first
+        // then the host system dirs (mirrors the image's own `/profile/bin:/usr/bin:/bin`).
+        let mut have_path = false;
         for kv in &c.env {
             if let Some((k, v)) = kv.split_once('=') {
-                if k != "PATH" { cfg.env.push((k.to_string(), v.to_string())); }
+                if k == "PATH" { have_path = true; }
+                cfg.env.push((k.to_string(), v.to_string()));
             }
         }
-        cfg.env.push(("PATH".into(), "/profile/bin".into()));
+        if !have_path { cfg.env.push(("PATH".into(), "/profile/bin:/usr/bin:/bin".into())); }
         // `-c` (not `-lc`): a login shell would source the host's /etc/profile via the lower and exec
         // arm64e system tools (which the arm64 jail can't inject into); the container has its own env.
         let wrapper = format!("{}/profile/bin/bash", c.rootfs);
-        // A pulled darwin image may still carry the generic `/bin/sh` default (which doesn't exist in
-        // the mac userland) — fall back to a bare `bash`, resolved via the in-jail PATH (/profile/bin).
+        // Normalize a leading POSIX-shell argv[0] to the in-jail nix `bash`: the host `/bin/sh` is
+        // arm64e, so the arm64 jail can't inject into it and it would ESCAPE the jail — running with
+        // the container PATH against the HOST filesystem (where /profile/bin doesn't exist), which is
+        // why a bare `ddcli mac` died on `exec: sh: not found`. Rewriting `/bin/sh`/`sh` to a bare
+        // `bash` keeps the entry shell inside the jail (resolved via the in-jail PATH), preserving any
+        // `-c <script>` args. An empty default likewise becomes the interactive jail bash.
         let mut argv = std::mem::take(&mut cfg.argv);
-        if argv.is_empty() || argv == ["/bin/sh"] { argv = vec!["bash".into()]; }
+        if argv.is_empty() {
+            argv = vec!["bash".into()];
+        } else if matches!(argv[0].as_str(), "/bin/sh" | "sh" | "/bin/bash" | "bash") {
+            argv[0] = "bash".into();
+        }
         let mut wrapped = vec![wrapper, "-c".into(), "exec \"$@\"".into(), "dd-mac".into()];
         wrapped.extend(argv);
         cfg.argv = wrapped;
