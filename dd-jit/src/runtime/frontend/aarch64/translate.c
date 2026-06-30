@@ -739,16 +739,22 @@ static void emit_selfloop(uint32_t in, uint64_t start, uint64_t fall, void *body
 // loop. Apple Silicon has FEAT_LSE: recognize the loop and emit a single atomic op
 // (2.29x faster, and it removes the load/store-exclusive monitor region that
 // complicates the translator). AL ordering is always safe.
-static void e_lse(uint32_t base, int sz, int rs, int rt, int rn) {
-    emit32(base | (sz == 3 ? 0x40000000u : 0) | (rs << 16) | (rn << 5) | rt);
-}
-// add/orr/eor/subs (shifted, no shift)
-static void e_op_reg(uint32_t base, int sz, int rd, int rn, int rm) {
-    emit32(base | (sz == 3 ? 0x80000000u : 0) | (rm << 16) | (rn << 5) | rd);
-}
-// casal Rs(compare/old), Rt(new), [Rn]
-static void e_cas(int sz, int rs, int rt, int rn) {
-    emit32((sz == 3 ? 0xC8E0FC00u : 0x88E0FC00u) | (rs << 16) | (rn << 5) | rt);
+// Emit ONE instruction of an LSE-atomic-loop rewrite, applying the same non-PIE bias-fold / stolen-reg
+// mangling the main decode loop would. `is_mem`: the access (swp/ldadd/.../casal) -- a non-PIE LOW [Xn]
+// gets +bias (emit_fold_mem, which also mangles stolen Rt/Rn/Rs and re-derives its own field mask, incl
+// the atomic value operand Rs). `mask` is used only off the fold path (PIE, or SP-based): the gpr fields
+// to mangle if they name a stolen reg. CRUCIAL: the original ldxr/stxr monitor fallback is UNUSABLE when
+// an operand is stolen or the base is a low non-PIE pointer -- the per-insn ldr/str it injects between the
+// load- and store-exclusive clear the monitor so stxr retries forever. Each rewritten LSE op is a SINGLE
+// instruction (no monitor), so the injected spill/fill is harmless, making this the correct path. The
+// common clean PIE case still lowers to the bare op -> byte-identical to before.
+static void emit_atomic_part(uint32_t in, int mask, int is_mem) {
+    if (is_mem && guestbase_on() && ((in >> 5) & 31) != 31)
+        emit_fold_mem(in);
+    else if (uses_x18(in, mask))
+        emit_mangled_x18(in, mask);
+    else
+        emit32(in);
 }
 // Returns bytes consumed (12 or 16) if a known atomic loop at gpc was rewritten, else 0.
 static int try_lse_atomic(uint64_t gpc) {
@@ -770,9 +776,8 @@ static int try_lse_atomic(uint64_t gpc) {
         uint32_t i2 = *(uint32_t *)(gpc + 8);
         if ((i2 & 0xFF000000u) == 0x35000000u && (i2 & 31) == Ws &&
             (gpc + 8 + (uint64_t)(sext((i2 >> 5) & 0x7FFFF, 19) << 2)) == gpc) {
-            if (is_stolen(Wt) || is_stolen(Xn) || is_stolen(Wv)) return 0;
-            e_lse(0xB8E08000u, sz, Wv, Wt, Xn);
-            // swpal Wv, Wt, [Xn]
+            // swpal Wv, Wt, [Xn] (a single LSE op; emit_atomic_part folds/mangles the corner cases).
+            emit_atomic_part(0xB8E08000u | (sz == 3 ? 0x40000000u : 0) | (Wv << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
             g_lse_n++;
             return 12;
         }
@@ -808,30 +813,24 @@ static int try_lse_atomic(uint64_t gpc) {
             int Ws = (i2 >> 16) & 31;
             if ((i3 & 0xFF000000u) == 0x35000000u && (i3 & 31) == Ws &&
                 (gpc + 12 + (uint64_t)(sext((i3 >> 5) & 0x7FFFF, 19) << 2)) == gpc) {
-                if (is_stolen(Wt) || is_stolen(Xn) || is_stolen(Wm) || is_stolen(Ws2) || is_stolen(Ws)) return 0;
-                // need Ws as scratch, can't be Wm
+                // op>=3 borrows Ws as a scratch holding ~Wm / -Wm across two ops -> it must not alias Wm.
                 if (op >= 3 && Wm == Ws) return 0;
-                // reconstruct = the original op (re-emit)
-                uint32_t rec = i1;
+                uint32_t szb = sz == 3 ? 0x40000000u : 0, szd = sz == 3 ? 0x80000000u : 0;
                 if (op <= 2) {
                     uint32_t lse = op == 0 ? 0xB8E00000u : op == 1 ? 0xB8E03000u : 0xB8E02000u;
-                    // ldaddal/ldsetal/ldeoral
-                    e_lse(lse, sz, Wm, Wt, Xn);
-                // fetch_and: *Xn &= Wm  ==  ldclr ~Wm
+                    // ldaddal/ldsetal/ldeoral Wm, Wt, [Xn]
+                    emit_atomic_part(lse | szb | (Wm << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
                 } else if (op == 3) {
-                    // mvn Ws, Wm  (orn Ws, wzr, Wm)
-                    e_op_reg(0x2A200000u, sz, Ws, 31, Wm);
-                    // ldclral Ws, Wt, [Xn]
-                    e_lse(0xB8E01000u, sz, Ws, Wt, Xn);
-                // fetch_sub: *Xn -= Wm  ==  ldadd -Wm
+                    // fetch_and: *Xn &= Wm  ==  ldclr ~Wm:  mvn Ws,Wm (orn Ws,wzr,Wm); ldclral Ws, Wt, [Xn]
+                    emit_atomic_part(0x2A200000u | szd | (Wm << 16) | (31 << 5) | Ws, 1 | 4, 0);
+                    emit_atomic_part(0xB8E01000u | szb | (Ws << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
                 } else {
-                    // neg Ws, Wm  (sub Ws, wzr, Wm)
-                    e_op_reg(0x4B000000u, sz, Ws, 31, Wm);
-                    // ldaddal Ws, Wt, [Xn]
-                    e_lse(0xB8E00000u, sz, Ws, Wt, Xn);
+                    // fetch_sub: *Xn -= Wm  ==  ldadd -Wm:  neg Ws,Wm (sub Ws,wzr,Wm); ldaddal Ws, Wt, [Xn]
+                    emit_atomic_part(0x4B000000u | szd | (Wm << 16) | (31 << 5) | Ws, 1 | 4, 0);
+                    emit_atomic_part(0xB8E00000u | szb | (Ws << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
                 }
-                emit32(rec);
-                // reconstruct new value (re-emit original op)
+                // reconstruct the new value (re-emit the original op) for any following guest code
+                emit_atomic_part(i1, gpr_field_mask(i1), 0);
                 g_lse_n++;
                 return 16;
             }
@@ -849,13 +848,13 @@ static int try_lse_atomic(uint64_t gpc) {
             int Ws = (i2 >> 16) & 31;
             if ((i3 & 0xFF000000u) == 0x35000000u && (i3 & 31) == Ws &&
                 (gpc + 12 + (uint64_t)(sext((i3 >> 5) & 0x7FFFF, 19) << 2)) == gpc) {
-                if (is_stolen(Wt) || is_stolen(Xn) || is_stolen(Ws2) || is_stolen(Ws)) return 0;
-                // Ws (dead status reg) = imm
-                e_movz(Ws, imm, 0);
+                uint32_t szb = sz == 3 ? 0x40000000u : 0;
+                // Ws (dead status reg) = imm  (movz Ws, #imm; e_movz always uses the 64-bit form)
+                emit_atomic_part(0xD2800000u | ((imm & 0xFFFFu) << 5) | Ws, 1, 0);
                 // ldaddal Ws, Wt, [Xn]
-                e_lse(0xB8E00000u, sz, Ws, Wt, Xn);
-                emit32(i1);
-                // re-emit add Ws2, Wt, #imm (reconstruct)
+                emit_atomic_part(0xB8E00000u | szb | (Ws << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
+                // re-emit add Ws2, Wt, #imm (reconstruct the new value)
+                emit_atomic_part(i1, gpr_field_mask(i1), 0);
                 g_lse_n++;
                 return 16;
             }
@@ -876,13 +875,17 @@ static int try_lse_atomic(uint64_t gpc) {
             // b.ne -> out
             && (gpc + 8 + (uint64_t)(sext((i2 >> 5) & 0x7FFFF, 19) << 2)) == gpc + 20) {
             int Wnew = i3 & 31;
-            if (is_stolen(Wt) || is_stolen(Xn) || is_stolen(Wexp) || is_stolen(Wnew) || Wt == Wexp) return 0;
-            // mov Wt, Wexp (orr Wt, wzr, Wexp)
-            e_op_reg(0x2A000000u, sz, Wt, 31, Wexp);
-            // casal Wt, Wnew, [Xn]; Wt = old
-            e_cas(sz, Wt, Wnew, Xn);
-            e_op_reg(0x6B000000u, sz, 31, Wt, Wexp);
-            // cmp Wt, Wexp (reproduce NZCV)
+            // casal carries the compare/old value in Wt, so Wt must differ from Wexp (a stolen Wt flows
+            // through its cpu slot across the three ops). The bare ldxr/stxr fallback would spin on a stolen
+            // operand / low non-PIE [Xn], so route every part through emit_atomic_part.
+            if (Wt == Wexp) return 0;
+            uint32_t szd = sz == 3 ? 0x80000000u : 0;
+            // mov Wt, Wexp (orr Wt, wzr, Wexp): Rd=Wt[0], Rm=Wexp[16]
+            emit_atomic_part(0x2A000000u | szd | (Wexp << 16) | (31 << 5) | Wt, 1 | 4, 0);
+            // casal Wt, Wnew, [Xn]; Wt = old:  Rs=Wt[16], Rn=Xn[5], Rt=Wnew[0]
+            emit_atomic_part((sz == 3 ? 0xC8E0FC00u : 0x88E0FC00u) | (Wt << 16) | (Xn << 5) | Wnew, 1 | 2 | 4 | 8, 1);
+            // cmp Wt, Wexp (reproduce NZCV): subs wzr, Wt, Wexp -> Rn=Wt[5], Rm=Wexp[16]
+            emit_atomic_part(0x6B00001Fu | szd | (Wexp << 16) | (Wt << 5), 2 | 4, 0);
             g_lse_n++;
             return 20;
         }
