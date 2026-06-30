@@ -151,12 +151,25 @@ static void e_nzcv_save_c1(void) { // logical ops: x86 CF=0,OF=0; ARM ANDS/TST l
     emit32(0xD51B4200u | 20); // sync live ARM nzcv
 }
 static void e_nzcv_save_setcf(int cfreg) { // save N/Z (from ARM nzcv), set stored C = NOT x86CF (cfreg holds 0/1)
-    emit32(0xD53B4200u | 20);              // mrs x20, nzcv  (N,Z valid)
-    e_movconst(22, 1u << 29);
-    e_rrr(A_BIC, 20, 20, 22, 1, 0); // clear C
+    // Capture NOT cf into x23 FIRST -- the mrs/movconst below clobber x20 and x22, so reading cfreg up
+    // front lets the carry-VALUE live in x20 (the narrow_adcsbb caller passes cfreg==20).
     e_movconst(23, 1);
     e_rrr(A_EOR, 23, cfreg, 23, 0, 0); // x23 = NOT cf (0/1)
-    e_rrr(A_ORR, 20, 20, 23, 1, 29);   // stored C = (NOT cf) << 29
+    emit32(0xD53B4200u | 20);          // mrs x20, nzcv  (N,Z valid)
+    e_movconst(22, 1u << 29);
+    e_rrr(A_BIC, 20, 20, 22, 1, 0); // clear C
+    e_rrr(A_ORR, 20, 20, 23, 1, 29); // stored C = (NOT cf) << 29
+    e_str(20, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 20); // sync live ARM nzcv
+}
+// clc/stc/cmc: touch ONLY x86 CF, leaving SF/ZF/OF/PF/AF intact. cpu->nzcv holds the ARM borrow C
+// (= NOT x86 CF), so set x86 CF=1 -> clear bit29, CF=0 -> set bit29, CF^=1 -> toggle bit29. `op` is
+// A_BIC (stc), A_ORR (clc) or A_EOR (cmc). The pending lazy producer (if any) was already materialized
+// by the top-of-loop classifier, so cpu->nzcv is current here.
+static void e_nzcv_setcf_op(uint32_t op) {
+    e_ldr(20, 28, OFF_NZCV);
+    e_movconst(22, 1u << 29);     // C is bit 29 of nzcv
+    e_rrr(op, 20, 20, 22, 1, 0);  // clear / set / toggle bit29
     e_str(20, 28, OFF_NZCV);
     emit32(0xD51B4200u | 20); // sync live ARM nzcv
 }

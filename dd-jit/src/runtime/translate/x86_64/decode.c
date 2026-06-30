@@ -53,8 +53,9 @@ static int op_has_modrm(int two, uint8_t op) {
     if (op == 0xC3 || op == 0xC2 || op == 0xC9 || op == 0x90 || op == 0xF4 || op == 0x99 || op == 0x98) return 0;
     if (op >= 0x91 && op <= 0x97) return 0;                                           // xchg eax, rN
     if (op == 0x9B || op == 0x9C || op == 0x9D || op == 0x9E || op == 0x9F) return 0; // fwait/pushf/popf/sahf/lahf
-    if (op == 0x9C || op == 0x9D || op == 0xFC || op == 0xFD || op == 0xCC || op == 0xF5)
-        return 0;                                                // pushf/popf/cld/std/int3/cmc
+    if (op == 0x9C || op == 0x9D || op == 0xFC || op == 0xFD || op == 0xCC || op == 0xF5 || op == 0xF8 ||
+        op == 0xF9)
+        return 0;                                                // pushf/popf/cld/std/int3/cmc/clc/stc
     if (op >= 0xA4 && op <= 0xAF) return 0;                      // movs/cmps/stos/lods/scas + test al,imm(A8/A9)
     if (op >= 0xB0 && op <= 0xBF) return 0;                      // mov r8/r, imm
     if (op < 0x40 && ((op & 7) == 4 || (op & 7) == 5)) return 0; // ALU al/eAX, imm (04/05,0C/0D,...,3C/3D)

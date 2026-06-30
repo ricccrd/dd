@@ -507,10 +507,12 @@ static void narrow_adcsbb(int adc, int dst, int a, int b, int w) {
     e_rrr(A_ORR, 27, 27, 23, 1, 0);
     e_rrr(A_ORR, 27, 27, 26, 1, 0);
     emit32(0xD51B4200u | 27);                 // msr nzcv, x27  (live N/Z/V)
-    e_nzcv_save_setcf(20);                    // store N/Z/V, set stored C = NOT new-CF
     e_pf_save(24);                            // x86 PF source = result low byte
     e_af_addsub(21, 22, 24, 19);              // x86 AF = bit 4 of (a ^ b ^ result)  (x19 free here)
     if (dst >= 0) e_bfi(dst, 24, 0, bits, 1); // merge low w bytes into dst
+    // CF store LAST: e_nzcv_save_setcf clobbers x20/x22/x23, so it must run after AF reads b (x22) and
+    // after the result merge; the carry-VALUE lives in x20 and is captured up front by the helper.
+    e_nzcv_save_setcf(20); // store N/Z/V, set stored C = NOT new-CF
 }
 
 // LOCK-prefixed read-modify-write to a memory operand, done ATOMICALLY via an LSE op (x17 = EA already
@@ -1278,6 +1280,13 @@ static void *translate_block(uint64_t gpc) {
                 e_bfi(RAX, 17, 8, 8, 1);
                 gpc = next;
                 continue; // AH = w17
+            }
+            // clc/stc/cmc (F8/F9/F5): set/clear/complement x86 CF only (other flags untouched). Borrow
+            // convention -> stored C(bit29) = NOT x86 CF, so clc(CF=0)=set, stc(CF=1)=clear, cmc=toggle.
+            if (op == 0xF8 || op == 0xF9 || op == 0xF5) {
+                e_nzcv_setcf_op(op == 0xF8 ? A_ORR : op == 0xF9 ? A_BIC : A_EOR);
+                gpc = next;
+                continue;
             }
             // pushfq (9C): materialize x86 RFLAGS from the flag substrate and push it. Bits assembled in
             // x17: reserved bit1=1, IF(bit9)=1 (userspace), DF(bit10)=g_df (block-local), then CF/PF/ZF/
