@@ -130,7 +130,7 @@ static void do_avx(struct cpu *c) {
         } else
             rm = c->r[I.rm_reg] & M;
         uint64_t v2 = c->r[vv] & M, res = 0;
-        int setfl = 0, cf = 0, zf, sf;
+        int setfl = 0, cf = 0, zf, sf, dest = rd;
         if (map == 2 && op == 0xf5 && pp == 0) { // BZHI rd, rm, vvvv: zero bits >= index(vvvv&0xff)
             int idx = (int)(v2 & 0xff);
             res = (idx >= wb) ? rm : (rm & ((idx == 0) ? 0 : ((1ull << idx) - 1)));
@@ -156,23 +156,43 @@ static void do_avx(struct cpu *c) {
             int sh = (int)(I.imm & (wb - 1));
             res = sh ? ((rm >> sh) | (rm << (wb - sh))) : rm;
             if (!I.vex_w) res &= M;
-        } else if (map == 2 && op == 0xf5 && pp == 3) { // PEXT rd, vvvv(src), rm(mask)
+        } else if (map == 2 && op == 0xf5 && pp == 2) { // PEXT rd, vvvv(src), rm(mask) -- F3 prefix => pp=2
             uint64_t src = v2, msk = rm, bit = 1;
             for (uint64_t m = msk; m; m &= m - 1) {
                 if (src & (m & (~m + 1))) res |= bit;
                 bit <<= 1;
             }
-        } else if (map == 2 && op == 0xf5 && pp == 2) { // PDEP rd, vvvv(src), rm(mask)
+        } else if (map == 2 && op == 0xf5 && pp == 3) { // PDEP rd, vvvv(src), rm(mask) -- F2 prefix => pp=3
             uint64_t src = v2, msk = rm, bit = 1;
             for (uint64_t m = msk; m; m &= m - 1) {
                 if (src & bit) res |= (m & (~m + 1));
                 bit <<= 1;
             }
+        } else if (map == 2 && op == 0xf2 && pp == 0) { // ANDN rd, vvvv, rm: (~src1) & src2; SF/ZF, CF=OF=0
+            res = (~v2) & rm;
+            cf = 0;
+            setfl = 1;
+        } else if (map == 2 && op == 0xf3 && pp == 0) { // BMI1 BLS group (ModRM.reg = opcode ext; dest in vvvv)
+            int grp = I.reg & 7;
+            dest = vv;
+            if (grp == 1) { // BLSR vvvv, rm: (rm-1) & rm; CF=(rm==0)
+                res = (rm - 1) & rm;
+                cf = (rm == 0);
+            } else if (grp == 2) { // BLSMSK vvvv, rm: (rm-1) ^ rm; CF=(rm==0)
+                res = (rm - 1) ^ rm;
+                cf = (rm == 0);
+            } else if (grp == 3) { // BLSI vvvv, rm: (-rm) & rm; CF=(rm!=0)
+                res = (0 - rm) & rm;
+                cf = (rm != 0);
+            } else {
+                goto avx_unimpl;
+            }
+            setfl = 1;
         } else {
             goto avx_unimpl;
         }
-        c->r[rd] = res & M; // 32-bit dest zero-extends to 64
-        if (setfl) {        // BZHI/BEXTR set ZF/SF, CF as computed, OF=0
+        c->r[dest] = res & M; // 32-bit dest zero-extends to 64
+        if (setfl) {          // BZHI/BEXTR/ANDN/BLS* set ZF/SF, CF as computed, OF=0
             zf = ((res & M) == 0);
             sf = (int)((res >> (wb - 1)) & 1);
             c->nzcv = ((uint64_t)sf << 31) | ((uint64_t)zf << 30) | ((uint64_t)(!cf) << 29);
@@ -1212,6 +1232,24 @@ static void do_sse3b(struct cpu *c) {
         return;
     }
 
+    // ---- PTEST (66 0F38 17, SSE4.1): read-only flag-setter. ZF=(D & s)==0, CF=(s & ~D)==0, OF/SF/AF/PF=0.
+    // D = operand1 (reg/xmm1), s = operand2 (r/m). node/V8 startup branches on these. Substrate: x86 CF=NOT stored-C.
+    if (map == 2 && op == 0x17) {
+        sse_get_rm(c, &I, next, s);
+        uint64_t d0, d1, s0, s1;
+        memcpy(&d0, D, 8);
+        memcpy(&d1, D + 8, 8);
+        memcpy(&s0, s, 8);
+        memcpy(&s1, s + 8, 8);
+        int zf = ((d0 & s0) == 0 && (d1 & s1) == 0);
+        int cf = ((s0 & ~d0) == 0 && (s1 & ~d1) == 0);
+        c->nzcv = ((uint64_t)zf << 30) | ((uint64_t)(!cf) << 29); // SF=0 (bit31), OF=0 (bit28)
+        c->pf = 1; // odd-popcount source byte -> x86 PF=0
+        c->af = 0; // AF=0
+        c->rip = next;
+        return;
+    }
+
     // ---- the remaining ops are xmm-destructive: load the r/m source, compute into r, write to D -----
     sse_get_rm(c, &I, next, s);
     memcpy(r, D, 16);
@@ -1507,6 +1545,40 @@ static void do_sse3b(struct cpu *c) {
             for (int i = 0; i < 16; i++) r[i] = t[i] ^ s[i];
             break;
         }
+        case 0xC8: { // sha1nexte: dst.dw3 = src.dw3 + ROL(dst.dw3,30); dst.dw0..2 = src.dw0..2 (passthrough)
+            uint32_t Dw[4], sw[4], o[4];
+            memcpy(Dw, D, 16);
+            memcpy(sw, s, 16);
+            uint32_t tmp = rotl32(Dw[3], 30); // ROL32(SRC1[127:96], 30)
+            o[3] = sw[3] + tmp;               // DEST[127:96] = SRC2[127:96] + TMP
+            o[2] = sw[2];
+            o[1] = sw[1];
+            o[0] = sw[0];
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0xC9: { // sha1msg1: W0..W3=SRC1 (hi->lo dwords), W4/W5=SRC2 hi dwords
+            uint32_t Dw[4], sw[4], o[4]; // Dw[k]=dword k ([31:0]=Dw[0]); W0=Dw[3],W1=Dw[2],W2=Dw[1],W3=Dw[0]
+            memcpy(Dw, D, 16);
+            memcpy(sw, s, 16); // W4=sw[3], W5=sw[2]
+            o[3] = Dw[1] ^ Dw[3]; // DEST[127:96] = W2 ^ W0
+            o[2] = Dw[0] ^ Dw[2]; // DEST[95:64]  = W3 ^ W1
+            o[1] = sw[3] ^ Dw[1]; // DEST[63:32]  = W4 ^ W2
+            o[0] = sw[2] ^ Dw[0]; // DEST[31:0]   = W5 ^ W3
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0xCA: { // sha1msg2: out.dw3..1 = ROL(SRC1.dw ^ SRC2.dw,1); out.dw0 chains on out.dw3
+            uint32_t Dw[4], sw[4], o[4];
+            memcpy(Dw, D, 16);
+            memcpy(sw, s, 16);
+            o[3] = rotl32(Dw[3] ^ sw[2], 1);
+            o[2] = rotl32(Dw[2] ^ sw[1], 1);
+            o[1] = rotl32(Dw[1] ^ sw[0], 1);
+            o[0] = rotl32(Dw[0] ^ o[3], 1); // chained: depends on the high-lane result
+            memcpy(r, o, 16);
+            break;
+        }
         case 0xCB: { // sha256rnds2: dst,src, implicit xmm0 = WK0/WK1
             uint32_t st1[4], st2[4], wk[4];
             memcpy(st1, D, 16);  // C0=st1[3],D0=st1[2],G0=st1[1],H0=st1[0]
@@ -1541,6 +1613,23 @@ static void do_sse3b(struct cpu *c) {
                 uint32_t s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3);
                 o[i] = in[i] + s0;
             }
+            memcpy(r, o, 16);
+            break;
+        }
+        case 0xCD: { // sha256msg2: W14=SRC2.dw2, W15=SRC2.dw3; W16..19 = SRC1.dw + sigma1(prev W)
+            uint32_t Dw[4], sw[4], o[4];
+            memcpy(Dw, D, 16);
+            memcpy(sw, s, 16);
+#define SHA_SIG1(x) (rotr32((x), 17) ^ rotr32((x), 19) ^ ((x) >> 10))
+            uint32_t W16 = Dw[0] + SHA_SIG1(sw[2]);
+            uint32_t W17 = Dw[1] + SHA_SIG1(sw[3]);
+            uint32_t W18 = Dw[2] + SHA_SIG1(W16);
+            uint32_t W19 = Dw[3] + SHA_SIG1(W17);
+#undef SHA_SIG1
+            o[0] = W16;
+            o[1] = W17;
+            o[2] = W18;
+            o[3] = W19;
             memcpy(r, o, 16);
             break;
         }
