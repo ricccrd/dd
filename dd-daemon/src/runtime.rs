@@ -393,6 +393,16 @@ pub(crate) async fn spawn_live(app: &App, c: &Container, vols: &[Vol], live: Arc
         (child, vec![reader])
     } else {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Put the guest in its own process group (leader pgid == child pid) so pause/unpause can
+        // SIGSTOP/SIGCONT the WHOLE container -- the JIT plus any host processes the guest forked, which
+        // inherit this pgid -- with a single killpg. (The TTY path above gets the same via login_tty's
+        // setsid.) SAFETY: setpgid(0,0) in the forked child is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 { return Err(std::io::Error::last_os_error()); }
+                Ok(())
+            });
+        }
         let mut child = match cmd.spawn() {
             Ok(ch) => ch,
             Err(e) => return live_fail(app, &c.id, &live, format!("jit exec failed: {e}")).await,
