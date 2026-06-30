@@ -368,18 +368,32 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
     g_nvols++;
     vol_mkmountpoint(v->guest);
 }
+// Longest matching bind-mount volume for an absolute guest path (the DEEPEST mount wins, exactly as the
+// kernel routes a path to the innermost mount), or -1 for the rootfs/overlay jail. Longest-prefix so a
+// nested volume (`-v H1:/x/y -v H2:/x/y/z`) routes /x/y/z to the inner mount regardless of registration
+// order; for non-nested volumes (no guest is a prefix of another) it is identical to a first-match scan.
+static int jail_match(const char *abs) {
+    int best = -1;
+    size_t blen = 0;
+    for (int i = 0; i < g_nvols; i++)
+        if (g_vols[i].glen > blen && !strncmp(abs, g_vols[i].guest, g_vols[i].glen) &&
+            (abs[g_vols[i].glen] == '/' || abs[g_vols[i].glen] == 0)) {
+            best = i;
+            blen = g_vols[i].glen;
+        }
+    return best;
+}
 // Pick the jail (rootfs or a volume) for an absolute guest path; *rel = the path within that jail.
 static int jail_pick(const char *abs, const char **canon, size_t *clen, const char **rel) {
-    for (int i = 0; i < g_nvols; i++)
-        if (!strncmp(abs, g_vols[i].guest, g_vols[i].glen) &&
-            (abs[g_vols[i].glen] == '/' || abs[g_vols[i].glen] == 0)) {
-            if (canon) {
-                *canon = g_vols[i].hcanon;
-                *clen = g_vols[i].hlen;
-            }
-            *rel = abs[g_vols[i].glen] ? abs + g_vols[i].glen : "/";
-            return g_vols[i].fd;
+    int i = jail_match(abs);
+    if (i >= 0) {
+        if (canon) {
+            *canon = g_vols[i].hcanon;
+            *clen = g_vols[i].hlen;
         }
+        *rel = abs[g_vols[i].glen] ? abs + g_vols[i].glen : "/";
+        return g_vols[i].fd;
+    }
     if (canon) {
         *canon = g_rootfs_canon;
         *clen = g_rootfs_canon_len;
@@ -434,11 +448,19 @@ static int confine_in(const char *jcanon, size_t jclen, const char *rel, char *o
     }
 }
 static int secure_resolve(const char *guest, char *out, size_t n, int nofollow) {
+    // Normalize '.'/'//'/'..' and clamp at the ROOTFS root FIRST, then route. Jail selection must see the
+    // post-`..` path: a `..` that pops above a volume's own root crosses the bind-mount boundary back to
+    // the dir holding the mount point ("/x/y/.." -> "/x"), which lives in the rootfs/overlay jail, not the
+    // volume. Routing the raw path would prefix-match "/x/y/.." to the volume and clamp `..` at the volume
+    // root. confine() already collapses `..` lexically below (so this only changes WHICH jail is chosen,
+    // not the symlink-via-realpath confinement) and never ascends past '/', so the result stays in rootfs.
+    char norm[4200];
+    confine(guest, norm, sizeof norm);
     const char *jcanon;
     size_t jclen;
     const char *rel;
     // rootfs or a volume root (jcanon is absolute)
-    jail_pick(guest, &jcanon, &jclen, &rel);
+    jail_pick(norm, &jcanon, &jclen, &rel);
     return confine_in(jcanon, jclen, rel, out, n, nofollow);
 }
 #include "vfs/overlay.c"

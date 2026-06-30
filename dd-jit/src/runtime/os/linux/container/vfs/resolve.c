@@ -7,11 +7,10 @@
 // detection is consistent with which jail a path is routed to. No RO volumes -> always 0 (rw is
 // byte-identical: g_vols[].ro is zero-initialized for every legacy/read-write bind).
 static int jail_ro(const char *abs) {
-    for (int i = 0; i < g_nvols; i++)
-        if (g_vols[i].ro && !strncmp(abs, g_vols[i].guest, g_vols[i].glen) &&
-            (abs[g_vols[i].glen] == '/' || abs[g_vols[i].glen] == 0))
-            return 1;
-    return 0;
+    // Test the volume the path actually routes to (longest match), so a read-write inner mount nested in a
+    // read-only outer one is correctly writable (and vice-versa) -- the innermost mount governs, as in Linux.
+    int i = jail_match(abs);
+    return i >= 0 && g_vols[i].ro;
 }
 // 1 if the absolute guest path falls under ANY bind-mount volume (rw or ro). A volume is its OWN jail
 // root, not the overlay rootfs/lowers, so a volume directory must be listed via plain readdir of its
@@ -31,17 +30,55 @@ static int jail_ro_at(int dirfd, const char *raw) {
     abs_guest(dirfd, raw, abs, sizeof abs);
     return jail_ro(abs);
 }
+// The guest directory that CONTAINS volume `vi`'s mount point: "/x/y" -> "/x", "/data" -> "/". A `..`
+// that pops above a volume's own root resolves, per Linux bind-mount semantics, to the parent mount's
+// directory at the mount point -- i.e. the dir that holds the volume, which lives in the rootfs/overlay
+// jail, not the volume. g_vols[].guest is absolute and has no trailing slash.
+static void vol_parent_guest(int vi, char *out, size_t n) {
+    const char *g = g_vols[vi].guest;
+    const char *sl = strrchr(g, '/');
+    size_t plen = (sl && sl != g) ? (size_t)(sl - g) : 0;
+    if (plen == 0 || plen >= n) {
+        snprintf(out, n, "/");
+        return;
+    }
+    memcpy(out, g, plen);
+    out[plen] = 0;
+}
+// Like jail_pick() but also reports the matched volume index (-1 for the rootfs/overlay jail), so the
+// walk can recognize a volume's own root and cross its bind-mount boundary on a `..`. Same first-prefix
+// match as jail_pick(); *rel is the path within the chosen jail.
+static int jail_pick_idx(const char *abs, const char **rel, int *vi) {
+    int i = jail_match(abs);
+    if (i >= 0) {
+        *rel = abs[g_vols[i].glen] ? abs + g_vols[i].glen : "/";
+        *vi = i;
+        return g_vols[i].fd;
+    }
+    *rel = abs;
+    *vi = -1;
+    return g_root_fd;
+}
 // TOCTOU-FREE confinement. Resolve `guest` (absolute) one component at a time on PINNED dir-fds,
 // never following a symlink out of the jail. Returns a fresh dir-fd to the confined parent (caller
 // closes) + the final component in `final`. -1 on escape/error. No check/use gap: each step
 // operates on a held fd, symlinks are read+respliced (clamped to root), and the caller's
 // openat(pfd, final, O_NOFOLLOW) is atomic -- a concurrent symlink swap cannot redirect it out.
 // Fully stack-local (fds[] + buffers) -> thread-safe; g_root_fd is read-only after startup.
+// Bind-mount `..`: a `..` that pops above a volume's own root crosses the mount boundary back to the
+// dir holding the mount point (in the parent/rootfs jail); we re-resolve that parent dir + the still
+// unconsumed tail from scratch (`goto restart`), so routing, symlinks, and any outer mount are handled
+// by a fresh confined walk. A `..` at the rootfs root still clamps -> the walk can never escape rootfs.
 static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
     if (g_root_fd < 0) return -1;
+    char gbuf[8192];
+    snprintf(gbuf, sizeof gbuf, "%s", guest);
+    int xings = 0; // bounded volume-boundary crossings -- guards against a pathological mount stack
+restart:;
     const char *rel;
-    // rootfs or a volume root
-    int root_fd = jail_pick(guest, NULL, NULL, &rel);
+    int volidx;
+    // rootfs/overlay or a volume root
+    int root_fd = jail_pick_idx(gbuf, &rel, &volidx);
     char rest[8192];
     snprintf(rest, sizeof rest, "%s", rel);
     int fds[260], nf = 0, budget = 40, ret = -EACCES;
@@ -71,10 +108,28 @@ static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
             continue;
         }
         if (!strcmp(comp, "..")) {
-            if (nf > 1) close(fds[--nf]);
+            if (nf > 1) { // within the current jail -> ordinary parent
+                close(fds[--nf]);
+                snprintf(rest, sizeof rest, "%s", tail);
+                continue;
+            }
+            if (volidx >= 0 && ++xings <= 64) {
+                // at a volume's own root: cross the bind-mount boundary to the dir holding the mount point
+                char parent[8192];
+                vol_parent_guest(volidx, parent, sizeof parent);
+                char next[8192];
+                if (parent[1] == 0)
+                    snprintf(next, sizeof next, "%s", tail[0] ? tail : "/");
+                else
+                    snprintf(next, sizeof next, "%s%s", parent, tail);
+                for (int i = 0; i < nf; i++)
+                    close(fds[i]);
+                snprintf(gbuf, sizeof gbuf, "%s", next);
+                goto restart;
+            }
+            // rootfs root (or crossing budget spent) -> clamp; the walk never escapes the rootfs
             snprintf(rest, sizeof rest, "%s", tail);
             continue;
-        // clamp at root
         }
         if (last && nofollow) {
             snprintf(final, fn, "%s", comp);
