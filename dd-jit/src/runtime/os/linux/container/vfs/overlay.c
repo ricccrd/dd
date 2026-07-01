@@ -418,6 +418,37 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
         if (ovl_push(&names, &types, &cap, nout, child, DT_DIR) < 0) break;
         nout++;
     }
+    // /proc has no host backing (macOS has no /proc), so the layer scan of the empty mountpoint lists no
+    // processes and `ps` shows nothing. Synthesize the introspectable pid directories -- the container
+    // init ("1"), this process's own pid -- plus the "self" symlink, so a process listing finds the
+    // running task(s). Each is deduped against the real entries (the proc files are served by proc_open).
+    if (!strcmp(gdir, "/proc")) {
+        char ent[3][16];
+        uint8_t ety[3];
+        int ne = 0;
+        snprintf(ent[ne], sizeof ent[ne], "1");
+        ety[ne++] = DT_DIR;
+        int cp = container_pid();
+        if (cp != 1) {
+            snprintf(ent[ne], sizeof ent[ne], "%d", cp);
+            ety[ne++] = DT_DIR;
+        }
+        snprintf(ent[ne], sizeof ent[ne], "self");
+        ety[ne++] = DT_LNK;
+        for (int i = 0; i < ne; i++) {
+            int dup = 0;
+            for (int j = 0; j < ns; j++)
+                if (!strcmp(seen[j], ent[i])) {
+                    dup = 1;
+                    break;
+                }
+            if (dup) continue;
+            if (ovl_seen(&seen, &scap, ns, ent[i]) < 0) break;
+            ns++;
+            if (ovl_push(&names, &types, &cap, nout, ent[i], ety[i]) < 0) break;
+            nout++;
+        }
+    }
     free(seen);
     *names_out = names;
     *types_out = types;

@@ -806,6 +806,35 @@ static int proc_fd_dir_open(void) {
         }
     return d;
 }
+// /proc/[pid]/cmdline -- the guest argv as NUL-separated, NUL-terminated arguments. The full argv vector
+// isn't retained past process start, so report argv[0] (the running image path) as the single argument;
+// that is what the usual readers (ps, error messages, language runtimes) consult. Returns the byte count.
+static int proc_cmdline_text(char *b, size_t n) {
+    const char *p = (g_exe_path && g_exe_path[0]) ? g_exe_path : "init";
+    int L = (int)strlen(p);
+    if (L + 1 > (int)n) L = (int)n - 1;
+    memcpy(b, p, (size_t)L);
+    b[L] = 0; // cmdline is NUL-terminated (a single empty-tail arg, exactly as the kernel emits)
+    return L + 1;
+}
+// /proc/[pid]/comm -- the task name (Linux comm: basename of the image, max 15 chars) plus a newline.
+static int proc_comm_text(char *b, size_t n) {
+    char comm[16];
+    proc_comm(comm, sizeof comm);
+    return snprintf(b, n, "%s\n", comm);
+}
+// /proc/[pid]/mountinfo -- the mounted-filesystem table df/findmnt parse, and which the JVM scans to locate
+// the cgroup mount. The rootfs is a single overlay mount at "/"; the pseudo-filesystems (proc, sysfs, the
+// cgroup2 hierarchy, devtmpfs) round it out so a reader looking up any of these mount points finds a
+// plausible, well-formed line. Field layout: id parent maj:min root mountpoint opts - fstype src superopts.
+static int proc_mountinfo_text(char *b, size_t n) {
+    return snprintf(b, n,
+                    "23 0 0:21 / / rw,relatime - overlay overlay rw\n"
+                    "24 23 0:22 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+                    "25 23 0:23 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n"
+                    "26 23 0:24 / /dev rw,nosuid - tmpfs tmpfs rw,mode=755\n"
+                    "27 23 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n");
+}
 // Real macOS stat -> Linux struct stat (the fake S_IFCHR version corrupted libc buffering).
 // fill_linux_stat (the guest struct-stat layout) is per-arch -> frontend/<arch>/fill_stat.c
 // Synthesize the common /proc files Linux programs read (macOS has no /proc). Returns an fd
@@ -822,6 +851,9 @@ static int proc_open(const char *rp) {
         if (!strcmp(leaf, "status")) n = proc_status_text(buf, sizeof buf);
         else if (!strcmp(leaf, "stat")) n = proc_stat_text(buf, sizeof buf);
         else if (!strcmp(leaf, "environ")) n = proc_environ_text(buf, sizeof buf);
+        else if (!strcmp(leaf, "cmdline")) n = proc_cmdline_text(buf, sizeof buf);
+        else if (!strcmp(leaf, "comm")) n = proc_comm_text(buf, sizeof buf);
+        else if (!strcmp(leaf, "mountinfo")) n = proc_mountinfo_text(buf, sizeof buf);
         if (n >= 0) return proc_text_fd(buf, n);
     }
     if (!strcmp(rp, "/proc/cpuinfo")) {
@@ -847,7 +879,14 @@ static int proc_open(const char *rp) {
     } else if (!strcmp(rp, "/proc/stat")) {
         n = snprintf(buf, sizeof buf, "cpu  0 0 0 0 0 0 0 0 0 0\nbtime 1700000000\nprocesses 1\n");
     } else if (!strcmp(rp, "/proc/mounts") || !strcmp(rp, "/proc/self/mounts")) {
-        n = snprintf(buf, sizeof buf, "rootfs / rootfs rw 0 0\n");
+        // The fstab-style mount table (mirror of mountinfo). Name the root mount "overlay", not the legacy
+        // "rootfs": busybox/util-linux df filters out a pseudo "rootfs" entry, leaving df unable to find the
+        // mount for "/". The pseudo-filesystems are listed too so a reader enumerating mounts sees them.
+        n = snprintf(buf, sizeof buf,
+                     "overlay / overlay rw,relatime 0 0\n"
+                     "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+                     "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
+                     "tmpfs /dev tmpfs rw,nosuid 0 0\n");
     } else if (!strcmp(rp, "/proc/uptime")) {
         n = snprintf(buf, sizeof buf, "12345.00 12345.00\n");
     } else if (!strcmp(rp, "/proc/loadavg")) {
@@ -887,6 +926,33 @@ static void fill_linux_stat(uint8_t *d, const struct stat *s, const char *hostpa
 // -> macOS struct stat for a synth file
 static int synth_stat_raw(const char *gp, struct stat *s) {
     if (!gp || (strncmp(gp, "/proc/", 6) && strncmp(gp, "/sys/fs/cgroup/", 15))) return 0;
+    // A bare /proc/self (the magic symlink) or /proc/<pid> directory for an introspectable pid (this
+    // process, the container init "1", or our container pid): report the right type so stat()/opendir()
+    // succeed and `ps`/`ls /proc` can descend. proc_self_leaf only matches paths WITH a leaf, so handle
+    // the no-leaf directory form here.
+    if (!strcmp(gp, "/proc/self")) {
+        memset(s, 0, sizeof *s);
+        s->st_mode = S_IFLNK | 0777;
+        s->st_nlink = 1;
+        char num[16];
+        s->st_size = snprintf(num, sizeof num, "%d", container_pid()); // symlink target = our pid
+        return 1;
+    }
+    {
+        const char *q = gp + 6; // tail after "/proc/"
+        int isnum = q[0] >= '0' && q[0] <= '9';
+        for (const char *t = q; *t && isnum; t++)
+            if (*t < '0' || *t > '9') isnum = 0;
+        if (isnum) {
+            int pid = atoi(q);
+            if (pid == (int)getpid() || pid == container_pid() || pid == 1) {
+                memset(s, 0, sizeof *s);
+                s->st_mode = S_IFDIR | 0555;
+                s->st_nlink = 8;
+                return 1;
+            }
+        }
+    }
     // /proc/<pid>/fd is a directory and /proc/<pid>/fd/N is a symlink -- answer these directly so stat()
     // sees the right type WITHOUT proc_open() materializing a temp dir as a stat side effect.
     const char *leaf = proc_self_leaf(gp);
