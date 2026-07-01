@@ -111,7 +111,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // ioctl(fd, req, arg) -- Linux req# -> macOS
     case 29: {
         int fd = (int)a0;
-        unsigned long rq = (unsigned long)a1;
+        // Truncate the ioctl request to 32 bits (Linux `cmd` is unsigned int). musl declares ioctl's request
+        // as `int`, so a read-direction request with the direction bit set (e.g. TIOCGPTN 0x80045430) arrives
+        // SIGN-EXTENDED as 0xffffffff80045430 and would miss its switch case -> ENOTTY (glibc zero-extends, so
+        // it worked there). This makes both forms match, fixing musl tmux/script/openpty and any high-bit ioctl. (#219)
+        unsigned long rq = (uint32_t)a1;
         void *arg = (void *)a2;
         switch (rq) {
         case 0x5401: {
