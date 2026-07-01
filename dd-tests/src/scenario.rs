@@ -57,6 +57,14 @@ pub enum Step {
     /// Developer-at-a-shell path: start a detached idle container and `docker exec -i <c> /bin/sh -c
     /// <script>` into it (the `exec -it /bin/bash` workflow).
     ExecIt(String),
+    /// Host-orchestrated recipe: the body is bash run on the docker HOST (not inside a guest), free to
+    /// drive `docker run -v`, `docker network create`, multiple containers, `docker exec`, `docker stop`,
+    /// `-e`/`-w` — the behaviours single-container Run/ExecIt can't express (volumes, user-defined
+    /// networks, cross-container reachability, signals). The harness injects these vars and ALWAYS cleans
+    /// up afterwards: `$IMG` (the image), `$PLAT` (the `--platform` words, unquoted), `$WORK` (a private
+    /// host scratch dir — bind-mount it for volume tests), `$C` (unique container-name PREFIX — name every
+    /// container `$C…` so it gets reaped), `$NET` (a unique network name — `docker network rm` is automatic).
+    Host(String),
 }
 
 /// One expectation against captured stdout+stderr / exit code.
@@ -87,6 +95,8 @@ pub fn scen(id: &'static str, image: &'static str) -> Scenario {
 impl Scenario {
     pub fn run(mut self, argv: &[&str]) -> Self { self.step = Step::Run(argv.iter().map(|s| s.to_string()).collect()); self }
     pub fn exec(mut self, script: &str) -> Self { self.step = Step::ExecIt(script.to_string()); self }
+    /// Host-orchestrated recipe (see [`Step::Host`]) — for volumes / networks / multi-container / signals.
+    pub fn host(mut self, body: &str) -> Self { self.step = Step::Host(body.to_string()); self }
     pub fn has(mut self, s: &str) -> Self { self.checks.push(Check::Has(s.into())); self }
     pub fn eq_(mut self, s: &str) -> Self { self.checks.push(Check::Eq(s.into())); self }
     pub fn rc(mut self, c: i32) -> Self { self.checks.push(Check::Rc(c)); self }
@@ -163,7 +173,11 @@ fn oracle_cache() -> &'static Mutex<HashMap<String, (String, i32)>> {
 }
 /// The logical key that fully determines a cell's output (no pid/host noise → stable across cells).
 fn cell_key(s: &Scenario, t: Target) -> String {
-    let step = match &s.step { Step::Run(a) => format!("run\u{1}{}", a.join("\u{1}")), Step::ExecIt(x) => format!("exec\u{1}{x}") };
+    let step = match &s.step {
+        Step::Run(a) => format!("run\u{1}{}", a.join("\u{1}")),
+        Step::ExecIt(x) => format!("exec\u{1}{x}"),
+        Step::Host(x) => format!("host\u{1}{x}"),
+    };
     format!("{}\u{1}{}\u{1}{}\u{1}{}", s.image, step, t.label(), s.tty)
 }
 /// Make a string safe to embed in a filename (image refs carry `/`, `:`, `@`).
@@ -287,20 +301,22 @@ fn drive(d: &Daemon, s: &Scenario, t: Target, cfg: &Cfg) -> (String, i32) {
             // Speed: the container name is unique (pid·id·target), so the old pre-run `docker rm -f` was
             // a guaranteed no-op bridge round-trip — dropped (a stale same-name container, only possible
             // after a hard-killed run with pid reuse, just falls through to the one-shot `run --rm`). And
-            // `-d --rm` + a final `docker kill` keeps teardown OFF the critical path: `kill` only signals
+            // `-d --rm` + a `docker kill` trap keeps teardown OFF the critical path: `kill` only signals
             // PID 1 and returns, while the daemon reaps + removes asynchronously (no leak, no wait — this
-            // matters for loaded servers like postgres that otherwise SIGKILL-stop synchronously).
+            // matters for loaded servers like postgres that otherwise SIGKILL-stop synchronously). The
+            // trap fires on EXIT *and* INT/TERM so the harness's outer `timeout` can't orphan the idle
+            // container; the fallback one-shot is `--name $N` too so the same trap reaps it.
             format!(
 "{hdr}N={name}
+trap 'docker kill $N >/dev/null 2>&1' EXIT INT TERM
 if docker run -d --rm --name $N {plat}{img} {sh} -c 'while true; do sleep 3600; done' >/dev/null 2>&1; then
   docker exec {xt} $N {sh} -c \"$(cat <<'DDEOF'
 {script}
 DDEOF
 )\"
   rc=$?
-  docker kill $N >/dev/null 2>&1
 else
-  docker run --rm {tt}{plat}{img} {sh} -c \"$(cat <<'DDEOF'
+  docker run --rm --name $N {tt}{plat}{img} {sh} -c \"$(cat <<'DDEOF'
 {script}
 DDEOF
 )\"
@@ -308,6 +324,28 @@ DDEOF
 fi
 exit $rc
 ", hdr = header(d.docker_host()), name = sh_quote(&name), plat = plat, tt = tt, xt = xt, img = sh_quote(s.image), sh = sh, script = script)
+        }
+        Step::Host(body) => {
+            // Host-orchestrated: inject the unique resources + a guaranteed teardown trap, then run the
+            // author's recipe verbatim. $C is a name PREFIX (a `^$C` filter reaps every `$C…` container),
+            // $NET a unique network, $WORK a private host scratch dir under the shared run dir (so a
+            // `-v $WORK:/x` bind mount is visible to the docker host). $PLAT is unquoted → word-splits.
+            let base = format!("ddh-{}-{}-{}", std::process::id(), s.id.replace('/', "-"), t.label());
+            let net = format!("ddnet-{}-{}-{}", std::process::id(), s.id.replace('/', "-"), t.label());
+            let work = dir.join(format!("work-{}-{}", s.id.replace('/', "_"), t.label()));
+            let _ = std::fs::create_dir_all(&work);
+            format!(
+"{hdr}IMG={img}
+PLAT={plat}
+C={c}
+NET={net}
+WORK={work}
+mkdir -p \"$WORK\"
+cleanup() {{ docker rm -f $(docker ps -aq -f name=\"^${{C}}\") >/dev/null 2>&1; docker network rm \"$NET\" >/dev/null 2>&1; rm -rf \"$WORK\"; }}
+trap cleanup EXIT INT TERM
+{body}
+", hdr = header(d.docker_host()), img = sh_quote(s.image), plat = sh_quote(plat.trim()),
+   c = sh_quote(&base), net = sh_quote(&net), work = sh_quote(&work.to_string_lossy()), body = body)
         }
     };
     if std::fs::write(&f, body).is_err() { return ("(failed to write op script)".into(), -1); }

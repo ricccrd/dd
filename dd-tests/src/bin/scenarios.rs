@@ -26,7 +26,7 @@ fn cell_weight(s: &Scenario) -> usize {
         "docker-entrypoint", "mongod", "mysqld", "mariadbd", "postgres", "redis-server", "valkey-server",
         "nginx", "httpd", "caddy", "haproxy", "memcached"];
     let base = match &s.step {
-        Step::ExecIt(script) => 1_000 + script.len() + HEAVY.iter().filter(|k| script.contains(*k)).count() * 100_000,
+        Step::ExecIt(script) | Step::Host(script) => 1_000 + script.len() + HEAVY.iter().filter(|k| script.contains(*k)).count() * 100_000,
         Step::Run(argv) => argv.iter().map(|x| x.len()).sum(),
     };
     if s.class == Class::Long { base + 1_000_000 } else { base }

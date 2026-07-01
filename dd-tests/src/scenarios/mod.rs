@@ -17,6 +17,12 @@ pub mod toolchains;
 pub mod utilities;
 pub mod weird;
 pub mod terminal;
+// Core container-behaviour regression net (fast, no heavy installs):
+pub mod filesystem;   // rootfs + overlay VFS (no volume)
+pub mod volumes;      // -v bind mounts (incl. #118 nested `..`)
+pub mod networking;   // single-container loopback / DNS / gated outbound
+pub mod netcontainer; // between containers on a user-defined network
+pub mod process;      // env / workdir / exit / streams / signals / exec
 
 pub fn all() -> Vec<ScenGroup> {
     vec![
@@ -28,5 +34,10 @@ pub fn all() -> Vec<ScenGroup> {
         utilities::group(),
         weird::group(),
         terminal::group(),
+        filesystem::group(),
+        volumes::group(),
+        networking::group(),
+        netcontainer::group(),
+        process::group(),
     ]
 }
