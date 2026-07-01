@@ -27,10 +27,12 @@ static void tty_ctl_restore(const sigset_t *saved) { sigprocmask(SIG_SETMASK, sa
 // that, a directory read partially then closed poisoned the next directory opened on the same fd, which
 // silently truncated postgres initdb's template1->template0/postgres copy (dropping ~1/4 of the catalog,
 // e.g. PG_VERSION -> "base/5 is not a valid data directory" on the first client connect).
+// nm/ty are heap-allocated by overlay_readdir (it grows them to the real entry count -- no 1024 cap, so
+// large directories no longer truncate, #179) and owned by the slot until it is freed (ovldents_free).
 static struct {
     int fd; // guest fd + 1 (0 = free slot)
     int n, pos;
-    char (*nm)[256]; // heap arrays (overlay_readdir allocs them; freed on drop) -- no fixed 1024 cap (#179)
+    char (*nm)[256];
     uint8_t *ty;
 } g_ovldents[16];
 static void ovldents_free(int i) {
@@ -39,6 +41,7 @@ static void ovldents_free(int i) {
     g_ovldents[i].nm = NULL;
     g_ovldents[i].ty = NULL;
     g_ovldents[i].fd = 0;
+    g_ovldents[i].n = g_ovldents[i].pos = 0;
 }
 static void ovldents_drop(int fd) {
     for (int i = 0; i < 16; i++)
@@ -1020,7 +1023,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         break;
                     }
                 if (slot < 0) slot = 0;
-                ovldents_free(slot); // drop any prior occupant of a force-reused slot (no heap leak)
+                ovldents_free(slot); // slot-0 fallback may still own a prior snapshot's heap arrays
                 g_ovldents[slot].fd = fd + 1;
                 g_ovldents[slot].pos = 0;
                 g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], &g_ovldents[slot].nm, &g_ovldents[slot].ty);
@@ -1041,7 +1044,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 o += lr;
                 g_ovldents[slot].pos++;
             }
-            // exhausted -> free the heap arrays + the slot
+            // exhausted -> free the slot (releases the heap snapshot arrays too)
             if (o == 0) ovldents_free(slot);
             G_RET(c) = (uint64_t)o;
             break;
