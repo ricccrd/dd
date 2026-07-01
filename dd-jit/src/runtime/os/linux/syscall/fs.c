@@ -30,13 +30,20 @@ static void tty_ctl_restore(const sigset_t *saved) { sigprocmask(SIG_SETMASK, sa
 static struct {
     int fd; // guest fd + 1 (0 = free slot)
     int n, pos;
-    char nm[1024][256];
-    uint8_t ty[1024];
+    char (*nm)[256]; // heap arrays (overlay_readdir allocs them; freed on drop) -- no fixed 1024 cap (#179)
+    uint8_t *ty;
 } g_ovldents[16];
+static void ovldents_free(int i) {
+    free(g_ovldents[i].nm);
+    free(g_ovldents[i].ty);
+    g_ovldents[i].nm = NULL;
+    g_ovldents[i].ty = NULL;
+    g_ovldents[i].fd = 0;
+}
 static void ovldents_drop(int fd) {
     for (int i = 0; i < 16; i++)
         if (g_ovldents[i].fd == fd + 1) {
-            g_ovldents[i].fd = 0;
+            ovldents_free(i);
             return;
         }
 }
@@ -1013,9 +1020,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         break;
                     }
                 if (slot < 0) slot = 0;
+                ovldents_free(slot); // drop any prior occupant of a force-reused slot (no heap leak)
                 g_ovldents[slot].fd = fd + 1;
                 g_ovldents[slot].pos = 0;
-                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], g_ovldents[slot].nm, g_ovldents[slot].ty, 1024);
+                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], &g_ovldents[slot].nm, &g_ovldents[slot].ty);
             }
             uint8_t *out = (uint8_t *)a1;
             size_t o = 0;
@@ -1033,8 +1041,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 o += lr;
                 g_ovldents[slot].pos++;
             }
-            // exhausted -> free the slot
-            if (o == 0) g_ovldents[slot].fd = 0;
+            // exhausted -> free the heap arrays + the slot
+            if (o == 0) ovldents_free(slot);
             G_RET(c) = (uint64_t)o;
             break;
         }

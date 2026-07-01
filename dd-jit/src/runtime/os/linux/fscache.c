@@ -281,9 +281,20 @@ static void res_bump(void) {
     CUL;
 }
 // fork child: drop every inherited (COW) entry so it cannot outlive a parent-side mutation.
+// This covers BOTH the path-string caches (rc_/oc_) and the metadata caches (mc_/rl_/ac_). The
+// metadata caches memoize stat/readlink/access RESULTS -- including NEGATIVE (ENOENT) ones -- and a
+// negative entry the parent recorded before some OTHER process created the file would otherwise be
+// inherited COW and make the child read the now-existing file as missing (build systems hit this hard:
+// gmake stats an output as absent, a child compiler creates it, a sibling link/stat then sees the stale
+// ENOENT -> "no such file" / "No rule to make target"). The epoch only invalidates this process's own
+// mutations, so it can't cover a cross-process create; dropping the inherited entries at the fork point
+// makes the child re-resolve against the real FS.
 static void rc_reset(void) {
     CLK;
     memset(g_rc, 0, sizeof g_rc);
+    memset(g_mc, 0, sizeof g_mc);
+    memset(g_rl, 0, sizeof g_rl);
+    memset(g_ac, 0, sizeof g_ac);
     g_res_epoch = 1;
     oc_reset(); // W4D: drop the inherited open-resolution cache too (same COW hazard, under the same lock)
     CUL;
@@ -403,6 +414,27 @@ static void fd_evict(int fd) {
 }
 static void fd_clear(int fd) {
     if (fd >= 0 && fd < 1024) g_fdpath[fd][0] = 0;
+}
+
+// A create/rename/link/symlink makes a host path appear -- or changes the identity of an existing
+// one. Drop every memoized existence (mc_/ac_) and readlink (rl_) entry for it so a later stat/
+// access/readlink -- including a forked child that inherited this COW cache -- re-resolves the real
+// file instead of a stale NEGATIVE lookup left over from before the name existed. These metadata
+// caches are precise-evict, NOT epoch-gated like the rc_/oc_ path-string caches, so every mutation
+// must name the exact path whose existence it changed. Two shapes: a full host path, and the jail
+// idiom of a dir-fd + final component (resolved to its host path via F_GETPATH).
+static void fc_evict_path(const char *hp) {
+    mc_evict(hp);
+    ac_evict(hp);
+    rl_evict(hp);
+}
+static void fc_evict_at(int pfd, const char *name) {
+    char dp[4200];
+    if (pfd >= 0 && fcntl(pfd, F_GETPATH, dp) == 0) {
+        char hp[4400];
+        snprintf(hp, sizeof hp, "%s/%s", dp, name);
+        fc_evict_path(hp);
+    }
 }
 
 // macOS errno -> Linux errno. They agree on 1..10 and 12..34 but diverge at 11 (EDEADLK<->EAGAIN)
