@@ -284,16 +284,21 @@ fn drive(d: &Daemon, s: &Scenario, t: Target, cfg: &Cfg) -> (String, i32) {
             // images with no keep-alive shell (distroless). Embed the user script verbatim via a
             // quoted heredoc so arbitrary quotes/heredocs inside it survive.
             let name = format!("ddx-{}-{}-{}", std::process::id(), s.id.replace('/', "-"), t.label());
+            // Speed: the container name is unique (pid·id·target), so the old pre-run `docker rm -f` was
+            // a guaranteed no-op bridge round-trip — dropped (a stale same-name container, only possible
+            // after a hard-killed run with pid reuse, just falls through to the one-shot `run --rm`). And
+            // `-d --rm` + a final `docker kill` keeps teardown OFF the critical path: `kill` only signals
+            // PID 1 and returns, while the daemon reaps + removes asynchronously (no leak, no wait — this
+            // matters for loaded servers like postgres that otherwise SIGKILL-stop synchronously).
             format!(
 "{hdr}N={name}
-docker rm -f $N >/dev/null 2>&1
-if docker run -d --name $N {plat}{img} {sh} -c 'while true; do sleep 3600; done' >/dev/null 2>&1; then
+if docker run -d --rm --name $N {plat}{img} {sh} -c 'while true; do sleep 3600; done' >/dev/null 2>&1; then
   docker exec {xt} $N {sh} -c \"$(cat <<'DDEOF'
 {script}
 DDEOF
 )\"
   rc=$?
-  docker rm -f $N >/dev/null 2>&1
+  docker kill $N >/dev/null 2>&1
 else
   docker run --rm {tt}{plat}{img} {sh} -c \"$(cat <<'DDEOF'
 {script}
