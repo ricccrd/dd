@@ -221,6 +221,7 @@ static struct kevent *g_ep_chg[1024];          // deferred changelist per epoll 
 static int g_ep_chgn[1024], g_ep_chgcap[1024];
 static uint8_t g_ep_rd[1024], g_ep_wr[1024];   // per guest fd: read/write filter currently armed
 static uint8_t g_ep_os[1024];                  // per guest fd: EPOLLONESHOT requested (kernel auto-removes on fire)
+static uint8_t g_epoll[1024];                  // per fd: an epoll instance (backed by kqueue) -- rebuilt across fork (macOS kqueue() is not inherited)
 static unsigned long long g_ep_kevent_calls;   // PROF: kevent() syscalls issued by the epoll path
 static int g_epprof = -1;
 static int epopt_on(void) {
@@ -256,6 +257,7 @@ static void ep_fd_reset(int fd) {
     g_ep_rd[fd] = g_ep_wr[fd] = g_ep_os[fd] = 0;
     if (g_ep_chg[fd]) { free(g_ep_chg[fd]); g_ep_chg[fd] = NULL; } // if fd was an epoll fd, drop its pending changelist
     g_ep_chgn[fd] = g_ep_chgcap[fd] = 0;
+    g_epoll[fd] = 0; // a reused fd number is no longer an epoll instance
 }
 // Shared boundary errno translation for every svc_<family>() module tail. Each family early-returns from
 // service_local (before its trailing m2l_errno), so each must map G_RET's host(macOS) errno to the Linux

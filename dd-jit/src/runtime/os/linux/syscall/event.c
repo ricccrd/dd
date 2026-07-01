@@ -50,6 +50,35 @@ static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
         ep_prime_push(ep, (uintptr_t)fd, filt, udata);
 }
 
+// macOS does NOT inherit kqueue() descriptors across fork(2) (unlike Linux epoll/timer/inotify fds, which
+// are), so every epoll/timerfd/inotify fd the engine emulates with a kqueue is DEAD in a freshly forked
+// child. A guest that then closes or re-arms it sees EBADF -- e.g. Ruby's post-fork timer-thread reset
+// close()s its inherited epoll fd, hits EBADF, reports "[ASYNC BUG] close event_fd" and aborts the child.
+// Rebuild a fresh kqueue at each such fd NUMBER so the descriptor is valid again; the (empty) instance
+// matches the re-init every runtime does post-fork, and the guest re-registers its own interest. Only fds
+// that are actually dead are rebuilt -- a stale marker on an fd the parent closed and reused for a live
+// (inherited) file leaves that file untouched. Called from the fork child in proc.c, before the guest runs.
+static void kqueue_rebuild_after_fork(void) {
+    for (int fd = 0; fd < 1024; fd++) {
+        if (!(g_epoll[fd] || g_timerfd[fd] || g_inotify[fd])) continue;
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue; // still a live inherited fd -> leave it
+        int kq = kqueue();
+        if (kq < 0) continue;
+        if (kq != fd) { dup2(kq, fd); close(kq); }
+        // the fresh instance carries no registrations: drop this epoll fd's inherited (now-invalid) changelist
+        // and prime buffer so a later epoll_ctl/epoll_wait re-arms against the new kqueue, not stale state.
+        if (g_ep_chg[fd]) { free(g_ep_chg[fd]); g_ep_chg[fd] = NULL; }
+        g_ep_chgn[fd] = g_ep_chgcap[fd] = 0;
+        if (g_ep_prime[fd]) { free(g_ep_prime[fd]); g_ep_prime[fd] = NULL; }
+        g_ep_primen[fd] = g_ep_primecap[fd] = 0;
+    }
+    // every kqueue was rebuilt empty -> no watched fd is armed on any instance anymore (the armed map is
+    // per-watched-fd and shared across epoll instances, so clear it wholesale to match the fresh kqueues).
+    memset(g_ep_rd, 0, sizeof g_ep_rd);
+    memset(g_ep_wr, 0, sizeof g_ep_wr);
+    memset(g_ep_os, 0, sizeof g_ep_os);
+}
+
 static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                      uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -90,7 +119,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // EPOLL_CLOEXEC
         if (r >= 0 && (a0 & 0x80000)) fcntl(r, F_SETFD, FD_CLOEXEC);
         // a reused fd number must start with an empty prime buffer (close() doesn't clear ours)
-        if (r >= 0 && r < 1024) g_ep_primen[r] = 0;
+        if (r >= 0 && r < 1024) { g_ep_primen[r] = 0; g_epoll[r] = 1; }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }

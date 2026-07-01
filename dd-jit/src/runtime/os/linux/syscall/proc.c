@@ -571,6 +571,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                                // serve a guest->host mapping that the parent populated before the FS diverged
             g_ndirs = 0;       // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
                                // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
+            kqueue_rebuild_after_fork(); // macOS kqueue() fds (epoll/timerfd/inotify) don't survive fork ->
+                                         // rebuild them so the child doesn't EBADF on its inherited event fds
 #ifdef DD_HAS_MACH_EXC
             // The CRASHDBG Mach exception port + its receiver thread do NOT survive fork, so a crash in the
             // child silently dies. Clear the inherited task exception port so a fault falls through to the
@@ -766,6 +768,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             jit_after_fork(); // dual map: rebuild the child's aliased cache (COW split RW/RX)
             G_SHADOW_RESET(c);
             rc_reset();
+            kqueue_rebuild_after_fork(); // macOS kqueue() fds don't survive fork -> rebuild epoll/timer/inotify
         }
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
