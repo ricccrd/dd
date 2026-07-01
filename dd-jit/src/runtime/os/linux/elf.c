@@ -453,6 +453,78 @@ __attribute__((constructor)) static void install_sync_fault_guards(void) {
     sigaction(SIGTRAP, &sa, NULL);
 }
 
+// ---------------- LOAD-path mapping hardening (BUG#207: never leave an unmapped hole in the image) -----
+// A large non-PIE ET_EXEC (e.g. gcc's ~29MB cc1, first PT_LOAD at a fixed low vaddr) maps its whole image
+// span in one anon reservation and then mprotects it per segment. An mmap here can fail nondeterministically
+// (host-VM address-space fragmentation leaving no contiguous span, engine mmap-pool degradation, or memory
+// pressure -> XNU returns ENOMEM). The loader must NEVER continue past such a failure: an unmapped hole in
+// the image surfaces much later as a hard-to-diagnose SIGSEGV on the guest's own text/data (BUG#207 -- the
+// fault landed INSIDE the first LOAD segment). Retry a bounded number of times (a transient shortage can
+// clear within a few ms), then fail the exec LOUDLY with a clean diagnostic rather than leaving a hole.
+#define ELF_MAP_RETRIES 6
+
+// BUG#207 mmap fault-injection gate (inert unless the env var is set; nothing sets it in production, and
+// the mac bridge drops ambient env -- same idiom as the sibling x86 loader's NONPIE_NOFIXUP/NORELRO gates).
+// Forces the Nth LOAD-path mmap/mprotect ATTEMPT to report failure, so the retry/abort hardening below can
+// be regression-tested without inducing real host-VM fragmentation or memory pressure. DDFAILMMAP /
+// DDFAILMPROT = "N" fails attempt N once (transient; the retry must recover); "N-" fails every attempt
+// from N onward (permanent; the loader must abort cleanly / stay best-effort, never leave a hole).
+static int elf_inject_fail(const char *var, int attempt) {
+    const char *s = getenv(var);
+    if (!s || !*s) return 0;
+    return strchr(s, '-') ? attempt >= atoi(s) : attempt == atoi(s);
+}
+
+// mmap (anon; fd=-1) with bounded retry under transient pressure. Never returns MAP_FAILED: on
+// persistent failure it reports the exact request and aborts, so a valid exec dies with a clean error
+// rather than continuing with an unmapped hole in the guest image.
+static void *elf_map_checked(void *hint, size_t len, int prot, int flags, const char *what) {
+    static int attempt;
+    for (int t = 0;; t++) {
+        void *p;
+        if (elf_inject_fail("DDFAILMMAP", ++attempt)) {
+            errno = ENOMEM;
+            p = MAP_FAILED;
+        } else {
+            p = mmap(hint, len, prot, flags, -1, 0);
+        }
+        if (p != MAP_FAILED) return p;
+        if (t >= ELF_MAP_RETRIES) {
+            fprintf(stderr, "dd: load_elf: cannot map %s (%zu bytes) for the guest image: %s\n", what, len,
+                    strerror(errno));
+            exit(1);
+        }
+        usleep(2000u << t); // back off and let transient pressure clear
+    }
+}
+
+// Narrow a segment's protection (W^X hardening) -- BEST-EFFORT, never fatal. The image is already fully
+// mapped R+W by the base reservation, and this JIT only READS guest code to translate it (it never
+// executes guest pages directly), so a segment left un-narrowed stays readable+writable = still fully
+// backed, never a hole. Two failures are expected and benign: EINVAL (segment bounds round to 4 KB but
+// Apple-Silicon mprotect needs 16 KB-aligned ranges, so adjacent segments share a host page) and, under
+// memory pressure, ENOMEM (XNU cannot allocate a vm_map_entry to split the span). Retry only the
+// transient ENOMEM a few times so the tightening still applies once pressure clears; give up quietly on
+// anything else -- matching the original best-effort mprotect, so no working image regresses.
+static void elf_mprotect_besteffort(void *addr, size_t len, int prot, const char *what) {
+    for (int t = 0;; t++) {
+        int r;
+        if (elf_inject_fail("DDFAILMPROT", t + 1)) {
+            errno = ENOMEM;
+            r = -1;
+        } else {
+            r = mprotect(addr, len, prot);
+        }
+        if (r == 0 || errno != ENOMEM || t >= ELF_MAP_RETRIES) {
+            if (r != 0 && getenv("JT"))
+                fprintf(stderr, "dd: load_elf: mprotect %s (%zu bytes) skipped: %s (region stays R+W, backed)\n", what,
+                        len, strerror(errno));
+            return;
+        }
+        usleep(2000u << t); // transient pressure: back off and re-tighten
+    }
+}
+
 static void load_elf(const char *path, struct loaded *out) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -493,11 +565,11 @@ static void load_elf(const char *path, struct loaded *out) {
     // NULL: non-colliding (main + interp). A non-PIE ET_EXEC gets biased here; the dispatcher redirects its
     // absolute code jumps (g_nonpie_*) and the nonpie_guard SIGSEGV handler re-serves its absolute DATA refs
     // to the low link vaddr at +bias (see nonpie_fixup above).
-    uint8_t *base = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (base == MAP_FAILED) {
-        perror("mmap base");
-        exit(1);
-    }
+    // Map the whole image span [basepage, basepage+span) in one anon reservation, then copy each PT_LOAD
+    // and narrow protections per segment below. elf_map_checked retries under transient host memory
+    // pressure and aborts loudly on persistent failure, so the full range is guaranteed backed here (a
+    // partial/failed map never slips through to become a SIGSEGV on the guest's own text/data -- BUG#207).
+    uint8_t *base = elf_map_checked(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, "image base");
     gmap_add((uint64_t)base, span); // track so execve() can reclaim the inherited image
     uint64_t bias = (uint64_t)base - basepage;
     if (etype == 2) {
@@ -520,7 +592,7 @@ static void load_elf(const char *path, struct loaded *out) {
         uint64_t v = rd64(ph + 16), msz = rd64(ph + 40);
         uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
         int prot = PROT_READ | ((fl & 2) ? PROT_WRITE : 0) | ((fl & 1) ? PROT_EXEC : 0);
-        if (e > s) mprotect((void *)s, e - s, prot);
+        if (e > s) elf_mprotect_besteffort((void *)s, e - s, prot, "image segment");
     }
     out->entry = e_entry + bias;
     out->base = (uint64_t)base;
