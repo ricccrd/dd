@@ -154,8 +154,13 @@ pub(crate) fn spawn_cfg(c: &Container, volumes_dir: &str, vols: &[Vol], bridge: 
         cfg.env.push(("DDJIT_PCACHE".into(), "1".into()));
         cfg.env.push(("DDJIT_PCACHE_DIR".into(), pdir.to_string_lossy().into_owned()));
     }
-    // `--network host` shares the host network (no per-container netns); otherwise isolate in one.
-    cfg.netns = (c.network_mode != "host").then(|| c.id[..c.id.len().min(40)].to_string());
+    // `--network host` shares the host network (no per-container netns); otherwise isolate in one. The
+    // DD_NETNS key names the container's private loopback (127.0.0.1) domain in the engine; it defaults to
+    // the container's own id, but a `docker exec` sets `netns_key` to the TARGET container's id so the
+    // exec'd process shares the container's 127.0.0.1 (docker semantics — exec joins the container's
+    // network) instead of being isolated in its own loopback. Truncated to 40 chars to match the engine.
+    let ns_key = c.netns_key.as_deref().unwrap_or(&c.id);
+    cfg.netns = (c.network_mode != "host").then(|| ns_key[..ns_key.len().min(40)].to_string());
     // `--network none`: no external egress -- the JIT refuses non-loopback connects (DD_NET_ISOLATE).
     if c.network_mode == "none" { cfg.env.push(("DD_NET_ISOLATE".into(), "1".into())); }
     // netstack PR2 — per-network AF_UNIX virtual switch: container<->container TCP for in-subnet peers.

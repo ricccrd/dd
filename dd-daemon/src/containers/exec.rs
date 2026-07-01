@@ -144,8 +144,13 @@ pub(crate) async fn exec_start(State(a): State<App>, Path(id): Path<String>, req
             return (StatusCode::NOT_FOUND, Json(json!({"message": format!("no such exec: {id}")}))).into_response();
         };
         let Some(c) = g.containers.get(&exec.container_id).cloned() else { return no_such(&exec.container_id) };
-        let mut temp = c; // share the container's rootfs/volumes/arch; distinct id -> own process+netns
+        let mut temp = c; // share the container's rootfs/volumes/arch; distinct id -> own process
         temp.id = id.clone();
+        // Share the TARGET container's loopback network: `docker exec` joins the container's netns, so the
+        // exec'd process must reach 127.0.0.1 servers the container's init is listening on (redis-cli ping,
+        // psql -h 127.0.0.1, etc.). Without this the id-derived DD_NETNS key would isolate the exec in its
+        // own loopback and those connects would fail. `exec.container_id` is the parent container's id.
+        temp.netns_key = Some(exec.container_id.clone());
         temp.cmd = exec.cmd.clone();
         temp.tty = exec.tty;
         // `docker exec -e/-w/-u`: the exec inherits the container's env and adds `-e` overrides (later

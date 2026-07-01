@@ -136,6 +136,12 @@ pub(crate) struct Container {
     // Re-derived from the image at load; never serialized.
     #[serde(skip)]
     pub(crate) arch: Option<Guest>,
+    // `docker exec` only: overrides the id-derived DD_NETNS loopback key so the exec'd process SHARES the
+    // TARGET container's 127.0.0.1 address space instead of getting its own isolated loopback. Set to the
+    // parent container's id in exec_start; None for a normal container (which keys off its own id).
+    // Runtime-only (lives on the throwaway exec temp), never persisted.
+    #[serde(skip)]
+    pub(crate) netns_key: Option<String>,
     // Captured output is not persisted (would bloat the state file).
     #[serde(skip)]
     pub(crate) stdout: Vec<u8>,
