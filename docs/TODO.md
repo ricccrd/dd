@@ -1,48 +1,39 @@
 # dd — todo
 
-Shipped **v0.9.0**; **v0.9.1 batch staged** (11 commits, not yet tagged). Open work below. Found by
-the real-software discovery sweep (#125). Most arm64 paths are solid; the bulk is x86_64 heavy-software.
-Keep this file current after each batch.
+Shipped **v0.9.0 / v0.9.1 / v0.9.2** (≈28 fixes this cycle, from the real-software discovery sweep #125).
+Most apps now run: redis (serves), jq, etcd/go, julia, node-x86, sha256sum, zstd, buildkitd, haproxy,
+the interpreters; postgres runs initdb + start + connect (one blocker left). Open work below.
 
-> Daemon resolves the engine via `resolve_bundled` → installed `/Applications/dd.app` unless
-> `DDJIT_DIR` is set. Install the new DMG for fixes to take effect.
+> Daemon resolves the engine via `resolve_bundled` → installed `/Applications/dd.app` unless `DDJIT_DIR`
+> set. Install the new DMG for fixes to take effect.
 
-## Fixed since v0.9.0 (staged in the v0.9.1 batch)
-readlinkat/realpath of lower-only files (#124) · execve forwards guest envp both arches (#127) ·
-x86 SHA-NI + PTEST + VEX ANDN/BLS (#128/#137) · julia past-EOF mmap SIGBUS (#133) · chroot(51) (#140) ·
-ioctl(FIOASYNC) for nginx (#141) · epoll EPOLLET prime (#142) · x86 raw select/poll/pipe (#144) ·
-by-CL shift CF.
+## In progress
+- [ ] **#160 postgres last blocker** *(agent active)* — AF_UNIX getsockname/getpeername mis-classifies the
+  unix connection → pg_hba "no entry for host '???'". Everything else (initdb/start/connect) works.
 
-## In progress (agents active)
-- [ ] **#132 jq/x86 codegen memory corruption** — jq `munmap_chunk` (deterministic); ld/git/rustc/haproxy
-  SIGSEGV. Aimed at the **#104** store-drop root (memory/EA suspect) — may fix both.
-- [ ] **#130 non-PIE Go loader** — static Go (etcd/caddy/traefik/`go run`) `moduledataverify` fatal: textStart
-  not honored after high rebase.
-- [ ] **#146 poll/ppoll/pselect EINTR-restart without delivering handler** → servers blocking in poll + SA_RESTART
-  SIGCHLD reaper hang.
-- [ ] **#148 getrlimit NOFILE=∞** (memcached) + **#134 R hangs at startup**.
-- [ ] **#136 x86 base64 -d SIMD shuffle miscompile** (busybox).
-- [ ] **#143 procfs** — /proc/self/{fd,maps,smaps,status,environ} + /proc/[pid]/stat (redis/httpd/mongo).
+## Deep / hard (engine codegen)
+- [ ] **#104 V8 store-drop** — Turboshaft MachineLowering drops Stores under OSR (java/.NET/node-opt). ET_DYN/PIE.
+- [ ] **#117 flaky x86 fork+exec** — execve re-translation can't tolerate a reused guest image base (stale
+  code-cache blocks) + x86 loader/stack untracked by gmap. ~0.4% under load. Needs engine execve-teardown fix.
+- [ ] **#155 go build/run driver SIGSEGV** — heavy go toolchain; same x86-codegen class as #117/#104.
+- [ ] **#135 PyPy x86 JIT** asserts (a 2nd guest-JIT).
 
-## Open / queued (share files with the active wave)
-- [ ] **#104 guest-JIT store-drop** — V8 Turboshaft MachineLowering drops Stores under OSR (java/.NET/node-opt).
-  Suspect: a memory load/store-width or effective-address edge (see #132).
-- [ ] **#151 execve doesn't reset g_sigact[]** — caught handlers survive exec → crash (redis via `sh -c`; broad). proc.c.
-- [ ] **#150 java sysinfo totalram=0** ("Too small maximum heap") then futex spin. misc.c.
-- [ ] **#149 AF_UNIX bind doesn't create the socket file** (mongo/mariadb/postgres unix sockets).
+## x86 opcode / flag gaps (ready or small)
+- [ ] **#136 base64 -d** — `xchg %ch,%cl` (byte-reg with high-byte operand) corrupts host regs. READY PATCH for translate.c:1041.
+- [ ] **#153 x87 FNSTENV (D9 /6) + FLDENV (D9 /4)** — R/OpenBLAS.
 - [ ] **#145 x86 flag residuals** — ror %cl CF, imul CF, shift OF(count==1).
-- [ ] **#135 PyPy x86 JIT backend asserts** (2nd guest-JIT). **#138 git write-tree** wrong hash (likely #128 — re-test).
-- [ ] **#131 .NET host** can't resolve its own exe path (re-test after #124). **#139 clang** link fails both arches.
-- [ ] **#117 flaky PIE fork+exec base** · **#119 mongosh SEA crash** · **#120 RFLAGS ID flag** · **#123 node-via-daemon ENOENT**.
+- [ ] **#120 RFLAGS ID flag** (32-bit CPUID detect, ready patch needs cpu_x86_64.h field).
+- [ ] **#138 git write-tree** wrong hash (re-test after #128 SHA-NI — likely fixed).
 
-## Deferred / non-blocking
+## Loaders / hosts / misc
+- [ ] **#131 .NET host** exe-path empty (re-test after #124). **#139 clang** link fails both arches (arm64 SIGSEGV).
+- [ ] **#119 mongosh** 193MB node-SEA early crash. **#123 node-via-daemon** ENOENT.
+- [ ] **#147 redis-arm crash** — re-test (procfs #143 + cloexec #157 likely fixed the root).
+- [ ] **#158 memcached** libevent listener. **#159 IPv6 (::) loopback** redirect (redis dual-stack).
+
+## Deferred
 - [ ] **#78** gcc-bundle /hello.c fixture · **#93** host-asm encoder de-dup · **#94** README benchmarks
 
-## Test-env notes (not code bugs)
-- Host `~/.docker/config.json` bogus Hub creds → real pulls 401 unless `DOCKER_CONFIG=<empty>`.
-- docker.sh + scenarios share `dd-scenarios.sock` → not concurrent. Shared poc/images mutated by parallel agents.
-- Engine-direct: upper under the shared project dir (not /tmp); export PATH in-guest; bare-name entry resolves
-  only against /usr/local/bin:/usr/bin:/bin (use absolute paths for tools elsewhere).
-
 ## Process
-- Each fix: verify on the real path → batch → gate (basics both arches + docker.sh) → tag → push.
+- Each fix: verify on the real path → batch → gate (basics both arches + docker.sh) → tag → push. Keep current.
+- Note: full basics matrix runs get SIGTERM'd under heavy agent load (bridge contention) — run when agents idle.
