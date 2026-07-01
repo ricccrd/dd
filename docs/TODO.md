@@ -10,9 +10,20 @@ lifecycle = READY (alpine/ubuntu, both arches). DATABASE blockers ALL FIXED this
   silently truncating the long upper path) → DB unix sockets usable.
 - **B4** — docker exec joins the container's emulated loopback netns → exec'd DB clients reach 127.0.0.1.
 Plus #224a getrandom non-PIE rebase, #219b TIOCGPTPEER (glibc openpty/forkpty).
-Open: release gate agent running the B2+B3+B4 real-DB integration proof; #201 (x86-only, NOT gating,
-agent active). Known non-gating: B1 flaky debian:bookworm amd64 fork/exec (demo uses ubuntu); B4b
-0.0.0.0-bind→127.0.0.1 on bridge (stock redis needs --bind 127.0.0.1 until fixed).
+**RELEASE GATE ran (commit 568613d, clean both-arch engine): NOT READY — 1 blocker.**
+- Basics: arm64 473/0 clean; x86_64 433/5 — the 5 = missing untracked `guests/x86/*` fixtures (absent
+  on main too, env/pre-existing, NOT a regression, NOT an engine bug).
+- Base `docker run` / `run -it` / `exec -it` / interactive PTY / lifecycle: PASS both arches.
+- **B5 (THE remaining DB blocker, agent active):** postgres/mariadb/mysql hang forever — gosu/su-exec
+  get past B2's stat but hang at the actual privilege-drop. Go `syscall.Setuid`→`doAllThreadsSyscall`
+  RT-signal-33 to sibling M threads via tgkill; engine never runs the sibling's handler → coordinator
+  spins on sched_yield forever. Fix = engine cross-thread RT-signal delivery (signal.c 130/131 +
+  thread.c). Blocks every gosu/su-exec image.
+- redis WORKS via direct `redis-server --ignore-warnings ARM64-COW-BUG` (bypasses entrypoint gosu).
+- Non-gating: nats scratch-image exec gap (both arches); B1 bookworm-amd64 flake (use ubuntu); B4b
+  0.0.0.0→127.0.0.1 on bridge (stock redis needs --bind 127.0.0.1); 8 stale .xfail markers to remove.
+- #201 (x86-only, NOT gating, agent active).
+**Next: land B5 → re-gate real postgres/mariadb round-trip → TAG v0.9.6 + PUSH.**
 
 ## Proven working this session (both arches, real software, correct output — not just "no crash")
 postgres · mariadb · nginx (1000/1000 req) · redis (500k ops) · sqlite (WAL, 100k rows) · ruby · perl ·
