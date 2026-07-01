@@ -222,7 +222,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (want_peer) {
                 socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;
                 int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a1, gcap);
-                if (ll < 0) { // non-inet peer (e.g. AF_UNIX): copy raw host bytes
+                if (ll < 0) ll = sa_un_m2l((struct sockaddr *)&hss, hsl, (uint8_t *)a1, gcap); // AF_UNIX -> Linux
+                if (ll < 0) {                                                                  // other non-inet peer: copy raw host bytes
                     socklen_t n = hsl < gcap ? hsl : gcap;
                     if (gcap) memcpy((void *)a1, &hss, n);
                     if (a2) *(socklen_t *)a2 = hsl;
@@ -381,6 +382,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r == 0 && a1) {
             socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a1, gcap);
+            if (ll < 0) ll = sa_un_m2l((struct sockaddr *)&hss, hsl, (uint8_t *)a1, gcap); // AF_UNIX -> Linux + guest path
             if (ll < 0) {
                 socklen_t n = hsl < gcap ? hsl : gcap;
                 if (gcap) memcpy((void *)a1, &hss, n);
@@ -415,6 +417,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r == 0 && a1) {
             socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a1, gcap);
+            if (ll < 0) ll = sa_un_m2l((struct sockaddr *)&hss, hsl, (uint8_t *)a1, gcap); // AF_UNIX -> Linux + guest path
             if (ll < 0) {
                 socklen_t n = hsl < gcap ? hsl : gcap;
                 if (gcap) memcpy((void *)a1, &hss, n);

@@ -20,6 +20,27 @@ static void tty_ctl_block(sigset_t *saved) {
 }
 static void tty_ctl_restore(const sigset_t *saved) { sigprocmask(SIG_SETMASK, saved, NULL); }
 
+// Overlay getdents64 snapshot cache (case 61): the merged cross-layer listing for a directory fd is taken
+// once on the first getdents call and consumed across the many small reads libc makes. Keyed by guest
+// fd+1 (0 == free). A slot MUST be invalidated on close() -- ovldents_drop, called from case 57 -- so a
+// reused fd re-snapshots a fresh directory rather than serving the previous one's leftover tail. Without
+// that, a directory read partially then closed poisoned the next directory opened on the same fd, which
+// silently truncated postgres initdb's template1->template0/postgres copy (dropping ~1/4 of the catalog,
+// e.g. PG_VERSION -> "base/5 is not a valid data directory" on the first client connect).
+static struct {
+    int fd; // guest fd + 1 (0 = free slot)
+    int n, pos;
+    char nm[1024][256];
+    uint8_t ty[1024];
+} g_ovldents[16];
+static void ovldents_drop(int fd) {
+    for (int i = 0; i < 16; i++)
+        if (g_ovldents[i].fd == fd + 1) {
+            g_ovldents[i].fd = 0;
+            return;
+        }
+}
+
 static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                   uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -954,8 +975,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             ep_fd_reset(cf); // w3e: drop epoll armed-state (kqueue auto-removes a closed fd)
             // reap eventfd peer / timerfd / overlay dir / loopback
         }
-        memf_close(cf); // release any RAM-backed scratch buffer
-        dirs_drop(cf);  // invalidate the getdents DIR* cache so a reused fd re-opendir's
+        memf_close(cf);   // release any RAM-backed scratch buffer
+        dirs_drop(cf);    // invalidate the getdents DIR* cache so a reused fd re-opendir's
+        ovldents_drop(cf); // invalidate the overlay getdents snapshot so a reused fd re-snapshots (not stale tail)
         int r = close(cf);
         fd_clear(cf);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -967,47 +989,41 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int fd = (int)a0;
         // OVERLAY: merged listing across layers
         if (g_nlower && fd >= 0 && fd < 1024 && g_ovldir[fd][0]) {
-            static struct {
-                int fd;
-                int n, pos;
-                char nm[1024][256];
-                uint8_t ty[1024];
-            } oc[16];
             int slot = -1;
             for (int i = 0; i < 16; i++)
-                if (oc[i].fd == fd + 1) {
+                if (g_ovldents[i].fd == fd + 1) {
                     slot = i;
                     break;
                 }
             if (slot < 0) {
                 for (int i = 0; i < 16; i++)
-                    if (oc[i].fd == 0) {
+                    if (g_ovldents[i].fd == 0) {
                         slot = i;
                         break;
                     }
                 if (slot < 0) slot = 0;
-                oc[slot].fd = fd + 1;
-                oc[slot].pos = 0;
-                oc[slot].n = overlay_readdir(g_ovldir[fd], oc[slot].nm, oc[slot].ty, 1024);
+                g_ovldents[slot].fd = fd + 1;
+                g_ovldents[slot].pos = 0;
+                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], g_ovldents[slot].nm, g_ovldents[slot].ty, 1024);
             }
             uint8_t *out = (uint8_t *)a1;
             size_t o = 0;
-            while (oc[slot].pos < oc[slot].n) {
-                const char *nm = oc[slot].nm[oc[slot].pos];
+            while (g_ovldents[slot].pos < g_ovldents[slot].n) {
+                const char *nm = g_ovldents[slot].nm[g_ovldents[slot].pos];
                 size_t nl = strlen(nm), lr = (19 + nl + 1 + 7) & ~7ull;
                 if (o + lr > (size_t)a2) break;
                 uint8_t *ld = out + o;
-                *(uint64_t *)(ld + 0) = oc[slot].pos + 1;
+                *(uint64_t *)(ld + 0) = g_ovldents[slot].pos + 1;
                 *(uint64_t *)(ld + 8) = o + lr;
                 *(uint16_t *)(ld + 16) = (uint16_t)lr;
-                *(ld + 18) = oc[slot].ty[oc[slot].pos];
+                *(ld + 18) = g_ovldents[slot].ty[g_ovldents[slot].pos];
                 memcpy(ld + 19, nm, nl);
                 ld[19 + nl] = 0;
                 o += lr;
-                oc[slot].pos++;
+                g_ovldents[slot].pos++;
             }
             // exhausted -> free the slot
-            if (o == 0) oc[slot].fd = 0;
+            if (o == 0) g_ovldents[slot].fd = 0;
             G_RET(c) = (uint64_t)o;
             break;
         }

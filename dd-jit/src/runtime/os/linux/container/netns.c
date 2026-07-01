@@ -786,6 +786,38 @@ static int sa_m2l(const struct sockaddr *m, uint8_t *g, socklen_t gcap) {
     }
     return -1;
 }
+// host(macOS) AF_UNIX sockaddr -> guest(Linux) layout. The two structs disagree in the leading bytes:
+//   Linux  sockaddr_un = { u16 sun_family;             char sun_path[108] }  (AF_UNIX = 1)
+//   macOS  sockaddr_un = { u8 sun_len; u8 sun_family;  char sun_path[104] }  (AF_UNIX = 1)
+// A raw byte copy (the old non-INET fallback) made the guest read sun_family as sun_len|(AF_UNIX<<8)
+// (e.g. 272/362), so a genuine AF_UNIX peer/name looked like an unknown family -> postgres classified a
+// unix-socket client as a TCP "host" and rejected it (no pg_hba host entry). Rewrite to a 2-byte family
+// and, for a bound pathname socket, reverse-map the host path (upper/lower/volume) back to the guest path
+// so getsockname/getpeername report the path the guest actually bound -- not its on-disk overlay location.
+// Returns the full Linux address length (Linux reports it even past gcap), or -1 if `m` is not AF_UNIX.
+static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, socklen_t gcap) {
+    if (!saxl_on() || !m || m->sa_family != AF_UNIX) return -1;
+    const struct sockaddr_un *u = (const struct sockaddr_un *)m;
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    size_t hplen = (size_t)mlen > off ? (size_t)mlen - off : 0; // path bytes the host reported (no NUL guarantee)
+    char hpath[256];
+    size_t i = 0;
+    for (; i < hplen && i + 1 < sizeof hpath && u->sun_path[i]; i++) hpath[i] = u->sun_path[i];
+    hpath[i] = 0;
+    char gpath[256];
+    if (hpath[0] == '/' && g_rootfs)
+        guest_from_host(hpath, gpath, sizeof gpath); // overlay host path -> guest-visible path
+    else
+        snprintf(gpath, sizeof gpath, "%s", hpath); // unnamed/autobind (empty) or non-jail: pass through
+    uint8_t t[2 + sizeof gpath];
+    *(uint16_t *)t = AF_UNIX;
+    size_t pl = strlen(gpath);
+    memcpy(t + 2, gpath, pl);
+    t[2 + pl] = 0;
+    int llen = pl ? (int)(2 + pl + 1) : 2; // pathname: family + path + NUL; unnamed: just the family
+    if (g && gcap) memcpy(g, t, (size_t)gcap < (size_t)llen ? gcap : (size_t)llen);
+    return llen;
+}
 
 // ---- abstract-namespace AF_UNIX (sun_path[0]=='\0'): macOS has no abstract namespace, so map the
 // abstract name to a real filesystem socket under a per-namespace dir keyed by DD_NETNS (same key as
