@@ -1387,6 +1387,37 @@ static void *translate_block(uint64_t gpc) {
                             e_movconst(16, 0x037f);
                             emit32(0x79000000u | (19 << 5) | 16);
                         } // fnstcw
+                        else if (reg == 6) {
+                            // FNSTENV m28: store the 28-byte 32-bit protected-mode x87 environment --
+                            // FCW@0, FSW@4 (TOP in bits 11:13), FTW@8, then FIP/FCS/FOO/FOS @12/16/20/24.
+                            // The engine keeps no per-reg tags and a fixed default FCW, so emit FCW=0x037f
+                            // (mirrors fnstcw) and FTW=0xffff (all-empty); the instruction/data pointers are
+                            // zeroed. OpenBLAS (R startup, the only caller) just saves/restores FCW/FSW/FTW.
+                            // x19 = EA. emit_fpsw_with_top() materializes cpu->fptop and yields FSW in x16.
+                            e_movconst(16, 0x037f);
+                            emit32(0x79000000u | (0u << 10) | (19 << 5) | 16); // strh FCW, [x19,#0]
+                            emit_fpsw_with_top();                              // x16 = FSW | (TOP<<11)
+                            emit32(0x79000000u | (2u << 10) | (19 << 5) | 16); // strh FSW, [x19,#4]
+                            e_movconst(16, 0xffff);
+                            emit32(0x79000000u | (4u << 10) | (19 << 5) | 16); // strh FTW, [x19,#8]
+                            emit32(0xB9000000u | (3u << 10) | (19 << 5) | 31); // str  wzr, [x19,#12] FIP
+                            emit32(0xB9000000u | (4u << 10) | (19 << 5) | 31); // str  wzr, [x19,#16] FCS
+                            emit32(0xB9000000u | (5u << 10) | (19 << 5) | 31); // str  wzr, [x19,#20] FOO
+                            emit32(0xB9000000u | (6u << 10) | (19 << 5) | 31); // str  wzr, [x19,#24] FOS
+                            // FNSTENV then masks all FP exceptions in FCW; the engine's FCW is the fixed
+                            // default 0x037f (exception-mask bits 0-5 already set), so nothing to update.
+                        } // fnstenv m28
+                        else if (reg == 4) {
+                            // FLDENV m28: reload the x87 environment (inverse of FNSTENV). Restore the FSW
+                            // condition codes and TOP from [EA+4]; FCW (fixed default) and FTW (no per-reg
+                            // tags) are ignored, exactly like fldcw. The reloaded TOP is unknown at translate
+                            // time, so leave the static-top model -> runtime-top addressing afterwards.
+                            fp_drop();
+                            emit32(0x79400000u | (2u << 10) | (19 << 5) | 16); // ldrh w16, [x19,#4]  (FSW)
+                            e_str(16, 28, OFF_FPSW);                            // cpu->fpsw  = FSW
+                            emit32(0x53000000u | (11u << 16) | (13u << 10) | (16 << 5) | 17); // ubfx w17,w16,#11,#3
+                            e_str(17, 28, OFF_FPTOP);                           // cpu->fptop = TOP
+                        } // fldenv m28
                         else {
                             report_unimpl(gpc, &I);
                             break;
