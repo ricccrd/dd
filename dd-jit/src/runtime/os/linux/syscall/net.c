@@ -68,8 +68,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // GUEST Linux sockaddr_in: family@0(u16 LE), port@2(BE)
         uint8_t *sa = (uint8_t *)a1;
         if (lo_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
-            // private loopback
-            lo_is(sa, (socklen_t)a2)) {
+            // private loopback (127/8, and 0.0.0.0 in direct mode -- a 0.0.0.0 server must answer 127.0.0.1)
+            lo_any_is(sa, (socklen_t)a2)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = lo_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
             char up[200];
@@ -121,6 +121,23 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             memset(&un, 0, sizeof un);
             un.sun_family = AF_UNIX;
             snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
+        // AF_UNIX pathname bind: materialize the socket inode in the overlay (writable upper), jail-confined,
+        // so the guest can stat/chmod/connect it through the SAME resolver. A raw host bind created the inode
+        // OUTSIDE the jail (at the literal guest path on the host fs), so the guest's overlay-routed stat()
+        // ENOENT'd it (mongod "Failed to chmod socket file", mariadb "Bind on unix socket"). Jail only.
+        if (g_rootfs && unix_path_is(sa, (socklen_t)a2)) {
+            char gp[200], host[1024];
+            unix_path_copy(sa, (socklen_t)a2, gp, sizeof gp);
+            overlay_copyup(gp, host, sizeof host); // guest path -> upper host path (+ materialize parent dirs)
+            unlink(host);                          // clear a stale inode (else EADDRINUSE)
+            struct sockaddr_un un;
+            memset(&un, 0, sizeof un);
+            un.sun_family = AF_UNIX;
+            snprintf(un.sun_path, sizeof un.sun_path, "%s", host);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -259,7 +276,24 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             un.sun_family = AF_UNIX;
             snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
-            if (r == 0 || errno == EINPROGRESS) g_lo_port[(int)a0] = p ? p : 1;
+            if (r == 0 || errno == EINPROGRESS) {
+                g_lo_port[(int)a0] = p ? p : 1;
+            } else if (errno == ENOENT && br_on() && g_myip) {
+                // Same-container localhost dial of a server that bound INADDR_ANY on the bridge (br_path,
+                // keyed by OUR own IP -- not lo_path): retry there so 127.0.0.1 still reaches a 0.0.0.0
+                // listener in bridge mode.
+                char bp[200];
+                br_path(g_myip, p, bp, sizeof bp);
+                struct sockaddr_un bu;
+                memset(&bu, 0, sizeof bu);
+                bu.sun_family = AF_UNIX;
+                snprintf(bu.sun_path, sizeof bu.sun_path, "%s", bp);
+                r = connect((int)a0, (struct sockaddr *)&bu, sizeof bu);
+                if (r == 0 || errno == EINPROGRESS) {
+                    g_br_port[(int)a0] = p ? p : 1;
+                    g_br_ip[(int)a0] = g_myip;
+                }
+            }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
@@ -295,6 +329,21 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             un.sun_family = AF_UNIX;
             snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
+            G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
+            break;
+        }
+        // AF_UNIX pathname connect: resolve through the overlay (same resolver as stat/open) so we dial the
+        // socket the guest actually bound -- materialized in the upper -- not a host path outside the jail.
+        if (g_rootfs && unix_path_is(sa, (socklen_t)a2)) {
+            char gp[200], host[1024];
+            unix_path_copy(sa, (socklen_t)a2, gp, sizeof gp);
+            const char *hp = atpath(-100, gp, host, sizeof host, 0); // guest path -> topmost layer's host path
+            struct sockaddr_un un;
+            memset(&un, 0, sizeof un);
+            un.sun_family = AF_UNIX;
+            snprintf(un.sun_path, sizeof un.sun_path, "%s", hp);
+            int r;
+            do { r = connect((int)a0, (struct sockaddr *)&un, sizeof un); } while (r < 0 && SVC_EINTR_RESTART(c));
             G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
             break;
         }

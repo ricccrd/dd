@@ -318,6 +318,16 @@ static int br_bind_is(const uint8_t *sa, socklen_t l) {
     uint32_t ip = *(uint32_t *)(sa + 4);
     return ip == 0 || ip == g_myip || br_in_subnet(ip);
 }
+// A STREAM bind the private loopback should own. Explicit 127/8 always; INADDR_ANY (0.0.0.0) too when the
+// bridge is OFF -- "any" includes loopback, and with no virtual switch the only reachable address under
+// isolation IS loopback, so a server that binds 0.0.0.0 (redis/memcached/nats default) must land on lo_path
+// or a same-container 127.0.0.1 connect finds nothing (ENOENT). In bridge mode 0.0.0.0 stays on br_path
+// (cross-container + publish); the loopback connect path falls back to our own br endpoint there.
+static int lo_any_is(const uint8_t *sa, socklen_t l) {
+    if (!sa || l < 8 || *(const uint16_t *)sa != AF_INET) return 0;
+    if (sa[4] == 127) return 1;
+    return *(const uint32_t *)(sa + 4) == 0 && !br_on();
+}
 // rendezvous path for <ip_be>:<port> under the shared per-network dir
 static void br_path(uint32_t ip_be, uint16_t port, char *out, size_t n) {
     const uint8_t *b = (const uint8_t *)&ip_be;
@@ -793,6 +803,18 @@ static void abs_init(void) {
 // Is this guest sockaddr an abstract AF_UNIX addr? family u16==AF_UNIX, sun_path[0]==NUL, name>=1B.
 static int abs_is(const uint8_t *sa, socklen_t l) {
     return sa && l > 3 && *(const uint16_t *)sa == AF_UNIX && sa[2] == 0; // sun_path[0] @ offset 2
+}
+// Is this guest sockaddr an AF_UNIX *pathname* addr (a filesystem socket, not abstract/autobind)?
+static int unix_path_is(const uint8_t *sa, socklen_t l) {
+    return sa && l > 3 && *(const uint16_t *)sa == AF_UNIX && sa[2] != 0; // sun_path[0] @ offset 2
+}
+// Copy a guest sockaddr_un's sun_path (NUL- or addrlen-bounded) into `out` as a C string.
+static void unix_path_copy(const uint8_t *sa, socklen_t l, char *out, size_t n) {
+    size_t pl = (size_t)l > 2 ? (size_t)l - 2 : 0; // bytes after the 2-byte family
+    size_t i = 0;
+    for (; i + 1 < n && i < pl && sa[2 + i]; i++)
+        out[i] = (char)sa[2 + i];
+    out[i] = 0;
 }
 // Map abstract name (bytes sa+3 .. for namelen=l-3) to a filesystem path. Hex when it fits macOS
 // sun_path[104], else FNV-1a hash (long D-Bus/X11/systemd names overflow); the name may hold NULs,
