@@ -116,27 +116,63 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         break;
     }
     case 216: {
-        // mremap (copy+grow)
-        void *r = mmap(0, (size_t)a2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        // mremap (a0=old, a1=old_len, a2=new_len, a3=flags, a4=new_addr). macOS has no mremap, so
+        // emulate it -- but honor the FLAGS contract, which the guest relies on:
+        //   flags==0        : the mapping MUST NOT move. Grow only if the tail is free, else -ENOMEM.
+        //   MREMAP_MAYMOVE  : may relocate (allocate a new region, copy, free the old).
+        // Getting this wrong corrupts the guest: a flags==0 caller keeps using the OLD address (Linux
+        // guarantees it is unchanged), so relocating -- and freeing the old region out from under those
+        // still-live pointers -- is a use-after-free (BUG #211: glibc/ZendMM grows a ~2 MB json_encode
+        // buffer by one page with a no-move mremap; the old code always moved it -> SIGSEGV).
+        // The original anon mmap (case 222) reserved a 64 KB guard tail past the guest's logical length,
+        // so the tracked extent is a1+guard; a grow whose new length still fits inside that already-mapped
+        // extent needs neither new memory nor a move.
+        const uint64_t guard = 0x10000;
+        uint64_t tracked = gmap_find_len(a0);          // full mapped extent at a0 (incl. guard), 0 if untracked
+        uint64_t phys = tracked ? tracked : (uint64_t)a1; // bytes we can assume are mapped at a0
+        // Shrink, or a grow that still fits within the already-mapped extent: stay in place, touch nothing.
+        if ((uint64_t)a2 <= phys) {
+            G_RET(c) = a0;
+            break;
+        }
+        // Grow beyond the current extent. Unless a fixed destination was requested, first try to extend in
+        // place by mapping the fresh tail right after the current extent; macOS relocates a hinted (non-
+        // FIXED) mmap when the target range isn't free, so an exact-address result means the tail was free.
+        if (!(a3 & 2 /*MREMAP_FIXED*/)) {
+            uint64_t end = a0 + phys, want = (uint64_t)a2 + guard;
+            void *ext =
+                mmap((void *)end, (size_t)(a0 + want - end), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (ext == (void *)end) {
+                gmap_del(a0);
+                gmap_add(a0, want); // track the grown extent (incl. fresh guard) for execve() teardown
+                anon_track(a0, want, PROT_READ | PROT_WRITE);
+                G_RET(c) = a0;
+                break;
+            }
+            if (ext != MAP_FAILED) munmap(ext, (size_t)(a0 + want - end)); // landed elsewhere -> discard
+        }
+        // Cannot extend in place. Without MREMAP_MAYMOVE we may not relocate -> ENOMEM (the caller then
+        // does its own alloc+copy+free, exactly as it would when Linux can't grow a no-move mapping).
+        if (!(a3 & 1 /*MREMAP_MAYMOVE*/)) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        // Relocate: allocate the new region (+guard tail so glibc's vectorized over-reads stay mapped),
+        // copy the old bytes, then free the old extent. Allocate-before-free so a failure leaves old intact.
+        void *r = mmap(0, (size_t)a2 + guard, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (r == MAP_FAILED) {
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        size_t old = (size_t)a1, n = old < (size_t)a2 ? old : (size_t)a2;
+        size_t n = (size_t)a1 < (size_t)a2 ? (size_t)a1 : (size_t)a2;
         memcpy(r, (void *)a0, n);
-        // W4-B leak fix: mremap MOVES the mapping, so free the OLD region (it was leaked — every
-        // realloc-driven grow leaked the whole previous buffer; busybox `sort` of a 2M-line file does
-        // ~3,874 grows leaking ~31 GB -> ~30 GB RSS -> OOM SIGKILL). Free the tracked extent (incl. the
-        // 64 KB guard tail); allocate-before-free preserved above.
-        uint64_t old_full = gmap_find_len(a0); // tracked extent (incl. guard tail); fall back to old length
-        if (old_full < old) old_full = old;
         if (a0) {
-            munmap((void *)a0, (size_t)old_full);
+            munmap((void *)a0, (size_t)phys); // free the FULL tracked extent (incl. old guard tail)
             gmap_del(a0);
-            anon_untrack(a0, (size_t)old_full); // untrack the FULL extent (was untracking only `old`)
+            anon_untrack(a0, (size_t)phys);
         }
-        gmap_add((uint64_t)r, (uint64_t)a2);                         // track the new region for execve() teardown
-        anon_track((uint64_t)r, (size_t)a2, PROT_READ | PROT_WRITE); // fresh private-anon copy
+        gmap_add((uint64_t)r, (uint64_t)a2 + guard);                         // track for execve() teardown
+        anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE); // fresh private-anon copy
         G_RET(c) = (uint64_t)r;
         break;
     }
