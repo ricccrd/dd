@@ -582,6 +582,230 @@ static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
     return gbuf;
 }
 #include "vfs/resolve.c"
+// ===================== /proc/[self|pid] process introspection =====================
+// macOS has no /proc, so the per-process files Linux servers read are synthesized here. All of these
+// answer for the GUEST's own process only -- "self", the host pid, the container pid, or init's "1".
+
+// Back a synthesized text file with an anonymous temp fd (mkstemp + immediate unlink): the fd holds the
+// content, has no name, and behaves like an ordinary read-only file. Returns the fd, or -1 on error.
+static int proc_text_fd(const char *buf, int n) {
+    char tn[] = "/tmp/.ddprocXXXXXX";
+    int fd = mkstemp(tn);
+    if (fd >= 0) {
+        unlink(tn);
+        if (write(fd, buf, (size_t)n) < 0) {}
+        lseek(fd, 0, SEEK_SET);
+    }
+    return fd;
+}
+// The guest task name (Linux comm, max 15 chars): the basename of the running image (g_exe_path).
+static void proc_comm(char *out, size_t n) {
+    const char *p = (g_exe_path && g_exe_path[0]) ? g_exe_path : "init";
+    const char *base = strrchr(p, '/');
+    base = base ? base + 1 : p;
+    if (!base[0]) base = "init";
+    snprintf(out, n, "%.15s", base);
+}
+// If `rp` addresses THIS process -- "/proc/self/<leaf>" or "/proc/<our-pid>/<leaf>" (host pid, container
+// pid, or init's "1") -- return the <leaf> tail; else NULL. Foreign pids are not introspectable.
+static const char *proc_self_leaf(const char *rp) {
+    if (!strncmp(rp, "/proc/self/", 11)) return rp + 11;
+    if (strncmp(rp, "/proc/", 6)) return NULL;
+    const char *q = rp + 6;
+    int i = 0;
+    while (q[i] >= '0' && q[i] <= '9' && i < 15)
+        i++;
+    if (i == 0 || q[i] != '/') return NULL;
+    char num[16];
+    memcpy(num, q, (size_t)i);
+    num[i] = 0;
+    int pid = atoi(num);
+    if (pid != (int)getpid() && pid != container_pid()) return NULL;
+    return q + i + 1;
+}
+// One /proc/.../maps line for [lo,hi), plus the per-region smaps fields when `smaps` is set. The smaps
+// fields are what redis's COW self-test parses; rss/dirty are reported equal to the region size (a
+// resident private mapping) so any field a parser looks up is present and consistent. Returns the length.
+static int proc_map_region(char *b, size_t n, unsigned long lo, unsigned long hi, const char *name, int smaps) {
+    unsigned long kb = (hi - lo) / 1024;
+    int m = snprintf(b, n, "%012lx-%012lx rw-p 00000000 00:00 0 %*s%s\n", lo, hi, name[0] ? 20 : 0, "", name);
+    if (smaps)
+        m += snprintf(b + m, (size_t)n - (size_t)m,
+                      "Size:%15lu kB\nKernelPageSize:%6d kB\nMMUPageSize:%9d kB\n"
+                      "Rss:%16lu kB\nPss:%16lu kB\nShared_Clean:%7d kB\nShared_Dirty:%7d kB\n"
+                      "Private_Clean:%6d kB\nPrivate_Dirty:%6lu kB\nReferenced:%9lu kB\n"
+                      "Anonymous:%10lu kB\nAnonHugePages:%6d kB\nSwap:%15d kB\nLocked:%13d kB\n"
+                      "VmFlags: rd wr mr mw me ac\n",
+                      kb, 4, 4, kb, kb, 0, 0, 0, kb, kb, kb, 0, 0, 0);
+    return m;
+}
+// Synthesize /proc/[pid]/maps (smaps=0) or /proc/[pid]/smaps (smaps=1) from the tracked guest mappings
+// (g_gmap) plus the published main-stack bounds. The [stack] line (with a guard line below it, as the
+// kernel shows) is what glibc's pthread_getattr_np scans for; the region list makes the file non-empty
+// and parseable. Returns an anonymous fd holding the content, or -1 on error.
+static int proc_maps_fd(int smaps) {
+    char tn[] = "/tmp/.ddprocXXXXXX";
+    int fd = mkstemp(tn);
+    if (fd < 0) return -1;
+    unlink(tn);
+    char b[768];
+    if (g_stack_hi) {
+        unsigned long lo = (unsigned long)g_stack_lo, hi = (unsigned long)g_stack_hi;
+        int m = snprintf(b, sizeof b, "%012lx-%012lx ---p 00000000 00:00 0 \n", lo > 0x1000 ? lo - 0x1000 : 0, lo);
+        if (write(fd, b, (size_t)m) < 0) {}
+        m = proc_map_region(b, sizeof b, lo, hi, "[stack]", smaps);
+        if (write(fd, b, (size_t)m) < 0) {}
+    }
+    for (int i = 0; i < g_ngmap; i++) {
+        unsigned long lo = (unsigned long)g_gmap[i].addr, hi = lo + (unsigned long)g_gmap[i].len;
+        if (g_stack_hi && lo >= (unsigned long)g_stack_lo && hi <= (unsigned long)g_stack_hi)
+            continue; // already emitted as [stack]
+        int m = proc_map_region(b, sizeof b, lo, hi, "", smaps);
+        if (write(fd, b, (size_t)m) < 0) {}
+    }
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+// /proc/[pid]/status -- the Name:/State:/VmRSS: key:value format (NOT the stat one-liner). VmRSS/VmSize
+// reflect the cgroup memory charge so a reader sees a plausible footprint.
+static int proc_status_text(char *b, size_t n) {
+    char comm[16];
+    proc_comm(comm, sizeof comm);
+    int pid = container_pid();
+    int ppid = pid == 1 ? 0 : (int)getppid();
+    unsigned long rss = (unsigned long)(atomic_load(&g_mem_charged) / 1024);
+    unsigned long vsz = g_mem_max ? (unsigned long)(g_mem_max / 1024) : rss + 4096;
+    if (vsz < rss) vsz = rss;
+    return snprintf(b, n,
+                    "Name:\t%s\nUmask:\t0022\nState:\tR (running)\nTgid:\t%d\nNgid:\t0\nPid:\t%d\nPPid:\t%d\n"
+                    "TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\n"
+                    "VmPeak:\t%8lu kB\nVmSize:\t%8lu kB\nVmLck:\t       0 kB\nVmHWM:\t%8lu kB\nVmRSS:\t%8lu kB\n"
+                    "VmData:\t%8lu kB\nVmStk:\t     132 kB\nVmExe:\t     512 kB\nVmLib:\t    2048 kB\nVmPTE:\t      32 kB\n"
+                    "VmSwap:\t       0 kB\nThreads:\t1\nSigQ:\t0/31000\nSigPnd:\t0000000000000000\n"
+                    "SigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\t0000000000000000\n"
+                    "Cpus_allowed:\t1\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t1\n"
+                    "nonvoluntary_ctxt_switches:\t0\n",
+                    comm, pid, pid, ppid, vsz, vsz, rss, rss, rss);
+}
+// /proc/[pid]/stat -- the 52-field single line (pid (comm) state ppid ...). Field 23 = vsize (bytes),
+// field 24 = rss (pages); the rest are plausible zeros. mongod's FTDC collector parses this.
+static int proc_stat_text(char *b, size_t n) {
+    char comm[16];
+    proc_comm(comm, sizeof comm);
+    int pid = container_pid();
+    int ppid = pid == 1 ? 0 : (int)getppid();
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long rss_pg = (unsigned long)(atomic_load(&g_mem_charged)) / pgsz;
+    unsigned long vsize = g_mem_max ? (unsigned long)g_mem_max : rss_pg * pgsz + (1ul << 20);
+    return snprintf(b, n,
+                    "%d (%s) R %d %d %d 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 100 %lu %lu 18446744073709551615 "
+                    "0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                    pid, comm, ppid, pid, pid, vsize, rss_pg);
+}
+// /proc/[pid]/environ -- the guest environment as NUL-separated KEY=VALUE. The authoritative source is
+// DD_GUEST_ENV (the container env the daemon forwards, "K=V\nK=V"); absent it (manual/direct mode), fall
+// back to the same defaults build_stack hands the guest. Returns the byte count written.
+static int proc_environ_text(char *b, size_t n) {
+    int o = 0;
+    const char *ge = getenv("DD_GUEST_ENV");
+    if (ge && ge[0]) {
+        for (const char *s = ge; *s;) {
+            const char *e = s;
+            while (*e && *e != '\n')
+                e++;
+            int L = (int)(e - s);
+            if (o + L + 1 > (int)n) break;
+            memcpy(b + o, s, (size_t)L);
+            o += L;
+            b[o++] = 0;
+            s = *e ? e + 1 : e;
+        }
+    } else {
+        static const char *const def[] = {"PATH=/usr/bin:/bin", "HOME=/root", "TERM=dumb", "LANG=C", NULL};
+        for (int i = 0; def[i]; i++) {
+            int L = (int)strlen(def[i]);
+            if (o + L + 1 > (int)n) break;
+            memcpy(b + o, def[i], (size_t)L);
+            o += L;
+            b[o++] = 0;
+        }
+    }
+    return o;
+}
+// A synthesized /proc/<pid>/fd directory is backed by a REAL temp dir of "N -> target" symlinks, so the
+// guest's opendir/getdents enumerate it through the ordinary fdopendir path and readlink/lstat of an
+// entry resolves the symlink. The dir persists until the guest closes its fd; we reap it lazily on the
+// next open (when the tracked fd is no longer open) and fully at exit.
+static struct {
+    int fd;
+    char path[32];
+} g_procfd_dirs[64];
+static void procfd_dir_rm(const char *path) {
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
+            char p[64];
+            snprintf(p, sizeof p, "%s/%s", path, e->d_name);
+            unlink(p);
+        }
+        closedir(d);
+    }
+    rmdir(path);
+}
+static void procfd_dirs_reap(int force) {
+    for (int i = 0; i < 64; i++) {
+        if (!g_procfd_dirs[i].path[0]) continue;
+        if (force || fcntl(g_procfd_dirs[i].fd, F_GETFD) == -1) {
+            procfd_dir_rm(g_procfd_dirs[i].path);
+            g_procfd_dirs[i].path[0] = 0;
+        }
+    }
+}
+static void procfd_dirs_atexit(void) { procfd_dirs_reap(1); }
+// Build the temp dir of fd symlinks and return its fd. The guest fd numbers ARE the host fd numbers here,
+// so this process's open fds are exactly the guest's; each link's target is the fd's path (or an
+// anon_inode placeholder for a pipe/socket/eventfd with no path). -1 on error.
+static int proc_fd_dir_open(void) {
+    static int registered = 0;
+    if (!registered) {
+        atexit(procfd_dirs_atexit);
+        registered = 1;
+    }
+    procfd_dirs_reap(0);
+    char tmpl[] = "/tmp/.ddfddirXXXXXX";
+    if (!mkdtemp(tmpl)) return -1;
+    for (int fd = 0; fd < 1024; fd++) {
+        if (fcntl(fd, F_GETFD) == -1) continue; // not open
+        char tgt[4200];
+        if (fcntl(fd, F_GETPATH, tgt) == 0 && tgt[0]) {
+            if (g_rootfs && !strncmp(tgt, g_rootfs_canon, g_rootfs_canon_len)) {
+                const char *g = tgt + g_rootfs_canon_len;
+                if (!g[0]) g = "/";
+                memmove(tgt, g, strlen(g) + 1);
+            }
+        } else {
+            snprintf(tgt, sizeof tgt, "anon_inode:[%d]", fd);
+        }
+        char link[64];
+        snprintf(link, sizeof link, "%s/%d", tmpl, fd);
+        if (symlink(tgt, link) != 0) {}
+    }
+    int d = open(tmpl, O_RDONLY | O_DIRECTORY);
+    if (d < 0) {
+        procfd_dir_rm(tmpl);
+        return -1;
+    }
+    for (int i = 0; i < 64; i++)
+        if (!g_procfd_dirs[i].path[0]) {
+            g_procfd_dirs[i].fd = d;
+            snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
+            break;
+        }
+    return d;
+}
 // Real macOS stat -> Linux struct stat (the fake S_IFCHR version corrupted libc buffering).
 // fill_linux_stat (the guest struct-stat layout) is per-arch -> frontend/<arch>/fill_stat.c
 // Synthesize the common /proc files Linux programs read (macOS has no /proc). Returns an fd
@@ -589,6 +813,17 @@ static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
 static int proc_open(const char *rp) {
     char buf[8192];
     int n = -1;
+    // Per-process files for the guest's own pid: /proc/[self|pid]/{fd,maps,smaps,status,stat,environ}.
+    const char *leaf = proc_self_leaf(rp);
+    if (leaf) {
+        if (!strcmp(leaf, "fd")) return proc_fd_dir_open();
+        if (!strcmp(leaf, "maps") || !strcmp(leaf, "task/1/maps")) return proc_maps_fd(0);
+        if (!strcmp(leaf, "smaps")) return proc_maps_fd(1);
+        if (!strcmp(leaf, "status")) n = proc_status_text(buf, sizeof buf);
+        else if (!strcmp(leaf, "stat")) n = proc_stat_text(buf, sizeof buf);
+        else if (!strcmp(leaf, "environ")) n = proc_environ_text(buf, sizeof buf);
+        if (n >= 0) return proc_text_fd(buf, n);
+    }
     if (!strcmp(rp, "/proc/cpuinfo")) {
         int nc = (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (nc < 1) nc = 1;
@@ -642,34 +877,9 @@ static int proc_open(const char *rp) {
             n = snprintf(buf, sizeof buf, "max\n");
     } else if (!strcmp(rp, "/sys/fs/cgroup/pids.current")) {
         n = snprintf(buf, sizeof buf, "%d\n", atomic_load(&g_pids_cur));
-    } else if ((!strcmp(rp, "/proc/self/maps") || !strcmp(rp, "/proc/self/task/1/maps")) && g_stack_hi) {
-        // Minimal but valid maps: glibc's pthread_getattr_np scans for the [stack] line containing %rsp.
-        // One stack line (+ a guard line below it, as the kernel shows) is enough; the guest's own mmaps
-        // aren't enumerated here, which is fine -- nothing in the guest relies on a complete map.
-        unsigned long lo = (unsigned long)g_stack_lo, hi = (unsigned long)g_stack_hi;
-        n = snprintf(buf, sizeof buf,
-                     "%012lx-%012lx ---p 00000000 00:00 0 \n"
-                     "%012lx-%012lx rw-p 00000000 00:00 0 %*s[stack]\n",
-                     lo > 0x1000 ? lo - 0x1000 : 0, lo, lo, hi, 26, "");
-    } else if (!strcmp(rp, "/proc/self/status") || !strcmp(rp, "/proc/self/stat")) {
-        // status (key:value)
-        if (rp[11] == 'a' && rp[12] == 't' && rp[13] == 'u')
-            n = snprintf(buf, sizeof buf,
-                         "Name:\tinit\nState:\tR (running)\nTgid:\t1\nPid:\t1\nPPid:\t0\n"
-                         "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\n");
-        else
-            // stat
-            n = snprintf(buf, sizeof buf, "1 (init) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0\n");
     }
     if (n < 0) return -2;
-    char tn[] = "/tmp/.ddprocXXXXXX";
-    int fd = mkstemp(tn);
-    if (fd >= 0) {
-        unlink(tn);
-        if (write(fd, buf, (size_t)n) < 0) {}
-        lseek(fd, 0, SEEK_SET);
-    }
-    return fd;
+    return proc_text_fd(buf, n);
 }
 // Linux-layout stat for a synthesized /proc or /sys file (so stat()/access() see it -- find, du,
 // container runtimes that stat /etc/mtab -> /proc/mounts, JVM that stats cgroup files, etc.).
@@ -677,6 +887,31 @@ static void fill_linux_stat(uint8_t *d, const struct stat *s);
 // -> macOS struct stat for a synth file
 static int synth_stat_raw(const char *gp, struct stat *s) {
     if (!gp || (strncmp(gp, "/proc/", 6) && strncmp(gp, "/sys/fs/cgroup/", 15))) return 0;
+    // /proc/<pid>/fd is a directory and /proc/<pid>/fd/N is a symlink -- answer these directly so stat()
+    // sees the right type WITHOUT proc_open() materializing a temp dir as a stat side effect.
+    const char *leaf = proc_self_leaf(gp);
+    if (leaf) {
+        if (!strcmp(leaf, "fd")) {
+            memset(s, 0, sizeof *s);
+            s->st_mode = S_IFDIR | 0555;
+            s->st_nlink = 2;
+            return 1;
+        }
+        if (!strncmp(leaf, "fd/", 3) && leaf[3]) {
+            int isnum = 1;
+            for (const char *t = leaf + 3; *t; t++)
+                if (*t < '0' || *t > '9') isnum = 0;
+            if (isnum) {
+                int fdn = atoi(leaf + 3);
+                char tgt[4200];
+                memset(s, 0, sizeof *s);
+                s->st_mode = S_IFLNK | 0777;
+                s->st_nlink = 1;
+                s->st_size = (fcntl(fdn, F_GETPATH, tgt) == 0 && tgt[0]) ? (off_t)strlen(tgt) : 64;
+                return 1;
+            }
+        }
+    }
     int fd = proc_open(gp);
     // -2 (not synth) or mkstemp fail
     if (fd < 0) return 0;

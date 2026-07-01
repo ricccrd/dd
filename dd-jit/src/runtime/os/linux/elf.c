@@ -544,6 +544,10 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     size_t SZ = 8u << 20;
     uint8_t *stk = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     gmap_add((uint64_t)stk, SZ); // track so execve() can reclaim the inherited stack
+    // Publish the main-stack bounds so /proc/self/maps synthesizes a [stack] line (glibc's
+    // pthread_getattr_np scans for it) and the maps/smaps builder can label the region.
+    g_stack_lo = (uint64_t)stk;
+    g_stack_hi = (uint64_t)(stk + SZ);
     uint8_t *top = stk + SZ;
     uint64_t argp[256], envp_[256];
     int envc = 0;
