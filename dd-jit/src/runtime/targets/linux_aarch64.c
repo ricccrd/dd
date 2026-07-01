@@ -83,7 +83,14 @@ static void diag_hx(char *b, uint64_t v) {
 }
 // async-signal-safe (write only)
 static void diag_crash(int s, siginfo_t *si, void *uc) {
-    (void)uc;
+    // BUG#221: mirror the normal-path nonpie_guard so CRASHDBG does not false-report faults that path
+    // resolves. A non-PIE ET_EXEC's absolute DATA ref into its low link range is served at +bias
+    // (nonpie_fixup); a fault a guest handler owns (e.g. gcc's SIGSEGV handler) is delivered to the guest
+    // (deliver_guest_fault). Only a genuinely unresolved fault falls through to the [CRASH] report below --
+    // that is the whole point of CRASHDBG. This POSIX handler covers forked children (whose inherited Mach
+    // exception port does not survive fork), so it must resolve the same faults the Mach path does.
+    if (nonpie_fixup(si, uc)) return;
+    if (deliver_guest_fault(s, si, uc)) return;
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     char b[96];
     for (int i = 0; i < 96; i++)
@@ -106,6 +113,12 @@ static void diag_hx8(char *b, uint32_t v) {
     }
 }
 static mach_port_t g_exc_port;
+// BUG#221: MiG lays exception messages out with 4-byte packing (see <mach/exc.h> `#pragma pack(push, 4)`),
+// so the 64-bit `code[]` array immediately follows `codeCnt` at a 4-byte-aligned offset with NO padding.
+// Without the pack, the compiler 8-byte-aligns `int64_t code[]` and inserts 4 bytes of padding, so `code[0]`
+// / `code[1]` read 4 bytes past the kernel's data -- the fault address (code[1]) then comes back as 0 while
+// the real address bleeds into code[0]. Match MiG's packing so the fault address is read correctly.
+#pragma pack(push, 4)
 typedef struct {
     mach_msg_header_t Head;
     mach_msg_body_t body;
@@ -116,6 +129,40 @@ typedef struct {
     int64_t code[2];
     char pad[64];
 } exc_msg_t;
+#pragma pack(pop)
+// Reply for a Mach exception (EXCEPTION_DEFAULT + MACH_EXCEPTION_CODES). RetCode=KERN_SUCCESS resumes the
+// (possibly state-modified) thread; the reply msgh_id is the request id + 100 (MiG convention).
+typedef struct {
+    mach_msg_header_t Head;
+    NDR_record_t NDR;
+    kern_return_t RetCode;
+} exc_reply_t;
+// BUG#221: the CRASHDBG Mach port must resolve the SAME faults nonpie_guard resolves on the normal run
+// path, instead of false-reporting them as crashes. nonpie_guard does nonpie_fixup() then, if that
+// declines, deliver_guest_fault() (a fault a guest handler owns -- e.g. gcc registers a SIGSEGV handler);
+// only an unresolved fault is a real crash. Mirror that here: rebuild the faulting thread's ARM/NEON state
+// into an mcontext, run the same two resolvers, and (if either resolves it) write the updated state back so
+// the KERN_SUCCESS reply resumes the thread correctly. Returns 1 if resolved (resume), 0 if a real crash.
+static int mach_resolve_fault(mach_port_t thread, int hostsig, uint64_t fault, arm_thread_state64_t *ss) {
+    _STRUCT_MCONTEXT64 mc;
+    memset(&mc, 0, sizeof mc);
+    mc.__ss = *ss;
+    mach_msg_type_number_t nc = ARM_NEON_STATE64_COUNT;
+    if (thread_get_state(thread, ARM_NEON_STATE64, (thread_state_t)&mc.__ns, &nc) != KERN_SUCCESS) return 0;
+    ucontext_t uc;
+    memset(&uc, 0, sizeof uc);
+    uc.uc_mcontext = &mc;
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_addr = (void *)fault;
+    // nonpie_fixup self-declines when the fault is not a non-PIE low-range access; deliver_guest_fault
+    // self-declines (returns 0) when the guest has no handler or the host PC is outside the code cache
+    // (a genuine engine fault) -- both then fall through to the [MACH] crash report below.
+    if (!nonpie_fixup(&si, &uc) && !deliver_guest_fault(hostsig, &si, &uc)) return 0;
+    thread_set_state(thread, ARM_THREAD_STATE64, (thread_state_t)&mc.__ss, ARM_THREAD_STATE64_COUNT);
+    thread_set_state(thread, ARM_NEON_STATE64, (thread_state_t)&mc.__ns, ARM_NEON_STATE64_COUNT);
+    return 1;
+}
 // catches faults on ALL threads (incl MAP_JIT workers)
 static void *exc_thread(void *arg) {
     (void)arg;
@@ -127,6 +174,24 @@ static void *exc_thread(void *arg) {
         arm_thread_state64_t st;
         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
         kern_return_t gs = thread_get_state(msg.thread.name, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt);
+        // BUG#221: resolve a fault the normal path would serve (non-PIE absolute data, or a guest-handled
+        // fault) and resume the thread via a KERN_SUCCESS reply, matching nonpie_guard. EXC_BAD_ACCESS maps
+        // to a guest SIGSEGV, EXC_BAD_INSTRUCTION to SIGILL; only an unresolved fault is a genuine crash.
+        int hostsig = (msg.exception == EXC_BAD_INSTRUCTION) ? SIGILL : SIGSEGV;
+        if (gs == KERN_SUCCESS && mach_resolve_fault(msg.thread.name, hostsig, (uint64_t)msg.code[1], &st)) {
+            exc_reply_t reply;
+            memset(&reply, 0, sizeof reply);
+            reply.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(msg.Head.msgh_bits), 0);
+            reply.Head.msgh_size = sizeof reply;
+            reply.Head.msgh_remote_port = msg.Head.msgh_remote_port;
+            reply.Head.msgh_local_port = MACH_PORT_NULL;
+            reply.Head.msgh_id = msg.Head.msgh_id + 100;
+            reply.NDR = NDR_record;
+            reply.RetCode = KERN_SUCCESS;
+            mach_msg(&reply.Head, MACH_SEND_MSG, sizeof reply, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE,
+                     MACH_PORT_NULL);
+            continue;
+        }
         char b[200];
         for (int i = 0; i < 200; i++)
             b[i] = ' ';
