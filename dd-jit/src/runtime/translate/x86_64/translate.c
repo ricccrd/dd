@@ -331,6 +331,15 @@ static void emit_rcl_rcr(struct insn *I, uint64_t next, int w, int rcr, int cnt_
 enum { FL_NONE, FL_SUB, FL_ADD, FL_LOGIC };
 static int g_fl_pending;
 
+// PF/AF dead-flag elimination. Unlike NZCV, x86 PF/AF have no host-flag analogue, so do_alu computes
+// and stores them eagerly to cpu->pf/cpu->af on every add/sub/logic/cmp/test/neg -- ~3-5 host insns an
+// op for flags real code almost never reads. They are DEAD when the immediately-following instruction
+// overwrites the full flags without reading any (an add/sub/logic/cmp/test/neg -- exactly the NZCV
+// dead-elim window). The main loop peeks one insn ahead (safe: a flag-killer never ends a block, so its
+// fall-through is real in-block code) and sets this; do_alu/neg then skip the PF/AF compute+store. Reset
+// per instruction by the main loop. NOLAZY leaves it 0 (eager PF/AF -- byte-identical to the old path).
+static int g_pfaf_dead;
+
 // x86 direction flag (DF), tracked at translate time. Compilers/libc emit `std`/`cld` straight-line
 // around the string op they govern (e.g. runtime.memmove's backward `std; rep movsq; cld`), so the
 // flag is always block-local -- no runtime cpu state needed. Reset to 0 (forward) at each block entry;
@@ -506,9 +515,12 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
         return;
     }
     int logical = (kind == 1 || kind == 4 || kind == 6); // or/and/xor (and test): x86 clears CF
+    int pfaf_dead = g_pfaf_dead;
+    g_pfaf_dead = 0; // consume: never leaks past this op (the main loop also resets it per instruction)
     // x86 PF: stash the result's low byte (computed from pristine a,b before alu_core may overwrite `out`).
     // PF depends only on the low 8 bits, so a non-flag, non-width-extended op gives the right source byte.
-    {
+    // Skipped when the next insn overwrites PF/AF without reading them (g_pfaf_dead) -- they're dead.
+    if (!pfaf_dead) {
         uint32_t pfop = (kind == 0) ? A_ADD : (kind == 1) ? A_ORR : (kind == 6) ? A_EOR : (kind == 4) ? A_AND : A_SUB;
         e_rrr(pfop, 25, a, b, 0, 0);
         e_pf_save(25);
@@ -809,6 +821,18 @@ static void *translate_block(uint64_t gpc) {
                 flags_materialize();
         }
 
+        // PF/AF dead-flag elimination: if THIS insn is a do_alu PF/AF producer (add/sub/logic/cmp/test/
+        // neg -- exactly insn_is_flagkill) and the NEXT insn also overwrites the flags without reading
+        // them, this op's eager PF/AF stores are dead. Peek one insn ahead -- safe because a flag-killer
+        // never ends a block, so `next` addresses real in-block code (the same bytes the loop decodes
+        // next iteration). do_alu/neg read + clear g_pfaf_dead. NOLAZY -> left 0 (eager PF/AF preserved).
+        g_pfaf_dead = 0;
+        if (lazyflags_on() && insn_is_flagkill(&I)) {
+            struct insn I2;
+            decode(next, &I2);
+            g_pfaf_dead = insn_is_flagkill(&I2);
+        }
+
         // x87 static-top tracking ends at any non-x87 instruction: spill the shadow top to
         // cpu->fptop and drop to the runtime-top model (the run only spans consecutive x87 ops, so
         // no top assumption ever crosses a non-x87 op, a branch target, or a block boundary).
@@ -873,9 +897,12 @@ static void *translate_block(uint64_t gpc) {
                     } else {
                         e_rrr(A_SUBS, 16, 31, rmv, w == 8, 0);
                         e_nzcv_save();
-                        e_pf_save(16);                // x86 PF source = result low byte (do_alu handles the w<4 path)
-                        e_af_addsub(31, rmv, 16, 19); // x86 AF = bit 4 of (0 ^ rmv ^ result)
+                        if (!g_pfaf_dead) {               // skip dead PF/AF (next insn overwrites them)
+                            e_pf_save(16);                // x86 PF source = result low byte (do_alu handles the w<4 path)
+                            e_af_addsub(31, rmv, 16, 19); // x86 AF = bit 4 of (0 ^ rmv ^ result)
+                        }
                     }
+                    g_pfaf_dead = 0;
                     rm_store(&I, w, 16);
                     gpc = next;
                     continue;
