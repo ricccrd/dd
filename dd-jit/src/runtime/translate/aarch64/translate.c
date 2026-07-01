@@ -698,57 +698,6 @@ static void emit_shadow_ret(void) {
     // UNWIND/FOREIGN -> IBTC (per-site IC + hash), NOT the dispatcher
     emit_ibranch(30);
 }
-// Fast correct ret on the stolen x30: per-site monomorphic cache on cpu->x[30] (a `br`, not a host
-// ret -> no RAS, but no stale-host_ret corruption either). Mirrors the IBTC per-site IC; the
-// dispatcher fills Lsite_tgt/Lsite_body via ic_site. Reads cpu->x[30] (x30 is stolen).
-static void emit_ret_ic(void) {
-    e_stur(16, 31, -16);
-    // stash scratch (target body_ind restores it)
-    e_stur(17, 31, -24);
-    // x16 = cpu->x[30]
-    e_ldr(16, CPUREG, 30 * 8);
-    uint32_t *p_ldrt = (uint32_t *)g_cp;
-    // ldr x17, Lsite_tgt
-    emit32(0);
-    // sub x17, x17, x16
-    emit32(0xCB000000u | (16 << 16) | (17 << 5) | 17);
-    uint32_t *p_cbnz = (uint32_t *)g_cp;
-    // cbnz x17, Lmiss
-    emit32(0);
-    uint32_t *p_ldrb = (uint32_t *)g_cp;
-    // ldr x16, Lsite_body
-    emit32(0);
-    // HIT -> body_ind
-    e_br(16);
-    uint32_t *miss = (uint32_t *)g_cp;
-    e_ldur(16, 31, -16);
-    e_ldur(17, 31, -24);
-    emit_spill();
-    e_ldr(9, 0, 30 * 8);
-    // cpu->pc = cpu->x[30]
-    e_str(9, 0, OFF_PC);
-    e_movconst(9, R_BRANCH);
-    e_str(9, 0, OFF_RSN);
-    uint32_t *p_adr = (uint32_t *)g_cp;
-    // adr x9, Lsite_tgt -> dispatcher fills the site
-    emit32(0);
-    e_str(9, 0, OFF_ICSITE);
-    e_movconst(9, (uint64_t)block_return);
-    e_br(9);
-    if ((uint64_t)g_cp & 7) emit32(0);
-    uint8_t *Lt = g_cp;
-    *(uint64_t *)g_cp = 0;
-    g_cp += 8;
-    uint8_t *Lb = g_cp;
-    *(uint64_t *)g_cp = 0;
-    g_cp += 8;
-    *p_ldrt = 0x58000000u | (((uint32_t)((Lt - (uint8_t *)p_ldrt) / 4) & 0x7FFFF) << 5) | 17;
-    *p_cbnz = 0xB5000000u | (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 17;
-    *p_ldrb = 0x58000000u | (((uint32_t)((Lb - (uint8_t *)p_ldrb) / 4) & 0x7FFFF) << 5) | 16;
-    int64_t ao = Lt - (uint8_t *)p_adr;
-    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) | (((uint32_t)((ao >> 2) & 0x7FFFF)) << 5) | 9;
-}
-
 // ---------------- the translator ----------------
 // Translate the basic block at guest address gpc; returns host entry pointer.
 // re-target a cond branch to offset d (instrs)
