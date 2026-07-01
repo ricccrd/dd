@@ -150,8 +150,8 @@ static void emit_ibranch_steal(int rn) {
     e_br(16);
     uint32_t *Lhash = (uint32_t *)g_cp;
     // --- shared hash IBTC ---
-    // ubfx x16, xTreg, #2, #13
-    emit32(0xD3423800u | (treg << 5) | 16);
+    // ubfx x16, xTreg, #2, #16  ((xTreg>>2) & (IBTC_N-1), IBTC_N=64Ki)
+    emit32(0xD3424400u | (treg << 5) | 16);
     // x17 = &g_ibtc
     e_adrp_add(17, (uint64_t)g_ibtc);
     // add x16, x17, x16, lsl #4  (slot ptr)
@@ -255,8 +255,8 @@ static void emit_ibranch(int rn) {
         e_stur(16, 31, -32);
         // lsr x17, x16, #2
         emit32(0xD342FC00u | (16 << 5) | 17);
-        // and x17, x17, #0x1FFF
-        emit32(0x92403000u | (17 << 5) | 17);
+        // and x17, x17, #0xFFFF   (IBTC_N-1, IBTC_N=64Ki)
+        emit32(0x92403C00u | (17 << 5) | 17);
         e_adrp_add(16, (uint64_t)g_ibtc);
         emit32(0x8B000000u | (17 << 16) | (4 << 10) | (16 << 5) | 16); // x16 = slot ptr
         // W5C: atomic 128-bit load of the {target,body} pair (single-copy atomic under LSE2 since the
@@ -323,8 +323,8 @@ static void emit_ibranch(int rn) {
     // HIT -> body_ind (restores x16/x17)
     e_br(16);
     uint32_t *Lhash = (uint32_t *)g_cp;
-    // ubfx x16, xRn, #2, #13  ((xRn>>2)&0x1FFF)
-    emit32(0xD3423800u | (rn << 5) | 16);
+    // ubfx x16, xRn, #2, #16  ((xRn>>2) & (IBTC_N-1), IBTC_N=64Ki)
+    emit32(0xD3424400u | (rn << 5) | 16);
     // x17 = &g_ibtc  (2 instr)
     e_adrp_add(17, (uint64_t)g_ibtc);
     // add x16, x17, x16, lsl #4  (slot ptr)
@@ -415,7 +415,7 @@ static void emit_vdbe_sdc(int rn) {
     // --- Lhash: shared-hash IBTC (byte-identical to emit_ibranch's general path) ---
     uint32_t *Lhash = (uint32_t *)g_cp;
     e_stur(17, 31, -24); // stash x17 (the shared hash + miss path need the pair)
-    emit32(0xD3423800u | (rn << 5) | 16); // ubfx x16,xRn,#2,#13
+    emit32(0xD3424400u | (rn << 5) | 16); // ubfx x16,xRn,#2,#16  (IBTC_N=64Ki)
     e_adrp_add(17, (uint64_t)g_ibtc);
     emit32(0x8B000000u | (16 << 16) | (4 << 10) | (17 << 5) | 16); // add x16,x17,x16,lsl#4
     e_ldp(17, 16, 16, 0);                                          // x17=slot.target, x16=slot.body

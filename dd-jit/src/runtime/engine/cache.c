@@ -155,7 +155,16 @@ static void map_put(uint64_t gpc, void *host, void *body) {
 // IBTC: a shared, direct-mapped hash table {guest target -> host body_ind} probed
 // inline by indirect branches. Handles polymorphic dispatch (interpreters) that a
 // per-site 1-entry cache can't. Plain data (no W^X); zeroed at start and on flush.
-#define IBTC_N 8192
+//
+// Sized at 64Ki entries (1 MiB). A direct-mapped IBTC keyed on the guest target takes a
+// conflict miss whenever two hot targets alias one slot; with multiple guest threads (V8
+// worker threads, Go) running the SAME translated code, each thread's distinct hot targets
+// evict the others' from a shared slot -- a cross-thread thrash whose miss bounces through
+// the C dispatcher (lock + map_host) every time. A 64Ki table (vs the former 8Ki) cuts the
+// aliasing pressure ~8x, so far more indirect branches hit inline and never reach the
+// dispatcher. The reader's hash width (engine/stubs.c) and both fills (the per-arch
+// G_IBTC_FILL, which key on `(target>>2) & (IBTC_N-1)`) follow this constant.
+#define IBTC_N 65536
 // 16-byte aligned so each {target,body} entry sits in a single 16-byte granule -> a
 // naturally-aligned 128-bit ldp/stp is single-copy atomic under FEAT_LSE2 (all Apple
 // Silicon). That atomicity is what lets a lock-free reader observe {target,body} as an
