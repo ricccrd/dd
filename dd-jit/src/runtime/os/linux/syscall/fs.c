@@ -27,16 +27,27 @@ static void tty_ctl_restore(const sigset_t *saved) { sigprocmask(SIG_SETMASK, sa
 // that, a directory read partially then closed poisoned the next directory opened on the same fd, which
 // silently truncated postgres initdb's template1->template0/postgres copy (dropping ~1/4 of the catalog,
 // e.g. PG_VERSION -> "base/5 is not a valid data directory" on the first client connect).
+// nm/ty are malloc'd, sized to the directory (no fixed cap -- a dir with >1024 merged entries enumerates
+// fully; #179), and freed on slot release (ovldents_free, via ovldents_drop on close / exhaustion / reuse).
 static struct {
     int fd; // guest fd + 1 (0 = free slot)
     int n, pos;
-    char nm[1024][256];
-    uint8_t ty[1024];
+    char (*nm)[256];
+    uint8_t *ty;
 } g_ovldents[16];
+static void ovldents_free(int i) {
+    free(g_ovldents[i].nm);
+    free(g_ovldents[i].ty);
+    g_ovldents[i].nm = NULL;
+    g_ovldents[i].ty = NULL;
+    g_ovldents[i].fd = 0;
+    g_ovldents[i].n = 0;
+    g_ovldents[i].pos = 0;
+}
 static void ovldents_drop(int fd) {
     for (int i = 0; i < 16; i++)
         if (g_ovldents[i].fd == fd + 1) {
-            g_ovldents[i].fd = 0;
+            ovldents_free(i);
             return;
         }
 }
@@ -1002,9 +1013,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         break;
                     }
                 if (slot < 0) slot = 0;
+                ovldents_free(slot); // free any arrays from a forced-evicted (all-16-busy) prior occupant
                 g_ovldents[slot].fd = fd + 1;
                 g_ovldents[slot].pos = 0;
-                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], g_ovldents[slot].nm, g_ovldents[slot].ty, 1024);
+                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], &g_ovldents[slot].nm, &g_ovldents[slot].ty);
             }
             uint8_t *out = (uint8_t *)a1;
             size_t o = 0;
@@ -1022,8 +1034,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 o += lr;
                 g_ovldents[slot].pos++;
             }
-            // exhausted -> free the slot
-            if (o == 0) g_ovldents[slot].fd = 0;
+            // exhausted -> free the slot (and its malloc'd nm/ty arrays)
+            if (o == 0) ovldents_free(slot);
             G_RET(c) = (uint64_t)o;
             break;
         }
@@ -1124,38 +1136,33 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
         {
             const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
-            // Magic /proc/.../exe + synthesized /proc|/sys files can ONLY live under "/proc" or "/sys"; gate
-            // both probes on that 1-char prefix so an ordinary path (the overwhelming majority of stats)
-            // skips proc_self_exe()/synth_stat() entirely instead of paying their strncmp()s every call.
-            if (gp[0] == '/' && (gp[1] == 'p' || gp[1] == 's')) {
-                char ep[1024];
-                if (proc_self_exe(gp, ep, sizeof ep)) {
-                    struct stat es;
-                    if (a3 & 0x100) { // lstat: report the magic symlink itself
-                        memset(&es, 0, sizeof es);
-                        es.st_mode = S_IFLNK | 0777;
-                        es.st_size = (off_t)strlen(ep);
-                        es.st_nlink = 1;
-                        fill_linux_stat((uint8_t *)a2, &es);
-                        G_RET(c) = 0;
-                        break;
-                    }
-                    // stat (follow): stat the actual executable file through the jail
-                    char hb[4200];
-                    const char *hp = xresolve(ep, hb, sizeof hb);
-                    if (stat(hp, &es) == 0) {
-                        fill_linux_stat((uint8_t *)a2, &es);
-                        G_RET(c) = 0;
-                        break;
-                    }
-                    // file unexpectedly missing -> fall through to the generic ENOENT path
-                }
-                if (synth_stat(gp, (uint8_t *)a2)) {
+            char ep[1024];
+            if (proc_self_exe(gp, ep, sizeof ep)) {
+                struct stat es;
+                if (a3 & 0x100) { // lstat: report the magic symlink itself
+                    memset(&es, 0, sizeof es);
+                    es.st_mode = S_IFLNK | 0777;
+                    es.st_size = (off_t)strlen(ep);
+                    es.st_nlink = 1;
+                    fill_linux_stat((uint8_t *)a2, &es);
                     G_RET(c) = 0;
                     break;
                 }
-                // synthesized /proc or /sys file
+                // stat (follow): stat the actual executable file through the jail
+                char hb[4200];
+                const char *hp = xresolve(ep, hb, sizeof hb);
+                if (stat(hp, &es) == 0) {
+                    fill_linux_stat((uint8_t *)a2, &es);
+                    G_RET(c) = 0;
+                    break;
+                }
+                // file unexpectedly missing -> fall through to the generic ENOENT path
             }
+            if (synth_stat(gp, (uint8_t *)a2)) {
+                G_RET(c) = 0;
+                break;
+            }
+            // synthesized /proc or /sys file
         }
         // cacheable: named path, follow
         if (raw && raw[0] && !(a3 & 0x100)) {

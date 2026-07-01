@@ -298,14 +298,46 @@ static void guest_from_host(const char *host, char *out, size_t n) {
     guest_from_host_raw(host, out, n);
     if (g_chroot[0]) chroot_strip(out, n);
 }
+// Append name/type to a growable (realloc-doubling) parallel array pair. Returns -1 on OOM (leaving the
+// arrays valid, just not grown) so the caller emits what it already has rather than overrunning.
+static int ovl_push(char (**names)[256], uint8_t **types, int *cap, int n, const char *nm, uint8_t ty) {
+    if (n == *cap) {
+        int nc = *cap ? *cap * 2 : 64;
+        char (*n2)[256] = realloc(*names, (size_t)nc * 256);
+        uint8_t *t2 = realloc(*types, (size_t)nc);
+        if (n2) *names = n2;
+        if (t2) *types = t2;
+        if (!n2 || !t2) return -1;
+        *cap = nc;
+    }
+    snprintf((*names)[n], 256, "%s", nm);
+    (*types)[n] = ty;
+    return 0;
+}
+// Append to the growable dedup list. Returns -1 on OOM.
+static int ovl_seen(char (**seen)[256], int *scap, int ns, const char *nm) {
+    if (ns == *scap) {
+        int nc = *scap ? *scap * 2 : 64;
+        char (*s2)[256] = realloc(*seen, (size_t)nc * 256);
+        if (!s2) return -1;
+        *seen = s2;
+        *scap = nc;
+    }
+    snprintf((*seen)[ns], 256, "%s", nm);
+    return 0;
+}
 // Overlay whiteout for a delete: remove the upper copy (if any) and drop a .wh.NAME marker in the upper.
 // Merged readdir across layers (upper first, then lowers). Higher layer wins; a .wh.NAME hides NAME
-// in all lower layers; .wh.* markers are not emitted. Fills names[]/types[], returns count.
-static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, int max) {
-    char seen[1024][256];
-    int ns = 0, nout = 0;
+// in all lower layers; .wh.* markers are not emitted. Allocates the merged name/type arrays sized to the
+// actual directory (no fixed cap -- a dir with >1024 merged entries enumerates fully; #179) and hands
+// them back via *names_out/*types_out for the caller to free(); returns the entry count (0 leaves the
+// out-pointers NULL). The internal `seen` dedup list grows with the directory too.
+static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **types_out) {
+    char(*names)[256] = NULL, (*seen)[256] = NULL;
+    uint8_t *types = NULL;
+    int cap = 0, nout = 0, scap = 0, ns = 0;
     // L=-1 is the upper (rootfs)
-    for (int L = -1; L < g_nlower && nout < max; L++) {
+    for (int L = -1; L < g_nlower; L++) {
         const char *jc = L < 0 ? g_rootfs_canon : g_lower[L].canon;
         size_t jcl = L < 0 ? g_rootfs_canon_len : g_lower[L].clen;
         char host[4300];
@@ -313,7 +345,7 @@ static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, 
         DIR *d = opendir(host);
         if (!d) continue;
         struct dirent *e;
-        while ((e = readdir(d)) && nout < max) {
+        while ((e = readdir(d))) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
             int wh = !strncmp(e->d_name, ".wh.", 4);
             const char *name = wh ? e->d_name + 4 : e->d_name;
@@ -324,11 +356,12 @@ static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, 
                     break;
                 }
             if (dup) continue;
-            // higher layer already decided this name
-            if (ns < 1024) snprintf(seen[ns++], 256, "%s", name);
+            // higher layer already decided this name -- record it (whiteouts included, so they keep
+            // hiding the lower-layer copy) in the growable dedup list
+            if (ovl_seen(&seen, &scap, ns, name) < 0) break;
+            ns++;
             if (!wh) {
-                snprintf(names[nout], 256, "%s", name);
-                types[nout] = e->d_type;
+                if (ovl_push(&names, &types, &cap, nout, name, e->d_type) < 0) break;
                 nout++;
             // whiteout -> hide, don't emit
             }
@@ -345,7 +378,7 @@ static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, 
     // mount is never asked to enumerate itself.)
     size_t glen = strlen(gdir);
     int at_root = glen == 1 && gdir[0] == '/';
-    for (int i = 0; i < g_nvols && nout < max; i++) {
+    for (int i = 0; i < g_nvols; i++) {
         const char *rest;
         if (at_root)
             rest = g_vols[i].guest + 1; // "/data" -> "data", "/x/y" -> "x/y"
@@ -368,11 +401,14 @@ static int overlay_readdir(const char *gdir, char names[][256], uint8_t *types, 
                 break;
             }
         if (dup) continue;
-        if (ns < 1024) snprintf(seen[ns++], 256, "%s", child);
-        snprintf(names[nout], 256, "%s", child);
-        types[nout] = DT_DIR;
+        if (ovl_seen(&seen, &scap, ns, child) < 0) break;
+        ns++;
+        if (ovl_push(&names, &types, &cap, nout, child, DT_DIR) < 0) break;
         nout++;
     }
+    free(seen);
+    *names_out = names;
+    *types_out = types;
     return nout;
 }
 static void overlay_whiteout(const char *guest) {
