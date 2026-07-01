@@ -1,6 +1,6 @@
 # dd — todo
 
-Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 35 commits (~27 fixes) staged since v0.9.5, NOT yet
+Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 37 commits (~28 fixes) staged since v0.9.5, NOT yet
 tagged** (holding for a clean full-matrix gate at low load once the fix-agent pipeline drains).
 
 ## Proven working this session (both arches, real software, correct output — not just "no crash")
@@ -25,6 +25,10 @@ basics matrix (fs, net, mmap, fork/exec, signals, eventfd/epoll) 0-failed both a
   guests (cc1) false-crashed under CRASHDBG though clean on the normal path. Also fixed a latent Mach
   msg struct-alignment bug (exc_msg_t missing #pragma pack(4) → fault addr read 4B past kernel data,
   reported fault=0x0). Restores CRASHDBG as a usable diagnostic on non-PIE binaries.
+- **kqueue-not-inherited-across-fork (#222)** — macOS kqueue() fds (the engine's epoll/timerfd/inotify
+  backing) don't survive fork(2), so a forked child close()ing an inherited epoll fd got EBADF →
+  ruby's timer-thread reset crashed (SIGSEGV). Child now rebuilds the dead kqueue-backed fds. General
+  fork+epoll fix (any forking program using epoll/timerfd/inotify), not ruby-specific.
 - Plus: pip .pyc coherence (#200), deep-find loop (#199), POSIX sem over fork (#192), single-file bind
   mount (#196), IPv6 + nc-u UDP loopback (#159/#206), munmap gmap-split (#212), the x86 fork+exec
   IBTC/#176 class, and the v0.9.5-tail perf/opcode work.
@@ -37,16 +41,18 @@ basics matrix (fs, net, mmap, fork/exec, signals, eventfd/epoll) 0-failed both a
   `map[string]int` hot loop (`target/tsordr201/mapt`). Nondeterminism = macOS guest-heap ASLR. Plan:
   deterministic-heap mode (mem.c) → instruction-trace mapt → fix in translate/x86_64. One fix cascades
   to 5+ runtimes.
-- [ ] **#158 — memcached-arm crash on client connect** *(parked, real, deterministic)*. Not a generic
-  arm-threading race (generic threads + valkey io-threads are solid); memcached/libevent-connection-
-  specific; likely a deterministic aarch64 codegen miscompile (bad/truncated pointer). translate/aarch64.
-- [ ] **#222 — ruby fork crash** *(agent active)*. Child dies in fork CFUNC; engine `[ASYNC BUG] close
-  event_fd EBADF` → SIGSEGV. Fork/child-fd + eventfd-across-fork family.
+- [ ] **#158 — memcached-arm crash on client connect** *(parked, real, deterministic; NARROWED)*.
+  dev-day proved tmux (musl, libevent) runs 3/3 clean on arm (full event-loop + accept/dispatch) →
+  #158 does NOT generalize to libevent; it is memcached-CONNECTION-specific (its own per-conn-struct,
+  the 0x9e0 offset). Likely a deterministic aarch64 codegen miscompile (bad/truncated pointer) hit only
+  by memcached's per-connection layout. translate/aarch64. De-risked for GA: only memcached affected.
 - [ ] **#188 — CPUID extended brand-string empty** (maxext=0x80000001 too low) → **java-x86** only
   ("SSE2 not supported" is a fallback, SSE2 bit IS set). numpy/feature-bit libs unaffected. Fix: raise
   maxext ≥0x80000004 + brand string (+ synth /proc/cpuinfo flags). Behind #201 (translate/x86_64).
-- [ ] **#224 — python-x86 startup** — (a) `_Py_HashRandomization_Init` getrandom fails, (b) segfault
-  (likely #201). Blocks x86 python/numpy.
+- [ ] **#224 — python-x86 startup** — (a) getrandom EFAULT *(ROOT FOUND, agent active)*: getrandom(278)
+  buffer missing from the dispatch.c nonpie_p rebase table → non-PIE low BSS buffer not rebased to
+  +bias → guard + arc4random_buf hit the unmapped low addr. Fix = add case 278 (+audit other engine-
+  manual-copy syscalls). (b) separate #201-class segfault after random-init. Blocks x86 python/numpy.
 - [ ] **#215 — erlang full boot** — multithreaded-fork (beam.smp) JIT corruption (fd EBADF now fixed).
 
 ## Tail (lower priority)
