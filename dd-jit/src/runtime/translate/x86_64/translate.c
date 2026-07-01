@@ -1038,6 +1038,18 @@ static void *translate_block(uint64_t gpc) {
                         byte_wb(&I, I.reg, 16);
                     else
                         e_bfi(I.reg, 16, 0, 8 * w, 1);
+                } else if (w == 1) {
+                    // byte xchg of two registers, either of which may be a high-byte (ah/bh/ch/dh) or even
+                    // the SAME underlying register (xchg %ch,%cl): materialize BOTH bytes into independent
+                    // scratch before writing either back, or the first write corrupts the second's source.
+                    // The full-register e_mov_rr swap below ignores the byte/hi8 lanes -> #136 base64 -d
+                    // byte-scramble (busybox decode_base64 repacks via `mov %esi,%ecx; xchg %ch,%cl`).
+                    int a = byte_val(&I, I.reg, 16);
+                    int b = byte_val(&I, I.rm_reg, 17);
+                    e_mov_rr(19, a, 0);
+                    e_mov_rr(23, b, 0);
+                    byte_wb(&I, I.reg, 23);
+                    byte_wb(&I, I.rm_reg, 19);
                 } else {
                     e_mov_rr(19, I.rm_reg, sf);
                     e_mov_rr(I.rm_reg, I.reg, sf);
