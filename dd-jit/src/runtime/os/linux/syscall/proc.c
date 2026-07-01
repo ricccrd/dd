@@ -82,14 +82,51 @@ static int exec_fd_is_engine(int fd) {
         if (fd == g_vols[i].fd) return 1;
     return 0;
 }
-static void exec_close_cloexec(void) {
-    int maxfd = getdtablesize();
-    if (maxfd < 0 || maxfd > (1 << 20)) maxfd = 4096;
+// Close the CLOEXEC guest fds among a bounded [0,maxfd) range (proc_pidinfo fallback path only).
+static void exec_close_cloexec_scan(int maxfd) {
+    if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
     for (int fd = 0; fd < maxfd; fd++) {
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
         if (fl >= 0 && (fl & FD_CLOEXEC)) close(fd);
     }
+}
+#include <libproc.h> // proc_pidinfo(PROC_PIDLISTFDS): enumerate only the OPEN fds (see below)
+static void exec_close_cloexec(void) {
+    // Sweep only the fds that are actually OPEN, not the whole descriptor table. The daemon raises the
+    // soft fd limit very high (getdtablesize() ~= 180K), so the old `for (fd=0; fd<getdtablesize())` scan
+    // issued ~180K fcntl(F_GETFD) syscalls -- ~21ms -- on EVERY execve. That single loop dominated the cost
+    // of an exec and made process-spawn-heavy guests (make/configure/npm/go/pip fork+exec hundreds to
+    // thousands of children) appear to hang: 21ms x thousands of execs = seconds of pure descriptor
+    // scanning. PROC_PIDLISTFDS returns just the live descriptors (a couple dozen), so the sweep becomes
+    // O(open fds). The real close-on-exec semantics are unchanged: every open non-engine CLOEXEC fd is
+    // still closed. Fall back to a bounded linear scan only if proc_pidinfo is unavailable.
+    int need = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, NULL, 0);
+    if (need <= 0) {
+        exec_close_cloexec_scan(getdtablesize());
+        return;
+    }
+    // Over-allocate a little: fds can be opened between the sizing call and the listing call.
+    int cap = need + 32 * (int)sizeof(struct proc_fdinfo);
+    struct proc_fdinfo *fds = malloc((size_t)cap);
+    if (!fds) {
+        exec_close_cloexec_scan(getdtablesize());
+        return;
+    }
+    int got = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, cap);
+    if (got <= 0) {
+        free(fds);
+        exec_close_cloexec_scan(getdtablesize());
+        return;
+    }
+    int n = got / (int)sizeof(struct proc_fdinfo);
+    for (int i = 0; i < n; i++) {
+        int fd = fds[i].proc_fd;
+        if (exec_fd_is_engine(fd)) continue;
+        int fl = fcntl(fd, F_GETFD);
+        if (fl >= 0 && (fl & FD_CLOEXEC)) close(fd);
+    }
+    free(fds);
 }
 
 // ---- runtime credential overlay (USER ns) -------------------------------------------------------
