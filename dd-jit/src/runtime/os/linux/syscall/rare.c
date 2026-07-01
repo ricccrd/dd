@@ -55,11 +55,13 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         long maxfd = sysconf(_SC_OPEN_MAX);
         if (maxfd <= 0 || maxfd > 65536) maxfd = 65536;
         if (last >= (unsigned)maxfd) last = (unsigned)maxfd - 1;
+        if (!(flags & 4)) engine_fd_vacate_range(first, last); // relocate engine fds out of the actual-close range
         for (unsigned fd = first; fd <= last; fd++) {
             if (flags & 4) { // CLOSE_RANGE_CLOEXEC
                 int fl = fcntl((int)fd, F_GETFD);
                 if (fl >= 0) fcntl((int)fd, F_SETFD, fl | FD_CLOEXEC);
             } else {
+                if (exec_fd_is_engine((int)fd)) continue; // never close a (relocated) live engine fd
                 close((int)fd);
             }
         }

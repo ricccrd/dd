@@ -1018,6 +1018,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 57: {
         int cf = (int)a0;
+        engine_fd_vacate(cf); // guest close must not clobber an engine-private fd (g_root_fd etc.) on this number
         if (cf >= 0 && cf < 1024) {
             if (g_eventfd_peer[cf]) {
                 close(g_eventfd_peer[cf] - 1);

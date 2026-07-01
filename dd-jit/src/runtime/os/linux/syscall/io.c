@@ -33,6 +33,16 @@ static void engine_fd_vacate(int newfd) {
     for (int i = 0; i < g_nvols; i++)
         engine_fd_reloc(&g_vols[i].fd, newfd);
 }
+// Vacate every engine-private fd whose NUMBER falls in [first,last] -- for a guest close_range() that would
+// otherwise close the runtime's descriptors (g_root_fd etc.). Visible to fs.c/rare.c (io.c is #included first).
+static void engine_fd_vacate_range(unsigned first, unsigned last) {
+    int fds[4] = {g_root_fd, g_gtimer_kq, g_sigfd_pipe[0], g_sigfd_pipe[1]};
+    for (int i = 0; i < 4; i++)
+        if (fds[i] >= 0 && (unsigned)fds[i] >= first && (unsigned)fds[i] <= last) engine_fd_vacate(fds[i]);
+    for (int i = 0; i < g_nvols; i++)
+        if (g_vols[i].fd >= 0 && (unsigned)g_vols[i].fd >= first && (unsigned)g_vols[i].fd <= last)
+            engine_fd_vacate(g_vols[i].fd);
+}
 
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
