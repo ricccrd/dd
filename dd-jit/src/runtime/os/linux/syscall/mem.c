@@ -35,6 +35,62 @@ static int gmap_contains(uint64_t addr, uint64_t len) {
     return 0;
 }
 
+// A munmap of [ustart,uend) removed those bytes from the address space; keep the gmap registry
+// consistent with what is STILL mapped. A full-cover unmap drops the whole entry (execve teardown no
+// longer needs it); a PARTIAL unmap must NOT drop the survivors -- otherwise the still-mapped head/tail
+// leaks past execve() teardown and gmap_find_len (the mremap in-place-grow path, case 216) can no longer
+// size it. So for each overlapping tracked mapping keep the surviving sub-region(s): resize the entry to
+// its head (tail unmap) or its tail (head unmap), and for a middle unmap add a second entry for the tail.
+// The 64 KB guard tail the anon mmap reserved is just the region's last bytes, so it rides along with
+// whichever survivor it belongs to. Multiple entries may overlap (defensive); handle them all.
+static void gmap_split_unmap(uint64_t ustart, uint64_t uend) {
+    for (int i = 0; i < g_ngmap;) {
+        uint64_t base = g_gmap[i].addr, end = base + g_gmap[i].len;
+        if (ustart >= end || uend <= base) { // no overlap
+            i++;
+            continue;
+        }
+        int keep_head = base < ustart; // [base, ustart) survives below the unmapped range
+        int keep_tail = uend < end;    // [uend, end)   survives above it
+        if (!keep_head && !keep_tail) {
+            g_gmap[i] = g_gmap[--g_ngmap]; // fully covered -> drop the whole entry (order-independent)
+            continue;
+        }
+        if (keep_head)
+            g_gmap[i].len = ustart - base; // addr unchanged; trim to the surviving head
+        else                               // keep_tail only
+            g_gmap[i].addr = uend, g_gmap[i].len = end - uend;
+        if (keep_head && keep_tail) gmap_add(uend, end - uend); // middle unmap -> tail becomes a 2nd entry
+        i++;
+    }
+}
+
+// Mirror of gmap_split_unmap for the DONTNEED private-anon registry: keep the surviving sub-region(s)
+// (with their prot) tracked so madvise(MADV_DONTNEED) still gives Linux semantics on what remains,
+// instead of forgetting the whole entry on a partial unmap. A non-anon range has no entry here and is
+// left untouched. gmap_add/anon_track append past g_ngmap/g_nanonmap, and the appended tail starts at
+// uend so it never re-overlaps [ustart,uend) -- the loop terminates.
+static void anon_split_unmap(uint64_t ustart, uint64_t uend) {
+    for (int i = 0; i < g_nanonmap;) {
+        uint64_t base = g_anonmap[i].addr, end = base + g_anonmap[i].len;
+        if (ustart >= end || uend <= base) {
+            i++;
+            continue;
+        }
+        int keep_head = base < ustart, keep_tail = uend < end, prot = g_anonmap[i].prot;
+        if (!keep_head && !keep_tail) {
+            g_anonmap[i] = g_anonmap[--g_nanonmap];
+            continue;
+        }
+        if (keep_head)
+            g_anonmap[i].len = ustart - base;
+        else
+            g_anonmap[i].addr = uend, g_anonmap[i].len = end - uend;
+        if (keep_head && keep_tail) anon_track(uend, end - uend, prot);
+        i++;
+    }
+}
+
 static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                    uint64_t a5) {
     switch (nr) {
@@ -96,16 +152,23 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // never faults an unmap of a partially/already-unmapped range.
         size_t hp = (size_t)getpagesize();
         int r;
+        uint64_t u_lo, u_hi; // the range host munmap actually cleared (empty when u_lo==u_hi)
         if ((a0 & (hp - 1)) == 0) {
             r = munmap((void *)a0, len);
+            u_lo = a0, u_hi = a0 + len;
         } else {
             uint64_t lo = (a0 + hp - 1) & ~(uint64_t)(hp - 1); // first host page fully in range
             uint64_t hi = (a0 + len) & ~(uint64_t)(hp - 1);    // end of last host page fully in range
             r = (lo < hi) ? munmap((void *)lo, (size_t)(hi - lo)) : 0;
+            u_lo = lo, u_hi = (lo < hi) ? hi : lo;
         }
-        if (r == 0) {
-            gmap_del(a0);          // drop from the execve() teardown registry
-            anon_untrack(a0, len); // and from the DONTNEED anon-range registry (covers the freed tail)
+        if (r == 0 && u_hi > u_lo) {
+            // Update both registries against the range actually unmapped. A full-cover unmap drops the
+            // entry; a partial unmap (guest trimming the head/middle of a larger mapping, e.g. ZendMM
+            // freeing an aligned over-allocation) SPLITS it so the surviving sub-region(s) stay tracked --
+            // reclaimed at execve() teardown and still findable by gmap_find_len (the mremap grow path).
+            gmap_split_unmap(u_lo, u_hi);
+            anon_split_unmap(u_lo, u_hi);
         }
         if (r == 0 && g_mem_max) {
             // uncharge (clamp >=0)
