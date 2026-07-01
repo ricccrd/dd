@@ -181,14 +181,15 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         struct kevent *chg = opt ? g_ep_chg[ep] : NULL;
         int nchg = opt ? g_ep_chgn[ep] : 0;
         int r;
-        // SA_RESTART: re-wait when interrupted by a restartable handler. kevent applies the changelist
-        // before blocking, so a restart re-waits only (changes already consumed -> pass none).
+        // #146: epoll_wait is never restarted by a handler -- re-wait only on a SPURIOUS EINTR (nothing to
+        // deliver); the moment a guest handler is runnable we return -EINTR and let the dispatcher run it.
+        // kevent applies the changelist before blocking, so a retry re-waits only (changes consumed -> none).
         do {
             r = kevent(ep, chg, nchg, kv, maxev, tp);
             ep_count();
             chg = NULL;
             nchg = 0;
-        } while (r < 0 && SVC_EINTR_RESTART(c));
+        } while (r < 0 && svc_poll_retry(c));
         if (opt) g_ep_chgn[ep] = 0; // consumed
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
@@ -322,7 +323,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             tsp = &ts;
         }
         int r;
-        do { r = pselect((int)a0, (fd_set *)a1, (fd_set *)a2, (fd_set *)a3, tsp, NULL); } while (r < 0 && SVC_EINTR_RESTART(c));
+        // #146: pselect is never restarted by a handler; retry only on a spurious EINTR (see svc_poll_retry).
+        do { r = pselect((int)a0, (fd_set *)a1, (fd_set *)a2, (fd_set *)a3, tsp, NULL); } while (r < 0 && svc_poll_retry(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -332,7 +334,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         struct timespec *ts = (void *)a2;
         int tmo = ts ? (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000) : -1;
         int r;
-        do { r = poll(fds, (nfds_t)a1, tmo); } while (r < 0 && SVC_EINTR_RESTART(c));
+        // #146: poll/ppoll is never restarted by a handler; retry only on a spurious EINTR (see svc_poll_retry).
+        do { r = poll(fds, (nfds_t)a1, tmo); } while (r < 0 && svc_poll_retry(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }

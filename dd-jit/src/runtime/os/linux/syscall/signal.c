@@ -29,6 +29,30 @@ static int syscall_should_restart(struct cpu *c) {
 // do/while around the blocking host call so the result variable stays local to each call site.
 #define SVC_EINTR_RESTART(c) (errno == EINTR && syscall_should_restart(c))
 
+// ---- #146: EINTR for a BLOCKING "never-restarted" syscall (poll/ppoll/pselect/epoll_pwait) ----
+// Per signal(7) these calls are in the set that is NEVER restarted: when a signal HANDLER interrupts them
+// they ALWAYS return EINTR, regardless of SA_RESTART -- the handler runs and the syscall does not restart.
+// The old SVC_EINTR_RESTART do/while got this wrong: whenever a pending handler had SA_RESTART it restarted
+// the host call IN PLACE, which (a) is the wrong semantics (they must return EINTR) and, worse, (b) never
+// delivered the handler because it never returned to the dispatcher -- so a forever-blocking call
+// (pause()->ppoll(NULL,0,NULL), poll(NULL,0,-1)) plus an SA_RESTART SIGCHLD reaper hung forever (#146).
+//
+// Correct rule: keep retrying in place ONLY for a SPURIOUS EINTR with nothing to deliver -- an internal/host
+// wakeup, or a SIG_DFL/IGN the host already actioned, which a real kernel would not surface to the guest at
+// all. The instant a real guest handler is runnable, STOP looping and let the syscall return -EINTR; the
+// dispatcher's maybe_deliver_signal then runs the handler (after the syscall returns) and the guest sees
+// EINTR -- exactly like Linux. Returns 1 to RETRY the host call, 0 to let it return.
+static int svc_poll_retry(struct cpu *c) {
+    if (errno != EINTR) return 0; // a genuine error -> let it propagate
+    uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
+    for (int s = 1; s <= 64; s++) {
+        if (!(p & (1ull << s))) continue;
+        if (c->sigmask & (1ull << (s - 1))) continue; // blocked -> not delivered now
+        if (g_sigact[s].handler > 1) return 0;        // a runnable guest handler -> return EINTR + deliver it
+    }
+    return 1; // nothing deliverable -> hide this EINTR and re-block (spurious/internal wakeup)
+}
+
 // Route a thread-directed signal (tkill/tgkill at `tid`). If it names ANOTHER live thread and the signal
 // has a real guest handler, deliver it to exactly that thread (its cpu->tpending) -- a process-wide
 // g_pending would let any thread (typically the sender) consume it, which breaks Go's stop-the-world
@@ -90,6 +114,39 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         G_RET(c) = 0;
         break;
     }
+#if G_O_DIRECTORY == 0x10000
+    // x86-64 pause(34): wait until a signal bearing a guest handler (unblocked under the CURRENT mask) is
+    // pending, then return -EINTR (the dispatcher delivers the handler). It has no aarch64 syscall number --
+    // asm-generic libcs lower pause() to ppoll(NULL,0,NULL) (handled by case 73), but x86-64 glibc issues the
+    // real pause syscall, which arrived UNMAPPED (CANON_X86ONLY|34) and ENOSYS'd -> a guest pause() returned
+    // immediately instead of blocking. pause == rt_sigsuspend with the current mask (no mask change); reuse
+    // that exact deliver-in-the-dispatcher discipline (case 133) rather than block on a host syscall.
+    case 0x10000 | 34: {
+        sigset_t allblk, prev, empty;
+        sigfillset(&allblk);
+        sigemptyset(&empty);
+        sigprocmask(SIG_BLOCK, &allblk, &prev); // close the check/sleep race (see case 133)
+        while (!c->exited) {
+            uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
+            int deliv = 0;
+            for (int s = 1; s <= 64; s++) {
+                uint64_t bit = 1ull << s;
+                if (!(p & bit) || (c->sigmask & (1ull << (s - 1)))) continue; // not pending / blocked
+                if (g_sigact[s].handler <= 1) { // SIG_DFL/IGN: host already actioned -> consume, keep waiting
+                    __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST);
+                    continue;
+                }
+                deliv = 1; // a real guest handler is runnable -> stop waiting (leave it pending to deliver)
+                break;
+            }
+            if (deliv) break;
+            sigsuspend(&empty); // sleep until any host signal (host_sigh sets g_pending); EINTR-returns
+        }
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+        G_RET(c) = (uint64_t)(-EINTR);
+        break;
+    }
+#endif
     // rt_sigsuspend(const sigset_t *unewset, size_t sigsetsize): atomically install the guest's arg
     // mask, wait until a signal that has a guest handler (and is unblocked under that mask) becomes
     // pending, then return -EINTR -- the handler runs and only then does sigsuspend "return" (standard
