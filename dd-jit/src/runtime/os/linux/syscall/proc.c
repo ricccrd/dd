@@ -707,6 +707,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     // clone3(clone_args*, size)
     case 435: {
+        // clone3(clone_args*, size): a hostile/buggy guest can pass a bad args pointer or a junk size;
+        // validate BEFORE any deref so it returns an errno instead of faulting the engine. -EINVAL if size
+        // is below the VER0 clone_args (we read only its first 64 bytes) or implausibly large; -EFAULT if
+        // the args struct isn't mapped.
+        if (a1 < 64 || a1 > 4096) { G_RET(c) = (uint64_t)(int64_t)(-EINVAL); break; }
+        if (!host_range_mapped(a0, a1)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
         uint64_t *ca = (uint64_t *)a0;
         uint64_t flags = ca[0];
         // CLONE_THREAD: sp = stack + stack_size

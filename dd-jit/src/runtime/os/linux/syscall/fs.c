@@ -1313,7 +1313,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // statx(dfd, path, flags, mask, buf)
         char pb[4200];
         int nofollow = (a2 & 0x100); // AT_SYMLINK_NOFOLLOW: stat the link itself, don't dereference
-        const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, nofollow);
+        const char *raw = (const char *)a1;
+        // Validate the guest pointers before any deref: a bad path or result buffer must return -EFAULT,
+        // not fault the engine (guest memory is identity-mapped host memory). atpath/raw[0] read the path;
+        // the 256-byte struct statx is written to a4 below.
+        if (raw && !host_addr_mapped((uintptr_t)raw)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
+        if (!host_range_mapped((uintptr_t)a4, 256)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
+        const char *p = atpath((int)a0, raw, pb, sizeof pb, nofollow);
         int rc, empty = (raw && !raw[0] && (a2 & 0x1000));
         const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
         char ep[1024];

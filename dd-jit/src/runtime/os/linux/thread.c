@@ -95,6 +95,18 @@ static int host_addr_mapped(uintptr_t a) {
         return 0; // nothing at/above -> unmapped
     return a >= (uintptr_t)addr && a < (uintptr_t)addr + (uintptr_t)size;
 }
+// Range form of host_addr_mapped: true iff every page spanning [a, a+len) is mapped. Used to validate a
+// guest-supplied syscall buffer (a result struct to write, an argument struct to read) BEFORE dereferencing
+// it, so a bad/garbage user pointer returns -EFAULT to the guest instead of faulting the engine (the
+// kernel's access_ok() role). A zero length is vacuously OK; an address-space-wrapping range is rejected.
+static int host_range_mapped(uintptr_t a, size_t len) {
+    if (!len) return 1;
+    uintptr_t end = a + len;
+    if (end < a) return 0; // wrap -> bogus pointer
+    for (uintptr_t p = a & ~(uintptr_t)0xfff; p < end; p += 0x1000)
+        if (!host_addr_mapped(p)) return 0;
+    return 1;
+}
 
 static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {
     clock_gettime(CLOCK_REALTIME, abs);
