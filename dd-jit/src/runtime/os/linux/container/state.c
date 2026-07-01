@@ -23,6 +23,52 @@ static int g_uid = -1,
            g_gid = -1;
 static int cuid(void) { return g_uid >= 0 ? g_uid : (int)getuid(); }
 static int cgid(void) { return g_gid >= 0 ? g_gid : (int)getgid(); }
+// ---- BUG #181: guest-set ownership persistence (chown(2)/fchownat on overlay-upper files) ----
+// Rootless: a guest chown can't change the host file's REAL owner, and #156 reports host-owned files
+// as the container uid/gid -- so a guest-set owner was silently lost (chown returned 0 but a re-stat
+// still showed the #156 default). Persist the guest-set (uid,gid) as host xattrs on the overlay
+// backing file; fill_linux_stat prefers them over the cuid/cgid default. A guest id of -1 means
+// "don't change" (POSIX chown) -> leave that xattr untouched so the other id / the default survives.
+// xattrs live on the real APFS upper file, so they persist across a re-stat AND across processes.
+#include <sys/xattr.h>
+#define DD_XATTR_UID "user.dd.uid"
+#define DD_XATTR_GID "user.dd.gid"
+static void chown_xattr_set_path(const char *hostpath, int uid, int gid, int nofollow) {
+    int opt = nofollow ? XATTR_NOFOLLOW : 0;
+    if (uid >= 0) {
+        uint32_t v = (uint32_t)uid;
+        setxattr(hostpath, DD_XATTR_UID, &v, sizeof v, 0, opt);
+    }
+    if (gid >= 0) {
+        uint32_t v = (uint32_t)gid;
+        setxattr(hostpath, DD_XATTR_GID, &v, sizeof v, 0, opt);
+    }
+}
+static void chown_xattr_set_fd(int fd, int uid, int gid) {
+    if (uid >= 0) {
+        uint32_t v = (uint32_t)uid;
+        fsetxattr(fd, DD_XATTR_UID, &v, sizeof v, 0, 0);
+    }
+    if (gid >= 0) {
+        uint32_t v = (uint32_t)gid;
+        fsetxattr(fd, DD_XATTR_GID, &v, sizeof v, 0, 0);
+    }
+}
+// Read back the guest-set ids (fd preferred when fd>=0, else hostpath). Each out is the set id or -1
+// (no xattr -> keep the #156 cuid/cgid default). Returns 1 if either id was guest-set.
+static int chown_xattr_get(const char *hostpath, int fd, int *uid, int *gid) {
+    *uid = -1;
+    *gid = -1;
+    uint32_t v;
+    if (fd >= 0) {
+        if (fgetxattr(fd, DD_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) *uid = (int)v;
+        if (fgetxattr(fd, DD_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) *gid = (int)v;
+    } else if (hostpath) {
+        if (getxattr(hostpath, DD_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) *uid = (int)v;
+        if (getxattr(hostpath, DD_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) *gid = (int)v;
+    }
+    return (*uid >= 0 || *gid >= 0);
+}
 // ---- NET ns Phase 1: port-map (docker run -p H:C). bind(:C) actually binds the host port :H;
 // getsockname reports :C back so the guest sees the port it asked for. {cport->hport} table.
 static struct {

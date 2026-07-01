@@ -883,7 +883,7 @@ static int proc_open(const char *rp) {
 }
 // Linux-layout stat for a synthesized /proc or /sys file (so stat()/access() see it -- find, du,
 // container runtimes that stat /etc/mtab -> /proc/mounts, JVM that stats cgroup files, etc.).
-static void fill_linux_stat(uint8_t *d, const struct stat *s);
+static void fill_linux_stat(uint8_t *d, const struct stat *s, const char *hostpath, int fd);
 // -> macOS struct stat for a synth file
 static int synth_stat_raw(const char *gp, struct stat *s) {
     if (!gp || (strncmp(gp, "/proc/", 6) && strncmp(gp, "/sys/fs/cgroup/", 15))) return 0;
@@ -929,6 +929,6 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
 static int synth_stat(const char *gp, uint8_t *out) {
     struct stat s;
     if (!synth_stat_raw(gp, &s)) return 0;
-    fill_linux_stat(out, &s);
+    fill_linux_stat(out, &s, NULL, -1); // synth /proc /sys file: no host backing -> no guest-chown xattr
     return 1;
 }

@@ -27,27 +27,16 @@ static void tty_ctl_restore(const sigset_t *saved) { sigprocmask(SIG_SETMASK, sa
 // that, a directory read partially then closed poisoned the next directory opened on the same fd, which
 // silently truncated postgres initdb's template1->template0/postgres copy (dropping ~1/4 of the catalog,
 // e.g. PG_VERSION -> "base/5 is not a valid data directory" on the first client connect).
-// nm/ty are malloc'd, sized to the directory (no fixed cap -- a dir with >1024 merged entries enumerates
-// fully; #179), and freed on slot release (ovldents_free, via ovldents_drop on close / exhaustion / reuse).
 static struct {
     int fd; // guest fd + 1 (0 = free slot)
     int n, pos;
-    char (*nm)[256];
-    uint8_t *ty;
+    char nm[1024][256];
+    uint8_t ty[1024];
 } g_ovldents[16];
-static void ovldents_free(int i) {
-    free(g_ovldents[i].nm);
-    free(g_ovldents[i].ty);
-    g_ovldents[i].nm = NULL;
-    g_ovldents[i].ty = NULL;
-    g_ovldents[i].fd = 0;
-    g_ovldents[i].n = 0;
-    g_ovldents[i].pos = 0;
-}
 static void ovldents_drop(int fd) {
     for (int i = 0; i < 16; i++)
         if (g_ovldents[i].fd == fd + 1) {
-            ovldents_free(i);
+            g_ovldents[i].fd = 0;
             return;
         }
 }
@@ -658,7 +647,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
-            fchownat(pfd, fin, (uid_t)a2, (gid_t)a3, (a4 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
+            int nofollow = (a4 & 0x100) ? 1 : 0;
+            fchownat(pfd, fin, (uid_t)a2, (gid_t)a3, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+            // BUG #181: the host chown is a rootless no-op; persist the guest-set owner as an xattr on
+            // the backing file so a later stat reports it (not the #156 cuid/cgid default). -1 = keep.
+            char dp[4200];
+            if (fcntl(pfd, F_GETPATH, dp) == 0) {
+                char hp[4400];
+                snprintf(hp, sizeof hp, "%s/%s", dp, fin);
+                chown_xattr_set_path(hp, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, nofollow);
+            }
             close(pfd);
             G_RET(c) = 0;
             break;
@@ -667,11 +665,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         fchownat(ATFD(a0), p, (uid_t)a2, (gid_t)a3, 0);
+        chown_xattr_set_path(p, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, 0);
         G_RET(c) = 0;
         break;
     }
     case 55: {
         fchown((int)a0, (uid_t)a1, (gid_t)a2);
+        chown_xattr_set_fd((int)a0, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2);
         G_RET(c) = 0;
         break;
         // fchown(fd,uid,gid) -- best-effort
@@ -1013,10 +1013,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         break;
                     }
                 if (slot < 0) slot = 0;
-                ovldents_free(slot); // free any arrays from a forced-evicted (all-16-busy) prior occupant
                 g_ovldents[slot].fd = fd + 1;
                 g_ovldents[slot].pos = 0;
-                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], &g_ovldents[slot].nm, &g_ovldents[slot].ty);
+                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], g_ovldents[slot].nm, g_ovldents[slot].ty, 1024);
             }
             uint8_t *out = (uint8_t *)a1;
             size_t o = 0;
@@ -1034,8 +1033,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 o += lr;
                 g_ovldents[slot].pos++;
             }
-            // exhausted -> free the slot (and its malloc'd nm/ty arrays)
-            if (o == 0) ovldents_free(slot);
+            // exhausted -> free the slot
+            if (o == 0) g_ovldents[slot].fd = 0;
             G_RET(c) = (uint64_t)o;
             break;
         }
@@ -1144,7 +1143,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     es.st_mode = S_IFLNK | 0777;
                     es.st_size = (off_t)strlen(ep);
                     es.st_nlink = 1;
-                    fill_linux_stat((uint8_t *)a2, &es);
+                    fill_linux_stat((uint8_t *)a2, &es, NULL, -1); // synth /proc/self/exe symlink
                     G_RET(c) = 0;
                     break;
                 }
@@ -1152,7 +1151,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char hb[4200];
                 const char *hp = xresolve(ep, hb, sizeof hb);
                 if (stat(hp, &es) == 0) {
-                    fill_linux_stat((uint8_t *)a2, &es);
+                    fill_linux_stat((uint8_t *)a2, &es, hp, -1);
                     G_RET(c) = 0;
                     break;
                 }
@@ -1172,7 +1171,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 rc = r < 0 ? -errno : 0;
                 mc_store(p, rc, &s);
             }
-            if (rc == 0) fill_linux_stat((uint8_t *)a2, &s);
+            if (rc == 0) fill_linux_stat((uint8_t *)a2, &s, p, -1);
             G_RET(c) = (uint64_t)(int64_t)rc;
             break;
         }
@@ -1185,7 +1184,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        fill_linux_stat((uint8_t *)a2, &s);
+        // guest-chown xattr lives on the host backing file: read via fd for AT_EMPTY_PATH, else by path
+        fill_linux_stat((uint8_t *)a2, &s, empty_self ? NULL : p, empty_self ? (int)a0 : -1);
         G_RET(c) = 0;
         break;
     }
@@ -1197,7 +1197,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        fill_linux_stat((uint8_t *)a1, &s);
+        fill_linux_stat((uint8_t *)a1, &s, NULL, (int)a0);
         G_RET(c) = 0;
         break;
     }
