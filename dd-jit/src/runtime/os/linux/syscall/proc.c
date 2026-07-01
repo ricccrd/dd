@@ -92,6 +92,41 @@ static void exec_close_cloexec(void) {
     }
 }
 
+// ---- runtime credential overlay (USER ns) -------------------------------------------------------
+// cuid()/cgid() give the container's CONFIGURED identity (default 0=root); a privileged guest may drop
+// to an unprivileged id at runtime (e.g. apt forks /usr/lib/apt/methods/http, which switches to `_apt`
+// via setgroups+setresgid/setgid+setresuid/setuid and then VERIFIES the drop took -- and that it can
+// NOT regain root). A blanket "set*id always returns 0" left the getters reporting the original id, so
+// apt aborted ("cannot switch group"). We track real/effective/saved uid+gid and honour the Linux
+// permission model (a euid==0 task is privileged; otherwise a new id must already be one of its three)
+// so both the drop AND the regain-must-fail check behave as on Linux. The base is cuid()/cgid(); per
+// process (fork inherits the copy, exec re-seeds from the container default), matching the guest's view.
+static int g_cred_init = 0;
+static int g_ruid, g_euid, g_suid; // real / effective / saved-set uid
+static int g_rgid, g_egid, g_sgid; // real / effective / saved-set gid
+static void cred_init(void) {
+    if (g_cred_init) return;
+    g_ruid = g_euid = g_suid = cuid();
+    g_rgid = g_egid = g_sgid = cgid();
+    g_cred_init = 1;
+}
+static int cred_euid(void) {
+    cred_init();
+    return g_euid;
+}
+static int cred_egid(void) {
+    cred_init();
+    return g_egid;
+}
+// An unprivileged task (euid != 0) may only set an id it already holds (real/effective/saved). -1 means
+// "leave unchanged". Returns 1 if id is permitted, 0 -> EPERM.
+static int uid_permitted(int id) {
+    return id == -1 || g_euid == 0 || id == g_ruid || id == g_euid || id == g_suid;
+}
+static int gid_permitted(int id) {
+    return id == -1 || g_euid == 0 || id == g_rgid || id == g_egid || id == g_sgid;
+}
+
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -239,26 +274,104 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = (r == -1 && errno) ? (uint64_t)(-errno) : (uint64_t)(20 - r);
         break;
     }
-    case 144:
-    case 146:
-    case 147:
-    // setgid/setfsuid/setresuid/setresgid -> ok
-    case 149: G_RET(c) = 0; break;
-    // getpgid
-    case 145: G_RET(c) = (uint64_t)getpgrp(); break;
+    // setuid(uid): a privileged task sets real+eff+saved; an unprivileged one may only set euid to an id
+    // it already holds. Honoured against the credential overlay so apt's _apt drop (and its "can't regain
+    // root" check) behave as on Linux. (See cred_init above.)
+    case 146: {
+        cred_init();
+        int u = (int)a0;
+        if (!uid_permitted(u)) {
+            G_RET(c) = (uint64_t)(-(int64_t)EPERM);
+            break;
+        }
+        if (g_euid == 0)
+            g_ruid = g_suid = u;
+        g_euid = u;
+        G_RET(c) = 0;
+        break;
+    }
+    // setgid(gid): symmetric to setuid above.
+    case 144: {
+        cred_init();
+        int gg = (int)a0;
+        if (!gid_permitted(gg)) {
+            G_RET(c) = (uint64_t)(-(int64_t)EPERM);
+            break;
+        }
+        if (g_euid == 0)
+            g_rgid = g_sgid = gg;
+        g_egid = gg;
+        G_RET(c) = 0;
+        break;
+    }
+    // setresuid(ruid,euid,suid): each (uid_t)-1 leaves that id unchanged; every requested id must be
+    // permitted (privileged, or already held). glibc's seteuid() arrives here as setresuid(-1,euid,-1).
+    case 147: {
+        cred_init();
+        int r = (int)a0, e = (int)a1, s = (int)a2;
+        if (!uid_permitted(r) || !uid_permitted(e) || !uid_permitted(s)) {
+            G_RET(c) = (uint64_t)(-(int64_t)EPERM);
+            break;
+        }
+        if (r != -1)
+            g_ruid = r;
+        if (e != -1)
+            g_euid = e;
+        if (s != -1)
+            g_suid = s;
+        G_RET(c) = 0;
+        break;
+    }
+    // setresgid(rgid,egid,sgid): symmetric. glibc's setegid() arrives here as setresgid(-1,egid,-1).
+    case 149: {
+        cred_init();
+        int r = (int)a0, e = (int)a1, s = (int)a2;
+        if (!gid_permitted(r) || !gid_permitted(e) || !gid_permitted(s)) {
+            G_RET(c) = (uint64_t)(-(int64_t)EPERM);
+            break;
+        }
+        if (r != -1)
+            g_rgid = r;
+        if (e != -1)
+            g_egid = e;
+        if (s != -1)
+            g_sgid = s;
+        G_RET(c) = 0;
+        break;
+    }
+    // setreuid(ruid,euid): -1 leaves an id unchanged. The kernel moves saved-uid to the new euid whenever
+    // the real uid is changed, or the euid is set to a value other than the previous real uid.
+    case 145: {
+        cred_init();
+        int r = (int)a0, e = (int)a1, old_ruid = g_ruid;
+        if (!uid_permitted(r) || !uid_permitted(e)) {
+            G_RET(c) = (uint64_t)(-(int64_t)EPERM);
+            break;
+        }
+        if (r != -1)
+            g_ruid = r;
+        if (e != -1)
+            g_euid = e;
+        if (r != -1 || (e != -1 && e != old_ruid))
+            g_suid = g_euid;
+        G_RET(c) = 0;
+        break;
+    }
     case 148: {
-        // getresuid(r,e,s)
-        if (a0) *(uint32_t *)a0 = cuid();
-        if (a1) *(uint32_t *)a1 = cuid();
-        if (a2) *(uint32_t *)a2 = cuid();
+        // getresuid(r,e,s) -- report the overlay so a runtime drop is observed (apt verifies all three).
+        cred_init();
+        if (a0) *(uint32_t *)a0 = (uint32_t)g_ruid;
+        if (a1) *(uint32_t *)a1 = (uint32_t)g_euid;
+        if (a2) *(uint32_t *)a2 = (uint32_t)g_suid;
         G_RET(c) = 0;
         break;
     }
     case 150: {
-        // getresgid(r,e,s)
-        if (a0) *(uint32_t *)a0 = cgid();
-        if (a1) *(uint32_t *)a1 = cgid();
-        if (a2) *(uint32_t *)a2 = cgid();
+        // getresgid(r,e,s) -- report the overlay (see getresuid above).
+        cred_init();
+        if (a0) *(uint32_t *)a0 = (uint32_t)g_rgid;
+        if (a1) *(uint32_t *)a1 = (uint32_t)g_egid;
+        if (a2) *(uint32_t *)a2 = (uint32_t)g_sgid;
         G_RET(c) = 0;
         break;
     }
@@ -295,10 +408,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     case 158: {
         if (g_gid >= 0) {
-            if ((int)a0 >= 1 && a1) *(gid_t *)a1 = (gid_t)cgid();
+            // getgroups -> [effective gid]. Tracking the overlay's egid means apt's drop to _apt's group
+            // is reflected here too (it setgroups(1,&_apt_gid) right before switching).
+            if ((int)a0 >= 1 && a1) *(gid_t *)a1 = (gid_t)cred_egid();
             G_RET(c) = 1;
             break;
-            // getgroups -> [container gid]
         }
         int r = getgroups((int)a0, (gid_t *)a1);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -371,12 +485,18 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = (container_pid() == 1) ? 0 : (uint64_t)getppid();
         // getppid (init's parent is 0 in the ns)
         break;
+    // getuid/geteuid -> container uid (0=root by default), reflecting any runtime drop (apt -> _apt).
     case 174:
-    // getuid/geteuid -> container uid (0=root by default)
-    case 175: G_RET(c) = (uint64_t)cuid(); break;
-    case 176:
+        cred_init();
+        G_RET(c) = (uint64_t)g_ruid;
+        break;
+    case 175: G_RET(c) = (uint64_t)cred_euid(); break;
     // getgid/getegid
-    case 177: G_RET(c) = (uint64_t)cgid(); break;
+    case 176:
+        cred_init();
+        G_RET(c) = (uint64_t)g_rgid;
+        break;
+    case 177: G_RET(c) = (uint64_t)cred_egid(); break;
     // gettid -- a UNIQUE per-thread id (unlike getpid, which is the shared tgid). The init thread keeps
     // c->tid==0 and reports the container pid (==1, where tid==tgid as on Linux); each spawned thread
     // carries its own id (spawn_thread). A correct gettid is load-bearing for runtimes that key thread
