@@ -177,16 +177,14 @@ pub fn group() -> ScenGroup {
             .xfail(&[Target::ArmLinux]),
         scen("databases/redis-dbsize", "redis:7-alpine")
             .exec(&redis("redis-cli mset a 1 b 2 c 3 >/dev/null; redis-cli dbsize"))
-            .has("3")
-            .xfail(&[Target::ArmLinux]),
+            .has("3"),
         scen("databases/redis-strlen", "redis:7-alpine")
             .exec(&redis("redis-cli set k 0123456789 >/dev/null; redis-cli strlen k"))
             .has("10")
             .xfail(&[Target::ArmLinux]),
         scen("databases/redis-hash-hlen", "redis:7-alpine")
             .exec(&redis("redis-cli hset h a 1 b 2 c 3 >/dev/null; redis-cli hlen h"))
-            .has("3")
-            .xfail(&[Target::ArmLinux]),
+            .has("3"),
 
         // ---- valkey (OSS redis fork) ----------------------------------------------------------------
         scen("databases/valkey-agg-8", "valkey/valkey:8-alpine")

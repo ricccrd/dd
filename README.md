@@ -97,31 +97,31 @@ it either way). dd's JIT beats qemu on **9 of 10** workloads, dramatically on fl
 
 | Workload | VM (qemu) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
-| float n-body | 5.18s | 0.20s | **26× faster** |
-| matmul | 8.08s | 0.65s | **12× faster** |
-| mandelbrot | 7.62s | 0.81s | **9.4× faster** |
-| SQLite (600k rows) | 2.88s | 0.73s | **4.0× faster** |
-| qsort | 3.86s | 1.36s | 2.8× faster |
-| memcpy | 2.30s | 0.92s | 2.5× faster |
-| int sieve | 1.26s | 0.63s | 2.0× faster |
-| text-scan (wc/grep) | 1.36s | 0.88s | 1.6× faster |
-| SHA-256 | 2.60s | 1.83s | 1.4× faster |
-| base64 | 4.10s | 4.71s | 0.87× (1.15× slower) |
+| float n-body | 5.39s | 0.23s | **24× faster** |
+| mandelbrot | 7.81s | 0.83s | **9.4× faster** |
+| matmul | 8.21s | 1.37s | **6.0× faster** |
+| SQLite (600k rows) | 2.99s | 1.01s | **3.0× faster** |
+| qsort | 3.91s | 1.68s | 2.3× faster |
+| memcpy | 2.40s | 1.10s | 2.2× faster |
+| text-scan (wc/grep) | 1.42s | 1.11s | 1.3× faster |
+| int sieve | 1.31s | 1.04s | 1.25× faster |
+| SHA-256 | 2.72s | 2.44s | 1.1× faster |
+| base64 | 4.28s | 5.39s | 0.79× (1.26× slower) |
 
 **aarch64 containers — dd vs a native VM** (the VM runs arm64 at full native speed — the hardest bar):
 
 | Workload | VM (native) | dd (no VM) | dd vs VM |
 |---|--:|--:|:--:|
-| int sieve | 0.74s | 0.48s | **1.55× faster** |
-| mandelbrot | 0.76s | 0.74s | 1.03× faster |
-| matmul | 0.63s | 0.64s | ~parity |
-| memcpy | 0.53s | 0.54s | ~parity |
-| base64 | 0.65s | 0.65s | ~parity |
-| float n-body | 0.16s | 0.17s | ~parity |
-| SHA-256 | 0.77s | 0.80s | ~parity |
-| qsort | 0.79s | 1.05s | 1.33× slower |
-| text-scan (wc/grep) | 0.49s | 0.66s | 1.35× slower |
-| SQLite (600k rows) | 0.35s | 0.52s | 1.48× slower |
+| int sieve | 0.75s | 0.48s | **1.58× faster** |
+| mandelbrot | 0.79s | 0.77s | 1.03× faster |
+| matmul | 0.66s | 0.66s | ~parity |
+| memcpy | 0.55s | 0.56s | ~parity |
+| base64 | 0.68s | 0.68s | ~parity |
+| float n-body | 0.17s | 0.17s | ~parity |
+| SHA-256 | 0.80s | 0.82s | ~parity |
+| qsort | 0.83s | 1.10s | 1.33× slower |
+| text-scan (wc/grep) | 0.51s | 0.68s | 1.35× slower |
+| SQLite (600k rows) | 0.36s | 0.62s | 1.71× slower |
 
 dd runs arm64 **compute at native speed** — ahead on int sieve + mandelbrot, at parity on SHA-256, matmul,
 memcpy, n-body, and base64. The remaining gaps are **indirect-branch / syscall-heavy** work — qsort (~1.3×),

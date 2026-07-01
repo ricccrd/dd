@@ -14,9 +14,11 @@ pub mod net;        // tcp/udp/unix/sockopt/nonblock/sendmsg/poll-loops/half-clo
 pub mod soak;       // long-run JIT machinery: code-cache/IBTC/SMC/churn endurance
 pub mod darwin;     // macOS-native (lighter-touch): kqueue/sysctl/mach/Mach-O ABI corners
 pub mod completeness; // syscall-table + x86-64/aarch64 opcode COMPLETENESS probes (no images)
+pub mod memory;     // RSS leak / sustainability probes (guest-visible memory growth over churn)
 
 pub fn all() -> Vec<Group> {
     let mut g = vec![];
+    g.extend(memory::groups());
     g.extend(abi::groups());
     g.extend(libc::groups());
     g.extend(posix::groups());

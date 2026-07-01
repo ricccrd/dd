@@ -135,11 +135,11 @@ pub fn group() -> ScenGroup {
     v.push(scen("toolchains/gcc-latest-banner", "gcc:latest")
         .exec("gcc --version | head -1").has("gcc (GCC)").timeout(120).long().xfail(&BOTH));
     v.push(scen("toolchains/gcc-latest-make-banner", "gcc:latest")
-        .exec("make --version | head -1").has("GNU Make").timeout(120).long().xfail(&BOTH));
+        .exec("make --version | head -1").has("GNU Make").timeout(120).long().xfail(&[Target::AmdLinux]));
     v.push(scen("toolchains/gcc-latest-ld-banner", "gcc:latest")
-        .exec("ld --version | head -1").has("GNU ld").timeout(120).long().xfail(&BOTH));
+        .exec("ld --version | head -1").has("GNU ld").timeout(120).long().xfail(&[Target::AmdLinux]));
     v.push(scen("toolchains/gcc-latest-as-banner", "gcc:latest")
-        .exec("as --version | head -1").has("GNU assembler").timeout(120).long().xfail(&BOTH));
+        .exec("as --version | head -1").has("GNU assembler").timeout(120).long().xfail(&[Target::AmdLinux]));
 
     // pinned gcc banners — no documented gap; may pass on dd (not xfailed).
     v.push(scen("toolchains/gcc-14-banner", "gcc:14")

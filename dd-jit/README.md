@@ -29,34 +29,42 @@ A *target* is a `(guest OS, guest ISA)` pair. Three are built today, all hosted 
 ## Layout
 
 ```
-src/lib.rs                       Rust: Guest (3 targets), SpawnConfig, the built-binary paths
-build.rs                         compiles + codesigns targets/<target>.c for each target
-.clang-format                    C style (4-space, 120-col) — `make fmt`
+src/lib.rs                        Rust: Guest (3 targets), SpawnConfig, the built-binary paths
+build.rs                          compiles + codesigns targets/<target>.c for each target
+.clang-format                     C style (4-space, 120-col) — `make fmt`
 src/runtime/
-  include/cpu_{aarch64,x86_64}.h guest CPU layouts
-  jit/                           host-aarch64 engine: code cache, emitters, dispatcher        (host ISA)
-  frontend/aarch64/              aarch64 transliterator (mangle + §B + LSE + depth-gate + PAC) (guest ISA)
-  frontend/x86_64/               x86-64 JIT (jit86): cache, emit+SSE+x87, decode, translate,
-                                 container, service, dispatch, elf                            (guest ISA)
-  os/linux/                      Linux personality: service (one sorted switch), elf, threads, signals,
-  os/linux/container/              path-jail VFS, overlay, netns, cgroup, /proc synth          (guest OS)
-  os/darwin/jitdarwin.c          macOS personality (jitdarwin, whole-imported)                (guest OS)
-  hal/darwin/                    host primitives (seam; currently inline)                      (host OS)
-  targets/{linux_aarch64,linux_x86_64,darwin_aarch64}.c   one unity TU per target
+  include/cpu_{aarch64,x86_64}.h  guest CPU layouts
+  engine/                         host-ISA-agnostic JIT core: code cache, dispatcher, stubs   (engine)
+  host/arm64/asm.c                ARM64 assembler — emit32 + the e_* encoders                 (host ISA)
+  translate/aarch64/              aarch64→ARM64 frontend (mangle + §B + LSE + depth-gate + PAC)(guest ISA)
+  translate/x86_64/               x86-64→ARM64 frontend (jit86): decode, emit, avx, x86_ops,
+                                  elf, pcache + translate/{alu,mov,shift,repstr,x87,trace}.c   (guest ISA)
+  os/linux/                       Linux personality: syscall/ (split dispatcher), elf, thread,
+  os/linux/container/               signal; path-jail VFS, overlay, netns, /proc synth         (guest OS)
+  os/darwin/                      macOS personality: jitdarwin DBT + jail/                     (guest OS)
+  targets/{linux_aarch64,linux_x86_64,darwin_aarch64}.c   one unity TU per target, entry dd_run
 ```
+
+The two **axes** are now distinct directories: an `engine/` (host-ISA-agnostic JIT core) and a
+`host/arm64/` assembler form the *host* side; `translate/<isa>/` frontends and `os/<os>/` personalities
+form the *guest* side. A `targets/<os>_<isa>.c` unity TU `#include`s one frontend + one OS personality
++ the shared engine/host, and exposes a single entry, `dd_run`.
 
 ## Decomposition state
 
-- **linux/aarch64** — fully decomposed into `jit/` + `os/linux/` + `frontend/aarch64/`; syscalls are one
-  sorted `service.c` (no `.inc` fragments); clang-formatted, comments above the code.
-- **linux/x86_64 (jit86)** — decomposed into `frontend/x86_64/` modules (mirrors the aarch64 split) and
-  **already sharing the whole `os/linux/` personality** (`service.c`, the container overlay/jail/cgroup/
+- **linux/aarch64** — fully decomposed into `engine/` + `host/arm64/` + `translate/aarch64/` +
+  `os/linux/`. The syscall dispatcher is split by family under `os/linux/syscall/` (`fs.c`, `io.c`,
+  `mem.c`, `net.c`, `proc.c`, `signal.c`, `sysv.c`, `time.c`, `event.c`, …) behind `dispatch.c` — no
+  `.inc` fragments; clang-formatted, comments above the code.
+- **linux/x86_64 (jit86)** — decomposed into `translate/x86_64/` modules (mirrors the aarch64 split, with
+  the big instruction switch further split into `translate/{alu,mov,shift,repstr,x87,trace}.c`) and
+  **already sharing the whole `os/linux/` personality** (the syscall split, the container overlay/jail/
   netns, `signal.c`, `thread.c`, `fscache.c`) through the `abi.h` `G_*` seam + the `sysmap.h`
   syscall-number→canonical map. It still carries its *own* cpu struct (genuinely per-ISA) and its *own*
-  engine (`frontend/x86_64/{cache,emit,dispatch}.c`) rather than the shared `jit/`.
-- **darwin/aarch64 (jitdarwin)** — minimal POC, brought in *whole* under `os/darwin/`.
+  engine glue (`translate/x86_64/engine_glue.c`, `pcache.c`) rather than the shared `engine/`.
+- **darwin/aarch64 (jitdarwin)** — minimal native-macOS DBT + the DYLD-interpose `jail/`, under `os/darwin/`.
 
 **Dedup (the remaining refactor):** the `os/linux/` half is done for jit86; what's left is lifting its
-engine onto the shared `jit/` (and jitdarwin onto `jit/` + a darwin personality) via cpu-access
-accessors. The aarch64 host codegen is identical across all three — only the decoder, the OS
+engine glue onto the shared `engine/` (and jitdarwin onto `engine/` + the darwin personality) via
+cpu-access accessors. The `host/arm64/` codegen is identical across all three — only the decoder, the OS
 personality, and the syscall numbers differ. End state: one engine, thin per-target frontends.
