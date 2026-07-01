@@ -180,16 +180,28 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
-        // eventfd write: ADD to the counter (not a raw pipe write); signal the pipe readable on 0->positive.
+        // eventfd write: ADD to the counter (not a raw pipe write); regenerate the readable edge.
         if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) {
             if (a2 < 8) { G_RET(c) = (uint64_t)(-EINVAL); break; }
             // a1 is a raw guest pointer we read directly -> validate before the deref (covers NULL too)
             if (!host_range_mapped((uintptr_t)a1, 8)) { G_RET(c) = (uint64_t)(-EFAULT); break; }
             uint64_t add = *(uint64_t *)a1;
             if (add == 0xffffffffffffffffULL) { G_RET(c) = (uint64_t)(-EINVAL); break; }
-            uint64_t old = g_eventfd_count[wfd];
-            g_eventfd_count[wfd] = old + add;
-            if (old == 0 && add > 0) { char b = 1; if (write(g_eventfd_peer[wfd] - 1, &b, 1) < 0) {} }
+            g_eventfd_count[wfd] += add;
+            // Linux wakes epoll edge-triggered waiters on EVERY write, not just the 0->positive transition.
+            // A waker eventfd that is never drained (mio/tokio's cross-thread wakeup) would otherwise lose
+            // its 2nd and later wakeups: the backing pipe already holds a byte, so an EV_CLEAR kqueue filter
+            // never re-fires and a blocked epoll_wait hangs forever. Drain the pipe to exactly one fresh byte
+            // so each write produces a new readable edge, bounded even when the reader never keeps up.
+            if (add > 0) {
+                int fl = fcntl(wfd, F_GETFL);
+                if (fl >= 0 && !(fl & O_NONBLOCK)) fcntl(wfd, F_SETFL, fl | O_NONBLOCK);
+                char buf[64];
+                while (read(wfd, buf, sizeof buf) > 0) {}
+                if (fl >= 0 && !(fl & O_NONBLOCK)) fcntl(wfd, F_SETFL, fl);
+                char b = 1;
+                if (write(g_eventfd_peer[wfd] - 1, &b, 1) < 0) {}
+            }
             G_RET(c) = 8;
             break;
         }
