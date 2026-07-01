@@ -1,7 +1,10 @@
 # dd — todo
 
-Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 37 commits (~28 fixes) staged since v0.9.5, NOT yet
-tagged** (holding for a clean full-matrix gate at low load once the fix-agent pipeline drains).
+Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 40 commits (~31 fixes) staged since v0.9.5, NOT yet
+tagged.** FINALIZING FOR SHOWCASE (2026-07-01): validate docker run / exec -it / interactive shells /
+databases, then TAG + PUSH (push now authorized). Landed since last note: #224a getrandom non-PIE
+rebase, #219b TIOCGPTPEER (glibc openpty/forkpty). Open important: #201 (agent active) + docker
+showcase validation (agent active).
 
 ## Proven working this session (both arches, real software, correct output — not just "no crash")
 postgres · mariadb · nginx (1000/1000 req) · redis (500k ops) · sqlite (WAL, 100k rows) · ruby · perl ·
