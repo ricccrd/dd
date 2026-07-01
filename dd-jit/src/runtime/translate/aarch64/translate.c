@@ -1614,6 +1614,16 @@ static void *translate_block(uint64_t gpc) {
 // correct). Caller is the dispatcher between block runs, so guest state is settled.
 static void tier2_promote(uint64_t gpc) {
     if (g_threaded || g_notier2) return;
+    // Promotion emits a fresh (folded) block at g_cp, but it runs from the dispatcher's post-run reason
+    // handling -- OUTSIDE the cache-full check, which only fires on a translate MISS (dispatch.c). A run of
+    // hot loops that all reach threshold between two misses promotes back-to-back with NO intervening
+    // headroom test, so near a nearly-full cache the emit runs past g_cache+CACHE_SZ and scribbles over
+    // whatever the kernel mapped after the arena (guest heap/image) -> a corrupted guest pointer surfaces
+    // much later as a wild store (#207/#158: window-gated, common only when the cache churns/flushes often).
+    // Demand the same headroom a normal translate does; if it's not there, skip promotion. That is always
+    // safe: the loop keeps running its correct tier-1 body (the spent down-counter simply wraps past 0 and
+    // stops re-raising R_TIER2), and it can promote later once a flush has reset the arena.
+    if (g_cp + (1u << 16) > g_cache + CACHE_SZ) return;
     int mi = map_idx(gpc);
     if (mi < 0) return;
     pthread_jit_write_protect_np(0);
