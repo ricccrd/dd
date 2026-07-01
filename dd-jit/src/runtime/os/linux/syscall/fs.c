@@ -810,7 +810,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char ep[1024];
                 if (proc_self_exe(rp, ep, sizeof ep)) {
                     char hb[4200];
-                    const char *hp = xresolve(ep, hb, sizeof hb);
+                    const char *hp = xresolve_overlay(ep, hb, sizeof hb);
                     int ef = open(hp, O_RDONLY);
                     if (ef >= 0 && (lf & 0x80000)) fcntl(ef, F_SETFD, FD_CLOEXEC); // honor O_CLOEXEC
                     G_RET(c) = ef < 0 ? (uint64_t)(-errno) : (uint64_t)ef;
@@ -1212,7 +1212,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 }
                 // stat (follow): stat the actual executable file through the jail
                 char hb[4200];
-                const char *hp = xresolve(ep, hb, sizeof hb);
+                const char *hp = xresolve_overlay(ep, hb, sizeof hb);
                 if (stat(hp, &es) == 0) {
                     fill_linux_stat((uint8_t *)a2, &es, hp, -1);
                     G_RET(c) = 0;
@@ -1345,7 +1345,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 rc = 0;
             } else {
                 char hb[4200];
-                const char *hp = xresolve(ep, hb, sizeof hb);
+                const char *hp = xresolve_overlay(ep, hb, sizeof hb);
                 rc = stat(hp, &s) == 0 ? 0 : -errno;
             }
         } else if (synth_stat_raw(gp, &s)) {
@@ -1448,7 +1448,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char ep[1024];
         if (proc_self_exe((const char *)a1, ep, sizeof ep)) {
             char hb[4200];
-            const char *hp = xresolve(ep, hb, sizeof hb);
+            const char *hp = xresolve_overlay(ep, hb, sizeof hb);
             int r = access(hp, (int)a2);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
