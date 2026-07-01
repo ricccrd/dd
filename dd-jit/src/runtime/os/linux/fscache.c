@@ -115,8 +115,6 @@ static struct mcent {
     int rc;
     struct stat st;
 } g_mc[MCACHE_N];
-// PROF
-static uint64_t g_mc_hits, g_mc_miss;
 static uint64_t mc_hash(const char *s) {
     uint64_t h = 1469598103934665603ull;
     for (; *s; s++) {
@@ -129,11 +127,11 @@ static int mc_lookup(const char *p, int *rc, struct stat *out) {
     if (!p || strlen(p) >= 192) return 0;
     CLK;
     int hit = 0;
-    struct mcent *e = &g_mc[mc_hash(p) & (MCACHE_N - 1)];
-    if (e->hash == mc_hash(p) && !strcmp(e->path, p)) {
+    uint64_t h = mc_hash(p);
+    struct mcent *e = &g_mc[h & (MCACHE_N - 1)];
+    if (e->hash == h && !strcmp(e->path, p)) {
         *rc = e->rc;
         *out = e->st;
-        g_mc_hits++;
         hit = 1;
     }
     CUL;
@@ -144,19 +142,20 @@ static void mc_store(const char *p, int rc, const struct stat *s) {
     // don't cache mutable volume paths
     if (g_nvols && strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) return;
     CLK;
-    struct mcent *e = &g_mc[mc_hash(p) & (MCACHE_N - 1)];
-    e->hash = mc_hash(p);
+    uint64_t h = mc_hash(p);
+    struct mcent *e = &g_mc[h & (MCACHE_N - 1)];
+    e->hash = h;
     strcpy(e->path, p);
     e->rc = rc;
     e->st = *s;
-    g_mc_miss++;
     CUL;
 }
 static void mc_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
-    struct mcent *e = &g_mc[mc_hash(p) & (MCACHE_N - 1)];
-    if (e->hash == mc_hash(p) && !strcmp(e->path, p)) e->hash = 0;
+    uint64_t h = mc_hash(p);
+    struct mcent *e = &g_mc[h & (MCACHE_N - 1)];
+    if (e->hash == h && !strcmp(e->path, p)) e->hash = 0;
     CUL;
 }
 // readlink cache (ld.so resolves symlinks on every library search path)
@@ -171,13 +170,13 @@ static int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
     int hit = 0;
-    struct rlent *e = &g_rl[mc_hash(p) & 2047];
-    if (e->hash == mc_hash(p) && !strcmp(e->path, p)) {
+    uint64_t h = mc_hash(p);
+    struct rlent *e = &g_rl[h & 2047];
+    if (e->hash == h && !strcmp(e->path, p)) {
         *rc = e->rc;
         int n = e->linklen < bs ? e->linklen : bs;
         if (e->rc >= 0) memcpy(out, e->link, n);
         *len = n;
-        g_mc_hits++;
         hit = 1;
     }
     CUL;
@@ -186,8 +185,9 @@ static int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
 static void rl_store(const char *p, int rc, const char *link, int len) {
     if (!p || strlen(p) >= 176 || len > 200) return;
     CLK;
-    struct rlent *e = &g_rl[mc_hash(p) & 2047];
-    e->hash = mc_hash(p);
+    uint64_t h = mc_hash(p);
+    struct rlent *e = &g_rl[h & 2047];
+    e->hash = h;
     strcpy(e->path, p);
     e->rc = rc;
     e->linklen = len;
@@ -197,8 +197,9 @@ static void rl_store(const char *p, int rc, const char *link, int len) {
 static void rl_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
-    struct rlent *e = &g_rl[mc_hash(p) & 2047];
-    if (e->hash == mc_hash(p) && !strcmp(e->path, p)) e->hash = 0;
+    uint64_t h = mc_hash(p);
+    struct rlent *e = &g_rl[h & 2047];
+    if (e->hash == h && !strcmp(e->path, p)) e->hash = 0;
     CUL;
 }
 // access(F_OK) existence cache (ld.so probes every library candidate)
@@ -211,10 +212,10 @@ static int ac_lookup(const char *p, int *rc) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
     int hit = 0;
-    struct acent *e = &g_ac[mc_hash(p) & 2047];
-    if (e->hash == mc_hash(p) && !strcmp(e->path, p)) {
+    uint64_t h = mc_hash(p);
+    struct acent *e = &g_ac[h & 2047];
+    if (e->hash == h && !strcmp(e->path, p)) {
         *rc = e->rc;
-        g_mc_hits++;
         hit = 1;
     }
     CUL;
@@ -223,8 +224,9 @@ static int ac_lookup(const char *p, int *rc) {
 static void ac_store(const char *p, int rc) {
     if (!p || strlen(p) >= 176) return;
     CLK;
-    struct acent *e = &g_ac[mc_hash(p) & 2047];
-    e->hash = mc_hash(p);
+    uint64_t h = mc_hash(p);
+    struct acent *e = &g_ac[h & 2047];
+    e->hash = h;
     strcpy(e->path, p);
     e->rc = rc;
     CUL;
@@ -232,8 +234,9 @@ static void ac_store(const char *p, int rc) {
 static void ac_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
-    struct acent *e = &g_ac[mc_hash(p) & 2047];
-    if (e->hash == mc_hash(p) && !strcmp(e->path, p)) e->hash = 0;
+    uint64_t h = mc_hash(p);
+    struct acent *e = &g_ac[h & 2047];
+    if (e->hash == h && !strcmp(e->path, p)) e->hash = 0;
     CUL;
 }
 
@@ -259,8 +262,6 @@ static struct rcent {
     char host[256];
 } g_rc[RCACHE_N];
 static uint32_t g_res_epoch = 1; // 0 is reserved as "never matches"
-// PROF
-static uint64_t g_rc_hits, g_rc_miss;
 // kill switch (read once): DD_NOPATHCACHE=1 -> exact baseline resolution, no memoization.
 static int res_enabled(void) {
     static int on = -1;
@@ -283,7 +284,6 @@ static void rc_reset(void) {
     CLK;
     memset(g_rc, 0, sizeof g_rc);
     g_res_epoch = 1;
-    g_rc_hits = g_rc_miss = 0;
     oc_reset(); // W4D: drop the inherited open-resolution cache too (same COW hazard, under the same lock)
     CUL;
 }
@@ -295,7 +295,6 @@ static int rc_lookup(const char *g, char *out, size_t n) {
     struct rcent *e = &g_rc[h & (RCACHE_N - 1)];
     if (e->hash == h && e->epoch == g_res_epoch && !strcmp(e->guest, g)) {
         snprintf(out, n, "%s", e->host);
-        g_rc_hits++;
         hit = 1;
     }
     CUL;
@@ -312,7 +311,6 @@ static void rc_store(const char *g, const char *host) {
     e->epoch = g_res_epoch; // stamp with the CURRENT epoch; a later mutation invalidates it
     strcpy(e->guest, g);
     strcpy(e->host, host);
-    g_rc_miss++;
     CUL;
 }
 
@@ -339,8 +337,6 @@ static struct ocent {
     char guest[200];
     char host[256];
 } g_oc[OCACHE_N];
-// PROF
-static uint64_t g_oc_hits, g_oc_miss;
 static int oc_enabled(void) {
     static int on = -1;
     if (on < 0) {
@@ -357,7 +353,6 @@ static int oc_lookup(const char *g, char *out, size_t n) {
     struct ocent *e = &g_oc[h & (OCACHE_N - 1)];
     if (e->hash == h && e->epoch == g_res_epoch && !strcmp(e->guest, g)) {
         snprintf(out, n, "%s", e->host);
-        g_oc_hits++;
         hit = 1;
     }
     CUL;
@@ -376,14 +371,12 @@ static void oc_store(const char *g, const char *host) {
     e->epoch = g_res_epoch; // stamp the CURRENT epoch; a later mutation invalidates it
     strcpy(e->guest, g);
     strcpy(e->host, host);
-    g_oc_miss++;
     CUL;
 }
 // fork child: drop every inherited (COW) entry so it cannot outlive a parent-side mutation. Called from
 // rc_reset() which already holds the cache lock, so this does NOT re-take it (non-recursive mutex).
 static void oc_reset(void) {
     memset(g_oc, 0, sizeof g_oc);
-    g_oc_hits = g_oc_miss = 0;
 }
 
 static void fd_setpath(int fd, const char *p) {
