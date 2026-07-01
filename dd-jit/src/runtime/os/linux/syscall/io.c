@@ -9,6 +9,31 @@
 #define G_O_DIRECT 0x10000 // aarch64 / asm-generic
 #endif
 
+// In dd's in-process exec model the guest shares the host descriptor table (fds are 1:1), and the engine
+// pins private host fds at LOW numbers (g_root_fd -- every path resolution openat()s off it -- plus the
+// timer kqueue, the signalfd pipe, and each bind-mount volume fd). A guest dup2/dup3 onto one of those low
+// numbers (e.g. BEAM's erl_child_setup does dup3(controlpipe, 3), landing on g_root_fd) would silently
+// clobber the engine's fd. engine_fd_vacate() relocates any engine-private fd sitting on the about-to-be-
+// reused target to a fresh high descriptor first, so the guest still gets the exact fd it asked for while
+// the runtime keeps a valid one. (Mirrors exec_fd_is_engine()'s skip-list used by the execve CLOEXEC sweep.)
+static void engine_fd_reloc(int *slot, int newfd) {
+    if (!slot || *slot != newfd || newfd < 0) return;
+    // F_DUPFD returns the lowest free fd >= the floor; a very high floor keeps the engine fd clear of the
+    // guest's active low fds, and the modest fallback keeps the relocation working under a small RLIMIT_NOFILE.
+    int hi = fcntl(newfd, F_DUPFD, 1 << 20);
+    if (hi < 0) hi = fcntl(newfd, F_DUPFD, 64);
+    if (hi >= 0) *slot = hi;
+}
+static void engine_fd_vacate(int newfd) {
+    if (newfd < 0) return;
+    engine_fd_reloc(&g_root_fd, newfd);
+    engine_fd_reloc(&g_gtimer_kq, newfd);
+    engine_fd_reloc(&g_sigfd_pipe[0], newfd);
+    engine_fd_reloc(&g_sigfd_pipe[1], newfd);
+    for (int i = 0; i < g_nvols; i++)
+        engine_fd_reloc(&g_vols[i].fd, newfd);
+}
+
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
     // ===================== I/O — read/write/seek (+ eventfd/timerfd/signalfd fd redirection) =====================
@@ -347,6 +372,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         memf_materialize((int)a0); // source: a 2nd fd shares the description -> flush RAM cache
         memf_close((int)a1);       // target fd is about to be reused; drop any cache it held
+        engine_fd_vacate((int)a1); // move any engine-private fd off the target before dup2 overwrites it
         int r = dup2((int)a0, (int)a1);
         if (r >= 0) {
             if ((int)a2 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC); // O_CLOEXEC
