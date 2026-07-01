@@ -9,10 +9,42 @@
 //!
 //! Each invocation boots its OWN engine/daemon (private socket) so many runners go in parallel.
 
-use dd_tests::scenario::{run_one, Backend, Cfg, Class, Daemon, Status, Target};
+use dd_tests::scenario::{run_one, Backend, Cfg, Class, Daemon, Scenario, Status, Target};
 use dd_tests::scenarios;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// Run every `(scenario, target)` cell of one group, returning `out[scenario][target]` in input order.
+/// `workers > 1` fans the cells across a bounded scoped-thread pool (each `run_one` is isolated — unique
+/// container name, op-script path, and daemon-side netns/overlay per container); `workers == 1` is the
+/// serial path the `terminal` category needs (PTY / job-control / controlling-TTY share process state).
+fn run_group(daemon: &Daemon, sel: &[&Scenario], cfg: &Cfg, workers: usize) -> Vec<Vec<Status>> {
+    let nt = cfg.targets.len();
+    let jobs: Vec<(usize, usize)> = (0..sel.len()).flat_map(|si| (0..nt).map(move |ti| (si, ti))).collect();
+    let slots: Vec<Mutex<Option<Status>>> = jobs.iter().map(|_| Mutex::new(None)).collect();
+    if workers <= 1 {
+        for (i, &(si, ti)) in jobs.iter().enumerate() {
+            *slots[i].lock().unwrap() = Some(run_one(daemon, sel[si], cfg.targets[ti], cfg));
+        }
+    } else {
+        let cursor = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers.min(jobs.len().max(1)) {
+                scope.spawn(|| loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs.len() { break; }
+                    let (si, ti) = jobs[i];
+                    let st = run_one(daemon, sel[si], cfg.targets[ti], cfg);
+                    *slots[i].lock().unwrap() = Some(st);
+                });
+            }
+        });
+    }
+    let mut flat = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap());
+    (0..sel.len()).map(|_| (0..nt).map(|_| flat.next().unwrap()).collect()).collect()
+}
 
 fn parse_target(s: &str) -> Option<Target> {
     match s { "arm" | "arm-linux" | "arm64" => Some(Target::ArmLinux),
@@ -65,6 +97,12 @@ fn main() {
     eprintln!("scenarios · backend={:?} · class={:?} · targets={:?}",
         cfg.backend, cfg.class, cfg.targets.iter().map(|t| t.label()).collect::<Vec<_>>());
 
+    // Worker pool size: env override, else ≈cores capped at 6 (modest — too many concurrent `mac`-bridge
+    // children invite SIGTERM contention). `DD_SCEN_JOBS=1` forces the old fully-serial behaviour.
+    let jobs_n = std::env::var("DD_SCEN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get().min(6)).unwrap_or(4));
+    eprintln!("            · jobs={jobs_n} (terminal category forced serial)");
+
     let (mut pass, mut fail, mut xfail, mut xpass, mut skip) = (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut failures: Vec<String> = vec![]; let mut xpasses: Vec<String> = vec![];
     let wall = Instant::now();
@@ -73,10 +111,12 @@ fn main() {
         let sel: Vec<_> = g.scenarios.iter().filter(|s| cfg.includes(s)).collect();
         if sel.is_empty() { continue; }
         println!("\n\x1b[1m{}\x1b[0m", g.name);
-        for s in sel {
+        let workers = if g.name.contains("terminal") { 1 } else { jobs_n };
+        let results = run_group(&daemon, &sel, &cfg, workers);
+        for (si, s) in sel.iter().enumerate() {
             print!("  {:<44}", s.id);
-            for &t in &cfg.targets {
-                match run_one(&daemon, s, t, &cfg) {
+            for (ti, &t) in cfg.targets.iter().enumerate() {
+                match &results[si][ti] {
                     Status::Skip(_) => { skip += 1; print!("  \x1b[90m· {}\x1b[0m", t.label()); }
                     Status::Pass => { pass += 1; print!("  \x1b[32m✓ {}\x1b[0m", t.label()); }
                     Status::Fail(m) => { fail += 1; print!("  \x1b[31m✗ {}\x1b[0m", t.label());

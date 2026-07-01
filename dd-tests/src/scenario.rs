@@ -21,9 +21,11 @@
 //!     .xfail(&[Target::ArmLinux])    // known dd fork+exec gap — passes on Real, xfail on Dd (GAPS.md)
 //! ```
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Which container engine the scenario runs against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -142,6 +144,33 @@ fn spawn_script(file: &std::path::Path, bridged: bool) -> std::io::Result<std::p
 }
 fn sh_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
 
+// ---- speed: caches + per-cell isolation ----------------------------------------------------------
+// The runner used to pay a `mac`-bridge round-trip for EVERY scenario×target just to re-confirm the
+// image is present, and re-ran the (deterministic) Real-docker oracle every time. Both verdicts are
+// invariant for a whole run, so we memoize them. Combined with the worker pool in `scenarios.rs` this
+// turns the lane from one serial bridge call per cell into a handful of cached, parallel ones.
+
+/// `image → availability` verdict, computed once per image instead of once per scenario×target.
+fn ensure_cache() -> &'static Mutex<HashMap<String, bool>> {
+    static C: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Real-backend (oracle) output cache, keyed by the logical run `(image,step,target,tty)`. The oracle
+/// is ground-truth-deterministic, so an identical cell never needs to hit the bridge twice.
+fn oracle_cache() -> &'static Mutex<HashMap<String, (String, i32)>> {
+    static C: OnceLock<Mutex<HashMap<String, (String, i32)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// The logical key that fully determines a cell's output (no pid/host noise → stable across cells).
+fn cell_key(s: &Scenario, t: Target) -> String {
+    let step = match &s.step { Step::Run(a) => format!("run\u{1}{}", a.join("\u{1}")), Step::ExecIt(x) => format!("exec\u{1}{x}") };
+    format!("{}\u{1}{}\u{1}{}\u{1}{}", s.image, step, t.label(), s.tty)
+}
+/// Make a string safe to embed in a filename (image refs carry `/`, `:`, `@`).
+fn slug(s: &str) -> String { s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect() }
+/// Phase timing is opt-in (`DD_SCEN_PROFILE=1`) so it never pollutes normal output.
+fn profiling() -> bool { std::env::var_os("DD_SCEN_PROFILE").is_some() }
+
 // ---- the daemon (Dd backend only) ----------------------------------------------------------------
 pub struct Daemon { child: Option<std::process::Child>, dir: PathBuf, log: PathBuf, host: String, bridged: bool }
 
@@ -215,17 +244,32 @@ fn header(host: Option<&str>) -> String {
     match host { Some(h) => format!("#!/bin/bash\nexport DOCKER_HOST={}\n", sh_quote(h)), None => "#!/bin/bash\n".into() }
 }
 fn ensure(d: &Daemon, cfg: &Cfg, image: &str) -> bool {
+    // Image availability is invariant for the whole run → memoize per image. This is the single biggest
+    // bridge-call saver: a category that reuses one image across N scenarios used to inspect it N times.
+    if let Some(&ok) = ensure_cache().lock().unwrap().get(image) { return ok; }
     let dir = if d.dir.as_os_str().is_empty() { shared_run_dir() } else { d.dir.clone() };
-    let f = dir.join("ensure.sh");
+    // Per-image filename so concurrent first-touches of DIFFERENT images don't clobber one script.
+    let f = dir.join(format!("ensure-{}.sh", slug(image)));
     let body = format!("{}docker image inspect {img} >/dev/null 2>&1 && exit 0\n{}\ndocker pull {img} >/dev/null 2>&1\n",
         header(d.docker_host()), if cfg.offline { "exit 1" } else { "" }, img = sh_quote(image));
     if std::fs::write(&f, body).is_err() { return false; }
-    run_script(&f, d.bridged, if cfg.offline { 20 } else { 180 }).status.success()
+    // Run unlocked (a pull can take minutes); two threads racing the SAME image just inspect twice — the
+    // op is idempotent. Record the verdict so every later cell using this image is a pure cache hit.
+    let ok = run_script(&f, d.bridged, if cfg.offline { 20 } else { 180 }).status.success();
+    ensure_cache().lock().unwrap().insert(image.to_string(), ok);
+    ok
 }
 
-fn drive(d: &Daemon, s: &Scenario, t: Target) -> (String, i32) {
+fn drive(d: &Daemon, s: &Scenario, t: Target, cfg: &Cfg) -> (String, i32) {
+    // Oracle output is deterministic ground truth → serve repeats of an identical cell from cache.
+    let key = (cfg.backend == Backend::Real).then(|| cell_key(s, t));
+    if let Some(k) = &key {
+        if let Some(v) = oracle_cache().lock().unwrap().get(k) { return v.clone(); }
+    }
     let dir = if d.dir.as_os_str().is_empty() { shared_run_dir() } else { d.dir.clone() };
-    let f = dir.join(format!("op-{}.sh", s.id.replace('/', "_")));
+    // Per-(scenario,target) filename so the two arches of one scenario can run concurrently without
+    // racing on a shared op script.
+    let f = dir.join(format!("op-{}-{}.sh", s.id.replace('/', "_"), t.label()));
     let plat = t.platform().map(|p| format!("--platform {p} ")).unwrap_or_default();
     let tt = if s.tty { "-t " } else { "" };          // run: allocate a container PTY
     let xt = if s.tty { "-t" } else { "-i" };          // exec: PTY vs plain stdin (no client TTY needed)
@@ -239,7 +283,7 @@ fn drive(d: &Daemon, s: &Scenario, t: Target) -> (String, i32) {
             // idle container we exec into (mirrors `docker exec -it`); fall back to one-shot run for
             // images with no keep-alive shell (distroless). Embed the user script verbatim via a
             // quoted heredoc so arbitrary quotes/heredocs inside it survive.
-            let name = format!("ddx-{}-{}", std::process::id(), s.id.replace('/', "-"));
+            let name = format!("ddx-{}-{}-{}", std::process::id(), s.id.replace('/', "-"), t.label());
             format!(
 "{hdr}N={name}
 docker rm -f $N >/dev/null 2>&1
@@ -265,16 +309,27 @@ exit $rc
     let o = run_script(&f, d.bridged, s.timeout + 10);
     let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
     out.push_str(&String::from_utf8_lossy(&o.stderr));
-    (out, o.status.code().unwrap_or(-1))
+    let res = (out, o.status.code().unwrap_or(-1));
+    if let Some(k) = key { oracle_cache().lock().unwrap().insert(k, res.clone()); }
+    res
 }
 
 /// Run one scenario on one target and classify (xfail-aware). xfail only applies to the Dd backend —
 /// on Real, a fail is always a real (test) failure.
 pub fn run_one(d: &Daemon, s: &Scenario, t: Target, cfg: &Cfg) -> Status {
     if !s.targets.contains(&t) { return Status::Skip("n/a for target".into()); }
+    let prof = profiling();
+    let t0 = Instant::now();
+    let cached = ensure_cache().lock().unwrap().contains_key(s.image);
     if !ensure(d, cfg, s.image) { return Status::Skip(format!("image {} unavailable", s.image)); }
+    let ensure_ms = t0.elapsed().as_millis();
     let xfail = cfg.backend == Backend::Dd && s.xfail.contains(&t);
-    let (out, code) = drive(d, s, t);
+    let t1 = Instant::now();
+    let (out, code) = drive(d, s, t, cfg);
+    if prof {
+        eprintln!("[prof] id={} tgt={} ensure_ms={} ensure_cached={} drive_ms={} total_ms={}",
+            s.id, t.label(), ensure_ms, cached as u8, t1.elapsed().as_millis(), t0.elapsed().as_millis());
+    }
     let bad: Option<String> = if code == 124 { Some(format!("timeout >{}s", s.timeout)) } else {
         s.checks.iter().find_map(|chk| match chk {
             Check::Has(sub) => (!out.contains(sub.as_str())).then(|| format!("lacks [{sub}] in [{}]", clip(&out))),
