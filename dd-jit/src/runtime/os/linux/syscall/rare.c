@@ -261,6 +261,30 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // mlockall/munlockall: no macOS equivalent; the guest's "don't swap" intent is a safe no-op
     case 230:
     case 231: G_RET(c) = 0; break;
+    // NUMA memory-policy syscalls (mbind/{set,get}_mempolicy/migrate_pages/move_pages). The host is a
+    // single NUMA node and these are advisory placement hints, so accept them as permissive no-ops --
+    // e.g. R/OpenBLAS calls mbind(2) on its large matrix buffers at startup. (arm64-normalized numbers;
+    // x86-64 237/238/239/256/279 are mapped to these by sysmap.h.)
+    case 235: G_RET(c) = 0; break; // mbind          -> success, no-op
+    case 237: G_RET(c) = 0; break; // set_mempolicy  -> success, no-op
+    case 238:                      // migrate_pages
+    case 239: G_RET(c) = 0; break; // move_pages     -> success, no-op (nothing moved)
+    case 450: G_RET(c) = 0; break; // set_mempolicy_home_node -> success, no-op (same NUMA-hint family)
+    // get_mempolicy(mode*, nodemask, maxnode, addr, flags): report the default policy. If the guest
+    // passed a mode pointer, write MPOL_DEFAULT(0) -- but validate it first (host_addr_mapped, thread.c)
+    // so a bad pointer returns -EFAULT to the guest rather than faulting the engine.
+    case 236: {
+        int *mode = (int *)a0;
+        if (mode) {
+            if (!host_addr_mapped((uintptr_t)mode)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            *mode = 0; // MPOL_DEFAULT
+        }
+        G_RET(c) = 0;
+        break;
+    }
     // getitimer/setitimer: wrap the host (ITIMER_* + struct itimerval layouts match Linux<->macOS)
     case 102: G_RET(c) = getitimer((int)a0, (struct itimerval *)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     case 103:
