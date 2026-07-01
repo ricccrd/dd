@@ -51,6 +51,22 @@ static void ovldents_drop(int fd) {
         }
 }
 
+// POSIX shm / named semaphores live under /dev/shm, for which the rootfs has no tmpfs; glibc backs them
+// with files there (shm_open -> /dev/shm/<name>, sem_open -> a temp /dev/shm/sem.<rnd> then link()ed to
+// /dev/shm/sem.<name>). openat (case 56) redirects these to a stable host file /tmp/.ddshm-<name> so the
+// page is real and MAP_SHARED across fork. The link/rename/unlink that COMPLETE glibc's create dance must
+// use the SAME backing, but the rootfs branches of those handlers resolve via jail_at into the (empty)
+// <rootfs>/dev/shm and ENOENT -- breaking sem_open (python multiprocessing). Returns the host backing path
+// for a /dev/shm/<name> guest path (into buf), or NULL otherwise. Same name-flattening as the openat redirect.
+static const char *shm_hostpath(const char *guest, char *buf, size_t n) {
+    if (!guest || strncmp(guest, "/dev/shm/", 9)) return NULL;
+    int m = snprintf(buf, n, "/tmp/.ddshm-%s", guest + 9);
+    if (m > (int)n - 1) m = (int)n - 1;
+    for (int i = 12; i < m; i++)
+        if (buf[i] == '/') buf[i] = '_';
+    return buf;
+}
+
 static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                   uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -292,6 +308,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     // unlinkat(dirfd, path, flags) -- confined
     case 35: {
+        // shm/sem files are flat host files under /tmp (see shm_hostpath); sem_unlink/shm_unlink and glibc's
+        // temp-file cleanup must hit that backing, not the jail's <rootfs>/dev/shm. AT_REMOVEDIR never applies.
+        char shb[300];
+        const char *shp = shm_hostpath((const char *)a1, shb, sizeof shb);
+        if (shp) {
+            G_RET(c) = unlink(shp) < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
         if (jail_ro_at((int)a0, (const char *)a1)) {
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
@@ -400,6 +424,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     // linkat(odir,opath,ndir,npath,flags) -- writes both ends (new link + source link count)
     case 37: {
+        // glibc's sem_open/shm_open creation links a temp /dev/shm/sem.<rnd> to the final /dev/shm/<name>;
+        // both ends are shm-backed host files under /tmp, so link them directly (the jail branch below would
+        // resolve them into the empty <rootfs>/dev/shm and ENOENT).
+        char lob[300], lnb[300];
+        const char *loh = shm_hostpath((const char *)a1, lob, sizeof lob);
+        const char *lnh = shm_hostpath((const char *)a3, lnb, sizeof lnb);
+        if (loh && lnh) {
+            G_RET(c) = link(loh, lnh) < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
         if (jail_ro_at((int)a0, (const char *)a1) || jail_ro_at((int)a2, (const char *)a3)) {
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
@@ -444,6 +478,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int lf = (int)a4;
             if (lf & 1) rxflags |= RENAME_EXCL;
             if (lf & 2) rxflags |= RENAME_SWAP;
+        }
+        // shm/sem create that renames (rather than links) a temp /dev/shm file to the final name: both ends
+        // are shm-backed host files under /tmp, so rename them directly (the jail branch would ENOENT them).
+        char rob[300], rnb[300];
+        const char *roh = shm_hostpath((const char *)a1, rob, sizeof rob);
+        const char *rnh = shm_hostpath((const char *)a3, rnb, sizeof rnb);
+        if (roh && rnh) {
+            G_RET(c) = renameatx_np(AT_FDCWD, roh, AT_FDCWD, rnh, rxflags) < 0 ? (uint64_t)(-errno) : 0;
+            break;
         }
         if (g_rootfs) {
             // both ends confined (TOCTOU-free). Copy a lower-only SOURCE up first so renameatx_np finds it
@@ -835,13 +878,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         {
             // POSIX shm: glibc shm_open opens /dev/shm/<name>; the rootfs has no tmpfs, so back it with a
             // real host file (MAP_SHARED + fork share it). Flatten any subdirs into the single filename.
-            const char *rp = (const char *)a1;
-            if (rp && !strncmp(rp, "/dev/shm/", 9)) {
-                char hp[300];
-                int n = snprintf(hp, sizeof hp, "/tmp/.ddshm-%s", rp + 9);
-                for (int i = 12; i < n; i++)
-                    if (hp[i] == '/') hp[i] = '_';
-                int d = open(hp, mf, (mode_t)a3);
+            char hp[300];
+            const char *sp = shm_hostpath((const char *)a1, hp, sizeof hp);
+            if (sp) {
+                int d = open(sp, mf, (mode_t)a3);
                 G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
                 break;
             }
