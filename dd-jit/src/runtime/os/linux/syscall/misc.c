@@ -7,6 +7,7 @@ static int svc_misc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 160: {
         char *u = (char *)a0;
         // uname
+        if (!host_range_mapped((uintptr_t)a0, 6 * 65)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
         memset(u, 0, 6 * 65);
         strcpy(u, "Linux");
         strcpy(u + 65, g_hostname[0] ? g_hostname : "jit");
@@ -20,6 +21,7 @@ static int svc_misc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int n = (int)a1;
         if (n > 64) n = 64;
         if (n > 0) {
+            if (!host_range_mapped((uintptr_t)a0, (size_t)n)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
             memcpy(g_hostname, (void *)a0, n);
             g_hostname[n] = 0;
             // sethostname (UTS ns)
@@ -30,6 +32,7 @@ static int svc_misc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // setdomainname -> ignore
     case 162: G_RET(c) = 0; break;
     case 179: {
+        if (!host_range_mapped((uintptr_t)a0, 112)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
         memset((void *)a0, 0, 112);
         // sysinfo: report a plausible FINITE machine. A zeroed struct gives totalram=0, which the JVM
         // reads as "Too small maximum heap" -> abort. 64-bit struct sysinfo byte offsets: uptime@0,
@@ -45,6 +48,7 @@ static int svc_misc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     }
     case 278:
+        if (!host_range_mapped((uintptr_t)a0, (size_t)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
         arc4random_buf((void *)a0, (size_t)a1);
         G_RET(c) = a1;
         // getrandom

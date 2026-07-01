@@ -167,6 +167,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         clock_gettime(mc, &ts);
         uint64_t *g = (uint64_t *)a1;
         if (g) {
+            if (!host_range_mapped((uintptr_t)a1, 16)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
             g[0] = ts.tv_sec;
             g[1] = ts.tv_nsec;
         }
@@ -175,6 +176,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     case 114: {
         if (a1) {
+            if (!host_range_mapped((uintptr_t)a1, 16)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
             *(uint64_t *)a1 = 0;
             *(uint64_t *)(a1 + 8) = 1;
         }
@@ -221,7 +223,10 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 153: {
         struct tms tb;
         clock_t r = times(&tb);
-        if (a0) *(struct tms *)a0 = tb;
+        if (a0) {
+            if (!host_range_mapped((uintptr_t)a0, sizeof(struct tms))) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
+            *(struct tms *)a0 = tb;
+        }
         G_RET(c) = (uint64_t)r;
         break;
     }
@@ -231,6 +236,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // gettimeofday
         uint64_t *g = (uint64_t *)a0;
         if (g) {
+            if (!host_range_mapped((uintptr_t)a0, 16)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
             g[0] = tv.tv_sec;
             g[1] = tv.tv_usec;
         }

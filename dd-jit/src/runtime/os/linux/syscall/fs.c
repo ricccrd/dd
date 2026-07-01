@@ -94,12 +94,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // getcwd -> the GUEST cwd (not the host path)
             size_t l = strlen(g_cwd);
             if (a0 && l + 1 <= a1) {
+                if (!host_range_mapped((uintptr_t)a0, l + 1)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
                 memcpy((void *)a0, g_cwd, l + 1);
                 G_RET(c) = l + 1;
             } else
                 G_RET(c) = (uint64_t)(-ERANGE);
             break;
         }
+        if (a0 && !host_range_mapped((uintptr_t)a0, (size_t)a1)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
         if (getcwd((char *)a0, (size_t)a1))
             G_RET(c) = strlen((char *)a0) + 1;
         else
@@ -554,6 +556,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         uint8_t *b = (uint8_t *)a1;
+        if (!host_range_mapped((uintptr_t)a1, 120)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
         memset(b, 0, 120);
         *(int64_t *)(b + 0) = 0x01021994;              // f_type (TMPFS_MAGIC; geometry is what matters)
         *(int64_t *)(b + 8) = (int64_t)hs.f_bsize;     // f_bsize
@@ -1379,7 +1382,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // and is rewritten to the produced size (-EOVERFLOW if the caller's buffer is too small).
     case 264: {
         uint8_t *fh = (uint8_t *)a2;
-        if (!fh) {
+        if (!fh || !host_range_mapped((uintptr_t)a2, 4)) { // handle_bytes read/write below
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -1404,12 +1407,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EOVERFLOW);
             break;
         }
+        if (!host_range_mapped((uintptr_t)a2, need + 8)) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
         uint64_t dev = (uint64_t)s.st_dev, ino = (uint64_t)s.st_ino;
         *(uint32_t *)(fh + 0) = need; // handle_bytes
         *(int32_t *)(fh + 4) = 1;     // handle_type (stable, arbitrary)
         memcpy(fh + 8, &dev, 8);
         memcpy(fh + 16, &ino, 8);
-        if (a3) *(int *)a3 = (int)s.st_dev; // mount_id
+        if (a3) {
+            if (!host_range_mapped((uintptr_t)a3, sizeof(int))) { G_RET(c) = (uint64_t)(int64_t)(-EFAULT); break; }
+            *(int *)a3 = (int)s.st_dev; // mount_id
+        }
         G_RET(c) = 0;
         break;
     }
