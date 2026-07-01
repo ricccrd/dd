@@ -186,6 +186,11 @@ static int tcp_opt_l2m(int o) {
 static char g_netns[200];
 // fd -> the loopback port it's bound/connected to (0 = not a private-lo socket)
 static uint16_t g_lo_port[1024];
+// fd -> 1 if this private-lo socket is AF_INET6 (so getsockname/getpeername/accept report a sockaddr_in6
+// with ::1 instead of an AF_INET 127.0.0.1). The unix-socket switch is keyed by port only, so a v6 server
+// and a v4 client on the same loopback port still rendezvous (dual-stack); this only picks the address
+// family reported back to the guest.
+static uint8_t g_lo_v6[1024];
 // fd -> 1 if created SOCK_STREAM (only those get loopback isolation)
 static uint8_t g_sock_stream[1024];
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
@@ -204,6 +209,29 @@ static int lo_on(void) { return g_netns[0] != 0; }
 static int lo_is(const uint8_t *sa, socklen_t l) {
     return sa && l >= 8 && *(uint16_t *)sa == AF_INET && sa[4] == 127;
 // 127.x.x.x
+}
+// ---- IPv6 loopback: same private-namespace redirect as 127/8, for AF_INET6 (::/::1). The guest passes a
+// Linux sockaddr_in6 { u16 family(==10); u16 port@2; u32 flow@4; u8 addr[16]@8; u32 scope@24 }; the family
+// VALUE is the Linux one (10), not macOS AF_INET6 (30). The 16-byte addr @8 is in6addr_loopback (::1, 15
+// zero bytes + 0x01) or in6addr_any (::, all zero). Routing both to the per-container loopback dir keeps a
+// dual-stack server's v6 bind isolated instead of escaping to the real host stack (and v6 has no bridge).
+#define LX_AF_INET6_FAM 10
+static int in6_all_zero(const uint8_t *a, int n) {
+    for (int i = 0; i < n; i++)
+        if (a[i]) return 0;
+    return 1;
+}
+static int in6_is_loopback(const uint8_t *a) { return in6_all_zero(a, 15) && a[15] == 1; }
+static int in6_is_any(const uint8_t *a) { return in6_all_zero(a, 16); }
+// connect(dest): v6 loopback if AF_INET6 and dest is ::1 (mirrors lo_is: only the explicit loopback addr)
+static int lo6_is(const uint8_t *sa, socklen_t l) {
+    return sa && l >= 24 && *(const uint16_t *)sa == LX_AF_INET6_FAM && in6_is_loopback(sa + 8);
+}
+// bind(addr): v6 loopback if AF_INET6 and addr is ::1 or :: (mirrors lo_any_is; :: includes loopback and,
+// with no v6 bridge, the only reachable v6 address under isolation IS loopback).
+static int lo6_any_is(const uint8_t *sa, socklen_t l) {
+    if (!sa || l < 24 || *(const uint16_t *)sa != LX_AF_INET6_FAM) return 0;
+    return in6_is_loopback(sa + 8) || in6_is_any(sa + 8);
 }
 static void lo_path(uint16_t port, char *out, size_t n) { snprintf(out, n, "%s/p%u", g_netns, (unsigned)port); }
 // Allocate an ephemeral loopback port for a bind(127.0.0.1:0). The kernel would assign a real port;
@@ -250,6 +278,17 @@ static void fill_inet_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
     memset(sa + 8, 0, 8);
     if (l) *l = 16;
 }
+// report AF_INET6 ::1:port back to the guest (Linux sockaddr_in6 layout; family value 10). Mirrors
+// fill_inet_lo: reports the loopback addr regardless of whether the socket bound :: or ::1 (apps key off
+// the port; cf. the v4 path reporting 127.0.0.1 for a 0.0.0.0 bind).
+static void fill_inet6_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
+    if (!sa) return;
+    memset(sa, 0, 28);                       // family/port/flow/addr/scope
+    *(uint16_t *)(sa + 0) = LX_AF_INET6_FAM; // 10
+    *(uint16_t *)(sa + 2) = htons(port);     // port (BE) @2
+    sa[8 + 15] = 1;                          // addr @8 = ::1 (in6addr_loopback)
+    if (l) *l = 28;
+}
 
 // ---- NET bridge (2A "virtual switch"): per-USER-NETWORK rendezvous for container<->container traffic.
 // Generalizes the loopback redirect from "127/8 -> per-container dir" to "this user network's subnet ->
@@ -278,6 +317,7 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_dgram[dst] = g_sock_dgram[src];
     g_sock_seqpacket[dst] = g_sock_seqpacket[src];
     g_lo_port[dst] = g_lo_port[src];
+    g_lo_v6[dst] = g_lo_v6[src];
     g_br_port[dst] = g_br_port[src];
     g_br_ip[dst] = g_br_ip[src];
 }

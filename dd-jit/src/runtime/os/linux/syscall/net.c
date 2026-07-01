@@ -23,10 +23,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
             if (r < 1024) {
-                g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && (int)a0 == AF_INET);
+                // AF_INET6 STREAM also gets loopback isolation (::/::1 -> private lo). a0 is the guest's
+                // Linux domain value, so test the Linux AF_INET6 (10), not the macOS one (30).
+                g_sock_stream[r] =
+                    ((ty & 0xf) == SOCK_STREAM && ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
                 g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM && (int)a0 == AF_INET);
                 g_sock_seqpacket[r] = 0;
                 g_lo_port[r] = 0;
+                g_lo_v6[r] = 0;
                 g_br_port[r] = 0;
                 g_br_ip[r] = 0;
             }
@@ -67,9 +71,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 200: {
         // GUEST Linux sockaddr_in: family@0(u16 LE), port@2(BE)
         uint8_t *sa = (uint8_t *)a1;
+        // private loopback: v4 127/8 (and 0.0.0.0 in direct mode -- a 0.0.0.0 server must answer 127.0.0.1),
+        // or v6 ::1/:: (dual-stack servers bind v6 too; route it to the SAME per-container loopback so it is
+        // isolated from the real host stack instead of escaping it). port@2 is identical in v4/v6 layout.
+        int is_lo6 = lo6_any_is(sa, (socklen_t)a2);
         if (lo_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
-            // private loopback (127/8, and 0.0.0.0 in direct mode -- a 0.0.0.0 server must answer 127.0.0.1)
-            lo_any_is(sa, (socklen_t)a2)) {
+            (lo_any_is(sa, (socklen_t)a2) || is_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = lo_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
             char up[200];
@@ -84,7 +91,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             un.sun_family = AF_UNIX;
             snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
-            if (r == 0) g_lo_port[(int)a0] = p ? p : 1;
+            if (r == 0) {
+                g_lo_port[(int)a0] = p ? p : 1;
+                g_lo_v6[(int)a0] = (uint8_t)is_lo6; // remember family for getsockname/accept
+            }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
@@ -195,6 +205,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int lfd = (int)a0;
         // accept / accept4
         int pl = (lfd >= 0 && lfd < 1024) ? g_lo_port[lfd] : 0;
+        int pl6 = (lfd >= 0 && lfd < 1024) ? g_lo_v6[lfd] : 0; // listener is AF_INET6 -> report v6 peer
         int pbr = (lfd >= 0 && lfd < 1024) ? g_br_port[lfd] : 0;
         uint32_t pbrip = (lfd >= 0 && lfd < 1024) ? g_br_ip[lfd] : 0;
         // Real host accept writes a macOS sockaddr; receive into a host scratch then translate the
@@ -233,9 +244,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (pl) {
                 if (r < 1024) {
                     g_lo_port[r] = pl;
+                    g_lo_v6[r] = (uint8_t)pl6;
                     g_sock_stream[r] = 1;
                 }
-                fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, pl);
+                if (pl6)
+                    fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, pl);
+                else
+                    fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, pl);
             } else if (pbr) {
                 if (r < 1024) {
                     g_br_port[r] = pbr;
@@ -262,9 +277,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-ENETUNREACH);
             break;
         }
+        int c_lo6 = lo6_is(sa, (socklen_t)a2);
         if (lo_on() && (int)a0 >= 0 && (int)a0 < 1024 && g_sock_stream[(int)a0] &&
-            // private loopback
-            lo_is(sa, (socklen_t)a2)) {
+            // private loopback: v4 127/8 or v6 ::1 (port@2 identical) -> the per-container loopback switch
+            (lo_is(sa, (socklen_t)a2) || c_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
             lo_path(p, up, sizeof up);
@@ -279,6 +295,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0 || errno == EINPROGRESS) {
                 g_lo_port[(int)a0] = p ? p : 1;
+                g_lo_v6[(int)a0] = (uint8_t)c_lo6;
             } else if (errno == ENOENT && br_on() && g_myip) {
                 // Same-container localhost dial of a server that bound INADDR_ANY on the bridge (br_path,
                 // keyed by OUR own IP -- not lo_path): retry there so 127.0.0.1 still reaches a 0.0.0.0
@@ -365,7 +382,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // getsockname
         int fd = (int)a0;
         if (fd >= 0 && fd < 1024 && g_lo_port[fd]) {
-            fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
+            if (g_lo_v6[fd])
+                fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
+            else
+                fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
             G_RET(c) = 0;
             break;
         }
@@ -401,7 +421,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // getpeername
         int fd = (int)a0;
         if (fd >= 0 && fd < 1024 && g_lo_port[fd]) {
-            fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
+            if (g_lo_v6[fd])
+                fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
+            else
+                fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
             G_RET(c) = 0;
             break;
         }
