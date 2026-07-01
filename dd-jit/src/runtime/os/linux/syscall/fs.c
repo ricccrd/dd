@@ -183,6 +183,21 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         // TIOCSPTLCK (unlockpt done at open)
         case 0x40045431: G_RET(c) = 0; break;
+        // TIOCGPTPEER (_IO('T',0x41) == 0x5441; no direction bit, so it arrives unchanged under both musl
+        // and glibc) -- glibc's openpty() opens the slave in a SINGLE call from the master fd instead of the
+        // ptsname()+open() dance. `fd` is the master and (as TIOCGPTN reports) IS the pts#, so ptsname(fd)
+        // resolves the host slave device -- the exact path the `/dev/pts/N` open uses. `arg` carries open
+        // flags (O_RDWR|O_NOCTTY, glibc may OR in O_CLOEXEC 0x80000); open the slave and RETURN the new fd,
+        // like a dup/open. (musl's openpty takes a different ptsname route and never issues this.)
+        case 0x5441: {
+            char *sn = ptsname(fd);
+            if (!sn) { G_RET(c) = (uint64_t)(int64_t)(-(errno ? errno : EINVAL)); break; }
+            int mf = ((int)a2 & 0x3) | O_NOCTTY;      // access mode (shared values) + no controlling tty
+            if (a2 & 0x80000) mf |= O_CLOEXEC;        // honor Linux O_CLOEXEC on the returned fd
+            int s = open(sn, mf);
+            G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s;
+            break;
+        }
         case 0x5421: {
             // FIONBIO
             int on = arg ? *(int *)arg : 0, fl = fcntl(fd, F_GETFL);
