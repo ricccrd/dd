@@ -425,6 +425,10 @@ static void e_cas(int sz, int rs, int rt, int rn) { // casal Rs(old/cmp), Rt(new
 #define LSE_LDSET 0xB8E03000u // ldsetal  ([m] |= rs)
 #define LSE_SWP 0xB8E08000u   // swpal    (x = [m]; [m] = rs)
 
+static int64_t sext(uint64_t v, int bits) {
+    uint64_t m = 1ull << (bits - 1);
+    return (int64_t)((v ^ m) - m);
+}
 static void block_return(void);
 
 // ---------------- prologue / spill / exits ----------------

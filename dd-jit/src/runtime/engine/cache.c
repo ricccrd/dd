@@ -86,6 +86,40 @@ static struct {
     void *host;
     void *body;
 } g_map[JIT_MAP_N];
+// ---- SMC precise gate: the set of guest 4KB pages we have translated ANY block from ----
+// A code-generating guest (V8, a JIT) issues `ic ivau` (icache invalidate by VA) after writing each
+// freshly-generated cache line. The old smc_icflush() responded to EVERY such flush by nuking the whole
+// translation map + the whole IBTC -- so a `node -e 1+1` paid ~80K re-translations and a tight JS loop
+// paid ~37M (60s of pure re-translation), because V8 flushes thousands of times while it grows its code
+// space. But almost every flush targets a BRAND-NEW page that was never translated, so there is provably
+// nothing stale to drop. This open-addressed set records which guest pages have a live translation; an
+// `ic ivau` to a page NOT in the set is a no-op (skip the wholesale drop). A page that WAS translated
+// still triggers the full conservative invalidation -> correctness for genuine in-place self-modification
+// is unchanged. Reset whenever g_map is wholesale-cleared (the set then re-fills as blocks re-translate).
+#define TXPG_N (1u << 18) // 256K slots * 8B = 2MB; guest code spans at most a few thousand pages
+static uint64_t g_txpg[TXPG_N]; // value = guest page (addr>>12); 0 = empty (page 0 never holds guest code)
+static void txpg_mark(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) hi = lo + 1;
+    for (uint64_t p = lo >> 12; p <= ((hi - 1) >> 12); p++) {
+        uint32_t h = (uint32_t)(p * 2654435761u) & (TXPG_N - 1);
+        for (uint32_t i = 0; i < TXPG_N; i++) {
+            uint32_t j = (h + i) & (TXPG_N - 1);
+            if (g_txpg[j] == p) break;                    // already present
+            if (g_txpg[j] == 0) { g_txpg[j] = p; break; } // insert into the first empty slot
+        }
+    }
+}
+static int txpg_has(uint64_t addr) {
+    uint64_t p = addr >> 12;
+    uint32_t h = (uint32_t)(p * 2654435761u) & (TXPG_N - 1);
+    for (uint32_t i = 0; i < TXPG_N; i++) {
+        uint32_t j = (h + i) & (TXPG_N - 1);
+        if (g_txpg[j] == p) return 1;
+        if (g_txpg[j] == 0) return 0; // hit an empty slot before the page -> not present
+    }
+    return 1; // table saturated -> conservatively assume present (forces a full invalidation)
+}
+static void txpg_clear(void) { memset(g_txpg, 0, sizeof g_txpg); }
 static int map_idx(uint64_t gpc) {
     // hash shift is per-arch (frontend/<arch>/abi.h G_GPC_HASH_SHIFT): aarch64 PCs are 4-byte aligned
     // (>>2 spreads), x86 PCs are byte-granular (>>0). Pure tuning constant; aarch64 value is 2 (unchanged).

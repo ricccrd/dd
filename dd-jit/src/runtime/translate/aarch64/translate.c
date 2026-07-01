@@ -698,6 +698,57 @@ static void emit_shadow_ret(void) {
     // UNWIND/FOREIGN -> IBTC (per-site IC + hash), NOT the dispatcher
     emit_ibranch(30);
 }
+// Fast correct ret on the stolen x30: per-site monomorphic cache on cpu->x[30] (a `br`, not a host
+// ret -> no RAS, but no stale-host_ret corruption either). Mirrors the IBTC per-site IC; the
+// dispatcher fills Lsite_tgt/Lsite_body via ic_site. Reads cpu->x[30] (x30 is stolen).
+static void emit_ret_ic(void) {
+    e_stur(16, 31, -16);
+    // stash scratch (target body_ind restores it)
+    e_stur(17, 31, -24);
+    // x16 = cpu->x[30]
+    e_ldr(16, CPUREG, 30 * 8);
+    uint32_t *p_ldrt = (uint32_t *)g_cp;
+    // ldr x17, Lsite_tgt
+    emit32(0);
+    // sub x17, x17, x16
+    emit32(0xCB000000u | (16 << 16) | (17 << 5) | 17);
+    uint32_t *p_cbnz = (uint32_t *)g_cp;
+    // cbnz x17, Lmiss
+    emit32(0);
+    uint32_t *p_ldrb = (uint32_t *)g_cp;
+    // ldr x16, Lsite_body
+    emit32(0);
+    // HIT -> body_ind
+    e_br(16);
+    uint32_t *miss = (uint32_t *)g_cp;
+    e_ldur(16, 31, -16);
+    e_ldur(17, 31, -24);
+    emit_spill();
+    e_ldr(9, 0, 30 * 8);
+    // cpu->pc = cpu->x[30]
+    e_str(9, 0, OFF_PC);
+    e_movconst(9, R_BRANCH);
+    e_str(9, 0, OFF_RSN);
+    uint32_t *p_adr = (uint32_t *)g_cp;
+    // adr x9, Lsite_tgt -> dispatcher fills the site
+    emit32(0);
+    e_str(9, 0, OFF_ICSITE);
+    e_movconst(9, (uint64_t)block_return);
+    e_br(9);
+    if ((uint64_t)g_cp & 7) emit32(0);
+    uint8_t *Lt = g_cp;
+    *(uint64_t *)g_cp = 0;
+    g_cp += 8;
+    uint8_t *Lb = g_cp;
+    *(uint64_t *)g_cp = 0;
+    g_cp += 8;
+    *p_ldrt = 0x58000000u | (((uint32_t)((Lt - (uint8_t *)p_ldrt) / 4) & 0x7FFFF) << 5) | 17;
+    *p_cbnz = 0xB5000000u | (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 17;
+    *p_ldrb = 0x58000000u | (((uint32_t)((Lb - (uint8_t *)p_ldrb) / 4) & 0x7FFFF) << 5) | 16;
+    int64_t ao = Lt - (uint8_t *)p_adr;
+    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) | (((uint32_t)((ao >> 2) & 0x7FFFF)) << 5) | 9;
+}
+
 // ---------------- the translator ----------------
 // Translate the basic block at guest address gpc; returns host entry pointer.
 // re-target a cond branch to offset d (instrs)
@@ -1049,11 +1100,21 @@ static int smc_disabled(void) {
 // shadow stack is left alone -- its host_rets point at old code that is still present in g_cp (valid targets).
 // g_smc_seen latches so indirect branches stop populating the per-site IC (see G_IBTC_FILL): that literal
 // lives in the unmodified CALLER block, which this flush cannot reach.
-static void smc_icflush(void) {
+static void smc_icflush(uint64_t va) {
+    // The guest issued `ic ivau` -> it generates/patches code -> the per-site monomorphic IC stays disabled
+    // (its literal lives in an unmodified caller block this flush can't reach). Latch this unconditionally,
+    // even when the precise gate below skips, so a code-modifying guest never trusts the per-site IC.
     g_smc_seen = 1;
+    // PRECISE GATE: if this guest page was never translated, there is nothing stale to drop. V8 flushes
+    // each freshly-written line as it grows its code space, almost always on brand-new pages -> this turns
+    // the catastrophic per-flush wholesale invalidation (which re-translated the entire working set on
+    // every `ic ivau`) into a no-op. A page that WAS translated still takes the full conservative drop, so
+    // genuine in-place self-modification remains correct.
+    if (!txpg_has(va)) return;
     memset(g_map, 0, sizeof g_map);
     memset(g_ibtc, 0, sizeof g_ibtc);
     g_npend = 0;
+    txpg_clear(); // g_map is now empty -> the page set re-fills as blocks re-translate
     g_smc_flushes++;
 }
 
@@ -1424,7 +1485,8 @@ static void *translate_block(uint64_t gpc) {
         // map + IBTC (smc_icflush) and the modified bytes re-translate. pc resumes PAST the ic ivau. Gated by
         // NOSMC; the dc cvau / isb in the same dance run verbatim (harmless: they touch real data memory).
         if ((in & 0xFFFFFFE0u) == 0xD50B7520u && !smc_disabled()) {
-            emit_exit_const(gpc + 4, R_ICFLUSH);
+            // Capture the invalidated VA (cpu->x[Xt]) on the exit so smc_icflush() can invalidate precisely.
+            emit_exit_icflush(gpc + 4, (int)(in & 31));
             break;
         }
 
@@ -1529,7 +1591,13 @@ static void *translate_block(uint64_t gpc) {
     // W4E tier-2: the promoter (g_tier2_build) recompiles in place and updates the EXISTING map entry
     // itself, so don't insert a duplicate. Expose the body for it.
     g_last_body = body;
-    if (!g_tier2_build) map_put(start, host, body);
+    if (!g_tier2_build) {
+        map_put(start, host, body);
+        // SMC precise gate: record every guest page this block's SOURCE spans, so a later guest `ic ivau`
+        // to one of these pages takes the full invalidation while a flush of any never-translated page is
+        // skipped. `gpc` is the (exclusive) end of the decoded block here; `start` is its entry.
+        txpg_mark(start, gpc);
+    }
     // patch_links_to is MOVED to the dispatcher, AFTER the new block's icache is invalidated:
     // chaining an existing block X -> this new block before its code is icache-coherent on a peer
     // core lets that core fetch stale instructions. Only chain to it once it's visible everywhere.

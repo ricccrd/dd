@@ -119,7 +119,7 @@ static uint64_t g_smc_flushes;
 // dispatcher loop into which this expands. Byte-for-byte the prior inline block.
 #define G_DISPATCH_REASON(c)                                                                                    \
     if ((c)->reason == R_ICFLUSH) {                                                                             \
-        smc_icflush(); /* guest `ic ivau`: drop stale translations + IBTC; pc already = past the ic ivau */   \
+        smc_icflush((c)->smc_va); /* guest `ic ivau`: precise drop keyed on the invalidated VA (cpu->smc_va) */ \
     } else if ((c)->reason == R_SYSCALL) {                                                                      \
         if (g_prof) g_prof_sys++;                                                                               \
         service(c);                                                                                             \

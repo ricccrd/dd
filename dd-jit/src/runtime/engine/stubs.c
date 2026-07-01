@@ -74,6 +74,23 @@ static void emit_exit_const(uint64_t pc, uint64_t reason) {
     // x0=cpu -> block_return
     e_br(9);
 }
+// SMC: exit a block at a guest `ic ivau, Xt` (R_ICFLUSH). Like emit_exit_const(pc, R_ICFLUSH) but it also
+// spills the invalidated guest VA (cpu->x[va_reg]) into cpu->smc_va so the dispatcher can do PRECISE
+// invalidation. emit_spill() has already written every NON-stolen guest reg to cpu->x[]; stolen regs
+// (x16/x17/x18/x30) keep their guest value in cpu->x[] continuously, so cpu->x[va_reg] is correct either
+// way -- read it back and stash it. pc resumes PAST the ic ivau.
+static void emit_exit_icflush(uint64_t pc, int va_reg) {
+    emit_spill(); // x0 = cpu; all guest regs now in cpu->x[]
+    e_ldr(9, 0, va_reg * 8);
+    // cpu->smc_va = cpu->x[va_reg]  (the invalidated VA)
+    e_str(9, 0, (int)OFF_SMCVA);
+    e_movconst(9, pc);
+    e_str(9, 0, OFF_PC);
+    e_movconst(9, R_ICFLUSH);
+    e_str(9, 0, OFF_RSN);
+    e_movconst(9, (uint64_t)block_return);
+    e_br(9);
+}
 static void emit_exit_reg(int rn, uint64_t reason) {
     // x0 = cpu
     emit_spill();

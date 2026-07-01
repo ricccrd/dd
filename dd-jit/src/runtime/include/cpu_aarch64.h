@@ -55,7 +55,13 @@ struct cpu {
     // A tgkill()/tkill() to THIS thread sets a bit here so the signal is delivered by this thread alone
     // (a process-directed signal in g_pending may be taken by any thread). Drained by maybe_deliver_signal.
     volatile uint64_t tpending;
+    // SMC: guest VA of the most recent `ic ivau` (icache invalidate). The emitter spills it here on the
+    // R_ICFLUSH exit so smc_icflush() can do PRECISE invalidation -- only drop the translation map + IBTC
+    // when that guest page was actually translated, instead of nuking everything on every guest icache
+    // flush (V8 issues one per freshly-written line). Appended after the baked-offset fields.
+    uint64_t smc_va;
 };
+#define OFF_SMCVA offsetof(struct cpu, smc_va)
 #define OFF_V 384
 #define OFF_HOSTV 896
 #define OFF_NZCV 1024
