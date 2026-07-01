@@ -108,9 +108,21 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
 // read-only image layers; the runtime owns the syscall stream, so it can answer
 // from cache. Precise invalidation: record fd->path on open, evict that path's
 // entry on write/truncate/create. Single-threaded only (no cross-thread races).
+//
+// POSITIVE entries are evicted precisely (the mutating syscall names the exact path it changed) and
+// otherwise survive across unrelated mutations -- the hot path (ld.so probing existing libraries) stays
+// warm. NEGATIVE (ENOENT) entries are additionally EPOCH-GATED on g_res_epoch: every name-adding syscall
+// (create/rename-into/mkdir/symlink/link, see dispatch.c) bumps the epoch BEFORE dispatch, so a negative
+// entry stamped before the mutation instantly misses and the next stat/access re-resolves the now-real
+// file. This closes the same-process create->stat coherence gap that precise eviction missed -- e.g. pip
+// writes a .pyc to a temp file then renames it into place and immediately stat()s the final name; the
+// rename target's earlier ENOENT must not outlive the rename. (Cross-process create-after-negative is
+// covered separately by rc_reset() dropping the inherited caches at fork.)
+static uint32_t g_res_epoch = 1; // 0 is reserved as "never matches" (shared by the rc_/oc_ path caches below)
 #define MCACHE_N 8192
 static struct mcent {
     uint64_t hash;
+    uint32_t epoch; // stamp at store; a negative (rc<0) entry only hits while it still equals g_res_epoch
     char path[192];
     int rc;
     struct stat st;
@@ -129,7 +141,9 @@ static int mc_lookup(const char *p, int *rc, struct stat *out) {
     int hit = 0;
     uint64_t h = mc_hash(p);
     struct mcent *e = &g_mc[h & (MCACHE_N - 1)];
-    if (e->hash == h && !strcmp(e->path, p)) {
+    // A negative (ENOENT) entry is only valid within the epoch it was recorded: a later create/rename can
+    // turn it positive, and every such mutation bumps g_res_epoch -> miss and re-stat the now-real file.
+    if (e->hash == h && (e->rc >= 0 || e->epoch == g_res_epoch) && !strcmp(e->path, p)) {
         *rc = e->rc;
         *out = e->st;
         hit = 1;
@@ -145,6 +159,7 @@ static void mc_store(const char *p, int rc, const struct stat *s) {
     uint64_t h = mc_hash(p);
     struct mcent *e = &g_mc[h & (MCACHE_N - 1)];
     e->hash = h;
+    e->epoch = g_res_epoch;
     strcpy(e->path, p);
     e->rc = rc;
     e->st = *s;
@@ -161,6 +176,7 @@ static void mc_evict(const char *p) {
 // readlink cache (ld.so resolves symlinks on every library search path)
 static struct rlent {
     uint64_t hash;
+    uint32_t epoch; // negative (rc<0) entries are epoch-gated; see the mcent rationale above
     char path[176];
     int rc;
     char link[200];
@@ -172,7 +188,9 @@ static int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
     int hit = 0;
     uint64_t h = mc_hash(p);
     struct rlent *e = &g_rl[h & 2047];
-    if (e->hash == h && !strcmp(e->path, p)) {
+    // a negative readlink (ENOENT/EINVAL) only hits within its epoch -- a later symlink/create can make it
+    // resolve, and that mutation bumps g_res_epoch.
+    if (e->hash == h && (e->rc >= 0 || e->epoch == g_res_epoch) && !strcmp(e->path, p)) {
         *rc = e->rc;
         int n = e->linklen < bs ? e->linklen : bs;
         if (e->rc >= 0) memcpy(out, e->link, n);
@@ -188,6 +206,7 @@ static void rl_store(const char *p, int rc, const char *link, int len) {
     uint64_t h = mc_hash(p);
     struct rlent *e = &g_rl[h & 2047];
     e->hash = h;
+    e->epoch = g_res_epoch;
     strcpy(e->path, p);
     e->rc = rc;
     e->linklen = len;
@@ -205,6 +224,7 @@ static void rl_evict(const char *p) {
 // access(F_OK) existence cache (ld.so probes every library candidate)
 static struct acent {
     uint64_t hash;
+    uint32_t epoch; // negative (rc<0) entries are epoch-gated; see the mcent rationale above
     char path[176];
     int rc;
 } g_ac[2048];
@@ -214,7 +234,9 @@ static int ac_lookup(const char *p, int *rc) {
     int hit = 0;
     uint64_t h = mc_hash(p);
     struct acent *e = &g_ac[h & 2047];
-    if (e->hash == h && !strcmp(e->path, p)) {
+    // a negative existence probe only hits within its epoch -- a later create can make the path exist, and
+    // that mutation bumps g_res_epoch -> miss and re-probe.
+    if (e->hash == h && (e->rc >= 0 || e->epoch == g_res_epoch) && !strcmp(e->path, p)) {
         *rc = e->rc;
         hit = 1;
     }
@@ -227,6 +249,7 @@ static void ac_store(const char *p, int rc) {
     uint64_t h = mc_hash(p);
     struct acent *e = &g_ac[h & 2047];
     e->hash = h;
+    e->epoch = g_res_epoch;
     strcpy(e->path, p);
     e->rc = rc;
     CUL;
@@ -262,7 +285,8 @@ static struct rcent {
     char guest[200];
     char host[256];
 } g_rc[RCACHE_N];
-static uint32_t g_res_epoch = 1; // 0 is reserved as "never matches"
+// g_res_epoch is defined up with the FS-metadata cache (the metadata caches' negative-entry gating
+// references it too); it is shared by these path-string caches and the metadata caches alike.
 // kill switch (read once): DD_NOPATHCACHE=1 -> exact baseline resolution, no memoization.
 static int res_enabled(void) {
     static int on = -1;
