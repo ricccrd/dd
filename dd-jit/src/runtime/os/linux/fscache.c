@@ -258,6 +258,7 @@ static void ac_evict(const char *p) {
 static struct rcent {
     uint64_t hash;
     uint32_t epoch;
+    uint16_t hlen; // strlen(host), cached so a hit copies via memcpy instead of re-scanning/snprintf
     char guest[200];
     char host[256];
 } g_rc[RCACHE_N];
@@ -294,7 +295,12 @@ static int rc_lookup(const char *g, char *out, size_t n) {
     uint64_t h = mc_hash(g);
     struct rcent *e = &g_rc[h & (RCACHE_N - 1)];
     if (e->hash == h && e->epoch == g_res_epoch && !strcmp(e->guest, g)) {
-        snprintf(out, n, "%s", e->host);
+        if (e->hlen < n) {
+            memcpy(out, e->host, (size_t)e->hlen + 1); // hot path: bounded copy incl. NUL, no format parse
+        } else {
+            memcpy(out, e->host, n - 1);
+            out[n - 1] = 0;
+        }
         hit = 1;
     }
     CUL;
@@ -303,14 +309,16 @@ static int rc_lookup(const char *g, char *out, size_t n) {
 static void rc_store(const char *g, const char *host) {
     if (!res_enabled() || !g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-resolved every time, safely.
-    if (strlen(g) >= sizeof(((struct rcent *)0)->guest) || strlen(host) >= sizeof(((struct rcent *)0)->host)) return;
+    size_t hl = strlen(host);
+    if (strlen(g) >= sizeof(((struct rcent *)0)->guest) || hl >= sizeof(((struct rcent *)0)->host)) return;
     CLK;
     uint64_t h = mc_hash(g);
     struct rcent *e = &g_rc[h & (RCACHE_N - 1)];
     e->hash = h;
     e->epoch = g_res_epoch; // stamp with the CURRENT epoch; a later mutation invalidates it
+    e->hlen = (uint16_t)hl;
     strcpy(e->guest, g);
-    strcpy(e->host, host);
+    memcpy(e->host, host, hl + 1);
     CUL;
 }
 
@@ -334,6 +342,7 @@ static void rc_store(const char *g, const char *host) {
 static struct ocent {
     uint64_t hash;
     uint32_t epoch;
+    uint16_t hlen; // strlen(host), cached so a hit copies via memcpy instead of re-scanning/snprintf
     char guest[200];
     char host[256];
 } g_oc[OCACHE_N];
@@ -352,7 +361,12 @@ static int oc_lookup(const char *g, char *out, size_t n) {
     uint64_t h = mc_hash(g);
     struct ocent *e = &g_oc[h & (OCACHE_N - 1)];
     if (e->hash == h && e->epoch == g_res_epoch && !strcmp(e->guest, g)) {
-        snprintf(out, n, "%s", e->host);
+        if (e->hlen < n) {
+            memcpy(out, e->host, (size_t)e->hlen + 1); // hot path: bounded copy incl. NUL, no format parse
+        } else {
+            memcpy(out, e->host, n - 1);
+            out[n - 1] = 0;
+        }
         hit = 1;
     }
     CUL;
@@ -361,7 +375,8 @@ static int oc_lookup(const char *g, char *out, size_t n) {
 static void oc_store(const char *g, const char *host) {
     if (!oc_enabled() || !g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-walked every time, safely.
-    if (strlen(g) >= sizeof(((struct ocent *)0)->guest) || strlen(host) >= sizeof(((struct ocent *)0)->host)) return;
+    size_t hl = strlen(host);
+    if (strlen(g) >= sizeof(((struct ocent *)0)->guest) || hl >= sizeof(((struct ocent *)0)->host)) return;
     // defensive: never cache a host path that resolved OUTSIDE the rootfs jail (item-9-style confinement).
     if (g_rootfs_canon_len && strncmp(host, g_rootfs_canon, g_rootfs_canon_len)) return;
     CLK;
@@ -369,8 +384,9 @@ static void oc_store(const char *g, const char *host) {
     struct ocent *e = &g_oc[h & (OCACHE_N - 1)];
     e->hash = h;
     e->epoch = g_res_epoch; // stamp the CURRENT epoch; a later mutation invalidates it
+    e->hlen = (uint16_t)hl;
     strcpy(e->guest, g);
-    strcpy(e->host, host);
+    memcpy(e->host, host, hl + 1);
     CUL;
 }
 // fork child: drop every inherited (COW) entry so it cannot outlive a parent-side mutation. Called from

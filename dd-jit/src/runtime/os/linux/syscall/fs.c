@@ -1124,33 +1124,38 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         const char *raw = (const char *)a1, *p = atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
         {
             const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
-            char ep[1024];
-            if (proc_self_exe(gp, ep, sizeof ep)) {
-                struct stat es;
-                if (a3 & 0x100) { // lstat: report the magic symlink itself
-                    memset(&es, 0, sizeof es);
-                    es.st_mode = S_IFLNK | 0777;
-                    es.st_size = (off_t)strlen(ep);
-                    es.st_nlink = 1;
-                    fill_linux_stat((uint8_t *)a2, &es);
+            // Magic /proc/.../exe + synthesized /proc|/sys files can ONLY live under "/proc" or "/sys"; gate
+            // both probes on that 1-char prefix so an ordinary path (the overwhelming majority of stats)
+            // skips proc_self_exe()/synth_stat() entirely instead of paying their strncmp()s every call.
+            if (gp[0] == '/' && (gp[1] == 'p' || gp[1] == 's')) {
+                char ep[1024];
+                if (proc_self_exe(gp, ep, sizeof ep)) {
+                    struct stat es;
+                    if (a3 & 0x100) { // lstat: report the magic symlink itself
+                        memset(&es, 0, sizeof es);
+                        es.st_mode = S_IFLNK | 0777;
+                        es.st_size = (off_t)strlen(ep);
+                        es.st_nlink = 1;
+                        fill_linux_stat((uint8_t *)a2, &es);
+                        G_RET(c) = 0;
+                        break;
+                    }
+                    // stat (follow): stat the actual executable file through the jail
+                    char hb[4200];
+                    const char *hp = xresolve(ep, hb, sizeof hb);
+                    if (stat(hp, &es) == 0) {
+                        fill_linux_stat((uint8_t *)a2, &es);
+                        G_RET(c) = 0;
+                        break;
+                    }
+                    // file unexpectedly missing -> fall through to the generic ENOENT path
+                }
+                if (synth_stat(gp, (uint8_t *)a2)) {
                     G_RET(c) = 0;
                     break;
                 }
-                // stat (follow): stat the actual executable file through the jail
-                char hb[4200];
-                const char *hp = xresolve(ep, hb, sizeof hb);
-                if (stat(hp, &es) == 0) {
-                    fill_linux_stat((uint8_t *)a2, &es);
-                    G_RET(c) = 0;
-                    break;
-                }
-                // file unexpectedly missing -> fall through to the generic ENOENT path
+                // synthesized /proc or /sys file
             }
-            if (synth_stat(gp, (uint8_t *)a2)) {
-                G_RET(c) = 0;
-                break;
-            }
-            // synthesized /proc or /sys file
         }
         // cacheable: named path, follow
         if (raw && raw[0] && !(a3 & 0x100)) {
