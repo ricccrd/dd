@@ -336,6 +336,18 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
     char(*names)[256] = NULL, (*seen)[256] = NULL;
     uint8_t *types = NULL;
     int cap = 0, nout = 0, scap = 0, ns = 0;
+    // POSIX: readdir must return "." (self) and ".." (parent) as real entries. The per-layer scan below
+    // skips "."/".." from every layer (a higher layer's "." must not shadow a lower's contents), so
+    // synthesize them first as DT_DIR (recorded in seen[] so no stray layer/volume entry doubles them).
+    // Without these, GNU find infinite-loops on deep trees -- it relies on "."/".." to walk (#184).
+    if (ovl_seen(&seen, &scap, ns, ".") >= 0) {
+        ns++;
+        if (ovl_push(&names, &types, &cap, nout, ".", DT_DIR) >= 0) nout++;
+    }
+    if (ovl_seen(&seen, &scap, ns, "..") >= 0) {
+        ns++;
+        if (ovl_push(&names, &types, &cap, nout, "..", DT_DIR) >= 0) nout++;
+    }
     // L=-1 is the upper (rootfs)
     for (int L = -1; L < g_nlower; L++) {
         const char *jc = L < 0 ? g_rootfs_canon : g_lower[L].canon;
