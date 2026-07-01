@@ -331,15 +331,6 @@ static void emit_rcl_rcr(struct insn *I, uint64_t next, int w, int rcr, int cnt_
 enum { FL_NONE, FL_SUB, FL_ADD, FL_LOGIC };
 static int g_fl_pending;
 
-// PF/AF dead-flag elimination. Unlike NZCV, x86 PF/AF have no host-flag analogue, so do_alu computes
-// and stores them eagerly to cpu->pf/cpu->af on every add/sub/logic/cmp/test/neg -- ~3-5 host insns an
-// op for flags real code almost never reads. They are DEAD when the immediately-following instruction
-// overwrites the full flags without reading any (an add/sub/logic/cmp/test/neg -- exactly the NZCV
-// dead-elim window). The main loop peeks one insn ahead (safe: a flag-killer never ends a block, so its
-// fall-through is real in-block code) and sets this; do_alu/neg then skip the PF/AF compute+store. Reset
-// per instruction by the main loop. NOLAZY leaves it 0 (eager PF/AF -- byte-identical to the old path).
-static int g_pfaf_dead;
-
 // x86 direction flag (DF), tracked at translate time. Compilers/libc emit `std`/`cld` straight-line
 // around the string op they govern (e.g. runtime.memmove's backward `std; rep movsq; cld`), so the
 // flag is always block-local -- no runtime cpu state needed. Reset to 0 (forward) at each block entry;
@@ -515,12 +506,9 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
         return;
     }
     int logical = (kind == 1 || kind == 4 || kind == 6); // or/and/xor (and test): x86 clears CF
-    int pfaf_dead = g_pfaf_dead;
-    g_pfaf_dead = 0; // consume: never leaks past this op (the main loop also resets it per instruction)
     // x86 PF: stash the result's low byte (computed from pristine a,b before alu_core may overwrite `out`).
     // PF depends only on the low 8 bits, so a non-flag, non-width-extended op gives the right source byte.
-    // Skipped when the next insn overwrites PF/AF without reading them (g_pfaf_dead) -- they're dead.
-    if (!pfaf_dead) {
+    {
         uint32_t pfop = (kind == 0) ? A_ADD : (kind == 1) ? A_ORR : (kind == 6) ? A_EOR : (kind == 4) ? A_AND : A_SUB;
         e_rrr(pfop, 25, a, b, 0, 0);
         e_pf_save(25);
@@ -821,18 +809,6 @@ static void *translate_block(uint64_t gpc) {
                 flags_materialize();
         }
 
-        // PF/AF dead-flag elimination: if THIS insn is a do_alu PF/AF producer (add/sub/logic/cmp/test/
-        // neg -- exactly insn_is_flagkill) and the NEXT insn also overwrites the flags without reading
-        // them, this op's eager PF/AF stores are dead. Peek one insn ahead -- safe because a flag-killer
-        // never ends a block, so `next` addresses real in-block code (the same bytes the loop decodes
-        // next iteration). do_alu/neg read + clear g_pfaf_dead. NOLAZY -> left 0 (eager PF/AF preserved).
-        g_pfaf_dead = 0;
-        if (lazyflags_on() && insn_is_flagkill(&I)) {
-            struct insn I2;
-            decode(next, &I2);
-            g_pfaf_dead = insn_is_flagkill(&I2);
-        }
-
         // x87 static-top tracking ends at any non-x87 instruction: spill the shadow top to
         // cpu->fptop and drop to the runtime-top model (the run only spans consecutive x87 ops, so
         // no top assumption ever crosses a non-x87 op, a branch target, or a block boundary).
@@ -897,12 +873,9 @@ static void *translate_block(uint64_t gpc) {
                     } else {
                         e_rrr(A_SUBS, 16, 31, rmv, w == 8, 0);
                         e_nzcv_save();
-                        if (!g_pfaf_dead) {               // skip dead PF/AF (next insn overwrites them)
-                            e_pf_save(16);                // x86 PF source = result low byte (do_alu handles the w<4 path)
-                            e_af_addsub(31, rmv, 16, 19); // x86 AF = bit 4 of (0 ^ rmv ^ result)
-                        }
+                        e_pf_save(16);                // x86 PF source = result low byte (do_alu handles the w<4 path)
+                        e_af_addsub(31, rmv, 16, 19); // x86 AF = bit 4 of (0 ^ rmv ^ result)
                     }
-                    g_pfaf_dead = 0;
                     rm_store(&I, w, 16);
                     gpc = next;
                     continue;
@@ -1255,15 +1228,55 @@ static void *translate_block(uint64_t gpc) {
                 emit_chain_exit(next + (uint64_t)I.imm);
                 break;
             }
-            // ---- jrcxz rel8 (E3): jump if RCX == 0 ----
+            // ---- jrcxz/jecxz rel8 (E3): jump if rCX == 0 (no decrement, no flag effect) ----
+            // 0x67 selects the 32-bit counter (ECX): test the W-form so a nonzero upper half of RCX
+            // doesn't suppress the branch; without it the 64-bit X-form tests all of RCX.
             if (op == 0xE3) {
                 uint64_t taken = next + (uint64_t)I.imm;
+                uint32_t cbz = I.addr32 ? 0x34000000u : 0xB4000000u; // cbz w_rcx / x_rcx
                 uint32_t *patch = (uint32_t *)g_cp;
-                emit32(0);             // cbz x_rcx -> taken
-                emit_chain_exit(next); // RCX != 0: fall through
+                emit32(0);             // cbz rcx -> taken
+                emit_chain_exit(next); // rCX != 0: fall through
                 int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
-                *patch = 0xB4000000u | (((uint32_t)d & 0x7FFFF) << 5) | RCX; // cbz x_rcx, taken
+                *patch = cbz | (((uint32_t)d & 0x7FFFF) << 5) | RCX; // cbz rcx, taken
                 emit_chain_exit(taken);
+                break;
+            }
+            // ---- loop/loope/loopne rel8 (E2/E1/E0): --rCX; branch if rCX != 0 [and ZF cond] ----
+            // None of these touch RFLAGS; loope/loopne only READ ZF. 0x67 makes the counter ECX (sf=0,
+            // which also zero-extends so the X-form cbz/cbnz still tests the right value); else RCX.
+            if (op == 0xE0 || op == 0xE1 || op == 0xE2) {
+                uint64_t taken = next + (uint64_t)I.imm;
+                int sf2 = I.addr32 ? 0 : 1; // counter width: ECX vs RCX
+                uint32_t cbz = I.addr32 ? 0x34000000u : 0xB4000000u;
+                uint32_t cbnz = I.addr32 ? 0x35000000u : 0xB5000000u;
+                e_subi(RCX, RCX, 1, sf2); // --rCX (no flag effect: plain SUB, not SUBS)
+                if (op == 0xE2) {
+                    // plain LOOP: taken iff rCX != 0.
+                    uint32_t *patch = (uint32_t *)g_cp;
+                    emit32(0);             // cbnz rcx -> taken
+                    emit_chain_exit(next); // rCX == 0: fall through
+                    int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
+                    *patch = cbnz | (((uint32_t)d & 0x7FFFF) << 5) | RCX;
+                    emit_chain_exit(taken);
+                    break;
+                }
+                // loope (E1): taken iff rCX != 0 && ZF==1; loopne (E0): rCX != 0 && ZF==0.
+                // Branch to the fall-through exit when EITHER test fails; fall through to the taken exit.
+                // Flags are already materialized to membank by the top-of-loop (E0/E1 aren't flagkill),
+                // but reload cpu->nzcv to be robust even when no producer was pending this block.
+                e_nzcv_load(); // ZF (ARM Z) canonical in live NZCV; SUB above left it untouched
+                int fail_cc = (op == 0xE1) ? 1 /*NE: ZF==0 fails loope*/ : 0 /*EQ: ZF==1 fails loopne*/;
+                uint32_t *p1 = (uint32_t *)g_cp;
+                emit32(0); // cbz rcx -> fall
+                uint32_t *p2 = (uint32_t *)g_cp;
+                emit32(0);                // b.<fail_cc> -> fall
+                emit_chain_exit(taken);   // both tests passed
+                int64_t d1 = ((uint8_t *)g_cp - (uint8_t *)p1) / 4;
+                *p1 = cbz | (((uint32_t)d1 & 0x7FFFF) << 5) | RCX; // cbz rcx, fall
+                int64_t d2 = ((uint8_t *)g_cp - (uint8_t *)p2) / 4;
+                *p2 = 0x54000000u | (((uint32_t)d2 & 0x7FFFF) << 5) | (uint32_t)fail_cc; // b.cc, fall
+                emit_chain_exit(next);
                 break;
             }
             // ---- jcc rel8 (70-7F) ----

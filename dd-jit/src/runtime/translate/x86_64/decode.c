@@ -50,6 +50,7 @@ static int op_has_modrm(int two, uint8_t op) {
     if (op >= 0x50 && op <= 0x5F) return 0;                             // push/pop r
     if (op >= 0x70 && op <= 0x7F) return 0;                             // jcc rel8
     if (op == 0xE8 || op == 0xE9 || op == 0xEB || op == 0xE3) return 0; // call/jmp rel, jrcxz
+    if (op == 0xE0 || op == 0xE1 || op == 0xE2) return 0;               // loopne/loope/loop rel8
     if (op == 0xC3 || op == 0xC2 || op == 0xC9 || op == 0x90 || op == 0xF4 || op == 0x99 || op == 0x98) return 0;
     if (op >= 0x91 && op <= 0x97) return 0;                                           // xchg eax, rN
     if (op == 0x9B || op == 0x9C || op == 0x9D || op == 0x9E || op == 0x9F) return 0; // fwait/pushf/popf/sahf/lahf
@@ -92,6 +93,7 @@ static int op_imm_bytes(struct insn *I) {
     if (op == 0xC2) return 2;                                             // ret imm16
     if (op >= 0x70 && op <= 0x7F) return 1;                               // jcc rel8
     if (op == 0xEB || op == 0xE3) return 1;                               // jmp rel8 / jrcxz rel8
+    if (op == 0xE0 || op == 0xE1 || op == 0xE2) return 1;                 // loopne/loope/loop rel8
     if (op == 0xE9 || op == 0xE8) return 4;                               // jmp/call rel32
     if (op >= 0xB0 && op <= 0xB7) return 1;                               // mov r8, imm8
     if (op >= 0xB8 && op <= 0xBF) return os == 8 ? 8 : (os == 2 ? 2 : 4); // mov r,imm (movabs if W)
