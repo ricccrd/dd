@@ -364,6 +364,38 @@ static void service_local(struct cpu *c) {
             a1 = nonpie_p(a1);
             break; // execve(PATH, ARGV, envp); argv base here,
                    //   each argv[] element rebased at case 221
+        // Syscalls whose result the ENGINE writes/reads into the guest buffer ITSELF (memset/memcpy/
+        // struct fill / arc4random_buf), not via a host syscall -- so there is no host EFAULT fixup to
+        // rescue a low, un-rebased non-PIE pointer; the handler's host_range_mapped() guard would simply
+        // fail on the unmapped low address. Rebase the buffer arg BEFORE the handler runs. (#224(a):
+        // getrandom's a0 was the one that made python3.11-x86 EFAULT in _Py_HashRandomization_Init.)
+        case 278: // getrandom(BUF, len, flags)      -- buffer is a0
+        case 179: // sysinfo(INFOBUF)
+        case 153: // times(TMSBUF)
+        case 169: // gettimeofday(TIMEVAL, tz)       -- tz ignored by the handler
+        case 236: // get_mempolicy(MODE, ...)        -- mode ptr is a0
+        case 161: // sethostname(NAME, len)          -- name buffer is a0
+            a0 = nonpie_p(a0);
+            break;
+        case 165: // getrusage(who, RUSAGEBUF)       -- buffer is a1
+        case 114: // clock_getres(clkid, TIMESPEC)
+        case 127: // sched_rr_get_interval(pid, TIMESPEC)
+        case 44:  // fstatfs(fd, STATFSBUF)
+            a1 = nonpie_p(a1);
+            break;
+        case 122: // sched_setaffinity(pid, len, MASK)  -- mask read directly (a1 is a size, never rebased)
+        case 123: // sched_getaffinity(pid, len, MASK)  -- mask written directly
+        case 115: // clock_nanosleep(clkid, flags, REQUEST, remain) -- req read directly in the ABSTIME loop
+            a2 = nonpie_p(a2);
+            break;
+        case 261: // prlimit64(pid, res, new, OLD)   -- old rlimit written to a3
+            a3 = nonpie_p(a3);
+            break;
+        case 43:  // statfs(PATH, STATFSBUF)         -- path read + buffer written
+        case 168: // getcpu(CPU, NODE, tcache)       -- cpu + node written
+            a0 = nonpie_p(a0);
+            a1 = nonpie_p(a1);
+            break;
         default: break;
         }
     }
