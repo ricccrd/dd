@@ -82,6 +82,14 @@ restart:;
     int volidx;
     // rootfs/overlay or a volume root
     int root_fd = jail_pick_idx(gbuf, &rel, &volidx);
+    if (volidx >= 0 && g_vols[volidx].isfile) {
+        // File bind-mount (jail_match matched only the exact mount point): `root_fd` is the host file's
+        // PARENT dir. Hand back that parent + the file's basename so the caller's openat opens the bound
+        // file itself -- a single-file mount has no interior to walk per-component.
+        snprintf(final, fn, "%s", vol_fbase(volidx));
+        int d = openat(root_fd, ".", O_RDONLY | O_DIRECTORY);
+        return d < 0 ? -errno : d;
+    }
     char rest[8192];
     snprintf(rest, sizeof rest, "%s", rel);
     int fds[260], nf = 0, budget = 40, ret = -EACCES;

@@ -384,8 +384,9 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
     // invisible to the layer scan above -- and the empty placeholder we create in the writable upper can be
     // served STALE by the host FS cache when the rootfs dir is held open for the container's lifetime.
     // Synthesize each volume's immediate child under `gdir` straight from the volume table so a parent
-    // listing always shows the mount entry, exactly as Docker (which mkdir -p's every mount target). A bind
-    // target is always a directory from the guest's view; deduped against the real layer entries. (A volume
+    // listing always shows the mount entry, exactly as Docker (which mkdir -p's every mount target). A
+    // directory mount's child (and any intermediate dir of a nested mount) shows as a directory; a
+    // single-file mount's leaf shows as a regular file. Deduped against the real layer entries. (A volume
     // dir fd lists via plain readdir, never here -- see the jail_is_vol() guard at the openat site -- so a
     // mount is never asked to enumerate itself.)
     size_t glen = strlen(gdir);
@@ -406,6 +407,9 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
             k++;
         }
         child[k] = 0;
+        // The file mount's own leaf (rest fully consumed, no further '/') lists as a regular file; an
+        // intermediate dir of a nested mount, or a directory mount's child, lists as a directory.
+        uint8_t cty = (g_vols[i].isfile && rest[k] == 0) ? DT_REG : DT_DIR;
         int dup = 0;
         for (int j = 0; j < ns; j++)
             if (!strcmp(seen[j], child)) {
@@ -415,7 +419,7 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
         if (dup) continue;
         if (ovl_seen(&seen, &scap, ns, child) < 0) break;
         ns++;
-        if (ovl_push(&names, &types, &cap, nout, child, DT_DIR) < 0) break;
+        if (ovl_push(&names, &types, &cap, nout, child, cty) < 0) break;
         nout++;
     }
     // /proc has no host backing (macOS has no /proc), so the layer scan of the empty mountpoint lists no

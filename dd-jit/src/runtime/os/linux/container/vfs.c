@@ -355,7 +355,9 @@ struct vol {
     char hcanon[1024];
     size_t hlen;
     int fd;
-    int ro; // 1 = read-only bind (`-v …:ro`): write-intent syscalls under `guest` fail EROFS
+    int ro;     // 1 = read-only bind (`-v …:ro`): write-intent syscalls under `guest` fail EROFS
+    int isfile; // 1 = single-file bind (`-v host/f:/ctr/f`): `fd` is the host file's PARENT dir, `hcanon`
+                // is the file itself, and `guest` matches ONLY its exact path (a file has no children).
 };
 static struct vol g_vols[32];
 static int g_nvols;
@@ -366,7 +368,9 @@ static int g_nvols;
 // itself still wins in jail_pick(), so `/x/y` shows the host files, not the empty placeholder. The rootfs
 // is the per-container overlay upper (daemon) or the plain rootfs (manual) -- both writable & private.
 // No-op until the rootfs is known (the bridge sets DDVOL after container_init resolves g_rootfs_canon).
-static void vol_mkmountpoint(const char *guest) {
+// A file mount's leaf is created as an empty placeholder FILE (not a dir) so a parent `ls` shows it as a
+// file, exactly as Docker materializes a single-file bind target inside the rootfs.
+static void vol_mkmountpoint(const char *guest, int isfile) {
     if (!g_rootfs_canon[0] || !guest || guest[0] != '/') return;
     char mp[4300];
     if ((size_t)snprintf(mp, sizeof mp, "%s%s", g_rootfs_canon, guest) >= sizeof mp) return;
@@ -376,7 +380,11 @@ static void vol_mkmountpoint(const char *guest) {
             mkdir(mp, 0755);
             *s = '/';
         }
-    mkdir(mp, 0755);
+    if (isfile) {
+        int fd = open(mp, O_CREAT | O_RDONLY, 0644);
+        if (fd >= 0) close(fd);
+    } else
+        mkdir(mp, 0755);
 }
 static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confined bind-mount volume
     if (g_nvols >= 32) return;
@@ -397,9 +405,23 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
     while (v->glen > 1 && v->guest[v->glen - 1] == '/') v->guest[--v->glen] = 0;
     if (!realpath(col + 1, v->hcanon)) return;
     v->hlen = strlen(v->hcanon);
-    if ((v->fd = open(v->hcanon, O_RDONLY | O_DIRECTORY)) < 0) return;
+    struct stat hst;
+    if (stat(v->hcanon, &hst) == 0 && S_ISREG(hst.st_mode)) {
+        // Single-file bind: openat's jail base must be a directory, so pin the file's PARENT dir as `fd`
+        // and route the exact mount point straight to `hcanon`. Dropping the O_DIRECTORY requirement here
+        // is what lets a regular-file source register at all (it ENOTDIRs otherwise -> the mount was lost).
+        v->isfile = 1;
+        char par[1024];
+        snprintf(par, sizeof par, "%s", v->hcanon);
+        char *sl = strrchr(par, '/');
+        if (!sl) return;
+        if (sl == par) par[1] = 0; // file directly under "/" -> parent is "/"
+        else *sl = 0;
+        if ((v->fd = open(par, O_RDONLY | O_DIRECTORY)) < 0) return;
+    } else if ((v->fd = open(v->hcanon, O_RDONLY | O_DIRECTORY)) < 0)
+        return;
     g_nvols++;
-    vol_mkmountpoint(v->guest);
+    vol_mkmountpoint(v->guest, v->isfile);
 }
 // Longest matching bind-mount volume for an absolute guest path (the DEEPEST mount wins, exactly as the
 // kernel routes a path to the innermost mount), or -1 for the rootfs/overlay jail. Longest-prefix so a
@@ -408,13 +430,21 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
 static int jail_match(const char *abs) {
     int best = -1;
     size_t blen = 0;
-    for (int i = 0; i < g_nvols; i++)
-        if (g_vols[i].glen > blen && !strncmp(abs, g_vols[i].guest, g_vols[i].glen) &&
-            (abs[g_vols[i].glen] == '/' || abs[g_vols[i].glen] == 0)) {
+    for (int i = 0; i < g_nvols; i++) {
+        char b = abs[g_vols[i].glen];
+        // A directory mount owns its children too (b=='/'); a file mount matches ONLY its exact path.
+        int hit = g_vols[i].isfile ? (b == 0) : (b == '/' || b == 0);
+        if (g_vols[i].glen > blen && hit && !strncmp(abs, g_vols[i].guest, g_vols[i].glen)) {
             best = i;
             blen = g_vols[i].glen;
         }
+    }
     return best;
+}
+// Basename of a file bind-mount's host source: the leaf to openat under the pinned parent-dir `fd`.
+static const char *vol_fbase(int vi) {
+    const char *sl = strrchr(g_vols[vi].hcanon, '/');
+    return sl ? sl + 1 : g_vols[vi].hcanon;
 }
 // Pick the jail (rootfs or a volume) for an absolute guest path; *rel = the path within that jail.
 static int jail_pick(const char *abs, const char **canon, size_t *clen, const char **rel) {
@@ -494,6 +524,14 @@ static int secure_resolve(const char *guest, char *out, size_t n, int nofollow) 
     }
     char norm[4200];
     confine(guest, norm, sizeof norm);
+    // Single-file bind-mount: the exact mount point maps straight to the bound host file (`hcanon` is the
+    // realpath'd file, not a dir to walk). jail_match only matches a file vol on its exact path, so a hit
+    // here IS that file -- emit it directly; confine_in would append rel ("/") and ENOTDIR on the file.
+    int fvi = jail_match(norm);
+    if (fvi >= 0 && g_vols[fvi].isfile) {
+        snprintf(out, n, "%s", g_vols[fvi].hcanon);
+        return 1;
+    }
     const char *jcanon;
     size_t jclen;
     const char *rel;
