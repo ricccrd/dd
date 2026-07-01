@@ -7,6 +7,7 @@ static void block_return(void);
 // in the real registers during a block. The cpu pointer is recovered from this
 // global only at block boundaries (set by the dispatcher before each run_block).
 static int g_trace;
+static int g_systrace; // JTS=1: syscall-entry trace only (no per-block dump) -- debug aid
 static const char *g_exe_path = "";
 // ARM-B1 IBPROF: gpc of the guest instruction currently being emitted (set each decode
 // step in translate_block); used to tag indirect-branch sites for the feasibility log.

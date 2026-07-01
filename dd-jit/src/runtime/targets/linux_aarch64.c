@@ -361,6 +361,7 @@ int dd_run(const char *rootfs, int argc, char *const argv[]) {
     g_cp = g_cache;
 
     g_trace = getenv("JT") != NULL;
+    g_systrace = getenv("JTS") != NULL;
     g_prof = getenv("PROF") != NULL;
     g_ibprof = getenv("IBPROF") != NULL;          // ARM-B1 feasibility: indirect-branch traffic + stability log
     g_vdbetrace = getenv("VDBETRACE") != NULL;    // ARM-B1 prototype: VDBE dispatch threading PoC

@@ -285,9 +285,10 @@ static void service_local(struct cpu *c) {
     // into their *at form here (x86: open->openat, ...); a no-op where the guest is already canonical.
     if (G_NORMALIZE(c)) return;
     uint64_t nr = G_NR(c), a0 = G_A0(c), a1 = G_A1(c), a2 = G_A2(c), a3 = G_A3(c), a4 = G_A4(c), a5 = G_A5(c);
-    if (g_trace)
-        fprintf(stderr, "[sys] %llu (%llx,%llx,%llx)\n", (unsigned long long)nr, (unsigned long long)a0,
-                (unsigned long long)a1, (unsigned long long)a2);
+    if (g_trace || g_systrace)
+        fprintf(stderr, "[sys pid=%d] %llu (%llx,%llx,%llx,%llx,%llx,%llx)\n", (int)getpid(), (unsigned long long)nr,
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
+                (unsigned long long)a4, (unsigned long long)a5);
     // --- non-PIE ET_EXEC pointer-arg redirect (g2h) --------------------------------------------------
     // Rebase ONLY the pointer-typed args of each syscall a non-PIE realistically hands a low-image
     // (.rodata/.data/.bss) pointer to, so the host syscall reads/writes the SAME bytes a native run would.

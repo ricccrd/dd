@@ -65,6 +65,33 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
     }
 }
 
+// Emulate the kernel's close-on-exec sweep. The JIT's execve re-loads the new image IN-PROCESS (no real
+// host exec happens -- see case 221), so the kernel never closes FD_CLOEXEC descriptors for us. We must do
+// it by hand, or a guest fd the caller opened O_CLOEXEC leaks into the new image. The classic failure this
+// fixes: initdb forks `postgres --boot` and feeds it the bootstrap script over a pipe2(O_CLOEXEC); the
+// child dup2()s the read end onto stdin and execs, expecting its inherited (CLOEXEC) copy of the WRITE end
+// to vanish on exec. Without this sweep that copy survives, so the pipe still has a writer after initdb
+// closes its end -> the child's read(stdin) never sees EOF and `running bootstrap script ...` hangs forever.
+// Engine-private host fds (the rootfs/volume dir-fds, the timer kqueue, the signal self-pipe) are skipped:
+// they back the runtime itself and must survive the emulated exec; closing them would leave dangling fd
+// numbers the new guest could reuse, corrupting timer/signal delivery and path confinement.
+static int exec_fd_is_engine(int fd) {
+    if (fd < 0) return 1;
+    if (fd == g_root_fd || fd == g_gtimer_kq || fd == g_sigfd_pipe[0] || fd == g_sigfd_pipe[1]) return 1;
+    for (int i = 0; i < g_nvols; i++)
+        if (fd == g_vols[i].fd) return 1;
+    return 0;
+}
+static void exec_close_cloexec(void) {
+    int maxfd = getdtablesize();
+    if (maxfd < 0 || maxfd > (1 << 20)) maxfd = 4096;
+    for (int fd = 0; fd < maxfd; fd++) {
+        if (exec_fd_is_engine(fd)) continue;
+        int fl = fcntl(fd, F_GETFD);
+        if (fl >= 0 && (fl & FD_CLOEXEC)) close(fd);
+    }
+}
+
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
     switch (nr) {
@@ -456,6 +483,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 argv[i] = na[i];
             ac = ni;
         }
+        // Committed to the exec now (all ENOENT early-returns are behind us): emulate the kernel's
+        // close-on-exec sweep. No real host exec runs below -- we re-load the new image in this same
+        // process -- so FD_CLOEXEC fds must be closed by hand or they leak into the new program.
+        exec_close_cloexec();
         // Tear down the inherited guest address space before loading the new image: a post-fork exec
         // otherwise keeps the parent's DENSE layout, and load_elf must bias a non-PIE ET_EXEC off its
         // fixed vaddr (__PAGEZERO blocks the low 4 GB) -> its baked absolute refs collide -> SIGSEGV.

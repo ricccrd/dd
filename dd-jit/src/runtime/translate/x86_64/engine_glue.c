@@ -15,6 +15,7 @@
 // Must be #included AFTER os/linux/container/state.c and BEFORE engine/cache.c + emit.c in the TU.
 
 static int g_trace, g_noibtc, g_itrace; // g_itrace: 1 instruction per block (per-insn register dump)
+static int g_systrace;                  // JTS=1: syscall-entry trace only (no per-block dump) -- debug aid
 static uint64_t g_disp_n, g_ibtc_fill;  // PROF: dispatcher round-trips, IBTC fills
 // ---- W4-C: rep cmps/scas idiom (R_REPSTR) globals + the NOREPCMP A/B kill-switch ----
 static uint64_t g_repstr_n;     // PROF: rep cmps/scas idiom firings
