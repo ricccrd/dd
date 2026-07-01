@@ -1,6 +1,6 @@
 # dd — todo
 
-Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 32 commits (~25 fixes) staged since v0.9.5, NOT yet
+Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 35 commits (~27 fixes) staged since v0.9.5, NOT yet
 tagged** (holding for a clean full-matrix gate at low load once the fix-agent pipeline drains).
 
 ## Proven working this session (both arches, real software, correct output — not just "no crash")
@@ -21,6 +21,10 @@ basics matrix (fs, net, mmap, fork/exec, signals, eventfd/epoll) 0-failed both a
 - **musl ioctl (#219)** — read-direction ioctls sign-extended under musl → ENOTTY (tmux/openpty/pty).
 - **NUMA no-ops (#217)** — mbind/set_mempolicy unhandled → R/OpenBLAS/numpy hung. Whole sci-stack.
 - **guest-pointer hardening (#194/#203/#214)** — bad syscall pointer returns EFAULT, never crashes engine.
+- **CRASHDBG serves non-PIE (#221)** — diag_crash + Mach exc_thread never ran nonpie_fixup → non-PIE
+  guests (cc1) false-crashed under CRASHDBG though clean on the normal path. Also fixed a latent Mach
+  msg struct-alignment bug (exc_msg_t missing #pragma pack(4) → fault addr read 4B past kernel data,
+  reported fault=0x0). Restores CRASHDBG as a usable diagnostic on non-PIE binaries.
 - Plus: pip .pyc coherence (#200), deep-find loop (#199), POSIX sem over fork (#192), single-file bind
   mount (#196), IPv6 + nc-u UDP loopback (#159/#206), munmap gmap-split (#212), the x86 fork+exec
   IBTC/#176 class, and the v0.9.5-tail perf/opcode work.
@@ -46,8 +50,9 @@ basics matrix (fs, net, mmap, fork/exec, signals, eventfd/epoll) 0-failed both a
 - [ ] **#215 — erlang full boot** — multithreaded-fork (beam.smp) JIT corruption (fd EBADF now fixed).
 
 ## Tail (lower priority)
-#221 CRASHDBG false-crashes non-PIE binaries *(agent active — diagnostic-integrity)* · #223 pty-master
-poll/EOF (script hangs) · #135 PyPy-x86 · #119 mongosh SEA · #104 V8 large-array · #190 MOVNTPS (dnf/rpm)
+#225 CRASHDBG gcc -c full-driver [MACH] fault (fork→execve child Mach exc-port, proc.c — diagnostic-
+only) · #226 x86 FAULT_ON jit86_faulth skips nonpie_fixup (#221 analogue, diagnostic-only) · #223 pty-
+master poll/EOF (script hangs) · #135 PyPy-x86 · #119 mongosh SEA · #104 V8 large-array · #190 MOVNTPS (dnf/rpm)
 · #183 x86 0x8c · #161 pg fast-shutdown SIGSYS · #167 amd jobctl · #218 vDSO ptr-check · #208 syscall-65573
 spam · #193 procfs follow-ups · #170 mkdir-EPERM (re-confirm) · #171 docker.sh gate · #178 PCACHE execve ·
 #220 xfail-sync (c-primes/cpp-stl now XPASS) · #93 encoder de-dup · #78 fixture.
