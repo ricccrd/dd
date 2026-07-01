@@ -43,6 +43,103 @@ static void e_imul2(int dst, int a, int b, int w) {
     e_mul_set_oc(21);
 }
 
+// 8/16-bit one-operand MUL/IMUL (F6/F7 /4,/5) CF=OF: MUL -> the high half is nonzero; IMUL -> the result
+// doesn't fit the low half (full signed product != sign-extension of the low `w` bytes). SF/ZF/AF/PF are
+// x86-undefined. `prod` holds the product (2*w bytes) in a 32-bit reg; k==4 MUL / k==5 IMUL. Scratch
+// x22/x23 (+ e_mul_set_oc's x20/x23); leaves `prod` intact.
+static void e_mul_oc_narrow(int prod, int k, int w) {
+    if (k == 4) { // MUL: CF=OF = (high half != 0)
+        e_lsr_i(22, prod, 8 * w, 0);
+        e_subi_s(23, 22, 0, 0);
+    } else { // IMUL: CF=OF = (sxt(low half) != full product)
+        e_sxt(22, prod, w);
+        e_rrr(A_SUBS, 23, prod, 22, 0, 0);
+    }
+    e_cset(22, 1 /*NE*/, 0);
+    e_mul_set_oc(22);
+}
+
+// x86 ROL/ROR affect ONLY CF and OF; SF/ZF/PF/AF are left untouched. CF gets the bit that wrapped to the
+// other end: ROR -> CF = MSB of the result (bit width-1); ROL -> CF = LSB (bit 0). OF is x86-DEFINED only
+// for a 1-bit rotate: ROL -> OF = MSB(result) XOR CF; ROR -> OF = MSB XOR (bit width-2). For any other
+// count OF is undefined and left unchanged. `res` holds the rotated value in its low `width` bits. We
+// rewrite only stored-C (bit29 = NOT CF, the borrow convention) and V (bit28 = OF), preserving N/Z and the
+// PF/AF lanes. `cnt` is the (already masked, nonzero) immediate count -> OF written iff cnt==1. Scratch x18..x23.
+static void e_rot_flags_const(int res, int k, int width, int cnt) {
+    int wsf = width == 64;
+    e_ldr(18, 28, OFF_NZCV);
+    e_lsr_i(20, res, k == 1 ? width - 1 : 0, wsf);
+    e_movconst(21, 1);
+    e_rrr(A_AND, 20, 20, 21, 0, 0);  // x20 = x86 CF (0/1)
+    e_movconst(21, 1u << 29);
+    e_rrr(A_BIC, 18, 18, 21, 1, 0);  // clear stored C
+    e_movconst(21, 1);
+    e_rrr(A_EOR, 22, 20, 21, 0, 0);  // x22 = NOT CF
+    e_rrr(A_ORR, 18, 18, 22, 1, 29); // stored C = (NOT CF) << 29
+    if (cnt == 1) {
+        e_lsr_i(22, res, width - 1, wsf);
+        e_movconst(21, 1);
+        e_rrr(A_AND, 22, 22, 21, 0, 0); // x22 = MSB(result)
+        if (k == 1) {
+            e_lsr_i(23, res, width - 2, wsf);
+            e_rrr(A_AND, 23, 23, 21, 0, 0); // x23 = bit width-2
+        } else
+            e_mov_rr(23, 20, 0); // x23 = CF
+        e_rrr(A_EOR, 22, 22, 23, 0, 0); // x22 = OF
+        e_movconst(21, 1u << 28);
+        e_rrr(A_BIC, 18, 18, 21, 1, 0);  // clear V
+        e_rrr(A_ORR, 18, 18, 22, 1, 28); // V = OF
+    }
+    e_str(18, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 18); // msr nzcv, x18 (sync live flags)
+}
+
+// ROL/ROR by CL: like e_rot_flags_const but the count is runtime (n = CL & (width-1)). When n==0 x86
+// changes NO flags, so keep the old NZCV; otherwise set CF (and OF via the 1-bit formula -- for n>1 OF is
+// x86-undefined, so emitting that legal value is fine). Reads CL (RCX); scratch x18..x25.
+static void e_rot_flags_cl(int res, int k, int width) {
+    int wsf = width == 64;
+    e_movconst(19, width - 1);
+    e_rrr(A_ANDS, 24, RCX, 19, wsf, 0); // x24 = n = CL & (width-1); Z = (n == 0)
+    e_ldr(18, 28, OFF_NZCV);            // old NZCV (kept when n == 0)
+    e_lsr_i(20, res, k == 1 ? width - 1 : 0, wsf);
+    e_movconst(21, 1);
+    e_rrr(A_AND, 20, 20, 21, 0, 0); // x20 = CF
+    e_mov_rr(25, 18, 1);            // candidate = copy of old NZCV
+    e_movconst(21, 1u << 29);
+    e_rrr(A_BIC, 25, 25, 21, 1, 0); // clear stored C
+    e_movconst(21, 1);
+    e_rrr(A_EOR, 22, 20, 21, 0, 0);  // NOT CF
+    e_rrr(A_ORR, 25, 25, 22, 1, 29); // stored C = (NOT CF) << 29
+    e_lsr_i(22, res, width - 1, wsf);
+    e_movconst(21, 1);
+    e_rrr(A_AND, 22, 22, 21, 0, 0); // MSB(result)
+    if (k == 1) {
+        e_lsr_i(23, res, width - 2, wsf);
+        e_rrr(A_AND, 23, 23, 21, 0, 0); // bit width-2
+    } else
+        e_mov_rr(23, 20, 0); // CF
+    e_rrr(A_EOR, 22, 22, 23, 0, 0); // OF
+    e_movconst(21, 1u << 28);
+    e_rrr(A_BIC, 25, 25, 21, 1, 0);  // clear V
+    e_rrr(A_ORR, 25, 25, 22, 1, 28); // V = OF
+    // all ops since the ANDS are flag-free, so its Z survives: n==0 -> keep old (x18), else candidate (x25).
+    e_csel(18, 18, 25, 0 /*EQ*/, 1);
+    e_str(18, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 18); // msr nzcv, x18 (sync live flags)
+}
+
+// Set x86 OF (= ARM V, bit28) of the stored NZCV to the 0/1 in `ofreg` (read-modify-write; the prior flag
+// save left V=0). Used by the 1-bit SHL/SHR paths where OF is x86-defined. `ofreg` must not be x20/x23.
+static void e_nzcv_set_of(int ofreg) {
+    e_ldr(20, 28, OFF_NZCV);
+    e_movconst(23, 1u << 28);
+    e_rrr(A_BIC, 20, 20, 23, 1, 0);     // clear V
+    e_rrr(A_ORR, 20, 20, ofreg, 1, 28); // V = OF
+    e_str(20, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 20); // msr nzcv, x20 (sync live flags)
+}
+
 // ALU operation selector from the primary opcode group (00..3D) or group1 /digit.
 // returns: 0 ADD 1 OR 2 ADC 3 SBB 4 AND 5 SUB 6 XOR 7 CMP, or -1.
 static int alu_kind_primary(uint8_t op) {
@@ -795,6 +892,7 @@ static void *translate_block(uint64_t gpc) {
                             e_sxt(20, rmv, 1);
                         } // sign-extend (sxtb)
                         e_mul(21, 19, 20, 0);
+                        e_mul_oc_narrow(21, k, 1); // CF=OF: AX doesn't fit AL (uses the full product in x21)
                         e_bfi(RAX, 21, 0, 16, 1); // write AX (low 16), preserve upper RAX (x86 8/16-bit semantics)
                     } else {                      // div/idiv r/m8: AL = AX / r/m8, AH = AX % r/m8
                         if (k == 6) {
@@ -828,6 +926,7 @@ static void *translate_block(uint64_t gpc) {
                             e_sxt(20, rmv, 2);
                         } // sign-extended (sxth)
                         e_mul(21, 19, 20, 0);
+                        e_mul_oc_narrow(21, k, 2); // CF=OF: product doesn't fit AX (uses full product in x21)
                         e_bfi(RAX, 21, 0, 16, 1); // AX = low 16
                         e_lsr_i(21, 21, 16, 0);
                         e_bfi(RDX, 21, 0, 16, 1); // DX = high 16
@@ -1319,6 +1418,8 @@ static void *translate_block(uint64_t gpc) {
                 e_ldr(18, 28, OFF_AF);
                 emit32(0x53000000u | (4 << 16) | (4 << 10) | (18 << 5) | 18); // ubfx w18,w18,#4,#1 (AF)
                 e_rrr(A_ORR, 17, 17, 18, 0, 4);                               // AF -> bit4
+                e_ldr(18, 28, OFF_ID);
+                e_rrr(A_ORR, 17, 17, 18, 0, 21); // ID(bit21) <- cpu->idflag (0/1) -- round-trips a CPUID probe
                 e_subi(RSP, RSP, 8, 1);
                 e_store(8, 17, RSP);
                 gpc = next;
@@ -1346,6 +1447,8 @@ static void *translate_block(uint64_t gpc) {
                 e_rrr(A_EOR, 18, 18, 19, 0, 0); // PF lane source byte = NOT PF (consumer takes even-parity)
                 e_str(18, 28, OFF_PF);
                 e_af_save(16); // AF from popped RFLAGS bit4 (cpu->af consumer extracts bit 4)
+                emit32(0x53000000u | (21 << 16) | (21 << 10) | (16 << 5) | 18); // ubfx w18,w16,#21,#1 (ID)
+                e_str(18, 28, OFF_ID); // stash RFLAGS.ID so a later pushfq observes the toggle (CPUID probe)
                 g_fl_pending = FL_NONE; // flags now materialized directly into cpu->nzcv
                 gpc = next;
                 continue;

@@ -56,7 +56,12 @@ struct cpu {
     // Thread-DIRECTED pending signals (1<<signo) -- the per-thread analogue of g_pending. A tkill/tgkill to
     // THIS thread sets a bit here so only this thread delivers it. Drained by maybe_deliver_signal.
     volatile uint64_t tpending;
+    // x86 RFLAGS.ID (bit 21) substrate. There is no ARM-NZCV equivalent, so popfq(9D) stashes the popped
+    // bit 21 here and pushfq(9C) reads it back -- a software toggle of ID round-trips, which is exactly the
+    // CPUID-availability probe 32-bit code uses (flip ID via pushf/popf and check it changed). 0/1 valued.
+    uint64_t idflag;
 };
+#define OFF_ID ((int)__builtin_offsetof(struct cpu, idflag))
 #define OFF_PF ((int)__builtin_offsetof(struct cpu, pf))
 #define OFF_AF ((int)__builtin_offsetof(struct cpu, af))
 #define OFF_EXITED ((int)__builtin_offsetof(struct cpu, exited)) // int exited; int exit_code (the next word)
