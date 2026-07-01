@@ -2,6 +2,22 @@
 // the private NET-ns loopback (af_l2m / cmsg / msg-flag translation live in container/netns.c). Returns 1 if
 // nr was handled, 0 otherwise. Included by service.c after service/io.c, before service() -- same TU scope.
 
+// A zero-length datagram receive that asks for the sender address. macOS short-circuits any receive with
+// a zero-length buffer (returns 0 at once, filling neither data nor the source address), but Linux blocks
+// until a datagram arrives and reports its sender. busybox `nc -u -l` depends on the Linux behaviour: it
+// peeks the first datagram's source with a zero-length recvmsg(MSG_PEEK) purely to learn whom to connect()
+// its reply back to. To match Linux we receive into a 1-byte host scratch instead, so macOS blocks and
+// fills the address; a MSG_PEEK leaves the datagram queued for the guest's real read, and a non-peek
+// receive consumes the whole datagram exactly as a zero-length Linux recv would. The guest still sees 0
+// bytes (it asked for none). Restricted to datagram/raw sockets -- a zero-length stream recv legitimately
+// returns 0 immediately -- so ordinary `recv(fd, buf, 0, 0)` probes are unaffected.
+static int dgram_addr_peek(int fd, int wantaddr, size_t totlen) {
+    if (!wantaddr || totlen != 0) return 0;
+    int ty = 0;
+    socklen_t tl = sizeof ty;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &ty, &tl) < 0) return 0;
+    return ty == SOCK_DGRAM || ty == SOCK_RAW;
+}
 static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                    uint64_t a5) {
     switch (nr) {
@@ -473,12 +489,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         struct sockaddr_storage hss;
         socklen_t hsl = sizeof hss;
         int want = a4 != 0;
+        // Zero-length address-peek idiom: force macOS to block + fill the sender via a 1-byte scratch.
+        char one;
+        int peekaddr = dgram_addr_peek((int)a0, want, (size_t)a2);
+        void *rbuf = peekaddr ? &one : (void *)a1;
+        size_t rlen = peekaddr ? 1 : (size_t)a2;
         ssize_t r;
         do {
             hsl = sizeof hss;
-            r = recvfrom((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
+            r = recvfrom((int)a0, rbuf, rlen, msgflags_l2m((int)a3),
                          want ? (struct sockaddr *)&hss : NULL, want ? &hsl : NULL);
         } while (r < 0 && SVC_EINTR_RESTART(c));
+        if (r > 0 && peekaddr) r = 0; // guest asked for 0 bytes; the address is what it wanted
         // SEQPACKET-as-DGRAM EOF: a peer-closed DGRAM recv reports ECONNRESET, but Linux SEQPACKET
         // returns 0 (EOF). Translate so the guest sees the expected end-of-stream. (See case 199.)
         if (r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
@@ -616,10 +638,26 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int on = 1;
             setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
         }
+        // Zero-length address-peek idiom (recvmsg): if the guest wants the sender but supplies no receive
+        // room, macOS returns 0 at once without filling msg_name (see dgram_addr_peek). Receive into a
+        // 1-byte scratch iov so it blocks and reports the source; MSG_PEEK keeps the datagram queued.
+        char one;
+        struct iovec sciov = {&one, 1};
+        int peekaddr = 0;
+        if (nr == 212) {
+            size_t totlen = 0;
+            struct iovec *iv = (struct iovec *)mh.msg_iov;
+            for (int i = 0; iv && i < (int)mh.msg_iovlen; i++) totlen += iv[i].iov_len;
+            if ((peekaddr = dgram_addr_peek((int)a0, gname && gnamelen, totlen))) {
+                mh.msg_iov = &sciov;
+                mh.msg_iovlen = 1;
+            }
+        }
         ssize_t r;
         do {
             r = (nr == 211) ? sendmsg((int)a0, &mh, msgflags_l2m((int)a2)) : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         } while (r < 0 && SVC_EINTR_RESTART(c));
+        if (r > 0 && peekaddr) r = 0; // guest supplied no data room; only the source address was wanted
         // SEQPACKET-as-DGRAM EOF: coerce a peer-closed recvmsg's ECONNRESET to 0 (EOF). (See case 199.)
         if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
         if (nr == 212 && r >= 0) {
