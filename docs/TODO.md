@@ -1,36 +1,45 @@
 # dd — todo
 
-Shipped **v0.9.0 / v0.9.1 / v0.9.2**; **v0.9.3 batch staged**. Real software working end-to-end now:
-**postgres (SELECT=42)**, redis, jq, etcd/go, julia, node-x86, java/.NET host, sha256sum, zstd,
-buildkitd, haproxy, git, the interpreters. ~31 of ~33 swept bugs fixed. Remaining tail below.
+Shipped **v0.9.0 → v0.9.5** (node/V8 **72× faster** SMC fix, postgres SELECT=42, x87/R, apt id-drop,
+compose, IPv6, x86 flags, macOS cd.., faster tests). **v0.9.6 batch staged** (8 fixes, gate-pending).
+Real software working: postgres, redis, R, jq, node, java/.NET host, git, sqlite, nginx, openssl,
+tar(arm), gcc/clang(arm), sed/awk/grep, all event/fd syscalls.
 
-> Daemon resolves the engine *beside the daemon* (`target/release/ddjit-linux_*`) then `/Applications/dd.app`.
-> The release engine is NOT auto-rebuilt by `cargo build --release -p dd-daemon` (build.rs #include trap) —
-> `cargo clean -p ddjit` first, or copy the fresh engine in, before any daemon/scenario run.
+> **Build race:** concurrent agents `cargo clean -p ddjit` in the shared target wipe each other's
+> engines. Each agent MUST use an isolated `CARGO_TARGET_DIR=target-<slug>`. Gate when builders idle.
+> **Env doesn't cross the OrbStack bridge** to the mac engine — use file-gates `poc/runtime/jit86/*`
+> (NOIBTC, FAULT_ON, …) for diagnostics, not env.
 
-## In progress
-- [ ] **#153 x87 FNSTENV (D9 /6) + FLDENV (D9 /4)** *(agent active)* — R/OpenBLAS.
+## v0.9.6 staged (verify when builders idle → tag)
+IPv6 loopback · perf-x86 PF/AF (1.71×) · perf-IBTC 8Ki→64Ki (40×) · perf-syscall · overlay 1024-cap ·
+x86 LOOP(0xE0-3) · chown-via-xattr · overlay `.`/`..`.
 
-## Deep / hard (engine codegen + signal-fork machinery)
-- [ ] **#104 V8 store-drop** — Turboshaft MachineLowering drops Stores under OSR (java/.NET/node-opt). ET_DYN/PIE.
-- [ ] **#117 flaky x86 fork+exec** — execve re-translation can't tolerate a reused guest image base. ~0.4% under load.
-- [ ] **#155 go build/run driver SIGSEGV** — heavy go toolchain; same x86-codegen class as #117/#104.
-- [ ] **#161 postgres fast-shutdown SIGSYS** — forked child re-issues kevent in-place after a host signal →
-  macOS SIGSYS. Robustness-only (SELECT=42 works). signal.c/sigframe/fork — held/regression-prone (node/redis/mongosh).
-- [ ] **#135 PyPy x86 JIT** asserts (2nd guest-JIT).
+## THE big one (in progress)
+- [ ] **#176/#117/#155 x86 IBTC stale across execve** *(agent active)* — the IBTC serves a freed host
+  body when a fork+exec'd child reuses guest PCs → branch-to-0x1 SIGSEGV. Empirically isolated (NOIBTC
+  → 0/10 vs 10/10). Blocks **apt, tar czf, clang -O2, git, rustc, cargo, go build**. Fix = flush g_xibtc
+  on execve + reset FS/TLS base (clang `fs:[0x28]` clue). Closes a whole class.
 
-## x86 opcode / flag gaps (small)
-- [ ] **#145 x86 flag residuals** — ror %cl CF, imul CF, shift OF(count==1). qemu differential.
-- [ ] **#120 RFLAGS ID flag** (32-bit CPUID detect; ready patch needs cpu_x86_64.h field + pushfq/popfq).
+## Open bugs (dev-day + tail)
+- [ ] **#185 procfs incomplete** — /proc/self/cmdline,/comm,/fd/N readlink,/mountinfo,/proc/<pid> missing
+  → ps shows nothing, df / fails. (vfs proc synth)
+- [ ] **#186 cmake configure fails** — gmake can't `include` a flags.make that exists on disk; fs
+  path-cache/fscache coherence under cmake churn (FS-mutating-syscall epoch misses a case). Blocks cmake.
+- [ ] **#187 JVM hangs at startup on arm** — `java -version` no output even -Xint; futex/thread or a
+  blocking /proc/cgroup read. No Java on arm.
+- [ ] **#188 x86 CPUID feature flags missing** — /proc/cpuinfo + CPUID advertise no sse2/sse/mmx (insns
+  work) → JVM "SSE2 not supported", numpy/ffmpeg abort. (translate-x86 CPUID + cpuinfo; behind #176)
+- [ ] **#183 x86 0x8c MOV r/m,Sreg (+0x67)** unimplemented — secondary tar/gzip.
+- [ ] **#161 postgres fast-shutdown SIGSYS** (forked child kevent retry; held/signal-fork).
+- [ ] **#175 npm/ruby hang via daemon** (forked child exit not observed → rc=124).
+- [ ] **#167 amd terminal/jobctl** container exits early.
+- [ ] **#104 V8 store-drop** (Turboshaft, ET_DYN) · **#135 PyPy x86 JIT** · **#119 mongosh SEA**.
+- [ ] **#158 memcached** libevent listener.
 
-## Loaders / servers / misc
-- [ ] **#139 clang full link** — crash gone, but the link emits no runnable binary (`./h` not found). Driver→ld exec/output.
-- [ ] **#119 mongosh** 193MB node-SEA early crash. **#123 node-via-daemon** ENOENT (re-test via daemon).
-- [ ] **#158 memcached** libevent listener (not loopback). **#159 IPv6 (::) loopback** redirect.
-
-## Deferred
-- [ ] **#78** gcc-bundle /hello.c fixture · **#93** host-asm encoder de-dup · **#94** README benchmarks
+## Infra / deferred
+- [ ] **#171 docker.sh gate** — pin daemon to current mac engine (placement). **#178 PCACHE execve** gap.
+- [ ] **#170 mkdir-EPERM** (likely moot — apt is #176; re-confirm). **#93** encoder de-dup · **#78** fixture.
 
 ## Process
-- Each fix: verify on the real path → batch → gate (basics both arches + docker.sh) → tag → push. Keep current.
-- Scenario lane: amd failures are a test-env image gap, not engine bugs; arm is the meaningful signal.
+- dev-day = fast/shallow reporter (symptom+repro, no diagnosis) → fix agents root-cause+fix, isolated
+  build dirs. Each fix: agent-verify → merge → (gate when idle) → batch → tag.
