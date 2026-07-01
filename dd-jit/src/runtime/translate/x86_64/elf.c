@@ -306,6 +306,37 @@ static void load_elf(const char *path, struct loaded *out) {
     // resolves the biased code PCs (otherwise runtime.pcdatavalue nil-derefs). Gated on g_nonpie_lo
     // (ET_EXEC only); NOGOREBASE=1 disables for A/B testing.
     if (g_nonpie_lo && !getenv("NOGOREBASE")) go_rebase_nonpie(f, st.st_size, bias, g_nonpie_lo, g_nonpie_hi);
+    // BUG#132: a biased non-PIE ET_EXEC (e.g. static glibc jq) carries baked ABSOLUTE pointers in
+    // .data.rel.ro AND .data (pointer tables) that the static linker resolved to LINK addresses with NO
+    // runtime relocation entry. After we bias the image high (macOS __PAGEZERO blocks the low link range)
+    // those pointers still point at the unmapped link addresses while rip-relative leas to the SAME
+    // objects ARE biased -- the inconsistency makes glibc free() a static rodata pointer -> munmap_chunk
+    // abort (jq --version; same class as the gcc-ld / git / rustc SIGSEGVs). Re-relocate every 8-byte word
+    // in those sections whose value lands in the original link range by +bias (what an R_X86_64_RELATIVE
+    // would do). .data is mixed, so a non-pointer qword that happens to fall in [lo,hi) is a (rare) false
+    // positive -- the fully robust fix is to map the image AT its link address (engine with a small
+    // __PAGEZERO). Gated by NORELRO=1 for A/B. ET_EXEC only; static-PIE carries real relocs, never here.
+    // Skip GO binaries: go_rebase_nonpie above already rebased their moduledata/.data pointers; a blind
+    // .data scan here double-biases the Go name/type tables (etcd -> "nameOff ... not in ranges"). Detect
+    // Go via .gopclntab (present in every Go binary, stripped or not).
+    if (g_nonpie_lo && !getenv("NORELRO") &&
+        !go_section_by_name(f, st.st_size, ".gopclntab", NULL, NULL, NULL)) {
+        uint64_t shoff = rd64(f + 40);
+        uint16_t shentsize = rd16(f + 58), shnum = rd16(f + 60), shstrndx = rd16(f + 62);
+        if (shoff && shnum && shstrndx < shnum) {
+            const uint8_t *shstr = f + rd64(f + shoff + (uint64_t)shstrndx * shentsize + 24);
+            for (int i = 0; i < shnum; i++) {
+                const uint8_t *sh = f + shoff + (uint64_t)i * shentsize;
+                const char *nm = (const char *)shstr + rd32(sh + 0);
+                if (strcmp(nm, ".data.rel.ro") != 0 && strcmp(nm, ".data") != 0) continue;
+                uint64_t saddr = rd64(sh + 16), ssize = rd64(sh + 32);
+                for (uint64_t o = 0; o + 8 <= ssize; o += 8) {
+                    uint64_t *slot = (uint64_t *)(saddr + bias + o);
+                    if (*slot >= g_nonpie_lo && *slot < g_nonpie_hi) *slot += bias;
+                }
+            }
+        }
+    }
     mprotect(base, span, PROT_READ | PROT_WRITE | PROT_EXEC);
     out->entry = e_entry + bias;
     out->base = (uint64_t)base;
