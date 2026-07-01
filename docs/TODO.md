@@ -1,10 +1,18 @@
 # dd — todo
 
-Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 40 commits (~31 fixes) staged since v0.9.5, NOT yet
-tagged.** FINALIZING FOR SHOWCASE (2026-07-01): validate docker run / exec -it / interactive shells /
-databases, then TAG + PUSH (push now authorized). Landed since last note: #224a getrandom non-PIE
-rebase, #219b TIOCGPTPEER (glibc openpty/forkpty). Open important: #201 (agent active) + docker
-showcase validation (agent active).
+Shipped **v0.9.0 → v0.9.5**. **v0.9.6 batch = 44 commits (~34 fixes) staged since v0.9.5, NOT yet
+tagged.** FINALIZING FOR SHOWCASE (2026-07-01): TAG + PUSH once the release gate is green (push now
+authorized). Showcase validation matrix: base `docker run`, interactive `run -it`, `docker exec -it`,
+lifecycle = READY (alpine/ubuntu, both arches). DATABASE blockers ALL FIXED this session:
+- **B2** — /proc/self/exe stat resolved via overlay lowers → gosu/su-exec work → official
+  postgres/mariadb/mongo entrypoints get past privilege-drop.
+- **B3** — AF_UNIX bind/connect at the full overlay-upper path via fchdir (macOS sun_path 104B was
+  silently truncating the long upper path) → DB unix sockets usable.
+- **B4** — docker exec joins the container's emulated loopback netns → exec'd DB clients reach 127.0.0.1.
+Plus #224a getrandom non-PIE rebase, #219b TIOCGPTPEER (glibc openpty/forkpty).
+Open: release gate agent running the B2+B3+B4 real-DB integration proof; #201 (x86-only, NOT gating,
+agent active). Known non-gating: B1 flaky debian:bookworm amd64 fork/exec (demo uses ubuntu); B4b
+0.0.0.0-bind→127.0.0.1 on bridge (stock redis needs --bind 127.0.0.1 until fixed).
 
 ## Proven working this session (both arches, real software, correct output — not just "no crash")
 postgres · mariadb · nginx (1000/1000 req) · redis (500k ops) · sqlite (WAL, 100k rows) · ruby · perl ·

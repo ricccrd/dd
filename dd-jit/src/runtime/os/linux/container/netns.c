@@ -14,6 +14,53 @@ static const int CC_L2M[17] = {
     VINTR, VQUIT, VERASE, VKILL,    VEOF,     VTIME,   VMIN,   -1,   VSTART,
     // Linux c_cc index -> macOS index
     VSTOP, VSUSP, VEOL,   VREPRINT, VDISCARD, VWERASE, VLNEXT, VEOL2};
+
+// bind()/connect() an AF_UNIX socket at host path `host`. macOS sun_path is only 104 bytes, but a container
+// overlay upper socket path ($HOME/.dd/containers/<64-hex>/upper/.../.s.PGSQL.5432) can exceed that -- a
+// plain snprintf into sun_path SILENTLY TRUNCATES, so bind creates the inode at the wrong (short) path and
+// the guest's later stat/chmod/connect (which resolve the FULL path) ENOENT it. When `host` fits, bind/
+// connect directly (byte-identical to before). When it overflows, split dir/base, fchdir into the parent,
+// and operate on the SHORT basename (.s.PGSQL.5432, mysqld.sock, ...) so the inode lands at -- and is dialed
+// from -- exactly the full path the overlay resolver produces. `connecting`: 0 = bind, 1 = connect.
+static int unix_sock_at(int fd, const char *host, int connecting) {
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    if (strlen(host) < sizeof un.sun_path) {
+        snprintf(un.sun_path, sizeof un.sun_path, "%s", host);
+        return connecting ? connect(fd, (struct sockaddr *)&un, sizeof un)
+                          : bind(fd, (struct sockaddr *)&un, sizeof un);
+    }
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", host);
+    char *sl = strrchr(dir, '/');
+    if (!sl || !sl[1] || strlen(sl + 1) >= sizeof un.sun_path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    snprintf(un.sun_path, sizeof un.sun_path, "%s", sl + 1);
+    *sl = 0;
+    int pfd = open(dir[0] ? dir : "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pfd < 0) return -1;
+    int cwd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (cwd < 0) {
+        close(pfd);
+        return -1;
+    }
+    int rc = -1, e = 0;
+    if (fchdir(pfd) == 0) {
+        rc = connecting ? connect(fd, (struct sockaddr *)&un, sizeof un)
+                        : bind(fd, (struct sockaddr *)&un, sizeof un);
+        e = errno;
+        fchdir(cwd);
+    } else {
+        e = errno;
+    }
+    close(cwd);
+    close(pfd);
+    errno = e;
+    return rc;
+}
 static uint32_t map_bits(uint32_t v, const uint32_t t[][2], int n, int fwd) {
     uint32_t o = 0;
     for (int i = 0; i < n; i++) {

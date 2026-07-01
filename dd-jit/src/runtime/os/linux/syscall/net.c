@@ -160,11 +160,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             unix_path_copy(sa, (socklen_t)a2, gp, sizeof gp);
             overlay_copyup(gp, host, sizeof host); // guest path -> upper host path (+ materialize parent dirs)
             unlink(host);                          // clear a stale inode (else EADDRINUSE)
-            struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", host);
-            int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
+            // bind at the FULL upper path (via unix_sock_at, which fchdir-shortens paths past sun_path[104])
+            // so the socket inode lands exactly where the guest's stat/chmod/connect resolves -- a plain bind
+            // would truncate the long upper path and strand the inode where nothing can find it.
+            int r = unix_sock_at((int)a0, host, 0);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
@@ -372,12 +371,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             char gp[200], host[1024];
             unix_path_copy(sa, (socklen_t)a2, gp, sizeof gp);
             const char *hp = atpath(-100, gp, host, sizeof host, 0); // guest path -> topmost layer's host path
-            struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", hp);
+            // dial via unix_sock_at (matches the bind side): fchdir-shortens paths past sun_path[104] so a
+            // long upper socket path is reached exactly, not truncated to some other (nonexistent) inode.
             int r;
-            do { r = connect((int)a0, (struct sockaddr *)&un, sizeof un); } while (r < 0 && SVC_EINTR_RESTART(c));
+            do { r = unix_sock_at((int)a0, hp, 1); } while (r < 0 && SVC_EINTR_RESTART(c));
             G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
             break;
         }
