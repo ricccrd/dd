@@ -28,27 +28,28 @@ static void tty_ctl_restore(const sigset_t *saved) { sigprocmask(SIG_SETMASK, sa
 // silently truncated postgres initdb's template1->template0/postgres copy (dropping ~1/4 of the catalog,
 // e.g. PG_VERSION -> "base/5 is not a valid data directory" on the first client connect).
 // nm/ty are heap-allocated by overlay_readdir (it grows them to the real entry count -- no 1024 cap, so
-// large directories no longer truncate, #179) and owned by the slot until it is freed (ovldents_free).
+// large directories no longer truncate, #179) and owned until freed (ovldents_free). Indexed DIRECTLY by
+// guest fd (the getdents call site guarantees fd in [0,1024)); a former 16-slot table with slot-0 eviction
+// broke deep `find`: a recursive walk keeps one open dir fd per level, so past 16 concurrent overlay dirs
+// an ancestor's snapshot was evicted and its next getdents re-snapshotted from pos 0 -> re-descended the
+// same subtree forever (loop threshold was exactly depth 16, #199).
 static struct {
-    int fd; // guest fd + 1 (0 = free slot)
+    int taken; // 1 = this fd's snapshot is live
     int n, pos;
     char (*nm)[256];
     uint8_t *ty;
-} g_ovldents[16];
+} g_ovldents[1024];
 static void ovldents_free(int i) {
     free(g_ovldents[i].nm);
     free(g_ovldents[i].ty);
     g_ovldents[i].nm = NULL;
     g_ovldents[i].ty = NULL;
-    g_ovldents[i].fd = 0;
+    g_ovldents[i].taken = 0;
     g_ovldents[i].n = g_ovldents[i].pos = 0;
 }
 static void ovldents_drop(int fd) {
-    for (int i = 0; i < 16; i++)
-        if (g_ovldents[i].fd == fd + 1) {
-            ovldents_free(i);
-            return;
-        }
+    if (fd >= 0 && fd < 1024 && g_ovldents[fd].taken)
+        ovldents_free(fd);
 }
 
 // POSIX shm / named semaphores live under /dev/shm, for which the rootfs has no tmpfs; glibc backs them
@@ -1050,42 +1051,30 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int fd = (int)a0;
         // OVERLAY: merged listing across layers
         if (g_nlower && fd >= 0 && fd < 1024 && g_ovldir[fd][0]) {
-            int slot = -1;
-            for (int i = 0; i < 16; i++)
-                if (g_ovldents[i].fd == fd + 1) {
-                    slot = i;
-                    break;
-                }
-            if (slot < 0) {
-                for (int i = 0; i < 16; i++)
-                    if (g_ovldents[i].fd == 0) {
-                        slot = i;
-                        break;
-                    }
-                if (slot < 0) slot = 0;
-                ovldents_free(slot); // slot-0 fallback may still own a prior snapshot's heap arrays
-                g_ovldents[slot].fd = fd + 1;
-                g_ovldents[slot].pos = 0;
-                g_ovldents[slot].n = overlay_readdir(g_ovldir[fd], &g_ovldents[slot].nm, &g_ovldents[slot].ty);
+            // snapshot cache is indexed directly by guest fd (no slot table -> no eviction thrash, #199)
+            if (!g_ovldents[fd].taken) {
+                g_ovldents[fd].taken = 1;
+                g_ovldents[fd].pos = 0;
+                g_ovldents[fd].n = overlay_readdir(g_ovldir[fd], &g_ovldents[fd].nm, &g_ovldents[fd].ty);
             }
             uint8_t *out = (uint8_t *)a1;
             size_t o = 0;
-            while (g_ovldents[slot].pos < g_ovldents[slot].n) {
-                const char *nm = g_ovldents[slot].nm[g_ovldents[slot].pos];
+            while (g_ovldents[fd].pos < g_ovldents[fd].n) {
+                const char *nm = g_ovldents[fd].nm[g_ovldents[fd].pos];
                 size_t nl = strlen(nm), lr = (19 + nl + 1 + 7) & ~7ull;
                 if (o + lr > (size_t)a2) break;
                 uint8_t *ld = out + o;
-                *(uint64_t *)(ld + 0) = g_ovldents[slot].pos + 1;
+                *(uint64_t *)(ld + 0) = g_ovldents[fd].pos + 1;
                 *(uint64_t *)(ld + 8) = o + lr;
                 *(uint16_t *)(ld + 16) = (uint16_t)lr;
-                *(ld + 18) = g_ovldents[slot].ty[g_ovldents[slot].pos];
+                *(ld + 18) = g_ovldents[fd].ty[g_ovldents[fd].pos];
                 memcpy(ld + 19, nm, nl);
                 ld[19 + nl] = 0;
                 o += lr;
-                g_ovldents[slot].pos++;
+                g_ovldents[fd].pos++;
             }
-            // exhausted -> free the slot (releases the heap snapshot arrays too)
-            if (o == 0) ovldents_free(slot);
+            // exhausted -> free the snapshot (releases the heap arrays too)
+            if (o == 0) ovldents_free(fd);
             G_RET(c) = (uint64_t)o;
             break;
         }
