@@ -83,8 +83,11 @@ static int exec_fd_is_engine(int fd) {
     return 0;
 }
 // Close the CLOEXEC guest fds among a bounded [0,maxfd) range (proc_pidinfo fallback path only).
+// The caller passes the REAL descriptor-table size (getdtablesize() = the current soft RLIMIT_NOFILE),
+// so do NOT clamp it DOWN -- that would leave CLOEXEC fds above the cap open across exec. The ceiling
+// only guards a garbage/negative getdtablesize() return from spinning an absurd loop.
 static void exec_close_cloexec_scan(int maxfd) {
-    if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+    if (maxfd < 0 || maxfd > (1 << 20)) maxfd = 4096;
     for (int fd = 0; fd < maxfd; fd++) {
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
