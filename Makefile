@@ -18,6 +18,7 @@ test-docker-full: jit ## FULL Docker CLI/API compliance matrix (every command; m
 	bash dd-tests/scenarios/docker-full.sh
 test-compose: jit ## end-to-end Docker Compose scenarios against dd-daemon (up/ps/logs/exec/down; skips if no compose)
 	bash dd-tests/scenarios/compose.sh
+	bash dd-tests/scenarios/compose-multinet.sh
 test-docker-net: jit ## container-to-container networking (by-name DNS / by-IP / cross-network isolation)
 	bash dd-tests/scenarios/docker-net.sh
 test-macos: jit ## macOS-container parity: same docker lifecycle on a Linux AND a native-macOS container

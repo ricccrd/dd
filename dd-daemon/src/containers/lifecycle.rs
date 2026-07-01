@@ -19,6 +19,16 @@ pub(crate) struct CreateBody {
     // of the create body, alongside Image/Cmd/Env). Stored on the Container and turned into DD_UID/DD_GID.
     #[serde(rename = "User")] user: Option<String>,
     #[serde(rename = "HostConfig")] host_config: Option<HostConfig>,
+    // `docker create`/compose attach a container to one or more user-defined networks via the
+    // top-level NetworkingConfig.EndpointsConfig (a map keyed by network name). HostConfig.NetworkMode
+    // names the *primary* network; EndpointsConfig enumerates ALL of them (compose puts every
+    // `networks:` entry of a service here). We join each so a multi-network service lands on them all.
+    #[serde(rename = "NetworkingConfig")] networking_config: Option<NetworkingConfig>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NetworkingConfig {
+    #[serde(rename = "EndpointsConfig")] endpoints_config: Option<HashMap<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +162,14 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         other => other,                 // a user-defined network by name
     };
     if !net_name.is_empty() { join_network(&mut g.networks, net_name, &id, &cname); }
+    // Additionally join every network named in NetworkingConfig.EndpointsConfig (compose lists all of a
+    // service's networks here; NetworkMode only carries the primary). join_network is idempotent, so
+    // re-joining the primary is a no-op, and unknown network names are skipped.
+    if let Some(nc) = body.networking_config.as_ref().and_then(|n| n.endpoints_config.as_ref()) {
+        for ep_name in nc.keys() {
+            if !ep_name.is_empty() { join_network(&mut g.networks, ep_name, &id, &cname); }
+        }
+    }
     crate::events::emit_event(&a.events, "container", "create", &id, json!({"name": c.name, "image": c.image}));
     g.containers.insert(id.clone(), c);
     save_state(&g, &a.state_path);
