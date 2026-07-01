@@ -55,6 +55,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 }
             if (sig) __atomic_and_fetch(&g_pending, ~(1ull << (unsigned)sig), __ATOMIC_SEQ_CST);
             if (a1 && a2 >= 128) {
+                // a1 is a raw guest buffer we write directly -> EFAULT a bad pointer instead of faulting the engine
+                if (!host_range_mapped((uintptr_t)a1, 128)) { G_RET(c) = (uint64_t)(-EFAULT); break; }
                 memset((void *)a1, 0, 128);
                 *(uint32_t *)a1 = (uint32_t)sig;
             // ssi_signo
@@ -64,6 +66,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // inotify read -> struct inotify_event[]
         if (rfd >= 0 && rfd < 1024 && g_inotify[rfd]) {
+            // The whole [a1, a1+a2) buffer is written directly by the engine below; validate it up front so a
+            // bad/unmapped pointer returns -EFAULT (without consuming events) instead of faulting the engine.
+            if (!host_range_mapped((uintptr_t)a1, (size_t)a2)) { G_RET(c) = (uint64_t)(-EFAULT); break; }
             struct kevent kv[32];
             struct timespec zero = {0, 0};
             int nb = fcntl(rfd, F_GETFL) & O_NONBLOCK;
@@ -130,13 +135,19 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             // EAGAIN
             }
-            if (a1 && a2 >= 8) *(uint64_t *)a1 = (uint64_t)kv.data;
+            if (a1 && a2 >= 8) {
+                if (!host_range_mapped((uintptr_t)a1, 8)) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+                *(uint64_t *)a1 = (uint64_t)kv.data;
+            }
             G_RET(c) = 8;
             break;
         }
         // eventfd read: return the accumulated counter, reset it, drain the readiness pipe
         if (rfd >= 0 && rfd < 1024 && g_eventfd_peer[rfd]) {
             if (a2 < 8) { G_RET(c) = (uint64_t)(-EINVAL); break; }
+            // a1 (the result counter) is written directly below; reject a bad pointer here, before any side
+            // effect (counter reset / pipe drain), so it returns -EFAULT rather than faulting the engine.
+            if (a1 && !host_range_mapped((uintptr_t)a1, 8)) { G_RET(c) = (uint64_t)(-EFAULT); break; }
             if (g_eventfd_count[rfd] == 0) {
                 if (fcntl(rfd, F_GETFL) & O_NONBLOCK) { G_RET(c) = (uint64_t)(-EAGAIN); break; }
                 char b; if (read(rfd, &b, 1) < 0) {} // block until a writer signals 0->positive
@@ -172,6 +183,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // eventfd write: ADD to the counter (not a raw pipe write); signal the pipe readable on 0->positive.
         if (wfd >= 0 && wfd < 1024 && g_eventfd_peer[wfd]) {
             if (a2 < 8) { G_RET(c) = (uint64_t)(-EINVAL); break; }
+            // a1 is a raw guest pointer we read directly -> validate before the deref (covers NULL too)
+            if (!host_range_mapped((uintptr_t)a1, 8)) { G_RET(c) = (uint64_t)(-EFAULT); break; }
             uint64_t add = *(uint64_t *)a1;
             if (add == 0xffffffffffffffffULL) { G_RET(c) = (uint64_t)(-EINVAL); break; }
             uint64_t old = g_eventfd_count[wfd];
@@ -198,6 +211,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 66: {
         if (memf_get((int)a0)) {
+            // The iovec array a1 is read directly by the engine (the regular writev path lets the host
+            // syscall validate it, but the memf path dereferences it here) -> guard it before the loop.
+            int niov = (int)a2;
+            if (niov > 0 && !host_range_mapped((uintptr_t)a1, (size_t)niov * sizeof(struct iovec))) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
             const struct iovec *iv = (const struct iovec *)a1;
             off_t end = g_memf[(int)a0]->pos;
             for (int i = 0; i < (int)a2; i++) end += iv[i].iov_len;
@@ -243,6 +263,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         memf_materialize(infd);
         off_t *po = (off_t *)a2;
         size_t cnt = (size_t)a3;
+        // po (the in/out file offset) is read AND written directly -> validate before the copy loop so a bad
+        // pointer returns -EFAULT instead of faulting the engine (and before any bytes move).
+        if (po && !host_range_mapped((uintptr_t)a2, sizeof(off_t))) { G_RET(c) = (uint64_t)(-EFAULT); break; }
         if (po) lseek(infd, *po, SEEK_SET);
         char bf[65536];
         size_t tot = 0;
@@ -263,6 +286,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // splice(fd_in,off_in,fd_out,off_out,len,fl) / tee -> emulate
     case 77: {
         int fin = (int)a0, fout = (int)a2;
+        // splice (nr==76) reads/writes the optional off_in (a1) / off_out (a3) pointers directly; validate
+        // them before moving any bytes so a bad pointer returns -EFAULT instead of faulting the engine.
+        if (nr == 76) {
+            if (a1 && !host_range_mapped((uintptr_t)a1, sizeof(off_t))) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+            if (a3 && !host_range_mapped((uintptr_t)a3, sizeof(off_t))) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+        }
         memf_materialize(fin); // splice/tee move bytes via the real fds -> flush RAM cache first
         memf_materialize(fout);
         size_t len = (size_t)a4;
@@ -355,6 +384,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // macOS F_GETLK=7,SETLK=8,SETLKW=9
             int mc = lcmd == 5 ? F_GETLK : lcmd == 6 ? F_SETLK : F_SETLKW;
             uint8_t *lf = (uint8_t *)a2;
+            // The Linux struct flock at a2 (fields up to lf+24) is read directly and written back for F_GETLK;
+            // validate the 32-byte struct before any deref so a bad pointer returns -EFAULT, not a crash.
+            if (!host_range_mapped((uintptr_t)a2, 32)) { G_RET(c) = (uint64_t)(-EFAULT); break; }
             struct flock fl;
             // Linux flock: type/whence/pad/start@8/len@16/pid@24
             memset(&fl, 0, sizeof fl);
@@ -424,6 +456,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // connection then hangs. Translate it to the O_ASYNC file-status flag (fcntl), exactly like Linux,
         // and defer every other request to svc_fs by returning "not handled".
         if (a1 != 0x5452) return 0; // not FIOASYNC -> let svc_fs handle it
+        if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(int))) { G_RET(c) = (uint64_t)(-EFAULT); break; }
         int on = a2 ? *(int *)a2 : 0, fl = fcntl((int)a0, F_GETFL);
         if (fl < 0) { G_RET(c) = (uint64_t)(-errno); break; }
         fl = on ? (fl | O_ASYNC) : (fl & ~O_ASYNC);
@@ -436,6 +469,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // preserves message boundaries exactly, so back an O_DIRECT pipe with one (SOCK_SEQPACKET would be
         // closer but macOS PF_LOCAL doesn't support it). A plain pipe is fine for the non-O_DIRECT case.
         int fds[2], fl = (int)a1;
+        // a0 receives the two result fds (8 bytes). Validate it BEFORE creating the pipe so a bad pointer
+        // returns -EFAULT without leaking the freshly-opened fds (and without faulting the engine).
+        if (!host_range_mapped((uintptr_t)a0, 2 * sizeof(int))) { G_RET(c) = (uint64_t)(-EFAULT); break; }
         int mk = (fl & G_O_DIRECT) ? socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) : pipe(fds);
         if (mk < 0) {
             G_RET(c) = (uint64_t)(-errno);
@@ -474,6 +510,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         size_t len = (size_t)a4, done = 0;
         int err = 0;
         off_t *poi = (off_t *)a1, *poo = (off_t *)a3;
+        // off_in (a1) / off_out (a3) are read here and written back below -> validate before any deref so a
+        // bad pointer returns -EFAULT instead of faulting the engine (and before any bytes are copied).
+        if (poi && !host_range_mapped((uintptr_t)a1, sizeof(off_t))) { G_RET(c) = (uint64_t)(-EFAULT); break; }
+        if (poo && !host_range_mapped((uintptr_t)a3, sizeof(off_t))) { G_RET(c) = (uint64_t)(-EFAULT); break; }
         off_t oi = poi ? *poi : -1, oo = poo ? *poo : -1;
         char cb[8192];
         while (done < len) {
@@ -513,6 +553,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 70: {
         if (memf_get((int)a0)) {
+            // memf path dereferences the iovec array a1 directly (the host pwritev path validates its own) ->
+            // guard it before the loop so a bad array pointer returns -EFAULT instead of faulting the engine.
+            int niov = (int)a2;
+            if (niov > 0 && !host_range_mapped((uintptr_t)a1, (size_t)niov * sizeof(struct iovec))) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
             const struct iovec *iv = (const struct iovec *)a1;
             off_t end = (off_t)a3;
             for (int i = 0; i < (int)a2; i++) end += iv[i].iov_len;

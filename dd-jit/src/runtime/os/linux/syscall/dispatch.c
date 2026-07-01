@@ -97,7 +97,9 @@ static int overlay_lower_has(const char *guest) {
 // CAP_SYS_TIME, which the container lacks -> EPERM (mirrors clock_settime). Returns the clock state
 // (TIME_OK) or a negative errno. Offsets match the LP64 Linux struct timex.
 static int svc_adjtimex(uint8_t *tx) {
-    if (!tx) return -EFAULT;
+    // The struct timex (fields up to tx+88) is a raw guest pointer we read AND write directly; validate the
+    // whole 96-byte struct before any deref so a bad/unmapped pointer returns -EFAULT, not an engine fault.
+    if (!tx || !host_range_mapped((uintptr_t)tx, 96)) return -EFAULT;
     uint32_t modes = *(uint32_t *)(tx + 0);
     if (modes != 0) return -EPERM; // any clock-adjusting call -> EPERM (no CAP_SYS_TIME)
     struct timeval now;
@@ -387,8 +389,12 @@ static void service_local(struct cpu *c) {
         if ((a2 & 0x40) || (g_nlower && (a2 & 3))) res_bump();
         break;
     case 437: { // openat2: flags live in open_how.flags (a2 -> struct open_how *), before its case rewrites a2
+        // a2 is a raw guest pointer to struct open_how; peek how[0] (flags) only if it is actually mapped, so
+        // a bad pointer doesn't fault the engine in this pre-dispatch cache-invalidation probe. If it is
+        // unmapped we simply skip the res_bump -- the real openat2 handler (svc_fs) returns -EFAULT below.
         uint64_t *how = (uint64_t *)a2;
-        if (how && ((how[0] & 0x40) || (g_nlower && (how[0] & 3)))) res_bump();
+        if (how && host_range_mapped((uintptr_t)a2, sizeof(uint64_t)) && ((how[0] & 0x40) || (g_nlower && (how[0] & 3))))
+            res_bump();
         break;
     }
     default: break;
