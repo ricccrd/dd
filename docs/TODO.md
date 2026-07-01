@@ -5,6 +5,10 @@ compose, IPv6, x86 flags, macOS cd.., faster tests). **v0.9.6 batch staged** (8 
 Real software working: postgres, redis, R, jq, node, java/.NET host, git, sqlite, nginx, openssl,
 tar(arm), gcc/clang(arm), sed/awk/grep, all event/fd syscalls.
 
+> **FIXED (9d20e08):** the #181 chown merge had reverted fs.c's #179 (kept fixed `char nm[1024][256]`
+> + a 4-arg caller) while overlay.c had the new allocating 3-arg `overlay_readdir` → linux engine
+> wouldn't compile; half-built siblings served corrupted (empty) readdir names. fs.c now holds heap
+> pointers + frees the snapshot. Both engines build clean; glob/sentry-fs prove names return.
 > **Build race:** concurrent agents `cargo clean -p ddjit` in the shared target wipe each other's
 > engines. Each agent MUST use an isolated `CARGO_TARGET_DIR=target-<slug>`. Gate when builders idle.
 > **Env doesn't cross the OrbStack bridge** to the mac engine — use file-gates `poc/runtime/jit86/*`
