@@ -1,14 +1,21 @@
 // frontend/aarch64/fill_stat.c -- the aarch64 Linux `struct stat` layout (per-arch: x86_64 differs).
 // Provided by the frontend so os/linux/ (vfs synth + the stat syscalls) stays layout-agnostic.
 
+// container uid/gid virtualization (cuid/cgid defined in os/linux/container/state.c, included later in
+// the unity TU): files the container creates live in the writable upper owned by the engine's REAL host
+// uid -- report them as the container's uid/gid so guest ownership checks pass (e.g. postgres initdb
+// "data directory has wrong ownership" when running as a non-root DD_UID).
+static int cuid(void);
+static int cgid(void);
+
 static void fill_linux_stat(uint8_t *d, const struct stat *s) {
     memset(d, 0, 128);
     *(uint64_t *)(d + 0) = s->st_dev;
     *(uint64_t *)(d + 8) = s->st_ino;
     *(uint32_t *)(d + 16) = s->st_mode;
     *(uint32_t *)(d + 20) = s->st_nlink;
-    *(uint32_t *)(d + 24) = s->st_uid;
-    *(uint32_t *)(d + 28) = s->st_gid;
+    *(uint32_t *)(d + 24) = (s->st_uid == (uid_t)getuid()) ? (uint32_t)cuid() : s->st_uid;
+    *(uint32_t *)(d + 28) = (s->st_gid == (gid_t)getgid()) ? (uint32_t)cgid() : s->st_gid;
     // st_rdev
     *(uint64_t *)(d + 32) = s->st_rdev;
     *(uint64_t *)(d + 48) = s->st_size;
