@@ -22,6 +22,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <unistd.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <mach-o/loader.h>
@@ -36,6 +37,10 @@ extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 extern void dj_clear_cache(void *start, void *end) __asm__("___clear_cache");
 
 static const char *g_rootfs, *g_hostname; static int g_pid1;
+// The container-side (guest) current working directory, kept as a canonical absolute container path.
+// getcwd() returns THIS (never the leaked host rootfs path), and chdir() resolves its argument against
+// it -- so "cd .." ascends to the real parent and clamps at the jail root "/". See dj_canon below.
+static char g_cwd[1024] = "/";
 static char *g_low[8]; static int g_nlow;
 static struct { char *host, *cont; } g_vol[16]; static int g_nvol;
 static struct { int host, cont; } g_pub[16]; static int g_npub;
@@ -62,13 +67,18 @@ static void add_pub(char *hc){
 }
 
 static const char *jail(const char *p, char *out); // defined below; used by init for DD_CWD
+static void dj_canon(const char *base, const char *in, char *out, size_t outsz); // path canonicalizer
 
 __attribute__((constructor)) static void init(void){
     g_rootfs = getenv("DD_ROOTFS"); g_hostname = getenv("DD_HOSTNAME"); g_pid1 = getenv("DD_PID1")!=0;
     split(getenv("DD_LOWERS"), add_low); split(getenv("DD_VOLUMES"), add_vol); split(getenv("DD_PUBLISH"), add_pub);
     // initial working directory (docker -w / the cwd ddcli mounts): chdir into the container path.
     const char *cwd = getenv("DD_CWD");
-    if(cwd && cwd[0] && g_rootfs){ char b[1024]; chdir(jail(cwd, b)); }
+    if(cwd && cwd[0] && g_rootfs){
+        char nc[1024]; dj_canon("/", cwd, nc, sizeof nc);     // canonical container path of the workdir
+        char b[1024];
+        if(chdir(jail(nc, b)) == 0) strlcpy(g_cwd, nc, sizeof g_cwd); // track it as the guest cwd
+    }
     char *mm=getenv("DD_MEM_MAX"), *pm=getenv("DD_PIDS_MAX");
     if(mm){ rlim_t v=dd_parse_u64("DD_MEM_MAX",mm,0,RLIM_INFINITY); struct rlimit r={v,v}; setrlimit(RLIMIT_AS,&r); }
     if(pm){ rlim_t v=dd_parse_u64("DD_PIDS_MAX",pm,0,INT_MAX); struct rlimit r={v,v}; setrlimit(RLIMIT_NPROC,&r); }
@@ -94,14 +104,40 @@ __attribute__((constructor)) static void init(void){
             fprintf(stderr,"[darwinjail] sandbox: %s\n",err?err:"?");
     }
 }
+// Canonicalize container path `in` into `out` as an absolute container path: a relative `in` is resolved
+// against `base`, then "." is dropped and ".." ascends one component -- but ".." CLAMPS at "/" (the jail
+// root), so no sequence of ".." can ever walk above the rootfs. Pure string math (no host fs access): the
+// guest namespace is the container's, not the host's. This both makes "cd .." work and seals the escape
+// where e.g. open("/a/../../../etc/passwd") would otherwise let the host fs resolve ".." out of the rootfs.
+static void dj_canon(const char *base, const char *in, char *out, size_t outsz){
+    char tmp[2048];
+    if(in[0]=='/') tmp[0]=0;                                  // absolute: base is irrelevant
+    else strlcpy(tmp, (base && base[0]) ? base : "/", sizeof tmp);
+    size_t l=strlen(tmp); snprintf(tmp+l, sizeof tmp-l, "/%s", in); // join base + "/" + in, then tokenize
+    out[0]='/'; out[1]=0; size_t olen=1;                      // build a clean absolute path in `out`
+    char *save=0;
+    for(char *t=strtok_r(tmp,"/",&save); t; t=strtok_r(0,"/",&save)){
+        if(!strcmp(t,".")) continue;
+        if(!strcmp(t,"..")){                                  // ascend, clamped at root
+            while(olen>1 && out[olen-1]!='/') olen--;         // strip the last component
+            if(olen>1) olen--;                                // and its leading slash
+            out[olen]=0;
+            continue;
+        }
+        if(olen+1+strlen(t) >= outsz) break;                  // truncate rather than overflow
+        if(olen>1) out[olen++]='/';
+        size_t tl=strlen(t); memcpy(out+olen,t,tl); olen+=tl; out[olen]=0;
+    }
+}
 // container path -> host path: bind volumes, then overlay (upper wins, else a lower, else upper for creates).
 static const char *jail(const char *p, char *out){
     if(!p || p[0]!='/' || !g_rootfs) return p;
+    char c[1024]; dj_canon("/", p, c, sizeof c);             // resolve "." / ".." within the jail first
     for(int i=0;i<g_nvol;i++){ size_t L=strlen(g_vol[i].cont);
-        if(!strncmp(p,g_vol[i].cont,L) && (p[L]=='/'||p[L]==0)){ snprintf(out,1024,"%s%s",g_vol[i].host,p+L); return out; } }
-    snprintf(out,1024,"%s%s",g_rootfs,p);
+        if(!strncmp(c,g_vol[i].cont,L) && (c[L]=='/'||c[L]==0)){ snprintf(out,1024,"%s%s",g_vol[i].host,c+L); return out; } }
+    snprintf(out,1024,"%s%s",g_rootfs,c);
     if(access(out,F_OK)==0) return out;
-    for(int i=0;i<g_nlow;i++){ char t[1024]; snprintf(t,1024,"%s%s",g_low[i],p);
+    for(int i=0;i<g_nlow;i++){ char t[1024]; snprintf(t,1024,"%s%s",g_low[i],c);
         if(access(t,F_OK)==0){ snprintf(out,1024,"%s",t); return out; } }
     return out;
 }
@@ -130,7 +166,26 @@ int   jail_unlinkat(int fd,const char*p,int f){ return unlinkat(fd, p&&p[0]=='/'
 int   jail_mkdir(const char*p,mode_t m){ return mkdir(JAIL(p), m); }
 int   jail_mkdirat(int fd,const char*p,mode_t m){ return mkdirat(fd, p&&p[0]=='/'?JAIL(p):p, m); }
 int   jail_rmdir(const char*p){ return rmdir(JAIL(p)); }
-int   jail_chdir(const char*p){ return chdir(JAIL(p)); }
+// chdir confined to the container: resolve the (relative-or-absolute) target against the guest cwd, with
+// ".." clamped at the jail root, then chdir into its host mapping. On success record the new guest cwd so
+// getcwd() and subsequent relative chdirs stay consistent. "cd .." at "/" stays at "/" (never escapes).
+int   jail_chdir(const char*p){
+    if(!p || !g_rootfs) return chdir(p);
+    char nc[1024]; dj_canon(g_cwd, p, nc, sizeof nc);
+    char hb[1024]; int r = chdir(jail(nc, hb));
+    if(r==0) strlcpy(g_cwd, nc, sizeof g_cwd);
+    return r;
+}
+// Report the GUEST cwd (the canonical container path), never the host rootfs path getcwd() would leak.
+// Mirrors libc's getcwd contract incl. the NULL-buf / size==0 malloc extension and ERANGE.
+char *jail_getcwd(char *buf, size_t size){
+    if(!g_rootfs) return getcwd(buf, size);
+    size_t n=strlen(g_cwd);
+    if(!buf){ size_t a=(size>n+1)?size:n+1; buf=malloc(a); if(!buf){ errno=ENOMEM; return 0; } }
+    else if(size < n+1){ errno=ERANGE; return 0; }
+    memcpy(buf, g_cwd, n+1);
+    return buf;
+}
 int   jail_chmod(const char*p,mode_t m){ return chmod(JAIL(p), m); }
 int   jail_chown(const char*p,uid_t u,gid_t g){ return chown(JAIL(p), u, g); }
 int   jail_lchown(const char*p,uid_t u,gid_t g){ return lchown(JAIL(p), u, g); }
@@ -240,6 +295,7 @@ INTERPOSE(jail_lstat, lstat)       INTERPOSE(jail_fstatat, fstatat)    INTERPOSE
 INTERPOSE(jail_faccessat, faccessat) INTERPOSE(jail_readlink, readlink) INTERPOSE(jail_readlinkat, readlinkat)
 INTERPOSE(jail_unlink, unlink)     INTERPOSE(jail_unlinkat, unlinkat)  INTERPOSE(jail_mkdir, mkdir)
 INTERPOSE(jail_mkdirat, mkdirat)   INTERPOSE(jail_rmdir, rmdir)        INTERPOSE(jail_chdir, chdir)
+INTERPOSE(jail_getcwd, getcwd)
 INTERPOSE(jail_chmod, chmod)       INTERPOSE(jail_chown, chown)        INTERPOSE(jail_lchown, lchown)
 INTERPOSE(jail_statfs, statfs)     INTERPOSE(jail_utimes, utimes)      INTERPOSE(jail_rename, rename)
 INTERPOSE(jail_link, link)         INTERPOSE(jail_symlink, symlink)    INTERPOSE(jail_opendir, opendir)
