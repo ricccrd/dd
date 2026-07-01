@@ -640,8 +640,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // flush old translations
         g_npend = 0;
         memset(g_ibtc, 0, sizeof g_ibtc);
-        // execve: drop IBTC + §B shadow (old image)
-        G_SHADOW_RESET(c);
+        // execve is a wholesale code-cache flush (g_cp reset + g_map/g_ibtc zeroed above), so it must ALSO
+        // run the per-arch wholesale-flush hook the dispatcher uses (jit/dispatch.c) -- not just the lighter
+        // fork/exec G_SHADOW_RESET. On x86 that hook drops the 2-way g_xibtc (G_SHADOW_RESET is a NO-OP there,
+        // so g_xibtc was surviving execve); on aarch64 it resets the §B shadow stack. Without it a forked
+        // child that execve's a new image (apt http method / gzip / cc1 / git child) keeps the OLD image's
+        // g_xibtc entries -- keyed by guest PC the new image REUSES, bodies pointing into the freed cache --
+        // and an indirect branch resolves into garbage host code -> SIGSEGV/SIGBUS (#176 / #117 / #155).
+        G_SHADOW_CLEAR(c);
         // POSIX execve resets CAUGHT signal handlers to SIG_DFL (SIG_IGN stays ignored). Without this, a
         // handler the calling shell installed (e.g. busybox sh's SIGCHLD job-control handler) survives into
         // the new image and is later delivered to a now-garbage handler address -> crash (redis/valkey run
