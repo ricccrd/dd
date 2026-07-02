@@ -793,9 +793,10 @@ static void procfd_dir_rm(const char *path) {
         struct dirent *e;
         while ((e = readdir(d))) {
             if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
-            char p[64];
+            char p[160];
             snprintf(p, sizeof p, "%s/%s", path, e->d_name);
-            unlink(p);
+            if (e->d_type == DT_DIR) procfd_dir_rm(p); // per-pid dirs nest a task/<tid>/ subtree
+            else unlink(p);
         }
         closedir(d);
     }
@@ -1216,6 +1217,132 @@ static int proc_comm_pid_text(char *b, size_t n, int host) {
     }
     return snprintf(b, n, "%s\n", comm);
 }
+// /proc/[pid]/statm -- the 7-field page-count line (size resident shared text lib data dt). htop's
+// MEM% column reads `resident` from HERE (not status VmRSS), so it must be present and non-zero.
+static int proc_statm_common(char *b, size_t n, unsigned long size_pg, unsigned long rss_pg) {
+    return snprintf(b, n, "%lu %lu %lu 1 0 %lu 0\n", size_pg, rss_pg, rss_pg / 2, size_pg);
+}
+static int proc_statm_text(char *b, size_t n) { // our own pid
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long rss_pg = (unsigned long)(atomic_load(&g_mem_charged)) / pgsz;
+    unsigned long size_pg = g_mem_max ? (unsigned long)(g_mem_max / pgsz) : rss_pg + 256;
+    if (size_pg < rss_pg) size_pg = rss_pg;
+    return proc_statm_common(b, n, size_pg, rss_pg);
+}
+static int proc_statm_pid_text(char *b, size_t n, int host) { // a peer -- REAL rss from libproc
+    struct dd_procinfo pi;
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long rss_pg = dd_get_procinfo(host, &pi) ? (unsigned long)(pi.rss / pgsz) : 0;
+    return proc_statm_common(b, n, rss_pg + 256, rss_pg);
+}
+// Register a materialized proc temp dir (fd + host temp path for reaping) AND tag the fd's GUEST /proc
+// path in g_fdpath. The tag is the key trick: a RELATIVE openat/readlink against this dir fd (htop uses
+// openat(pid_dirfd,"stat"/"task"/...) exclusively) then resolves via abs_guest back to the /proc path,
+// so it re-enters this same synthesis instead of hitting the real (empty) temp entry. abs_guest strips
+// g_rootfs_canon, so we store "<canon><guestpath>".
+static void proc_dir_register(int fd, const char *tmpl, const char *guestpath) {
+    for (int i = 0; i < 64; i++)
+        if (!g_procfd_dirs[i].path[0]) {
+            g_procfd_dirs[i].fd = fd;
+            snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
+            break;
+        }
+    if (fd >= 0 && fd < 1024) snprintf(g_fdpath[fd], sizeof g_fdpath[fd], "%s%s", g_rootfs_canon, guestpath);
+}
+// Materialize a /proc/<gp> (or task/<tid>) directory as a temp dir of placeholder entries so
+// opendir/getdents works and htop can descend; the CONTENT of each entry is served live on the
+// (re-intercepted) relative open by proc_open. `guestpath` is the /proc path this dir represents;
+// with_task adds the "task" subdir entry (omitted for a task/<tid> dir, which never nests another).
+static int proc_leaf_dir_open(const char *guestpath, int with_task) {
+    static int registered = 0;
+    if (!registered) {
+        atexit(procfd_dirs_atexit);
+        registered = 1;
+    }
+    procfd_dirs_reap(0);
+    char tmpl[] = "/tmp/.ddppidXXXXXX";
+    if (!mkdtemp(tmpl)) return -1;
+    static const char *const files[] = {"stat", "statm", "status", "cmdline", "comm", 0};
+    for (int i = 0; files[i]; i++) {
+        char p[64];
+        snprintf(p, sizeof p, "%s/%s", tmpl, files[i]);
+        int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+        if (f >= 0) close(f);
+    }
+    if (with_task) {
+        char p[64];
+        snprintf(p, sizeof p, "%s/task", tmpl);
+        mkdir(p, 0555);
+    }
+    // NB: no "exe" placeholder -- a symlink here would name a GUEST path that doesn't exist on the host,
+    // so a plain `ls /proc/<pid>` (which stat()s each entry) would print a spurious ENOENT. /proc/<pid>/exe
+    // by full PATH is served by proc_self_exe (fs.c) for self/init, which is what realpath(3) reads (#266).
+    int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        procfd_dir_rm(tmpl);
+        return -1;
+    }
+    proc_dir_register(fd, tmpl, guestpath);
+    return fd;
+}
+// Materialize /proc/<gp>/task -- a dir whose sole entry is the main thread tid (== gp for the common
+// single-threaded case; enough for htop to count the process). Returns the fd or -1.
+static int proc_task_dir_open(int gp) {
+    procfd_dirs_reap(0);
+    char tmpl[] = "/tmp/.ddptaskXXXXXX";
+    if (!mkdtemp(tmpl)) return -1;
+    char p[64];
+    snprintf(p, sizeof p, "%s/%d", tmpl, gp);
+    mkdir(p, 0555);
+    int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        procfd_dir_rm(tmpl);
+        return -1;
+    }
+    char gpath[48];
+    snprintf(gpath, sizeof gpath, "/proc/%d/task", gp);
+    proc_dir_register(fd, tmpl, gpath);
+    return fd;
+}
+// If `rp` is a /proc/<pid> DIRECTORY path (the pid dir, its task/ dir, or a task/<tid>/ dir) for a live
+// container pid, materialize it and return the fd. Returns -1 on error, or -2 if `rp` is not such a
+// directory (a per-pid FILE like stat/status -> the caller falls through to proc_open). fs.c calls this.
+static int proc_dir_try_open(const char *rp) {
+    if (!rp || strncmp(rp, "/proc/", 6)) return -2;
+    const char *q = rp + 6;
+    int i = 0;
+    while (q[i] >= '0' && q[i] <= '9' && i < 15)
+        i++;
+    if (i == 0) return -2;
+    char num[16];
+    memcpy(num, q, (size_t)i);
+    num[i] = 0;
+    int pid = atoi(num), host;
+    if (pid != (int)getpid() && pid != container_pid() && pid != 1 && !proc_pid_member(pid, &host)) return -2;
+    const char *rest = q + i; // "" | "/task" | "/task/<tid>" | "/task/<tid>/<leaf>" | "/<leaf>"
+    if (rest[0] == 0 || (rest[0] == '/' && rest[1] == 0)) {
+        char gpath[32];
+        snprintf(gpath, sizeof gpath, "/proc/%d", pid);
+        return proc_leaf_dir_open(gpath, 1);
+    }
+    if (!strncmp(rest, "/task", 5) && (rest[5] == 0 || (rest[5] == '/' && rest[6] == 0)))
+        return proc_task_dir_open(pid);
+    if (!strncmp(rest, "/task/", 6)) {
+        const char *t = rest + 6;
+        int j = 0;
+        while (t[j] >= '0' && t[j] <= '9')
+            j++;
+        if (j > 0 && (t[j] == 0 || (t[j] == '/' && t[j + 1] == 0))) {
+            int tid = atoi(t);
+            char gpath[48];
+            snprintf(gpath, sizeof gpath, "/proc/%d/task/%d", pid, tid);
+            return proc_leaf_dir_open(gpath, 0);
+        }
+    }
+    return -2; // a per-pid FILE -> proc_open serves it
+}
 // Materialize /proc as a real temp directory of entries (static files + one numeric name per live
 // container process) so the guest's ordinary opendir/getdents enumerates it. Entries are empty regular
 // files -- ps/top/htop identify pids by digit-name and then open /proc/<pid>/stat BY PATH (served by
@@ -1257,28 +1384,21 @@ static int proc_root_dir_open(void) {
             int guest = (g_init_hostpid && host == g_init_hostpid) ? 1 : host;
             char p[96];
             snprintf(p, sizeof p, "%s/%d", tmpl, guest);
-            int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
-            if (f >= 0) close(f);
+            mkdir(p, 0555); // a real (empty) subdir: getdents reports DT_DIR, and htop opens /proc/<pid>
         }
         closedir(d);
     }
     { // always list ourselves (our registry write may have lagged the first `ps`)
         char p[96];
         snprintf(p, sizeof p, "%s/%d", tmpl, container_pid());
-        int f = open(p, O_WRONLY | O_CREAT, 0444);
-        if (f >= 0) close(f);
+        mkdir(p, 0555);
     }
     int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
         procfd_dir_rm(tmpl);
         return -1;
     }
-    for (int i = 0; i < 64; i++)
-        if (!g_procfd_dirs[i].path[0]) {
-            g_procfd_dirs[i].fd = fd;
-            snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
-            break;
-        }
+    proc_dir_register(fd, tmpl, "/proc"); // tag the fd's guest path so relative opens re-enter /proc synth
     return fd;
 }
 // Real macOS stat -> Linux struct stat (the fake S_IFCHR version corrupted libc buffering).
@@ -1288,6 +1408,22 @@ static int proc_root_dir_open(void) {
 static int proc_open(const char *rp) {
     char buf[8192];
     int n = -1;
+    // Per-thread files mirror the main process for a single-threaded proc: fold
+    // /proc/<pid>/task/<tid>/<leaf> -> /proc/<pid>/<leaf> so htop's per-thread reads are served.
+    char taskbuf[4200];
+    {
+        const char *t = strstr(rp, "/task/");
+        if (t && !strncmp(rp, "/proc/", 6)) {
+            const char *s = t + 6; // after "/task/"
+            while (*s >= '0' && *s <= '9')
+                s++;
+            if (s > t + 6 && *s == '/') { // a real /task/<tid>/ segment with a trailing leaf
+                int head = (int)(t - rp);
+                snprintf(taskbuf, sizeof taskbuf, "%.*s%s", head, rp, s);
+                rp = taskbuf;
+            }
+        }
+    }
     // Per-process files for the guest's own pid: /proc/[self|pid]/{fd,maps,smaps,status,stat,environ}.
     const char *leaf = proc_self_leaf(rp);
     if (leaf) {
@@ -1296,6 +1432,7 @@ static int proc_open(const char *rp) {
         if (!strcmp(leaf, "smaps")) return proc_maps_fd(1);
         if (!strcmp(leaf, "status")) n = proc_status_text(buf, sizeof buf);
         else if (!strcmp(leaf, "stat")) n = proc_stat_text(buf, sizeof buf);
+        else if (!strcmp(leaf, "statm")) n = proc_statm_text(buf, sizeof buf);
         else if (!strcmp(leaf, "environ")) n = proc_environ_text(buf, sizeof buf);
         else if (!strcmp(leaf, "cmdline")) n = proc_cmdline_text(buf, sizeof buf);
         else if (!strcmp(leaf, "comm")) n = proc_comm_text(buf, sizeof buf);
@@ -1313,6 +1450,7 @@ static int proc_open(const char *rp) {
             if (proc_pid_member(gp2, &host)) {
                 if (!strcmp(fl, "stat")) n = proc_stat_pid_text(buf, sizeof buf, gp2, host);
                 else if (!strcmp(fl, "status")) n = proc_status_pid_text(buf, sizeof buf, gp2, host);
+                else if (!strcmp(fl, "statm")) n = proc_statm_pid_text(buf, sizeof buf, host);
                 else if (!strcmp(fl, "cmdline")) n = proc_cmdline_pid_text(buf, sizeof buf, host);
                 else if (!strcmp(fl, "comm")) n = proc_comm_pid_text(buf, sizeof buf, host);
                 if (n >= 0) return proc_text_fd(buf, n);
@@ -1497,6 +1635,27 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
                 s->st_mode = S_IFDIR | 0555;
                 s->st_nlink = 8;
                 return 1;
+            }
+        }
+    }
+    { // /proc/<pid>/task and /proc/<pid>/task/<tid> are directories (htop/`test -e` stat them)
+        int pid;
+        const char *lf = proc_any_leaf(gp, &pid);
+        if (lf && pid > 0) {
+            int host;
+            if (pid == (int)getpid() || pid == container_pid() || pid == 1 || proc_pid_member(pid, &host)) {
+                int istaskdir = !strcmp(lf, "task");
+                if (!istaskdir && !strncmp(lf, "task/", 5) && lf[5]) {
+                    istaskdir = 1;
+                    for (const char *t = lf + 5; *t; t++)
+                        if (*t < '0' || *t > '9') istaskdir = 0; // task/<tid> only (not task/<tid>/<leaf>)
+                }
+                if (istaskdir) {
+                    memset(s, 0, sizeof *s);
+                    s->st_mode = S_IFDIR | 0555;
+                    s->st_nlink = 3;
+                    return 1;
+                }
             }
         }
     }

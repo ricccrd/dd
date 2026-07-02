@@ -848,6 +848,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 abs_guest((int)a0, rp, gpb_syn, sizeof gpb_syn);
                 rp = gpb_syn;
             }
+            // abs_guest emits "/<gdir>/<name>", so a gdir tracked as "/proc" (a materialized proc dir fd)
+            // yields a leading "//proc/..." -- collapse it so the /proc checks below match. This is what
+            // makes htop's relative openat(pid_dirfd, "stat"/"task"/...) re-enter the /proc synthesis.
+            while (rp && rp[0] == '/' && rp[1] == '/')
+                rp++;
             // opendir("/proc"): materialize the process table (numeric pid dir per live container process
             // + the synthesized static files) so getdents enumerates the whole container -- `ps`/top/htop
             // read this to find processes. Without it the empty rootfs /proc dir yielded an empty table.
@@ -860,6 +865,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 // else fall through to the real (empty) rootfs /proc
             }
             if (rp && !strncmp(rp, "/proc/", 6)) {
+                // /proc/<pid>, /proc/<pid>/task, /proc/<pid>/task/<tid> as DIRECTORIES: materialize a temp
+                // dir so opendir/getdents work and htop can descend (it opens each pid as an O_DIRECTORY fd
+                // and reads task/<tid>/stat). Per-pid FILES return -2 -> served by proc_open below.
+                int pd = proc_dir_try_open(rp);
+                if (pd != -2) {
+                    if (pd >= 0 && (lf & 0x80000)) fcntl(pd, F_SETFD, FD_CLOEXEC); // honor O_CLOEXEC
+                    G_RET(c) = pd < 0 ? (uint64_t)(-errno) : (uint64_t)pd;
+                    break;
+                }
                 // /proc/[self|pid]/exe -> open the actual guest executable (the magic symlink target)
                 char ep[1024];
                 if (proc_self_exe(rp, ep, sizeof ep)) {
