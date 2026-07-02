@@ -2802,9 +2802,13 @@ static void *translate_block(uint64_t gpc) {
                 } else if (cnt) { // lzcnt: leading zeros = CLZ
                     e_clz(I.reg, src, sf);
                 } else { // bsr: (w-1) - clz
-                    e_clz(16, src, sf);
+                    // clz lands in a scratch that can NEVER alias src: for a memory operand rm_load returns
+                    // x16, so using x16 here would clobber the loaded source before the ZF test below reads
+                    // it (a top-bit-set operand -> clz==0 -> ZF wrongly set -> csel keeps the old dest). x20
+                    // is engine scratch (guest regs are x0..x15), so it is safe.
+                    e_clz(20, src, sf);
                     e_movconst(19, sf ? 63 : 31);
-                    e_rrr(A_SUB, 22, 19, 16, sf, 0);
+                    e_rrr(A_SUB, 22, 19, 20, sf, 0);
                 }
                 if (cnt) { // tzcnt/lzcnt: x86 CF = (src==0), ZF = (result==0)
                     e_rrr(A_SUBS, 31, src, 31, sf, 0);
