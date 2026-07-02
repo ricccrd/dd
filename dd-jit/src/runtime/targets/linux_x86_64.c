@@ -107,6 +107,7 @@ static void container_init(const char *rootfs) {
         if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
         g_rootfs_canon_len = strlen(g_rootfs_canon);
         g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
+        container_populate_dev(); // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         // Container identity = root (0) by default, matching linux_aarch64.c; DD_UID/DD_GID (or --uid/--gid)
         // override. Without this g_uid stayed -1 and cuid() fell back to the HOST uid -> the guest saw
         // getuid()/geteuid() == the host's 501 ("I have no name!", non-root shell) on x86-64 only.

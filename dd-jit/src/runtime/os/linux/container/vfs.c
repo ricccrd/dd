@@ -1429,7 +1429,41 @@ static const char *dev_node_hostpath(const char *gp) {
            : !strcmp(gp, "/dev/random")  ? "/dev/random"
            : !strcmp(gp, "/dev/urandom") ? "/dev/urandom"
            : !strcmp(gp, "/dev/tty")     ? "/dev/tty"
+           : !strcmp(gp, "/dev/console") ? "/dev/null" // no host console in the jail -> back it with /dev/null
                                          : NULL;
+}
+// Populate the container's /dev at start-up. dd flattens the image into one rootfs (no per-container
+// devtmpfs) and the OCI unpacker strips every `dev/*` node (unprivileged mknod fails on macOS), so the
+// rootfs /dev is empty. Docker mounts a fresh /dev with these standard entries; we materialize the ones
+// that don't need a privileged mknod straight in the writable upper so they appear in `ls /dev`, stat,
+// and readlink -- while the char devices (null/zero/tty/ptmx/console) keep working through the fs.c
+// open()/stat() synth. The big win is the /proc/self/fd symlinks: bash process substitution and postgres
+// initdb open /dev/fd/63, and these plus procfd_num() in fs.c make that resolve. Idempotent (EEXIST ok).
+static void container_populate_dev(void) {
+    if (!g_rootfs_canon[0]) return;
+    char base[4200];
+    if ((size_t)snprintf(base, sizeof base, "%s/dev", g_rootfs_canon) >= sizeof base) return;
+    size_t bl = strlen(base);
+    mkdir(base, 0755); // ensure /dev exists (image /dev contents were excluded at unpack)
+    // helper: build <rootfs>/dev/<leaf> into a scratch buffer
+#define DEVP(leaf) (snprintf(base + bl, sizeof base - bl, "/%s", (leaf)), base)
+    // /dev/fd + the std stream aliases: the standard Linux symlinks into /proc/self/fd (which the engine
+    // already synthesizes). readlink/ls see the symlink; open("/dev/fd/N") is caught by procfd_num().
+    symlink("/proc/self/fd", DEVP("fd"));
+    symlink("/proc/self/fd/0", DEVP("stdin"));
+    symlink("/proc/self/fd/1", DEVP("stdout"));
+    symlink("/proc/self/fd/2", DEVP("stderr"));
+    // char-device placeholders so they list in /dev; open()/stat() are intercepted by the fs.c synth
+    // (dev_node_hostpath), so the empty file is never actually read/written.
+    static const char *const chr[] = {"null", "zero", "full", "random", "urandom", "tty", "console", "ptmx"};
+    for (size_t i = 0; i < sizeof chr / sizeof *chr; i++) {
+        int fd = open(DEVP(chr[i]), O_CREAT | O_WRONLY, 0666);
+        if (fd >= 0) close(fd);
+    }
+    mkdir(DEVP("pts"), 0755);  // devpts mount point; /dev/pts/N slaves resolve via ptsname in fs.c
+    mkdir(DEVP("shm"), 01777); // POSIX shm dir (shm_open names get redirected to a host tmp file in fs.c)
+    mkdir(DEVP("mqueue"), 01777);
+#undef DEVP
 }
 // -> macOS struct stat for a synth file
 static int synth_stat_raw(const char *gp, struct stat *s) {

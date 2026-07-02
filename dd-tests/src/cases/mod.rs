@@ -334,6 +334,14 @@ fn container() -> Group {
         sh("symlink", "rm -f /l; ln -s /etc/hostname /l && readlink /l; rm -f /l").out("/etc/hostname\n"),
         sh("proc-self", "test -r /proc/self/status && echo proc-ok").out("proc-ok\n"),
         sh("dev-null", "echo discard > /dev/null && echo dev-ok").out("dev-ok\n"),
+        // /dev completeness (#265): fd/std* symlinks + ptmx/pts/shm/console nodes the OCI unpacker strips.
+        sh("dev-fd-link", "readlink /dev/fd").out("/proc/self/fd\n"),       // the standard symlink
+        sh("dev-fd-open", "printf hi | cat /dev/fd/0").out("hi"),            // /dev/fd/N -> reopen host fd
+        sh("dev-stdin", "printf yo | cat /dev/stdin").out("yo"),            // /dev/stdin open -> reopen fd 0
+        sh("dev-stdin-link", "readlink /dev/stdin").out("/proc/self/fd/0\n"), // readlink keeps symlink text
+        sh("dev-present", "for f in fd stdin stdout stderr ptmx shm console pts; do test -e /dev/$f || { echo MISSING $f; exit 1; }; done; echo all-present").out("all-present\n"),
+        // `ls -l /dev` must not error (readlink of std* went via the on-disk symlink, not a pipe F_GETPATH).
+        sh("dev-ls-clean", "ls -l /dev >/dev/null 2>/tmp/e; wc -l </tmp/e | tr -d ' '; rm -f /tmp/e").out("0\n"),
         sh("mem-ok", "echo cg ok").mem(64 << 20).out("cg ok\n"),            // runs under cgroup limit
     ])
 }

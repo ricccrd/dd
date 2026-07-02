@@ -935,8 +935,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // /proc/self/fd/N -> reopen what host fd N points at. Linux reopen gives a FRESH file
             // description (offset 0, access narrowed to the requested mode), so prefer reopening by the
             // F_GETPATH path with the guest's flags; for fds with no path (pipe/socket/anon) fall back to
-            // dup(N), which at least hands back a working, equivalent fd.
+            // dup(N), which at least hands back a working, equivalent fd. /dev/std{in,out,err} map to
+            // fd 0/1/2 here (open-only; their readlink stays the on-disk symlink so `ls -l /dev` works).
             int pfn = procfd_num((const char *)a1);
+            if (pfn < 0) pfn = dev_std_fd((const char *)a1);
             if (pfn >= 0) {
                 memf_materialize(pfn); // reopen-by-fd would expose the real file -> flush RAM cache first
                 char gp[4200];

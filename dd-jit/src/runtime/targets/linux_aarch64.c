@@ -341,6 +341,7 @@ int dd_run(const char *rootfs, int argc, char *const argv[]) {
         g_rootfs_canon_len = strlen(g_rootfs_canon);
         // pinned root for the per-component resolver
         g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
+        container_populate_dev(); // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         if (g_uid < 0) g_uid = 0;
         // container default: run as root (0); unless DD_UID/--uid set
         if (g_gid < 0) g_gid = 0;

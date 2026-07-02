@@ -265,8 +265,18 @@ static int anon_prot_if_contained(uint64_t addr, uint64_t len) {
 // resolution). NOTE: <pid>/fd accepts only this process's pid; foreign pids are not introspectable.
 static int procfd_num(const char *p) {
     if (!p) return -1;
+    // /dev/fd/N is the standard Linux symlink into /proc/self/fd (bash process substitution opens
+    // /dev/fd/63; postgres initdb reads the password from /dev/fd/63). macOS has no /dev, and the
+    // on-disk /dev/fd -> /proc/self/fd symlink can't be followed into the (synthetic) /proc by the host
+    // resolver, so recover the fd number here -- the caller reopens it by F_GETPATH/dup, exactly as it
+    // does for /proc/self/fd/N. Numeric leaf only, so /dev/fd itself (the bare dir) falls through to the
+    // on-disk symlink (readlink -> "/proc/self/fd"). The /dev/std{in,out,err} aliases are deliberately
+    // NOT matched here: they must readlink to their symlink text ("/proc/self/fd/0") for `ls -l /dev`,
+    // so their open() is handled at the openat call site instead (dev_std_fd), not via readlink.
     const char *rest = NULL;
-    if (!strncmp(p, "/proc/self/fd/", 14))
+    if (!strncmp(p, "/dev/fd/", 8))
+        rest = p + 8;
+    else if (!strncmp(p, "/proc/self/fd/", 14))
         rest = p + 14;
     else if (!strncmp(p, "/proc/", 6)) {
         const char *q = p + 6;
@@ -286,6 +296,15 @@ static int procfd_num(const char *p) {
     for (const char *s = rest; *s; s++)
         if (*s < '0' || *s > '9') return -1; // trailing path component -> not a bare fd link
     return atoi(rest);
+}
+// The /dev/std{in,out,err} aliases -> fd 0/1/2 for the OPEN path only (readlink keeps its on-disk
+// symlink text, so `ls -l /dev` doesn't F_GETPATH a pipe fd and get EBADF). Returns the fd, else -1.
+static int dev_std_fd(const char *p) {
+    if (!p) return -1;
+    if (!strcmp(p, "/dev/stdin")) return 0;
+    if (!strcmp(p, "/dev/stdout")) return 1;
+    if (!strcmp(p, "/dev/stderr")) return 2;
+    return -1;
 }
 // ===== w3e EPOLL FAST PATH (gate: NOEPOLLOPT=1 reverts to the original per-ctl kevent path) =====
 // The baseline emulates epoll over a per-epoll-fd kqueue, but issues a *separate* kevent() syscall
