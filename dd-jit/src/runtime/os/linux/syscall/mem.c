@@ -278,6 +278,28 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         void *r =
             mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
+        size_t hp = (size_t)getpagesize();
+        int off_emul = 0;
+        // Host-page-unaligned file offset. macOS uses 16 KB pages and its mmap requires the FILE OFFSET to
+        // be a multiple of the host page size, but a Linux guest (4 KB pages) may legitimately map a file at
+        // any 4 KB-granular offset. A non-MAP_FIXED file map whose offset is 4 KB- but not 16 KB-aligned is
+        // therefore rejected with EINVAL (gcc maps its spec files at off=0x1000 and dies with an "internal
+        // compiler error"). ld.so never trips this -- it maps its extra segments MAP_FIXED, which the
+        // reconciliation block below already emulates -- which is why it stayed hidden. Emulate it the same
+        // way: a kernel-chosen (a0 honored as a placement hint) private-anon region preloaded from the file
+        // at the requested offset. RW so a later PROT upgrade is already in effect (mprotect is a no-op); a
+        // short pread past EOF leaves the tail as anon zero, exactly as Linux presents it. Gated on the
+        // direct mmap having FAILED for such an offset, so every aligned/fixed map keeps the native path and
+        // is byte-identical. (A writable MAP_SHARED map at such an offset loses write-back -- the same
+        // limitation the MAP_FIXED emulation has -- but read-only/private maps, the common case, are exact.)
+        if (r == MAP_FAILED && !(a3 & 0x10) && !(a3 & 0x20) && (int)a4 >= 0 && ((off_t)a5 & (off_t)(hp - 1))) {
+            void *ar = mmap((void *)a0, (size_t)a1, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (ar != MAP_FAILED) {
+                pread((int)a4, ar, (size_t)a1, (off_t)a5); // short read => trailing bytes stay anon-zero
+                r = ar;
+                off_emul = 1;
+            }
+        }
         // Past-EOF tail zero-fill. A file mmap whose length runs past the file's end leaves the trailing
         // WHOLE pages with no backing: macOS SIGBUSes on any read of them. ld.so does exactly this -- it maps
         // a .so's WHOLE vaddr span from the FIRST segment, so the inter-segment bytes become such past-EOF
@@ -292,11 +314,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // macOS W^X EPERM; the JIT never executes guest pages anyway). MAP_PRIVATE only: a MAP_SHARED file
         // map past EOF can be made valid later by ftruncate-extending the file (sqlite/lmdb), so its tail
         // must stay the real shared mapping; ld.so's .so segments are all MAP_PRIVATE, so julia is covered.
-        if (r != MAP_FAILED && (a3 & 0x02) && !(a3 & 0x20) && (int)a4 >= 0 && a1) {
+        if (r != MAP_FAILED && !off_emul && (a3 & 0x02) && !(a3 & 0x20) && (int)a4 >= 0 && a1) {
             struct stat st;
             if (fstat((int)a4, &st) == 0) {
                 uint64_t avail = (uint64_t)st.st_size > a5 ? (uint64_t)st.st_size - (uint64_t)a5 : 0;
-                size_t hp = (size_t)getpagesize();
                 uint64_t valid_end = (avail + hp - 1) & ~(uint64_t)(hp - 1); // first host page wholly past EOF
                 if (valid_end < a1)
                     mmap((char *)r + valid_end, (size_t)(a1 - valid_end), PROT_READ | PROT_WRITE,
