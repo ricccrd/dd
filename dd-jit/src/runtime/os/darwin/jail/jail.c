@@ -252,21 +252,39 @@ static char **env_drop_dyld_insert(char *const env[]){            // malloc'd co
     out[j]=0;
     return out;
 }
+// Return a malloc'd env copy with DD_CWD set to the LIVE guest cwd. The daemon injects DD_CWD once (the
+// docker -w) at container start, but a shell then cd's around IN-PROCESS -- so an exec'd child that
+// inherited the stale start value would re-init() into the wrong directory and getcwd() would report it
+// (the shell's builtin pwd hides this; real tools calling getcwd -- git/make/coreutils -- do not).
+// Carrying the current g_cwd forward on every exec keeps getcwd() consistent across exec. Mirrors
+// env_drop_dyld_insert's copy-on-exec pattern; the child seeds g_cwd from this DD_CWD in init().
+static char **env_set_cwd(char *const env[]){
+    size_t n=0; while(env && env[n]) n++;
+    char **out = malloc((n+2)*sizeof *out);                       // room for the (re)added DD_CWD + NULL
+    if(!out) return (char**)env;
+    static __thread char kv[sizeof g_cwd + 8];                    // "DD_CWD=" + path + NUL
+    snprintf(kv, sizeof kv, "DD_CWD=%s", g_cwd);
+    size_t j=0;
+    for(size_t i=0;i<n;i++) if(strncmp(env[i],"DD_CWD=",7)) out[j++]=env[i]; // drop any stale DD_CWD
+    out[j++]=kv; out[j]=0;                                         // then append the live one
+    return out;
+}
 // exec: jail the program path so a container PATH / a container-local binary resolves into the rootfs.
 // The child inherits DYLD_INSERT_LIBRARIES (env), so the jail re-arms in the new process -- except for
-// an arm64e target, where the insert is dropped (see is_arm64e_image).
+// an arm64e target, where the insert is dropped (see is_arm64e_image). A jailed child also carries the
+// live DD_CWD (env_set_cwd) so getcwd() stays anchored to the current dir across exec.
 int jail_execve(const char*p,char*const a[],char*const e[]){
     const char *jp = JAIL(p);
-    if(is_arm64e_image(jp)) return execve(jp, a, env_drop_dyld_insert(e));
-    return execve(jp, a, e);
+    if(is_arm64e_image(jp)) return execve(jp, a, env_drop_dyld_insert(e)); // un-jailed child: DD_CWD unused
+    char **ne=env_set_cwd(e); int r=execve(jp, a, ne); free(ne); return r; // free reached only if exec fails
 }
 int jail_posix_spawn (pid_t*pid,const char*p,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const a[],char*const e[]){
     const char *jp = JAIL(p);
     if(is_arm64e_image(jp)){ char **ne=env_drop_dyld_insert(e); int r=posix_spawn(pid,jp,fa,at,a,ne); free(ne); return r; }
-    return posix_spawn (pid, jp, fa, at, a, e); }
+    char **ne=env_set_cwd(e); int r=posix_spawn(pid,jp,fa,at,a,ne); free(ne); return r; }
 int jail_posix_spawnp(pid_t*pid,const char*p,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const a[],char*const e[]){
     if(p && p[0]=='/' && is_arm64e_image(p)){ char **ne=env_drop_dyld_insert(e); int r=posix_spawnp(pid,p,fa,at,a,ne); free(ne); return r; }
-    return posix_spawnp(pid, p, fa, at, a, e); } // p is a name; PATH search uses interposed access()
+    char **ne=env_set_cwd(e); int r=posix_spawnp(pid,p,fa,at,a,ne); free(ne); return r; } // p may be a name; PATH via interposed access()
 // macOS forbids a page that is simultaneously writable and executable (W^X), so a guest's plain
 // mmap(PROT_WRITE|PROT_EXEC) with no MAP_JIT -- the pattern guest JIT runtimes (JVM/V8/LuaJIT) use --
 // returns EPERM. Emulate RWX with the MAP_JIT mechanism: add MAP_JIT under the hood and leave the
