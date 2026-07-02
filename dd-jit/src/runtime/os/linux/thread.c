@@ -141,7 +141,48 @@ static void futex_rel_from_abs(struct timespec *rel, const struct timespec *dead
     rel->tv_sec = ns / 1000000000;
     rel->tv_nsec = ns % 1000000000;
 }
-static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
+
+// ---- interruptible waits: let a cross-thread tgkill wake a thread parked in futex_op ----
+// A guest FUTEX_WAIT lands the host thread in an (otherwise uninterruptible) pthread_cond_wait. A signal
+// aimed at that thread via tkill/tgkill only sets its cpu->tpending; the thread must then round-trip through
+// the dispatcher for maybe_deliver_signal to run the guest handler. A thread spinning in translated code
+// crosses that boundary continuously (Go's SIGURG stop-the-world preemption relies on exactly that), but a
+// PARKED thread sits in cond_wait and never returns -- so the handler never runs. This bit Go's
+// runtime.doAllThreadsSyscall (glibc/musl setuid/setgid across all OS threads): the coordinator tgkills each
+// sibling M with realtime signal 33 and busy-waits (sched_yield) for its handler to perform the per-thread
+// syscall and ack; a parked sibling never woke, so the coordinator spun forever (postgres/mysql/mariadb
+// gosu/su-exec privilege-drop hung). Fix: publish the wait primitive so the signaler can wake the parked
+// thread, and check for a deliverable thread-directed signal around the wait so it returns -EINTR (the guest
+// retries the futex and the dispatcher delivers the handler first), exactly as a real futex is interrupted.
+
+// A thread-directed signal is "actionable" for thread c iff it is pending and NOT blocked by c's mask: the
+// dispatcher will then either run its guest handler or apply the default action, so the thread makes
+// progress. A blocked pending signal must NOT interrupt a wait (it stays pending, as on Linux) -- otherwise
+// the guest would re-wait, see it still pending, and spin returning EINTR forever.
+static int cpu_has_actionable_tsig(const struct cpu *c) {
+    uint64_t t = __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
+    if (!t) return 0; // no thread-directed signal pending -- the common case on the hot futex path
+    for (int s = 1; s <= 64; s++)
+        if ((t & (1ull << s)) && !(c->sigmask & (1ull << (s - 1)))) return 1;
+    return 0;
+}
+// A futex/interruptible wait must abort (return -EINTR so the guest round-trips through the dispatcher) when
+// either an actionable thread-directed signal arrives OR this thread has been flagged exited by a peer's
+// execve teardown (thread_exit_others) -- in both cases the dispatcher must regain control.
+static int cpu_wait_interrupted(const struct cpu *c) {
+    return __atomic_load_n(&c->exited, __ATOMIC_SEQ_CST) || cpu_has_actionable_tsig(c);
+}
+// This thread's slot in g_threg (set on register), so it can publish the primitive it is about to wait on
+// without re-scanning the registry on the hot futex path.
+static __thread int g_my_threg = -1;
+// Publish/clear (defined after g_threg) the mutex+condvar this thread is blocked on. thread_wait_publish is
+// called UNDER the wait's own mutex and BEFORE the tpending re-check, so the publish (store) is ordered
+// ahead of that check (load): with the signaler's store-tpending-then-load-waitc, this seq_cst StoreLoad
+// handshake guarantees at least one side observes the other -- no lost wakeup.
+static void thread_wait_publish(pthread_mutex_t *m, pthread_cond_t *cnd);
+static void thread_wait_clear(void);
+
+static long futex_op(struct cpu *c, int *uaddr, int op, int val, const struct timespec *ts) {
     if (!g_futexq) {
         // ---- legacy single global queue ----
         if (op == 0 || op == 9) {
@@ -149,6 +190,14 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
             if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
                 pthread_mutex_unlock(&g_futex_m);
                 return -EAGAIN;
+            }
+            // Publish, then re-check tpending (the StoreLoad handshake with thread_target_signal), so a
+            // thread-directed signal that arrives right before we sleep interrupts the wait, not deadlocks.
+            thread_wait_publish(&g_futex_m, &g_futex_c);
+            if (cpu_wait_interrupted(c)) {
+                thread_wait_clear();
+                pthread_mutex_unlock(&g_futex_m);
+                return -EINTR;
             }
             int rc = 0;
             if (ts) {
@@ -159,7 +208,10 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
                 rc = pthread_cond_timedwait(&g_futex_c, &g_futex_m, &abs);
             } else
                 pthread_cond_wait(&g_futex_c, &g_futex_m);
+            thread_wait_clear();
+            int intr = cpu_wait_interrupted(c);
             pthread_mutex_unlock(&g_futex_m);
+            if (intr) return -EINTR; // woken by a cross-thread signal -> guest retries; dispatcher delivers it
             return rc == ETIMEDOUT ? -ETIMEDOUT : 0;
         }
         if (op == 1 || op == 10 || op == 3 || op == 4) { // WAKE / WAKE_BITSET / REQUEUE / CMP_REQUEUE
@@ -185,6 +237,15 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
             pthread_mutex_unlock(&b->m);
             return -EAGAIN;
         }
+        // Publish, then re-check tpending (the StoreLoad handshake with thread_target_signal) so a
+        // thread-directed signal arriving just before we sleep interrupts the wait instead of deadlocking.
+        thread_wait_publish(&b->m, &b->c);
+        if (cpu_wait_interrupted(c)) {
+            thread_wait_clear();
+            atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_relaxed);
+            pthread_mutex_unlock(&b->m);
+            return -EINTR;
+        }
         int rc = 0;
         if (ts) {
             struct timespec abs, rel;
@@ -194,8 +255,11 @@ static long futex_op(int *uaddr, int op, int val, const struct timespec *ts) {
             rc = pthread_cond_timedwait(&b->c, &b->m, &abs);
         } else
             pthread_cond_wait(&b->c, &b->m);
+        thread_wait_clear();
+        int intr = cpu_wait_interrupted(c);
         atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_relaxed);
         pthread_mutex_unlock(&b->m);
+        if (intr) return -EINTR; // woken by a cross-thread signal -> guest retries; dispatcher delivers it
         // A pure-timeout wait must report -ETIMEDOUT so the guest stops re-waiting.
         return rc == ETIMEDOUT ? -ETIMEDOUT : 0;
     }
@@ -264,16 +328,57 @@ static volatile int g_next_tid = 1000;
 static struct {
     struct cpu *c;
     pthread_t th;
+    // The mutex+condvar this thread is currently parked on in an interruptible futex wait (NULL if none), so
+    // thread_target_signal can wake it out of pthread_cond_wait. waitc is the published flag (accessed via
+    // __atomic); waitm points at a permanent (bucket / global) mutex, valid whenever waitc != NULL.
+    pthread_cond_t *volatile waitc;
+    pthread_mutex_t *waitm;
 } g_threg[THREAD_REG_MAX];
 static pthread_mutex_t g_threg_m = PTHREAD_MUTEX_INITIALIZER;
+
+// A dedicated host signal used only to INTERRUPT a sibling guest thread out of a blocking host syscall
+// (kevent/read/poll/nanosleep/...) so it observes cpu->exited and leaves the dispatcher -- see
+// thread_exit_others (execve teardown). macOS has no realtime signals; SIGINFO(29) is unused by the guest
+// signal map (sig_l2m omits 7/EMT and 29/INFO), so a process-wide handler for it cannot collide with an
+// emulated guest signal -- the same free-signal reasoning the STW code uses for SIGEMT.
+#define THREAD_INT_SIG SIGINFO
+static void thread_int_handler(int sig) { (void)sig; } // empty: its only job is to make a blocked syscall EINTR
+static pthread_once_t g_thread_int_once = PTHREAD_ONCE_INIT;
+static void thread_int_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = thread_int_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // NO SA_RESTART: the interrupted syscall must return EINTR so its retry loop can bail on exited
+    sigaction(THREAD_INT_SIG, &sa, NULL);
+}
+
 // The guest tid this cpu answers gettid() with (see proc.c case 178): its own id, or the init's pid 1.
 static int cpu_tid(const struct cpu *c) { return c->tid ? c->tid : container_pid(); }
+// Publish/clear the wait primitive this thread is blocked on (see the futex_op waits + thread_target_signal).
+static void thread_wait_publish(pthread_mutex_t *m, pthread_cond_t *cnd) {
+    if (g_my_threg < 0) return;
+    g_threg[g_my_threg].waitm = m; // ordered ahead of the waitc store below (a reader only reads it when set)
+    __atomic_store_n(&g_threg[g_my_threg].waitc, cnd, __ATOMIC_SEQ_CST);
+}
+static void thread_wait_clear(void) {
+    if (g_my_threg < 0) return;
+    __atomic_store_n(&g_threg[g_my_threg].waitc, NULL, __ATOMIC_SEQ_CST);
+}
 static void thread_register(struct cpu *c) {
+    pthread_once(&g_thread_int_once, thread_int_install);
+    // Keep THREAD_INT_SIG deliverable on this thread so a peer's execve teardown can interrupt its syscalls.
+    sigset_t unb;
+    sigemptyset(&unb);
+    sigaddset(&unb, THREAD_INT_SIG);
+    pthread_sigmask(SIG_UNBLOCK, &unb, NULL);
     pthread_mutex_lock(&g_threg_m);
     for (int i = 0; i < THREAD_REG_MAX; i++)
         if (!g_threg[i].c) {
             g_threg[i].c = c;
             g_threg[i].th = pthread_self();
+            __atomic_store_n(&g_threg[i].waitc, NULL, __ATOMIC_SEQ_CST);
+            g_my_threg = i;
             break;
         }
     pthread_mutex_unlock(&g_threg_m);
@@ -282,28 +387,79 @@ static void thread_unregister(struct cpu *c) {
     pthread_mutex_lock(&g_threg_m);
     for (int i = 0; i < THREAD_REG_MAX; i++)
         if (g_threg[i].c == c) {
+            __atomic_store_n(&g_threg[i].waitc, NULL, __ATOMIC_SEQ_CST);
             g_threg[i].c = NULL;
             break;
         }
     pthread_mutex_unlock(&g_threg_m);
+    g_my_threg = -1;
 }
 // Deliver signal `sig` to the guest thread `tid`: set that thread's per-thread pending bit so it (and not
 // some other thread) runs the handler at its next dispatcher safepoint. A thread that is preempted while
 // running translated code (e.g. Go's sysmon tgkill'ing a worker with SIGURG to stop-the-world) crosses a
 // dispatcher boundary continuously, so the per-thread pending is observed promptly without poking the host
-// thread. Returns 1 if the target was found and flagged, 0 if no live thread carries that tid (caller then
-// falls back to process semantics, as Linux drops a tgkill to a dead tid).
+// thread. But a thread PARKED in an interruptible futex wait (pthread_cond_wait) reaches no boundary on its
+// own, so if the signal is deliverable now we wake it out of that wait (matching a real futex interrupted by
+// a signal) -- without this, Go's doAllThreadsSyscall (setuid/setgid across all Ms, via signal 33) hangs
+// because a parked sibling M never runs the per-thread-syscall handler the coordinator busy-waits on.
+// Returns 1 if the target was found and flagged, 0 if no live thread carries that tid (caller then falls
+// back to process semantics, as Linux drops a tgkill to a dead tid).
 static int thread_target_signal(int tid, int sig) {
     int found = 0;
     pthread_mutex_lock(&g_threg_m);
     for (int i = 0; i < THREAD_REG_MAX; i++)
         if (g_threg[i].c && cpu_tid(g_threg[i].c) == tid) {
             __atomic_or_fetch(&g_threg[i].c->tpending, 1ull << sig, __ATOMIC_SEQ_CST);
+            // Load waitc AFTER storing tpending: the seq_cst StoreLoad here pairs with the target's
+            // publish-then-recheck in futex_op so the wakeup is never lost. Only wake for a signal that is
+            // actionable now (unblocked) -- a blocked one stays pending without interrupting the wait.
+            if (cpu_has_actionable_tsig(g_threg[i].c)) {
+                pthread_cond_t *cnd = __atomic_load_n(&g_threg[i].waitc, __ATOMIC_SEQ_CST);
+                if (cnd) {
+                    pthread_mutex_t *m = g_threg[i].waitm;
+                    pthread_mutex_lock(m); // serialize with the target's pre-wait window; broadcast can't be lost
+                    pthread_cond_broadcast(cnd);
+                    pthread_mutex_unlock(m);
+                }
+            }
             found = 1;
             break;
         }
     pthread_mutex_unlock(&g_threg_m);
     return found;
+}
+
+// execve makes the process single-threaded: the kernel terminates every OTHER thread in the group before the
+// new image runs. The JIT re-loads the new image IN-PROCESS, so we must do that teardown by hand -- BEFORE
+// flushing the address space and closing CLOEXEC fds -- or a surviving sibling M keeps running the old image
+// against freed state (e.g. Go's netpoller M, parked in epoll_wait, crashes with EBADF the instant execve
+// closes its epoll fd; every postgres/mysql/mariadb entrypoint `exec gosu ...` right past a Go all-threads
+// setuid, so this is on the DB showcase path). Flag every peer exited, wake a futex-parked one and interrupt
+// any other blocking host syscall (or nudge one running translated code), and BLOCK until all peers have left
+// run_guest and unregistered -- only then is it safe for the caller to munmap/flush the shared address space.
+static void thread_exit_others(struct cpu *self) {
+    struct timespec slice = {0, 500000}; // 0.5ms between rounds; re-signal each round to catch a peer that was
+    for (int round = 0; round < 20000; round++) { // between syscalls when we first flagged it (~10s ceiling)
+        int others = 0;
+        pthread_mutex_lock(&g_threg_m);
+        for (int i = 0; i < THREAD_REG_MAX; i++) {
+            struct cpu *tc = g_threg[i].c;
+            if (!tc || tc == self) continue;
+            others++;
+            __atomic_store_n(&tc->exited, 1, __ATOMIC_SEQ_CST);
+            pthread_cond_t *cnd = __atomic_load_n(&g_threg[i].waitc, __ATOMIC_SEQ_CST);
+            if (cnd) { // parked in a futex wait -> wake it (see thread_target_signal)
+                pthread_mutex_t *m = g_threg[i].waitm;
+                pthread_mutex_lock(m);
+                pthread_cond_broadcast(cnd);
+                pthread_mutex_unlock(m);
+            }
+            pthread_kill(g_threg[i].th, THREAD_INT_SIG); // EINTR any other blocking host syscall
+        }
+        pthread_mutex_unlock(&g_threg_m);
+        if (!others) return;
+        nanosleep(&slice, NULL);
+    }
 }
 
 static void *thread_trampoline(void *p) {

@@ -210,6 +210,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 if (d.tv_sec < 0 || (d.tv_sec == 0 && d.tv_nsec <= 0)) break; // deadline passed
                 if (nanosleep(&d, NULL) == 0) break;
                 if (errno != EINTR) break; // recompute against the absolute deadline and retry
+                if (__atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) break; // execve teardown: stop re-sleeping
             }
             G_RET(c) = 0; // absolute sleep has no remainder to report
             break;

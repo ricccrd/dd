@@ -260,7 +260,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // unshare / setns -> ok (no real ns)
     case 268: G_RET(c) = 0; break;
     // futex
-    case 98: G_RET(c) = (uint64_t)futex_op((int *)a0, (int)a1 & 0x7f, (int)a2, (struct timespec *)a3); break;
+    case 98: G_RET(c) = (uint64_t)futex_op(c, (int *)a0, (int)a1 & 0x7f, (int)a2, (struct timespec *)a3); break;
     // set_robust_list
     case 99: G_RET(c) = 0; break;
     // syslog
@@ -645,9 +645,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 argv[i] = na[i];
             ac = ni;
         }
-        // Committed to the exec now (all ENOENT early-returns are behind us): emulate the kernel's
-        // close-on-exec sweep. No real host exec runs below -- we re-load the new image in this same
-        // process -- so FD_CLOEXEC fds must be closed by hand or they leak into the new program.
+        // Committed to the exec now (all ENOENT early-returns are behind us). execve makes the process
+        // single-threaded -- the kernel terminates every OTHER thread in the group -- so before we flush the
+        // address space and CLOEXEC fds below, tear down any sibling guest threads (a Go all-threads setuid,
+        // e.g. gosu/su-exec, leaves netpoller/idle Ms live; a surviving M would run the old image against the
+        // freed state). Blocks until all peers have left run_guest, so the teardown below is race-free.
+        thread_exit_others(c);
+        // emulate the kernel's close-on-exec sweep. No real host exec runs below -- we re-load the new image
+        // in this same process -- so FD_CLOEXEC fds must be closed by hand or they leak into the new program.
         exec_close_cloexec();
         // Tear down the inherited guest address space before loading the new image: a post-fork exec
         // otherwise keeps the parent's DENSE layout, and load_elf must bias a non-PIE ET_EXEC off its
