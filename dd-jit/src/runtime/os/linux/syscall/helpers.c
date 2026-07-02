@@ -219,6 +219,55 @@ static int parse_shebang(const char *host_path, char *interp, size_t ni, char *a
         arg[0] = 0;
     return 1;
 }
+// Max "#!" nesting Linux binfmt_script resolves before ELOOP (BINPRM_MAX_RECURSION == 4).
+#define SHEBANG_MAX 4
+// Resolve a possibly-NESTED "#!" shebang chain the way Linux binfmt_script does, recursing up to
+// SHEBANG_MAX levels. On entry argv[0] is the guest program path and `host0` its already-resolved host
+// path; `argv` is a NULL-terminated array of capacity `cap` (>= argc + SHEBANG_MAX*2 + 1). While argv[0]
+// resolves to a shebang script "#!I [opt]", argv is rewritten IN PLACE, Linux-style, to [I, (opt), argv...]
+// -- the old argv[0] stays on as the script-path argument -- and the loop repeats on I. This is what makes
+// an interpreter that is ITSELF a "#!" script work: mysql:8's docker-entrypoint.sh is "#!/usr/bin/env bash",
+// and /usr/bin/env is "#!/usr/bin/coreutils --coreutils-prog-shebang=env" (a script, not an ELF). The old
+// single-level code followed only the first "#!", then tried to load /usr/bin/env's SCRIPT text as an ELF
+// (e_machine garbage -> "wrong engine"). Synthesized I/opt strings are copied into `store` (caller-owned
+// char[SHEBANG_MAX*2][256], stable for as long as argv is used). On return *phost -> the FINAL interpreter's
+// host path (in `hostbuf`, size nh) which the caller loads as an ELF, and the NEW argc is returned. A
+// non-shebang / unreadable argv[0] is the base case (argc unchanged, *phost = its host path). Returns -1 on
+// ELOOP (chain deeper than SHEBANG_MAX) or when argv has no room -- the caller must then error out.
+static int resolve_shebang_chain(char **argv, int argc, int cap, const char *host0, char store[][256],
+                                 char *hostbuf, size_t nh, const char **phost) {
+    char curhost[4200];
+    snprintf(curhost, sizeof curhost, "%s", host0);
+    int nstore = 0;
+    for (int level = 0;; level++) {
+        char interp[256], opt[256];
+        if (parse_shebang(curhost, interp, sizeof interp, opt, sizeof opt) != 1) {
+            // base case: argv[0] is an ELF (or unreadable -> caller's load_elf/access reports it)
+            snprintf(hostbuf, nh, "%s", curhost);
+            *phost = hostbuf;
+            return argc;
+        }
+        if (level >= SHEBANG_MAX) return -1; // too many nested "#!" -> ELOOP
+        int ins = opt[0] ? 2 : 1;            // interp, plus the optional single arg (Linux: everything after
+        if (argc + ins >= cap) return -1;    // the first space is ONE arg)
+        char *si = store[nstore++];
+        snprintf(si, 256, "%s", interp);
+        char *so = NULL;
+        if (opt[0]) {
+            so = store[nstore++];
+            snprintf(so, 256, "%s", opt);
+        }
+        // shift argv (incl. its NULL terminator) right by `ins`, then prepend [I, (opt)]
+        for (int i = argc; i >= 0; i--)
+            argv[i + ins] = argv[i];
+        argv[0] = si;
+        if (so) argv[1] = so;
+        argc += ins;
+        // resolve the new interpreter's host path (overlay-aware) for the next round
+        char nb[4200];
+        snprintf(curhost, sizeof curhost, "%s", xresolve_overlay(si, nb, sizeof nb));
+    }
+}
 // Anonymous PRIVATE mmap ranges (MAP_ANON|MAP_PRIVATE) tracked so that madvise(MADV_DONTNEED) can
 // give real Linux semantics -- re-mmap fresh zero pages over the range -- WITHOUT ever disturbing a
 // file-backed or shared mapping (re-mmapping those with MAP_ANON would discard file data / break

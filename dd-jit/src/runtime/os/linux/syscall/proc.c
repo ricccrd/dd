@@ -643,30 +643,37 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // rustup's proxy execs the real rustc, whose RUNPATH $ORIGIN/../lib must point into the toolchain).
         char gexe[4200];
         abs_guest(-100, (const char *)a0, gexe, sizeof gexe);
-        // shebang: exec the #! interpreter instead (parse_shebang is shared with the initial loader)
-        char sh_interp[256], sh_arg[256], shpb[4200];
-        if (parse_shebang(p, sh_interp, sizeof sh_interp, sh_arg, sizeof sh_arg) == 1) {
-            snprintf(gexe, sizeof gexe, "%s", sh_interp); // a script exec: /proc/self/exe names the interpreter
-            char *na[258];
-            int ni = 0;
-            // [interp, (optarg), scriptpath, args...]
-            na[ni++] = sh_interp;
-            if (sh_arg[0]) na[ni++] = sh_arg;
-            // the guest script path (interp re-opens it)
-            na[ni++] = (char *)a0;
-            for (int i = 1; i < ac && ni < 256; i++)
-                na[ni++] = argv[i];
-            na[ni] = NULL;
-            // load the interpreter, not the script -- through the overlay (the #! interp, e.g. /bin/sh, may
-            // live only in a read-only lower in a fresh container; xresolve_exec sees the upper alone -> ENOENT)
-            p = xresolve_overlay(sh_interp, shpb, sizeof shpb);
+        // shebang: exec the #! interpreter instead (resolve_shebang_chain is shared with the initial loader).
+        // RECURSIVE -- the interpreter may itself be a #! script (e.g. /usr/bin/env -> coreutils multicall);
+        // resolve the whole chain (Linux binfmt_script, up to SHEBANG_MAX levels) and load the FINAL interp.
+        char sh_store[SHEBANG_MAX * 2][256], shpb[4200];
+        char *na[256];
+        int nn = 0;
+        // Linux passes the execve path (a0) as the script-path arg; the original argv[0] is discarded.
+        na[nn++] = (char *)a0;
+        for (int i = 1; i < ac && nn < 255; i++)
+            na[nn++] = argv[i];
+        na[nn] = NULL;
+        const char *sh_finalhost;
+        int sh_new = resolve_shebang_chain(na, nn, 256, p, sh_store, shpb, sizeof shpb, &sh_finalhost);
+        if (sh_new < 0) {
+            // too many nested #! -> ELOOP. `-ELOOP` is the HOST (macOS, 62) errno; svc_done's m2l_errno
+            // maps it to Linux ELOOP (40) at the syscall boundary, exactly like the vfs symlink-loop path.
+            G_RET(c) = (uint64_t)(-ELOOP);
+            break;
+        }
+        if (sh_new != nn) { // a shebang chain resolved -> load the final interpreter, not the script
+            snprintf(gexe, sizeof gexe, "%s", na[0]); // /proc/self/exe names the interpreter
+            // the final interp host is already overlay-resolved (the #! interp, e.g. /bin/sh, may live only
+            // in a read-only lower in a fresh container; the chain resolves each level through the overlay)
+            p = sh_finalhost;
             if (access(p, F_OK) != 0) {
                 G_RET(c) = (uint64_t)(-2);
                 break;
             }
-            for (int i = 0; i <= ni; i++)
+            for (int i = 0; i <= sh_new; i++)
                 argv[i] = na[i];
-            ac = ni;
+            ac = sh_new;
         }
         // Committed to the exec now (all ENOENT early-returns are behind us). execve makes the process
         // single-threaded -- the kernel terminates every OTHER thread in the group -- so before we flush the

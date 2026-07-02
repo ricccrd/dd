@@ -452,28 +452,34 @@ int dd_run(const char *rootfs, int argc, char *const argv[]) {
         // resolve through the overlay (upper, then lowers) + follow the entry symlink (/bin/sh->busybox)
         xresolve_overlay(prog, pb, sizeof pb);
 
-    // Initial-exec shebang handling -- mirror of execve case 221 via the shared parse_shebang() helper.
-    // The container entry may itself be a "#!" script (e.g. postgres' docker-entrypoint.sh). load_elf has
-    // no ELF-magic/#! check, so it would parse the script text as a bogus ELF and fault before any guest
-    // syscall runs. If the entry is a shebang, rewrite argv to [interp, (optarg), scriptpath, args...] and
-    // load the INTERPRETER instead. A missing/non-shebang ELF falls straight through unchanged below.
-    char sh_interp[256], sh_arg[256];
+    // Initial-exec shebang handling -- mirror of execve case 221 via the shared resolve_shebang_chain()
+    // helper. The container entry may itself be a "#!" script (e.g. postgres' docker-entrypoint.sh), AND
+    // that script's interpreter may ITSELF be a "#!" script (mysql:8's #!/usr/bin/env bash -> /usr/bin/env
+    // is #!/usr/bin/coreutils ...). load_elf has no ELF-magic/#! check, so it would parse the script text
+    // as a bogus ELF and fault before any guest syscall runs. Resolve the whole chain (Linux binfmt_script,
+    // up to SHEBANG_MAX nested levels), rewriting argv to [finalInterp, ..., scriptpath, args...] and
+    // loading the FINAL interpreter. A missing/non-shebang ELF falls straight through unchanged below.
+    char sb_store[SHEBANG_MAX * 2][256];
     char *sb_argv[256];
-    if (parse_shebang(prog_host, sh_interp, sizeof sh_interp, sh_arg, sizeof sh_arg) == 1) {
-        int sb_argc = 0;
-        sb_argv[sb_argc++] = sh_interp;
-        if (sh_arg[0]) sb_argv[sb_argc++] = sh_arg;
-        // the guest script path (interp re-opens it through the jail); `prog` is pre-shebang, find_in_path-resolved
-        sb_argv[sb_argc++] = (char *)prog;
-        for (int i = 1; i < argc && sb_argc < 255; i++)
-            sb_argv[sb_argc++] = (char *)argv[i];
-        sb_argv[sb_argc] = NULL;
-        argc = sb_argc;
+    int sb_argc = 0;
+    sb_argv[sb_argc++] = (char *)prog; // `prog` is find_in_path-resolved; the chain keeps it as scriptpath
+    for (int i = 1; i < argc && sb_argc < 255; i++)
+        sb_argv[sb_argc++] = (char *)argv[i];
+    sb_argv[sb_argc] = NULL;
+    const char *sb_finalhost;
+    char sb_fhb[4200];
+    int sb_new = resolve_shebang_chain(sb_argv, sb_argc, 256, prog_host, sb_store, sb_fhb, sizeof sb_fhb,
+                                       &sb_finalhost);
+    if (sb_new < 0) {
+        fprintf(stderr, "dd: too many nested #! interpreters (ELOOP): %s\n", prog);
+        return 40; // ELOOP
+    }
+    if (sb_new != sb_argc) { // a shebang chain resolved -> run the final interpreter, not the script
+        argc = sb_new;
         argv = (char *const *)sb_argv;
-        // resolve the interpreter through the overlay/jail, exactly as the main program was resolved above
-        prog = sh_interp;
-        g_exe_path = sh_interp; // the binary actually loaded (matches /proc/self/exe for a script exec)
-        prog_host = xresolve_overlay(sh_interp, pb, sizeof pb);
+        prog = sb_argv[0];
+        g_exe_path = sb_argv[0]; // the binary actually loaded (matches /proc/self/exe for a script exec)
+        prog_host = sb_finalhost;
     }
     struct loaded lm;
     load_elf(prog_host, &lm);
