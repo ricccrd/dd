@@ -887,10 +887,21 @@ static int try_lse_atomic(uint64_t gpc) {
         uint32_t i2 = *(uint32_t *)(gpc + 8);
         if ((i2 & 0xFF000000u) == 0x35000000u && (i2 & 31) == Ws &&
             (gpc + 8 + (uint64_t)(sext((i2 >> 5) & 0x7FFFF, 19) << 2)) == gpc) {
-            // swpal Wv, Wt, [Xn] (a single LSE op; emit_atomic_part folds/mangles the corner cases).
-            emit_atomic_part(0xB8E08000u | (sz == 3 ? 0x40000000u : 0) | (Wv << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
-            g_lse_n++;
-            return 12;
+            // A bare `swpal` in place of this swap loop is a deterministic lost-wakeup for multithreaded
+            // musl: node's V8 workers park forever in __unlock's `a_swap(l,0)==2 && __wake` because the
+            // swp'd old value doesn't drive the wake (node:alpine hung >400s; the exclusive pair completes
+            // in 0.28s, matching the docker oracle). The `ldadd*`/`casal` idioms below are unaffected. So
+            // upgrade ONLY when the exclusive-pair fallback is UNUSABLE -- i.e. when translating it verbatim
+            // would inject a monitor-clearing ldr/str between the ldxr and stxr (a stolen operand needs a
+            // cpu-slot mangle, or a non-PIE low base needs a bias-fold), which would spin the stxr forever.
+            // The common clean-PIE case (no stolen operand, no fold) keeps the proven exclusive pair.
+            if (guestbase_on() || is_stolen(Wt) || is_stolen(Xn) || is_stolen(Ws) || is_stolen(Wv)) {
+                // swpal Wv, Wt, [Xn] (a single LSE op; emit_atomic_part folds/mangles the corner cases).
+                emit_atomic_part(0xB8E08000u | (sz == 3 ? 0x40000000u : 0) | (Wv << 16) | (Xn << 5) | Wt, 1 | 2 | 4,
+                                 1);
+                g_lse_n++;
+                return 12;
+            }
         }
     }
     // LDADD/LDSET/LDEOR/LDCLR/LDADD-neg:  ldxr Wt,[Xn]; <op> Ws2,Wt,Wm; stxr Ws,Ws2,[Xn]; cbnz Ws,loop
