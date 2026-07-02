@@ -18,6 +18,26 @@ static int dgram_addr_peek(int fd, int wantaddr, size_t totlen) {
     if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &ty, &tl) < 0) return 0;
     return ty == SOCK_DGRAM || ty == SOCK_RAW;
 }
+// IPPROTO_IPV6 optname: Linux -> macOS. CRITICAL: like IPPROTO_TCP, these numbers diverge, so a raw
+// pass-through silently sets the WRONG option. The load-bearing case is IPV6_V6ONLY (Linux 26 -> macOS 27):
+// leaving it untranslated hits macOS's optname 26 (unrelated) instead, so a wildcard `::` bind stays
+// dual-stack on the host and reserves the v4 wildcard too -- a later 0.0.0.0 bind on the same port then
+// fails EADDRINUSE (breaks dual-stack servers like MariaDB that bind :: v6-only + 0.0.0.0 separately).
+// Map the known ones; ignore (-1) unknown rather than pass a Linux number straight to macOS IPPROTO_IPV6.
+static int ip6_opt_l2m(int o) {
+    switch (o) {
+    case 16: return 4;   // IPV6_UNICAST_HOPS
+    case 17: return 9;   // IPV6_MULTICAST_IF
+    case 18: return 10;  // IPV6_MULTICAST_HOPS
+    case 19: return 11;  // IPV6_MULTICAST_LOOP
+    case 20: return 12;  // IPV6_ADD_MEMBERSHIP / IPV6_JOIN_GROUP  (struct ipv6_mreq: same layout)
+    case 21: return 13;  // IPV6_DROP_MEMBERSHIP / IPV6_LEAVE_GROUP
+    case 26: return 27;  // IPV6_V6ONLY  (the fix)
+    case 66: return 35;  // IPV6_RECVTCLASS
+    case 67: return 36;  // IPV6_TCLASS
+    default: return -1;  // unknown -> ignore (never pass a Linux number straight to macOS IPPROTO_IPV6)
+    }
+}
 static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                    uint64_t a5) {
     switch (nr) {
@@ -531,6 +551,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = 0;
                 break;
             }
+        } else if (lvl == 41) { // IPPROTO_IPV6: optnames diverge — translate (esp. IPV6_V6ONLY), ignore unknown
+            opt = ip6_opt_l2m((int)a2);
+            if (opt < 0) {
+                G_RET(c) = 0;
+                break;
+            }
         }
         int r = setsockopt((int)a0, lvl, opt, (void *)a3,
                            // other levels (IP/IPv6) pass through
@@ -573,6 +599,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // unknown -> report 0
         } else if (lvl == 6) { // IPPROTO_TCP: translate optname, report 0 for unknown
             opt = tcp_opt_l2m((int)a2);
+            if (opt < 0) {
+                if (a4 && *(socklen_t *)a4 >= 4 && a3) *(int *)a3 = 0;
+                G_RET(c) = 0;
+                break;
+            }
+        } else if (lvl == 41) { // IPPROTO_IPV6: translate optname (esp. IPV6_V6ONLY), report 0 for unknown
+            opt = ip6_opt_l2m((int)a2);
             if (opt < 0) {
                 if (a4 && *(socklen_t *)a4 >= 4 && a3) *(int *)a3 = 0;
                 G_RET(c) = 0;
