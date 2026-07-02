@@ -1636,11 +1636,21 @@ static void *translate_block(uint64_t gpc) {
                             report_unimpl(gpc, &I);
                             break;
                         }
-                    } else { // D8 (f32) / DC (f64) arith with ST0
-                        if (op == 0xD8) {
+                    } else { // D8/DC/DA/DE arith with ST0: load the operand into d16 honoring its
+                        // declared memory type -- m32/m64 float (D8/DC) or a SIGNED 32/16-bit integer
+                        // (DA/DE: the fiadd/fimul/ficom/fisub/fidiv group) -- then share the reg-field
+                        // arith dispatch below (identical fadd(0)/fmul(1)/fcom(2)/fcomp(3)/fsub(4)/
+                        // fsubr(5)/fdiv(6)/fdivr(7) encoding for all four opcodes).
+                        if (op == 0xD8) { // m32 float
                             e_ldr_s(16, 19);
-                            emit32(0x1E22C000u | (16 << 5) | 16);
-                        } else
+                            emit32(0x1E22C000u | (16 << 5) | 16); // fcvt d16, s16
+                        } else if (op == 0xDA) {                  // m32 signed integer
+                            emit32(0xB9400000u | (19 << 5) | 16); // ldr   w16, [x19]
+                            emit32(0x1E620000u | (16 << 5) | 16); // scvtf d16, w16
+                        } else if (op == 0xDE) {                  // m16 signed integer
+                            emit32(0x79C00000u | (19 << 5) | 16); // ldrsh w16, [x19]
+                            emit32(0x1E620000u | (16 << 5) | 16); // scvtf d16, w16
+                        } else                                    // 0xDC: m64 float
                             e_ldr_d(16, 19);
                         if (reg == 2 || reg == 3) {
                             fp_ld(18, 0);
