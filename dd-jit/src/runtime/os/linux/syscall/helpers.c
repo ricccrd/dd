@@ -3,6 +3,88 @@
 // Emulated pipe-buffer sizes for F_SETPIPE_SZ/F_GETPIPE_SZ (macOS has no pipe-size fcntl): we record
 // the requested (page-rounded) size per-fd and report it back, so size-probing programs see it stick.
 static int g_pipesz[1024];
+
+// ---- flock(2) emulation on a private companion file (BSD whole-file advisory locks) ----------------
+// On Linux, flock() (BSD, whole-file, per-open-file-description) and fcntl() POSIX record locks are
+// INDEPENDENT lock spaces: one process can hold both on the same fd at once. macOS instead routes BOTH
+// through the same per-vnode lock list, so a process holding a flock spuriously conflicts with its OWN
+// fcntl F_SETLK on the same file (and vice-versa) -> EAGAIN. To restore Linux independence we service
+// flock() NOT on the guest's real fd but on a private COMPANION file -- a distinct vnode, keyed by the
+// target's (device,inode) -- using host fcntl locks there. flock therefore never touches the real file's
+// fcntl record locks. Cross-process/cross-fork flock exclusion is preserved because every process that
+// flock()s the same underlying file contends on the same companion (same dev/ino -> same companion path);
+// fcntl record locks stay on the real fd, disjoint from the companion. LOCK_SH->F_RDLCK, LOCK_EX->F_WRLCK,
+// LOCK_NB->F_SETLK (else F_SETLKW), LOCK_UN->F_UNLCK. Per-fd state (fd<1024) drives release-on-close so a
+// held flock is dropped when its last fd closes, matching flock's "released on last close" semantics.
+#define FLOCK_DIR "/tmp/.ddflock"
+static uint8_t g_flock_type[1024]; // per guest fd: 0 none, else LOCK_SH / LOCK_EX currently held via companion
+static struct {
+    dev_t dev;
+    ino_t ino;
+    int fd;   // host fd of the companion lock file (kept open for the process lifetime)
+    int refs; // guest fds in THIS process currently holding a flock on this file (for release-on-close)
+} g_flkcomp[256];
+static int g_nflkcomp;
+// Companion index for the file underlying guest `fd` (opening/caching it on first use). -1 (errno set) on
+// failure. The companion is pushed to a high descriptor so it never collides with the guest's low fds
+// (mirrors engine_fd_reloc); CLOEXEC keeps it out of any real host exec while still inheriting across fork.
+static int flock_companion(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) return -1;
+    for (int i = 0; i < g_nflkcomp; i++)
+        if (g_flkcomp[i].dev == st.st_dev && g_flkcomp[i].ino == st.st_ino) return i;
+    if (g_nflkcomp >= (int)(sizeof g_flkcomp / sizeof g_flkcomp[0])) { errno = ENOLCK; return -1; }
+    mkdir(FLOCK_DIR, 0777);
+    char p[80];
+    snprintf(p, sizeof p, FLOCK_DIR "/%llx.%llx", (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
+    int c = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (c < 0) return -1;
+    int hi = fcntl(c, F_DUPFD_CLOEXEC, 1 << 20);
+    if (hi < 0) hi = fcntl(c, F_DUPFD_CLOEXEC, 64);
+    if (hi >= 0) { close(c); c = hi; }
+    g_flkcomp[g_nflkcomp].dev = st.st_dev;
+    g_flkcomp[g_nflkcomp].ino = st.st_ino;
+    g_flkcomp[g_nflkcomp].fd = c;
+    g_flkcomp[g_nflkcomp].refs = 0;
+    return g_nflkcomp++;
+}
+// flock(2): whole-file advisory lock delegated to the companion. Returns 0 or -1 (host errno set); the
+// caller applies the normal macOS->Linux errno translation.
+static int dd_flock(int fd, int op) {
+    int idx = flock_companion(fd);
+    if (idx < 0) return -1;
+    int comp = g_flkcomp[idx].fd, base = op & ~LOCK_NB;
+    struct flock fl = {.l_whence = SEEK_SET, .l_start = 0, .l_len = 0}; // whole file
+    if (base == LOCK_UN) {
+        fl.l_type = F_UNLCK;
+        int r = fcntl(comp, F_SETLK, &fl);
+        if (r == 0 && fd >= 0 && fd < 1024 && g_flock_type[fd]) {
+            g_flock_type[fd] = 0;
+            if (--g_flkcomp[idx].refs < 0) g_flkcomp[idx].refs = 0;
+        }
+        return r;
+    }
+    fl.l_type = base == LOCK_SH ? F_RDLCK : F_WRLCK;
+    int r = fcntl(comp, (op & LOCK_NB) ? F_SETLK : F_SETLKW, &fl);
+    if (r == 0 && fd >= 0 && fd < 1024) {
+        if (!g_flock_type[fd]) g_flkcomp[idx].refs++;
+        g_flock_type[fd] = (uint8_t)base;
+    }
+    return r;
+}
+// close() hook: drop the flock this fd contributed; release the companion lock once its last holder in
+// this process is gone (flock is released on the last close of the file).
+static void flock_on_close(int fd) {
+    if (fd < 0 || fd >= 1024 || !g_flock_type[fd]) return;
+    g_flock_type[fd] = 0;
+    int idx = flock_companion(fd);
+    if (idx < 0) return;
+    if (--g_flkcomp[idx].refs <= 0) {
+        g_flkcomp[idx].refs = 0;
+        struct flock fl = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
+        fcntl(g_flkcomp[idx].fd, F_SETLK, &fl);
+    }
+}
 // Configurable fsync durability policy (S3DB_DURABILITY=none|fast|strict), read once and cached.
 //   0 = fast   (DEFAULT, and when env unset): plain fsync() -- the macOS fast path, unchanged legacy
 //               behavior. NOTE: a plain fsync() only reaches the drive's write cache on macOS; this is

@@ -1062,6 +1062,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             g_eventfd_count[cf] = 0;
             g_eventfd_sema[cf] = 0;
             ep_fd_reset(cf); // w3e: drop epoll armed-state (kqueue auto-removes a closed fd)
+            flock_on_close(cf); // release any flock this fd held on its companion (before the real fd is closed)
             // reap eventfd peer / timerfd / overlay dir / loopback
         }
         memf_close(cf);   // release any RAM-backed scratch buffer

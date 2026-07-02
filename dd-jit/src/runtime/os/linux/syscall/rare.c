@@ -41,8 +41,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = fd < 0 ? (uint64_t)(-errno) : (uint64_t)fd;
         break;
     }
-    // flock(fd, op): macOS flock(2); Linux LOCK_SH/EX/UN/NB op values match the host
-    case 32: G_RET(c) = flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    // flock(fd, op): BSD whole-file advisory lock. Serviced on a private companion file (see dd_flock in
+    // helpers.c) so it stays INDEPENDENT of fcntl POSIX record locks -- on macOS both would otherwise share
+    // one per-vnode lock list and spuriously conflict with each other. Linux LOCK_SH/EX/UN/NB match the host.
+    case 32: G_RET(c) = dd_flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     // close_range(first, last, flags): close every fd in [first,last]. CLOSE_RANGE_CLOEXEC(4) sets
     // FD_CLOEXEC instead of closing; CLOSE_RANGE_UNSHARE(2) (file-table unshare) is a no-op here.
     case 436: {
