@@ -609,7 +609,7 @@ pub(crate) async fn images_build(State(a): State<App>, Query(q): Query<BuildQ>, 
     {
         let mut g = a.inner.lock().await;
         g.images.retain(|im| repo_tag(&im.name) != repo_tag(&name));
-        g.images.push(Image { name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, entrypoint, env, workdir, labels, created: now_secs() });
+        g.images.push(Image { name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, entrypoint, env, workdir, labels, created: now_secs(), ..Default::default() });
     }
     log.push(json!({"stream": format!("Successfully built {}\n", &id[..12.min(id.len())])}).to_string());
     log.push(json!({"stream": format!("Successfully tagged {raw_tag}\n")}).to_string());
@@ -735,7 +735,7 @@ pub(crate) async fn commit_container(State(a): State<App>, Query(q): Query<Commi
         if !key.is_empty() { g.images.retain(|im| im.name != key); }
         g.images.push(Image {
             name: key.clone(), rootfs: new_rootfs.to_string_lossy().into_owned(), arch,
-            cmd, entrypoint, env, workdir, labels, created: now_secs(),
+            cmd, entrypoint, env, workdir, labels, created: now_secs(), ..Default::default()
         });
     }
     crate::events::emit_event(&a.events, "image", "commit", &id, json!({"name": key}));

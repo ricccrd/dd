@@ -110,6 +110,10 @@ pub(crate) async fn image_inspect(State(a): State<App>, Path(name): Path<String>
                     "Entrypoint": entrypoint,
                     "Env": env,
                     "WorkingDir": i.workdir,
+                    "User": i.user,
+                    // OCI stores ExposedPorts as a set; re-materialize `{ "5432/tcp": {} }` for inspect.
+                    "ExposedPorts": i.exposed_ports.iter().map(|p| (p.clone(), json!({})))
+                        .collect::<serde_json::Map<String, Value>>(),
                     "Labels": i.labels,
                 },
                 "RootFS": {"Type": "layers", "Layers": []}})).into_response()
@@ -285,6 +289,8 @@ pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: C
     let entrypoint = config_strs(&pulled.config, "Entrypoint");
     let env = config_strs(&pulled.config, "Env");
     let workdir = pulled.config["config"]["WorkingDir"].as_str().unwrap_or("").to_string();
+    let user = pulled.config["config"]["User"].as_str().unwrap_or("").to_string();
+    let exposed_ports = config_exposed_ports(&pulled.config);
     let labels = config_labels(&pulled.config);
     // A pulled macOS image's `dd-image.json` sidecar doesn't survive the registry round-trip and its
     // userland shell lives on the in-jail PATH (`/profile/bin/bash`), not `/bin/sh` — so default a
@@ -300,12 +306,13 @@ pub(crate) fn pull_image(images_dir: &str, from_image: &str, tag: &str, creds: C
     // round-trip -- e.g. "docker.io_library_alpine_latest"). Mirrors the `docker load` path (`image_load`).
     let mut meta = json!({ "name": name.clone(), "cmd": cmd.clone(), "env": env.clone(),
                            "entrypoint": entrypoint.clone(), "workdir": workdir.clone(),
+                           "user": user.clone(), "exposed_ports": exposed_ports.clone(),
                            "arch": arch.arch(), "os": arch.os() });
     if darwin { meta["os"] = json!("darwin"); }
     let _ = std::fs::write(format!("{images_dir}/{}/dd-image.json", safe_name(&iref)), meta.to_string());
     Ok(Image {
         name, rootfs: rootfs.to_string_lossy().into_owned(), arch,
-        cmd, env, entrypoint, workdir, labels, created: now_secs(),
+        cmd, env, entrypoint, workdir, user, exposed_ports, labels, created: now_secs(),
     })
 }
 
@@ -354,6 +361,16 @@ pub(crate) fn config_strs(config: &Value, key: &str) -> Vec<String> {
     config["config"][key].as_array()
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default()
+}
+
+/// The keys of the `config.config.ExposedPorts` object of an OCI image config blob (e.g. `"5432/tcp"`),
+/// as a sorted `Vec<String>`. OCI stores exposed ports as a set (object with empty values); we keep just
+/// the keys and re-materialize the `{port: {}}` object at inspect time. Absent -> empty.
+pub(crate) fn config_exposed_ports(config: &Value) -> Vec<String> {
+    let mut v: Vec<String> = config["config"]["ExposedPorts"].as_object()
+        .map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    v.sort();
+    v
 }
 
 /// The `config.config.Labels` object of an OCI image config blob as a `HashMap` (absent/non-string -> empty).
@@ -563,7 +580,8 @@ pub(crate) async fn image_save(State(a): State<App>, Query(q): Query<SaveQ>) -> 
     if let Err(e) = std::fs::create_dir_all(&staging) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))).into_response();
     }
-    let mut meta = json!({ "name": img.name, "cmd": img.cmd, "env": img.env, "entrypoint": img.entrypoint, "workdir": img.workdir });
+    let mut meta = json!({ "name": img.name, "cmd": img.cmd, "env": img.env, "entrypoint": img.entrypoint,
+                           "workdir": img.workdir, "user": img.user, "exposed_ports": img.exposed_ports });
     if img.arch.os() == "darwin" { meta["os"] = json!("darwin"); }
     let _ = std::fs::write(staging.join("dd-manifest.json"), meta.to_string());
     let out = std::process::Command::new("tar").arg("cf").arg("-")
@@ -617,13 +635,17 @@ pub(crate) async fn image_load(State(a): State<App>, body: axum::body::Bytes) ->
     if cmd.is_empty() { cmd = if darwin { vec!["bash".into()] } else { default_shell(&rootfs) }; }
     let (env, entrypoint) = (strs("env"), strs("entrypoint"));
     let workdir = meta.as_ref().and_then(|m| m["workdir"].as_str()).unwrap_or("").to_string();
+    let user = meta.as_ref().and_then(|m| m["user"].as_str()).unwrap_or("").to_string();
+    let exposed_ports = strs("exposed_ports");
     let img = Image {
         name: name.clone(), rootfs: rootfs.to_string_lossy().into_owned(), arch,
         cmd: cmd.clone(), env: env.clone(), entrypoint: entrypoint.clone(), workdir: workdir.clone(),
+        user: user.clone(), exposed_ports: exposed_ports.clone(),
         created: now_secs(), ..Default::default()
     };
     // Persist a dd-image.json so the image round-trips through `discover_images` after a daemon restart.
-    let mut dd = json!({ "name": name, "cmd": cmd, "env": env, "entrypoint": entrypoint, "workdir": workdir });
+    let mut dd = json!({ "name": name, "cmd": cmd, "env": env, "entrypoint": entrypoint, "workdir": workdir,
+                         "user": user, "exposed_ports": exposed_ports });
     if darwin { dd["os"] = json!("darwin"); }
     let _ = std::fs::write(target.join("dd-image.json"), dd.to_string());
     register_image(&a, img).await;

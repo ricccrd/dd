@@ -102,6 +102,9 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
     let mut env = img.env.clone();
     env.extend(body.env.unwrap_or_default());
     let working_dir = body.working_dir.filter(|w| !w.is_empty()).unwrap_or_else(|| img.workdir.clone());
+    // Run user = `docker run --user` if given, else the image's default Config.User (dropped to DD_UID/DD_GID
+    // in runtime.rs). Computed before `img` is partially moved into the Container below.
+    let user = body.user.filter(|u| !u.is_empty()).unwrap_or_else(|| img.user.clone());
     let tty = body.tty.unwrap_or(false);
     // `docker run --name X` with a name already in use is a 409 Conflict (docker refuses to start a
     // second container under the same name). Match on the effective name (leading `/` stripped, as we
@@ -152,7 +155,7 @@ pub(crate) async fn containers_create(State(a): State<App>, Query(cq): Query<Cre
         created: now_secs(), tty,
         name: want_name,
         working_dir, env,
-        user: body.user.unwrap_or_default(),
+        user,
         labels: body.labels.unwrap_or_default(),
         network_mode: hc.as_ref().and_then(|h| h.network_mode.clone()).unwrap_or_default(),
         // HostConfig fidelity extras: parse + persist verbatim (surfaced back in inspect HostConfig).

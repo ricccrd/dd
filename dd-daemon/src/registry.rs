@@ -496,7 +496,13 @@ mod http {
     }
 
     pub fn get(url: &str, accept: Option<&str>, token: Option<&str>) -> Result<Resp, String> {
-        run_curl(&with_auth(vec![url.into()], accept, token))
+        // `-L` FOLLOW REDIRECTS: registries (Docker Hub, ECR, GCR, …) serve blob GETs — including the
+        // image CONFIG blob — as a 307 to pre-signed CDN storage. Without following it we'd get the 307
+        // (not 200) and `config_blob` would fail, silently dropping the image's Entrypoint/Cmd/Env/User/
+        // WorkingDir (this is exactly the layer path's `download_to_file`, which already uses `-sSL`).
+        // Safe on manifest/non-redirected GETs (curl only redirects on a 3xx), and curl strips the
+        // Authorization header on a cross-host redirect (the CDN URL is pre-signed, so no auth is needed).
+        run_curl(&with_auth(vec!["-L".into(), url.into()], accept, token))
     }
     pub fn get_with_basic(url: &str, creds: Option<&Credentials>) -> Result<Resp, String> {
         let mut args = vec![url.to_string()];

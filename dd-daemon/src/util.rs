@@ -205,6 +205,8 @@ pub(crate) fn discover_images(images_dir: &str) -> Vec<Image> {
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
         let entrypoint = arr("entrypoint");
         let workdir = meta.as_ref().and_then(|m| m["workdir"].as_str()).unwrap_or("").to_string();
+        let user = meta.as_ref().and_then(|m| m["user"].as_str()).unwrap_or("").to_string();
+        let exposed_ports = arr("exposed_ports");
         let created = std::fs::metadata(&rootfs).and_then(|m| m.modified()).ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
         // The sidecar is the source of truth, but pre-seeded/umoci-built images (and any image cached
@@ -219,7 +221,7 @@ pub(crate) fn discover_images(images_dir: &str) -> Vec<Image> {
                 env = recovered;
             }
         }
-        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env, entrypoint, workdir, created, ..Default::default() });
+        out.push(Image { name, rootfs: rootfs.to_string_lossy().into_owned(), arch, cmd, env, entrypoint, workdir, user, exposed_ports, created, ..Default::default() });
     }
     dedup_images(out)
 }

@@ -39,6 +39,8 @@ pub(crate) struct Image {
     pub(crate) env: Vec<String>,        // "K=V" entries (ENV)
     pub(crate) entrypoint: Vec<String>, // ENTRYPOINT (prepended to the command)
     pub(crate) workdir: String,         // WORKDIR / Config.WorkingDir
+    pub(crate) user: String,            // USER / Config.User — the image's default run user (uid[:gid]/name)
+    pub(crate) exposed_ports: Vec<String>, // Config.ExposedPorts keys, e.g. "5432/tcp" (reported by inspect)
     pub(crate) created: i64,            // unix secs; image creation/discovery time
     pub(crate) labels: std::collections::HashMap<String, String>, // LABEL + build --label
 }
