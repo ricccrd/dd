@@ -7,6 +7,6 @@ dd.sock
 /target-mac/
 /target-bench/
 /test.db
-
+/target-*
 # Claude Code worktrees + transcripts
 .claude/

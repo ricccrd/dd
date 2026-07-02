@@ -32,29 +32,6 @@ npm · node (incl. heavy heaps) · php (json_encode 50k) · gcc/cc1 (C compile�
 OpenBLAS) · numpy/scipy/pandas (arm) · tmux · git · openssl · tar · sed/awk/grep · coreutils · full
 basics matrix (fs, net, mmap, fork/exec, signals, eventfd/epoll) 0-failed both arches.
 
-## Landed this session (highlights)
-- **execve-churn (#204)** — exec was scanning the whole fd table (~184K fcntl/exec = 22ms); now O(open
-  fds) via proc_pidinfo → ~70× faster exec. Cleared the npm/go/pip/make apparent-hangs.
-- **tier-2 code-cache overrun (fd412af)** — tier2_promote emitted past the 64MB arena into GUEST memory
-  → wild guest store. Root of a cluster of intermittent arm crashes (php-heavy, clang-O2, flaky class).
-- **mremap flags-contract (#211)** — no-move mremap must not relocate (was a use-after-free; php crash).
-- **engine-fd protection (#209+#216)** — guest dup2/dup3/close/close_range could clobber the engine's
-  pinned low fds (g_root_fd) → EBADF everywhere (erlang, and general).
-- **musl ioctl (#219)** — read-direction ioctls sign-extended under musl → ENOTTY (tmux/openpty/pty).
-- **NUMA no-ops (#217)** — mbind/set_mempolicy unhandled → R/OpenBLAS/numpy hung. Whole sci-stack.
-- **guest-pointer hardening (#194/#203/#214)** — bad syscall pointer returns EFAULT, never crashes engine.
-- **CRASHDBG serves non-PIE (#221)** — diag_crash + Mach exc_thread never ran nonpie_fixup → non-PIE
-  guests (cc1) false-crashed under CRASHDBG though clean on the normal path. Also fixed a latent Mach
-  msg struct-alignment bug (exc_msg_t missing #pragma pack(4) → fault addr read 4B past kernel data,
-  reported fault=0x0). Restores CRASHDBG as a usable diagnostic on non-PIE binaries.
-- **kqueue-not-inherited-across-fork (#222)** — macOS kqueue() fds (the engine's epoll/timerfd/inotify
-  backing) don't survive fork(2), so a forked child close()ing an inherited epoll fd got EBADF →
-  ruby's timer-thread reset crashed (SIGSEGV). Child now rebuilds the dead kqueue-backed fds. General
-  fork+epoll fix (any forking program using epoll/timerfd/inotify), not ruby-specific.
-- Plus: pip .pyc coherence (#200), deep-find loop (#199), POSIX sem over fork (#192), single-file bind
-  mount (#196), IPv6 + nc-u UDP loopback (#159/#206), munmap gmap-split (#212), the x86 fork+exec
-  IBTC/#176 class, and the v0.9.5-tail perf/opcode work.
-
 ## GA BLOCKERS (the real, re-verified open bugs)
 - [ ] **#201 — x86 indirect/virtual-dispatch codegen miscompile** *(agent active; THE #1 GA blocker)*.
   A GC'd managed runtime's heap-address→metadata machinery miscompiles on x86: a base pointer loads as
