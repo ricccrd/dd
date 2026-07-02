@@ -116,9 +116,31 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
 // entry stamped before the mutation instantly misses and the next stat/access re-resolves the now-real
 // file. This closes the same-process create->stat coherence gap that precise eviction missed -- e.g. pip
 // writes a .pyc to a temp file then renames it into place and immediately stat()s the final name; the
-// rename target's earlier ENOENT must not outlive the rename. (Cross-process create-after-negative is
-// covered separately by rc_reset() dropping the inherited caches at fork.)
-static uint32_t g_res_epoch = 1; // 0 is reserved as "never matches" (shared by the rc_/oc_ path caches below)
+// rename target's earlier ENOENT must not outlive the rename. Cross-process create-after-negative (a child /
+// pipe coprocess creates a file the parent probed absent) is covered by g_res_epoch being SHARED across the
+// container process-tree (see its definition below) PLUS rc_reset() dropping the inherited caches at fork.
+// CROSS-PROCESS coherence (#242 / #239): the epoch lives in a MAP_SHARED page so a file CREATED by ANOTHER
+// process in the same container process-tree bumps the SAME counter every process reads. The headline case is
+// apt: its http download method is a fork+exec'd, PERSISTENT pipe coprocess the parent apt never reaps -- so
+// there is no fork/wait boundary at which to drop the parent's stale caches. Without a shared epoch, the
+// parent that cached a NEGATIVE stat/access/resolve for partial/*_InRelease BEFORE the child downloaded it
+// keeps serving ENOENT forever (its own private g_res_epoch never moved), so the file looks "vanished" and
+// apt's split rename fails ENOENT. With the counter shared, the child's O_CREAT/rename res_bump() invalidates
+// the negative entry in the parent too. The page is created in a constructor BEFORE any guest fork, so every
+// fork descendant AND in-process execve (dd keeps its own mappings across the guest execve) share one physical
+// counter; a fresh `docker exec` is a NEW dd process = its own tree = its own counter (correct per-container
+// isolation). Falls back to a private local counter if the mmap fails (degrades to the old per-process
+// behaviour, never crashes). Positive entries are still served epoch-independently, unchanged.
+static _Atomic uint32_t g_res_epoch_local = 1;                 // fallback when the shared mapping can't be made
+static _Atomic uint32_t *g_res_epoch_ptr = &g_res_epoch_local; // -> a MAP_SHARED page once the ctor runs
+#define g_res_epoch (*g_res_epoch_ptr) // 0 is reserved as "never matches" (shared by the rc_/oc_ path caches)
+__attribute__((constructor)) static void res_epoch_ctor(void) {
+    void *m = mmap(NULL, sizeof(_Atomic uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (m != MAP_FAILED) {
+        atomic_store((_Atomic uint32_t *)m, 1);
+        g_res_epoch_ptr = (_Atomic uint32_t *)m;
+    }
+}
 #define MCACHE_N 8192
 static struct mcent {
     uint64_t hash;
@@ -319,7 +341,9 @@ static void rc_reset(void) {
     memset(g_mc, 0, sizeof g_mc);
     memset(g_rl, 0, sizeof g_rl);
     memset(g_ac, 0, sizeof g_ac);
-    g_res_epoch = 1;
+    // NB: do NOT reset g_res_epoch here -- it is now a container-wide SHARED counter (see its definition); a
+    // fork child / chroot must not rewind the whole tree's epoch. Clearing the local arrays above (hash=0 =>
+    // never hits) already drops every inherited entry, which is all this reset needs to do.
     oc_reset(); // W4D: drop the inherited open-resolution cache too (same COW hazard, under the same lock)
     CUL;
 }
