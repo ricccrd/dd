@@ -140,6 +140,37 @@ static int pidfd_lookup(int fd, pid_t *pid) {
         }
     return -1;
 }
+// Drop a pidfd's table slot when the guest close()s it, so a spawn-heavy driver (go/npm/cargo forks
+// thousands of children, one pidfd each) can't exhaust the fixed table.
+static void pidfd_forget(int fd) {
+    for (int i = 0; i < PIDFD_MAX; i++)
+        if (g_pidfd[i].fd == fd) g_pidfd[i].fd = 0;
+}
+// Mint a pidfd for `pid`. macOS has no pidfd, so back it with a kqueue armed EVFILT_PROC/NOTE_EXIT on the
+// process: the fd is pollable and goes readable exactly when `pid` exits (poll(2) directly, and epoll --
+// itself a kqueue -- via EVFILT_READ on this nested kqueue). No EV_CLEAR, so the exit stays pending and the
+// fd stays readable afterwards, matching Linux pidfd semantics. This is the load-bearing half of CLONE_PIDFD
+// (go/rust/glibc-posix_spawn epoll_wait the returned pidfd to reap their compiler child). If the process is
+// already gone or EVFILT_PROC can't arm (e.g. a non-child target), fall back to an always-readable /dev/null
+// fd so a wait returns immediately instead of blocking forever. Registers the fd->pid map for
+// waitid(P_PIDFD)/pidfd_send_signal. Returns -1 only if no fd could be opened at all.
+static int pidfd_make(pid_t pid) {
+    int kq = kqueue();
+    if (kq >= 0) {
+        struct kevent kv;
+        EV_SET(&kv, (uintptr_t)pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, NULL);
+        if (kevent(kq, &kv, 1, NULL, 0, NULL) == 0) {
+            fcntl(kq, F_SETFD, FD_CLOEXEC);
+            pidfd_register(kq, pid);
+            return kq;
+        }
+        close(kq);
+    }
+    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    pidfd_register(fd, pid);
+    return fd;
+}
 // POSIX message queues (mq_*): macOS has no POSIX mqueue, so emulate an in-process named priority queue.
 // Each queue keeps messages highest-priority-first (FIFO within a priority); descriptors are real
 // (/dev/null-backed) fds so close()/poll() stay valid, with an fd->queue table to map them back. This

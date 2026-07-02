@@ -1149,6 +1149,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             flock_on_close(cf); // release any flock this fd held on its companion (before the real fd is closed)
             // reap eventfd peer / timerfd / overlay dir / loopback
         }
+        pidfd_forget(cf); // free the pidfd->pid slot so a spawn-heavy driver can't exhaust the table
         memf_close(cf);   // release any RAM-backed scratch buffer
         dirs_drop(cf);    // invalidate the getdents DIR* cache so a reused fd re-opendir's
         ovldents_drop(cf); // invalidate the overlay getdents snapshot so a reused fd re-snapshots (not stale tail)

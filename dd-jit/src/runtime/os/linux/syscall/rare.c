@@ -77,12 +77,11 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
             break;
         }
-        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        int fd = pidfd_make(pid); // kqueue EVFILT_PROC/NOTE_EXIT so poll/epoll on it wakes on the target's exit
         if (fd < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        pidfd_register(fd, pid);
         G_RET(c) = (uint64_t)fd;
         break;
     }
@@ -342,6 +341,19 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 95: {
         siginfo_t si;
         memset(&si, 0, sizeof si);
+        // P_PIDFD (Linux idtype 3): macOS has no pidfd, so resolve the emulated pidfd back to its pid and
+        // wait on P_PID. Go's os.(*Process).pidfdWait reaps a CLONE_PIDFD child exactly this way.
+        int idt = (int)a0;
+        id_t idv = (id_t)a1;
+        if (idt == 3) {
+            pid_t tp;
+            if (pidfd_lookup((int)a1, &tp) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+                break;
+            }
+            idt = P_PID;
+            idv = (id_t)tp;
+        }
         int lopt = (int)a3, mopt = 0;
         // Linux wait-option bits -> macOS bits (only WNOHANG/WEXITED share a value)
         if (lopt & 0x00000001) mopt |= WNOHANG;    // WNOHANG
@@ -349,7 +361,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (lopt & 0x00000004) mopt |= WEXITED;    // WEXITED
         if (lopt & 0x00000008) mopt |= WCONTINUED; // Linux WCONTINUED(8) -> macOS WCONTINUED
         if (lopt & 0x01000000) mopt |= WNOWAIT;    // Linux WNOWAIT -> macOS WNOWAIT
-        int r = waitid((idtype_t)(int)a0, (id_t)a1, &si, mopt);
+        int r = waitid((idtype_t)idt, idv, &si, mopt);
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;

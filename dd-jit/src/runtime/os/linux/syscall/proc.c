@@ -596,6 +596,15 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                                          MACH_PORT_NULL, EXCEPTION_DEFAULT, 0);
 #endif
         }
+        // CLONE_PIDFD(0x1000): the kernel stores a pidfd for the new child at the address in `parent_tid`
+        // (a2, the aarch64 clone slot). macOS has no pidfd, so mint a kqueue that fires on the child's exit
+        // (pidfd_make); modern runtimes (Go/Rust/glibc posix_spawn) then epoll_wait/poll THAT fd to reap the
+        // compiler child they just forked. Without it the guest's pidfd storage keeps its stale value (Go
+        // seeds it 0 -> fd 0 = stdin) and the wait blocks forever at 0% CPU -- the go/npm/cargo build hang.
+        if (pid > 0 && (a0 & 0x1000) && a2) {
+            int pfd = pidfd_make(pid);
+            if (pfd >= 0) *(int *)a2 = pfd;
+        }
         // parent: pid, child: 0
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         // A fork/vfork that was normalized to clone repurposed the guest's arg registers; put them back so
@@ -789,6 +798,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_SHADOW_RESET(c);
             rc_reset();
             kqueue_rebuild_after_fork(); // macOS kqueue() fds don't survive fork -> rebuild epoll/timer/inotify
+        }
+        // CLONE_PIDFD: clone3 stores the child pidfd via the `pidfd` field (clone_args[1]); back it the same
+        // way as case 220 so a clone3-based spawn (newer glibc/runtimes) can epoll_wait/poll it to reap.
+        if (pid > 0 && (flags & 0x1000) && ca[1]) {
+            int pfd = pidfd_make(pid);
+            if (pfd >= 0) *(int *)ca[1] = pfd;
         }
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
