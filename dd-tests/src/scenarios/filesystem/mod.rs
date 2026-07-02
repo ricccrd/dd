@@ -12,13 +12,18 @@ pub fn group() -> ScenGroup {
         scen("filesystem/ls-rootfs", "alpine:latest")
             .exec("cd / && ls | grep -qx etc && ls | grep -qx bin && echo LS_OK").has("LS_OK"),
         scen("filesystem/cd-absolute", "alpine:latest")
-            .exec("cd /usr/bin && pwd").has("/usr/bin"),
+            .exec("cd /usr/bin && pwd").has("/usr/bin").plus_mac(),
         scen("filesystem/cd-relative", "alpine:latest")
-            .exec("cd /usr && cd bin && pwd").has("/usr/bin"),
+            .exec("cd /usr && cd bin && pwd").has("/usr/bin").plus_mac(),
         scen("filesystem/dotdot-ascends", "alpine:latest")
             .exec("mkdir -p /t/a/b && cd /t/a/b && cd ../.. && pwd").has("/t"),
+        // REGRESSION #162 (darwinjail cwd): `cd ..` must actually ASCEND, not stay in the same folder.
+        // Uses only paths present in BOTH a Linux image and the macOS container, so it exercises the mac
+        // container `cd` too — `.plus_mac()` (runs on `-t mac`; the default suite stays Linux-only).
+        scen("filesystem/cd-dotdot-existing", "alpine:latest")
+            .exec("cd /usr/bin && cd .. && pwd | grep -qx /usr && echo CD_DOTDOT_OK").has("CD_DOTDOT_OK").plus_mac(),
         scen("filesystem/dot-stays", "alpine:latest")
-            .exec("cd /etc && cd . && pwd").has("/etc"),
+            .exec("cd /etc && cd . && pwd").has("/etc").plus_mac(),
         scen("filesystem/dotdot-to-root", "alpine:latest")
             .exec("cd /usr/lib && cd ../.. && pwd | grep -qx / && echo AT_ROOT").has("AT_ROOT"),
         scen("filesystem/find-by-name", "alpine:latest")

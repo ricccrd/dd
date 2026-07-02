@@ -32,5 +32,19 @@ pub fn scenarios() -> Vec<Scenario> {
         scen("languages/node-fib-22-alpine", "node:22-alpine")
             .run(&["node", "-e", "let a=0n,b=1n;for(let i=0;i<50;i++){[a,b]=[b,a+b]}console.log(a.toString())"])
             .has("12586269025"),
+
+        // ---- interactive REPL (`node -i` reading from a pipe): the eval loop, not the one-shot -e path.
+        // Feeds statements on stdin, each evaluated + printed; distinct code path (readline + repl.eval).
+        scen("languages/node-repl-eval-22-alpine", "node:22-alpine")
+            .exec("printf 'console.log(\"R\"+(6*7))\\n.exit\\n' | node -i 2>&1 | grep -q 'R42' && echo REPL_OK")
+            .has("REPL_OK"),
+        // PERF GATE — the REPL must START + evaluate promptly. A pathological indirect-dispatch/JIT
+        // slowdown (regression of #166 node-V8-IBTC) blows the tight timeout -> exit 124 -> FAILS on
+        // the Dd backend while the Real oracle finishes in ~1s. Workload is trivial (1+1) so ONLY
+        // startup+dispatch speed is measured. If this reddens, node interactive is "too slow" again.
+        scen("languages/node-repl-perf-20-alpine", "node:20-alpine")
+            .exec("printf '1+1\\n.exit\\n' | node -i >/dev/null 2>&1 && echo REPL_FAST")
+            .has("REPL_FAST")
+            .timeout(25),
     ]
 }

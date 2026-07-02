@@ -43,5 +43,33 @@ pub fn group() -> ScenGroup {
         scen("volumes/nested-dotdot-crosses-boundary", "alpine:latest")
             .host("mkdir -p \"$WORK/sub\"\necho host-sibling > \"$WORK/HOSTMARK\"\ndocker run --rm $PLAT -v \"$WORK/sub\":/mnt $IMG sh -c 'ls /mnt/.. | grep -qx etc && ls /mnt/.. | grep -qx bin && echo PARENT_IS_ROOTFS; ls /mnt/.. | grep -q HOSTMARK && echo LEAKED || echo NO_LEAK'")
             .has("PARENT_IS_ROOTFS").has("NO_LEAK"),
+
+        // ---- basic commands ACROSS a volume: the everyday toolbox must work on bind-mounted files, not
+        // just raw read/write. Each seeds files on the host ($WORK), runs a coreutils/busybox command in
+        // the container against the mount (/d), and checks the result. These were previously uncovered. ----
+        scen("volumes/cmd-cat-grep-wc", "alpine:latest")
+            .host("printf 'apple\\nbanana\\ncherry\\n' > \"$WORK/f\"\ndocker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'cat /d/f | grep a | wc -l | tr -d \" \"'")
+            .has("2"), // apple+banana contain 'a', cherry does not -> 2
+        scen("volumes/cmd-cp-mv-rm", "alpine:latest")
+            .host("echo hi > \"$WORK/a\"\ndocker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'cp /d/a /d/b && mv /d/b /d/c && rm /d/a && ls /d | sort | tr \"\\n\" \",\"'")
+            .has("c,"),
+        scen("volumes/cmd-sed-inplace", "alpine:latest")
+            .host("echo 'foo=1' > \"$WORK/cfg\"\ndocker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'sed -i s/foo/bar/ /d/cfg'\ncat \"$WORK/cfg\"")
+            .has("bar=1"),
+        scen("volumes/cmd-append-redirect", "alpine:latest")
+            .host("echo one > \"$WORK/log\"\ndocker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'echo two >> /d/log'\ntr \"\\n\" \" \" < \"$WORK/log\"")
+            .has("one two"),
+        scen("volumes/cmd-sort-head-tail", "alpine:latest")
+            .host("printf '3\\n1\\n2\\n' > \"$WORK/n\"\ndocker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'echo MIN=$(sort /d/n | head -1); echo MAX=$(sort /d/n | tail -1)'")
+            .has("MIN=1").has("MAX=3"),
+        scen("volumes/cmd-chmod-perms", "alpine:latest")
+            .host("echo x > \"$WORK/s\"\ndocker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'chmod 640 /d/s && ls -l /d/s | cut -c1-10'")
+            .has("-rw-r-----"),
+        scen("volumes/cmd-mkdir-touch-find", "alpine:latest")
+            .host("docker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'mkdir -p /d/x/y && touch /d/x/y/z.txt && find /d -name z.txt'")
+            .has("/d/x/y/z.txt"),
+        scen("volumes/cmd-wc-bytes", "alpine:latest")
+            .host("printf 'abcde' > \"$WORK/b\"\ndocker run --rm $PLAT -v \"$WORK\":/d $IMG sh -c 'wc -c < /d/b | tr -d \" \"'")
+            .has("5"),
     ])
 }
