@@ -1555,6 +1555,25 @@ static void *translate_block(uint64_t gpc) {
             gpc += 4;
             continue;
         }
+        // ldr (literal), SIMD&FP: `ldr St/Dt/Qt, [pc, #imm]`. The integer ldr-literal above only matches
+        // V=0; the SIMD/FP form (V=1, bit26) would otherwise fall through to the verbatim emit and execute
+        // PC-relative from the HOST code cache -- loading garbage instead of the guest literal pool. LuaJIT
+        // trace mcode loads its double constants this way (e.g. `ldr d15,[pc,#-N]`), so a verbatim emit
+        // corrupts the trace's FP constants (intermittent crashes once a bad value reaches a Lua value).
+        // Rewrite it like the integer case: materialize the guest literal ADDRESS into a scratch GPR and
+        // load the V register from it. opc[31:30]: 00=S(32b) 01=D(64b) 10=Q(128b); 11 is PRFM (no data reg).
+        if ((in & 0x3F000000u) == 0x1C000000u && ((in >> 30) & 3) != 3) {
+            int vt = in & 31, sz = (in >> 30) & 3;
+            int64_t off = sext((in >> 5) & 0x7FFFF, 19) << 2;
+            // ldr (V), [Xn] unsigned-offset #0 base forms, Rn=x0: S=0xBD400000 D=0xFD400000 Q=0x3DC00000
+            uint32_t ld = sz == 0 ? 0xBD400000u : (sz == 1 ? 0xFD400000u : 0x3DC00000u);
+            x18_prolog();               // stash x0/x1 in the red zone; x0 becomes the address scratch
+            e_movconst(0, gpc + off);   // x0 = guest literal address (PIE: pcrel_base is identity)
+            emit32(ld | (0u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x0]
+            x18_epilog();
+            gpc += 4;
+            continue;
+        }
 
         // pointer authentication (ubuntu 24.04 -mbranch-protection): we don't enforce PAC, and signing
         // x30 on the PAC-capable host would corrupt the §B shadow-stack return match (it expects an
