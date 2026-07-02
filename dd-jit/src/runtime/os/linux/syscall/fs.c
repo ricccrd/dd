@@ -355,7 +355,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             base = base ? base + 1 : gp;
             try_adopt = !strncmp(gp, "/tmp/", 5) || !strncmp(gp, "/var/tmp/", 9) || strstr(base, "etilqs_") != 0;
         }
-        // OVERLAY: whiteout (hides lower) + drop the upper copy
+        // OVERLAY: delete. A name a read-only lower still provides must be MASKED with a .wh.NAME whiteout
+        // (overlay_whiteout also drops any upper copy) so it stays hidden. An UPPER-ONLY file has no lower to
+        // mask, so it is simply removed with NO whiteout -- a spurious .wh.NAME would otherwise linger in the
+        // parent and hide a later re-create of that same name (apt's http method deletes partial/X after a
+        // failed fetch, then re-creates and renames it -> the stale whiteout ENOENTed the rename source).
         if (g_rootfs && g_nlower) {
             char gp[4200];
             abs_guest((int)a0, (const char *)a1, gp, sizeof gp);
@@ -365,8 +369,20 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
                 // ENOENT
             }
-            overlay_whiteout(gp);
-            G_RET(c) = 0;
+            if (overlay_lower_has(gp)) {
+                overlay_whiteout(gp);
+                G_RET(c) = 0;
+            } else {
+                // upper-only -> plain remove (file or empty dir), no whiteout
+                G_RET(c) = remove(host) < 0 ? (uint64_t)(-errno) : 0;
+            }
+            // Invalidate the stat/access/readlink caches for the removed path: `host` is the merged-resolve
+            // host path, the SAME key case 79/48 memoize under, so a follow-up `test -e`/stat sees it gone
+            // (mirrors the non-overlay branch below). Without this a removed upper entry kept reporting as
+            // present via a stale mc_ hit even though it no longer appears in a readdir.
+            mc_evict(host);
+            ac_evict(host);
+            rl_evict(host);
             break;
         }
         if (g_rootfs) {
