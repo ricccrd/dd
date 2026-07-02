@@ -99,7 +99,9 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (sig != 0) raise_guest_signal(c, sig);
             G_RET(c) = 0;
         } else {
-            G_RET(c) = kill(pid, sig) < 0 ? (uint64_t)(-errno) : 0;
+            // Cross-process: translate Linux->macOS signo (the target dd engine listens on the macOS number;
+            // see kill, case 129). Untranslated, a divergent signal (SIGUSR1/2, SIGURG, ...) is lost.
+            G_RET(c) = kill(pid, sig_l2m(sig)) < 0 ? (uint64_t)(-errno) : 0;
         }
         break;
     }

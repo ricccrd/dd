@@ -78,7 +78,14 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // self / pgrp (PID-ns aware)
         }
         else
-            G_RET(c) = kill((pid_t)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0;
+            // Cross-process: the target is another dd engine whose host_sigh is installed on the MACOS signal
+            // number (rt_sigaction, case 134, installs on sig_l2m(sig)); its host_sigh translates back via
+            // sig_m2l. So the sender MUST translate Linux->macOS here too -- else a divergent signal (SIGUSR1=10,
+            // SIGUSR2=12, SIGURG=23, ... differ between Linux and macOS) lands on the wrong disposition and is
+            // lost. This is exactly the postgres fast-shutdown deadlock: the postmaster's kill(checkpointer,
+            // SIGUSR2=12) was delivered as macOS 12 (SIGSYS), the checkpointer never ran ShutdownXLOG, and
+            // `pg_ctl -w stop` hung ("server does not shut down"). sig 0 (existence check) maps to 0 unchanged.
+            G_RET(c) = kill((pid_t)a0, sig_l2m((int)a1)) < 0 ? (uint64_t)(-errno) : 0;
         break;
     case 130:
         // tkill(tid, sig)
