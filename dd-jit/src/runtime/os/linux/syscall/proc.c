@@ -133,39 +133,11 @@ static void exec_close_cloexec(void) {
 }
 
 // ---- runtime credential overlay (USER ns) -------------------------------------------------------
-// cuid()/cgid() give the container's CONFIGURED identity (default 0=root); a privileged guest may drop
-// to an unprivileged id at runtime (e.g. apt forks /usr/lib/apt/methods/http, which switches to `_apt`
-// via setgroups+setresgid/setgid+setresuid/setuid and then VERIFIES the drop took -- and that it can
-// NOT regain root). A blanket "set*id always returns 0" left the getters reporting the original id, so
-// apt aborted ("cannot switch group"). We track real/effective/saved uid+gid and honour the Linux
-// permission model (a euid==0 task is privileged; otherwise a new id must already be one of its three)
-// so both the drop AND the regain-must-fail check behave as on Linux. The base is cuid()/cgid(); per
-// process (fork inherits the copy, exec re-seeds from the container default), matching the guest's view.
-static int g_cred_init = 0;
-static int g_ruid, g_euid, g_suid; // real / effective / saved-set uid
-static int g_rgid, g_egid, g_sgid; // real / effective / saved-set gid
-static void cred_init(void) {
-    if (g_cred_init) return;
-    g_ruid = g_euid = g_suid = cuid();
-    g_rgid = g_egid = g_sgid = cgid();
-    g_cred_init = 1;
-}
-static int cred_euid(void) {
-    cred_init();
-    return g_euid;
-}
-static int cred_egid(void) {
-    cred_init();
-    return g_egid;
-}
-// An unprivileged task (euid != 0) may only set an id it already holds (real/effective/saved). -1 means
-// "leave unchanged". Returns 1 if id is permitted, 0 -> EPERM.
-static int uid_permitted(int id) {
-    return id == -1 || g_euid == 0 || id == g_ruid || id == g_euid || id == g_suid;
-}
-static int gid_permitted(int id) {
-    return id == -1 || g_euid == 0 || id == g_rgid || id == g_egid || id == g_sgid;
-}
+// The credential overlay state + accessors (g_ruid/euid/suid, g_rgid/egid/sgid, cred_init/cred_euid/
+// cred_egid/uid_permitted/gid_permitted) and the #255 new-file ownership stamp (g_fs*_ovr, newfile_*)
+// are defined in os/linux/container/state.c -- BEFORE both fs.c (create sites) and this file in the
+// unity TU -- so the fs.c create paths and these set*id handlers share one view. See there for the
+// apt `_apt` / gosu postgres drop rationale.
 
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
@@ -251,6 +223,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
 #ifdef PCACHE_SAVE_HOOK
         PCACHE_SAVE_HOOK; // opt8: persist the translated arena before the one-shot _exit (DDJIT_PCACHE only)
 #endif
+        proc_reg_unlink(); // drop our /proc process-table entry (_exit bypasses the atexit handler)
         _exit((int)a0);
     case 96:
         G_RET(c) = (uint64_t)getpid();
@@ -327,6 +300,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (g_euid == 0)
             g_ruid = g_suid = u;
         g_euid = u;
+        g_fsuid_ovr = -1; // #255: fsuid follows the new euid (POSIX) -> new files stamped with it
         G_RET(c) = 0;
         break;
     }
@@ -341,6 +315,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (g_euid == 0)
             g_rgid = g_sgid = gg;
         g_egid = gg;
+        g_fsgid_ovr = -1; // #255: fsgid follows the new egid
         G_RET(c) = 0;
         break;
     }
@@ -359,6 +334,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             g_euid = e;
         if (s != -1)
             g_suid = s;
+        g_fsuid_ovr = -1; // #255: fsuid follows euid
         G_RET(c) = 0;
         break;
     }
@@ -376,6 +352,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             g_egid = e;
         if (s != -1)
             g_sgid = s;
+        g_fsgid_ovr = -1; // #255: fsgid follows egid
         G_RET(c) = 0;
         break;
     }
@@ -394,7 +371,44 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             g_euid = e;
         if (r != -1 || (e != -1 && e != old_ruid))
             g_suid = g_euid;
+        g_fsuid_ovr = -1; // #255: fsuid follows euid
         G_RET(c) = 0;
+        break;
+    }
+    // setregid(rgid,egid): symmetric to setreuid. -1 leaves an id unchanged; saved-gid moves to the new
+    // egid when the real gid is changed, or the egid is set to a value other than the previous real gid.
+    case 143: {
+        cred_init();
+        int r = (int)a0, e = (int)a1, old_rgid = g_rgid;
+        if (!gid_permitted(r) || !gid_permitted(e)) {
+            G_RET(c) = (uint64_t)(-(int64_t)EPERM);
+            break;
+        }
+        if (r != -1)
+            g_rgid = r;
+        if (e != -1)
+            g_egid = e;
+        if (r != -1 || (e != -1 && e != old_rgid))
+            g_sgid = g_egid;
+        g_fsgid_ovr = -1; // #255: fsgid follows egid
+        G_RET(c) = 0;
+        break;
+    }
+    // setfsuid(fsuid) / setfsgid(fsgid): set only the FS id used for ownership checks (and, here, the id
+    // that STAMPS newly-created files). Linux always returns the PREVIOUS fs id and never sets errno; the
+    // change is honoured only for a permitted id. == euid/egid clears the override so it tracks the creds.
+    case 151: {
+        cred_init();
+        int prev = newfile_uid(), u = (int)a0;
+        if (u != -1 && uid_permitted(u)) g_fsuid_ovr = (u == g_euid) ? -1 : u;
+        G_RET(c) = (uint64_t)(uint32_t)prev;
+        break;
+    }
+    case 152: {
+        cred_init();
+        int prev = newfile_gid(), g = (int)a0;
+        if (g != -1 && gid_permitted(g)) g_fsgid_ovr = (g == g_egid) ? -1 : g;
+        G_RET(c) = (uint64_t)(uint32_t)prev;
         break;
     }
     case 148: {
@@ -710,6 +724,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         brk_lo = brk_cur = (uint64_t)heap;
         brk_hi = brk_lo + (256u << 20);
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
+        proc_reg_publish(gexe, ac, argv); // republish the process table entry (comm/argv changed on exec)
         free(xpath);
         for (int i = 0; i < ac && i < 255; i++)
             free(xargv[i]);

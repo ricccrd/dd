@@ -279,6 +279,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
                 ac_evict(hp);
+                if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1); // #255: dropped-cred creator owns it
             }
             close(pfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
@@ -290,6 +291,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (r >= 0) {
             mc_evict(p);
             ac_evict(p);
+            if (newfile_stamp_wanted()) newfile_stamp_path(p, 1); // #255
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
@@ -314,6 +316,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
                 ac_evict(hp);
+                if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1); // #255: dropped-cred creator owns the dir
             }
             close(pfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
@@ -325,6 +328,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         mc_evict(p);
         // namespace change -> evict
         ac_evict(p);
+        if (r >= 0 && newfile_stamp_wanted()) newfile_stamp_path(p, 1); // #255
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -369,12 +373,25 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
                 // ENOENT
             }
+            // Enforce rmdir/unlink type semantics against the MERGED target BEFORE touching it. The
+            // non-overlay branches pass AT_REMOVEDIR straight to unlinkat() so the kernel does this, but
+            // the overlay path used remove()/overlay_whiteout() which pick unlink-vs-rmdir by the target's
+            // OWN type -- so rmdir() wrongly succeeded on a regular file (and unlink() on a directory). dpkg
+            // probes a control file's type with `rmdir(f) == 0`: the wrongly-successful rmdir deleted the
+            // file and made dpkg abort "package control info contained directory" (#254). Match Linux:
+            // rmdir a non-directory -> ENOTDIR; unlink a directory -> EISDIR.
+            struct stat lst;
+            int isdir = lstat(host, &lst) == 0 && S_ISDIR(lst.st_mode);
+            if ((a2 & 0x200) && !isdir) { G_RET(c) = (uint64_t)(int64_t)(-ENOTDIR); break; }
+            if (!(a2 & 0x200) && isdir) { G_RET(c) = (uint64_t)(int64_t)(-EISDIR); break; }
             if (overlay_lower_has(gp)) {
                 overlay_whiteout(gp);
                 G_RET(c) = 0;
             } else {
-                // upper-only -> plain remove (file or empty dir), no whiteout
-                G_RET(c) = remove(host) < 0 ? (uint64_t)(-errno) : 0;
+                // upper-only -> remove with the CORRECT op (rmdir for a dir, unlink for a file) so the
+                // kernel still enforces ENOTDIR/EISDIR/ENOTEMPTY exactly as Linux would.
+                int r = (a2 & 0x200) ? rmdir(host) : unlink(host);
+                G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             }
             // Invalidate the stat/access/readlink caches for the removed path: `host` is the merged-resolve
             // host path, the SAME key case 79/48 memoize under, so a follow-up `test -e`/stat sees it gone
@@ -821,6 +838,27 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         {
             // synthesize /proc/* (macOS has no /proc)
             const char *rp = (const char *)a1;
+            // Resolve a RELATIVE target to its guest-absolute path so the /proc checks below fire even when
+            // the guest opened e.g. "stat" or "<pid>/stat" relative to a /proc cwd (busybox top xchdir's to
+            // /proc, then opens "<pid>/stat"). Absolute paths are untouched -> zero change for those callers;
+            // a resolved non-/proc relative path matches none of the synth checks and the real open (which
+            // uses the original a1) is unaffected.
+            char gpb_syn[4200];
+            if (rp && rp[0] != '/') {
+                abs_guest((int)a0, rp, gpb_syn, sizeof gpb_syn);
+                rp = gpb_syn;
+            }
+            // opendir("/proc"): materialize the process table (numeric pid dir per live container process
+            // + the synthesized static files) so getdents enumerates the whole container -- `ps`/top/htop
+            // read this to find processes. Without it the empty rootfs /proc dir yielded an empty table.
+            if (rp && g_rootfs && (!strcmp(rp, "/proc") || !strcmp(rp, "/proc/"))) {
+                int d = proc_root_dir_open();
+                if (d >= 0) {
+                    G_RET(c) = (uint64_t)d;
+                    break;
+                }
+                // else fall through to the real (empty) rootfs /proc
+            }
             if (rp && !strncmp(rp, "/proc/", 6)) {
                 // /proc/[self|pid]/exe -> open the actual guest executable (the magic symlink target)
                 char ep[1024];
@@ -888,6 +926,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (lf & 0x800) mf |= O_NONBLOCK;
         if (lf & G_O_DIRECTORY) mf |= O_DIRECTORY;
         if (lf & 0x80000) mf |= O_CLOEXEC;
+        // #255: when a runtime-dropped process (gosu postgres) O_CREATs a file, the new inode must be
+        // owned by its current fsuid/fsgid, not the cuid/cgid default. Only meaningful when O_CREAT is
+        // set AND a cred drop makes the stamp differ from the default; the pre-existence probe (so we
+        // never re-own a file merely OPENED with O_CREAT) then runs only in that rare dropped case.
+        int nf_want = (lf & 0x40) && newfile_stamp_wanted();
         {
             // /proc/self/fd/N -> reopen what host fd N points at. Linux reopen gives a FRESH file
             // description (offset 0, access narrowed to the requested mode), so prefer reopening by the
@@ -955,7 +998,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 overlay_copyup(gp, host, sizeof host);
             else
                 overlay_resolve(gp, host, sizeof host, (lf & G_O_NOFOLLOW) != 0);
+            // #255: after copy-up, `host` (the upper path) exists iff the file was already present in the
+            // overlay -> a missing upper means this open will CREATE it fresh; stamp its owner post-open.
+            int nf_new = nf_want && access(host, F_OK) != 0;
             int r = open(host, mf | ((lf & G_O_NOFOLLOW) ? O_NOFOLLOW : 0), (mode_t)a3);
+            if (r >= 0 && nf_new) newfile_stamp_fd(r);
             if (r >= 0) {
                 char gpa[4200];
                 int have_canon = fcntl(r, F_GETPATH, gpa) == 0;
@@ -1019,9 +1066,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             // fin is resolved -> O_NOFOLLOW safe
+            // #255: probe pre-existence (relative to the resolved parent) so we stamp ONLY a fresh create.
+            int nf_new = nf_want && faccessat(pfd, fin, F_OK, AT_SYMLINK_NOFOLLOW) != 0;
             int r = openat(pfd, fin, mf | O_NOFOLLOW, (mode_t)a3);
             int e = errno;
             close(pfd);
+            if (r >= 0 && nf_new) newfile_stamp_fd(r);
             if (r >= 0) {
                 char gp[4200];
                 // canonical host path for tracking
@@ -1043,7 +1093,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char pb[4200];
         // no jail
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
+        int nf_new = nf_want && faccessat(ATFD(a0), p, F_OK, AT_SYMLINK_NOFOLLOW) != 0; // #255: stamp only fresh
         int r = openat(ATFD(a0), p, mf, (mode_t)a3);
+        if (r >= 0 && nf_new) newfile_stamp_fd(r);
         if (r >= 0) {
             fd_setpath(r, p);
             if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
@@ -1168,6 +1220,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         const char *p = (const char *)a1;
         char *buf = (char *)a2;
         size_t bs = (size_t)a3;
+        // /proc/self (and /proc/thread-self) are magic symlinks to the caller's own pid -- readlink returns
+        // the decimal pid. `ls -l /proc` readlinks it now that /proc lists a "self" entry.
+        if (p && (!strcmp(p, "/proc/self") || !strcmp(p, "/proc/thread-self"))) {
+            char num[16];
+            int l = snprintf(num, sizeof num, "%d", container_pid());
+            if ((size_t)l > bs) l = (int)bs;
+            memcpy(buf, num, (size_t)l);
+            G_RET(c) = (uint64_t)l;
+            break;
+        }
         // /proc/self/fd/N -> the path host fd N currently points at (recovered via F_GETPATH on macOS).
         int pfn = procfd_num(p);
         if (pfn >= 0) {

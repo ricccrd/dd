@@ -501,6 +501,7 @@ int dd_run(const char *rootfs, int argc, char *const argv[]) {
     c.sp = build_stack(argc, (char **)argv, &lm, at_base);
     c.pc = jump;
 
+    proc_reg_publish(g_exe_path, argc, (char *const *)argv); // publish this process into the /proc table
     if (g_untrusted) sentry_init(); // fork the host-authority sentry + (optionally) confine the worker
     run_guest(&c);
     if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)

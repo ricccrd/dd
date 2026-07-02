@@ -56,6 +56,12 @@ pub fn group() -> ScenGroup {
             .exec("printf '#!/bin/sh\\necho SCRIPT_RAN\\n' > /s && chmod +x /s && /s").has("SCRIPT_RAN"),
         scen("filesystem/chown-uid-gid", "alpine:latest")
             .exec("touch /f && chown 1:1 /f && stat -c '%u:%g' /f").has("1:1"),
+        // #255: a process that DROPS privilege at runtime (gosu setuid/setgid to postgres=70:70) and then
+        // creates a file/dir must own the new inode with its CURRENT euid/egid, not the container id (0).
+        // Regressed initdb ("data directory has wrong ownership"). Covers file AND dir, uid AND gid.
+        scen("filesystem/setuid-drop-owns-newfile", "postgres:16-alpine")
+            .exec("gosu postgres sh -c 'mkdir /td && touch /td/f && stat -c %u:%g /td/f && stat -c %u:%g /td'")
+            .has("70:70"),
 
         // ---- symlinks (create / follow / dangling) --------------------------------------------------
         scen("filesystem/symlink-follow", "alpine:latest")

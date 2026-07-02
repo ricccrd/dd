@@ -881,6 +881,406 @@ static int proc_mountinfo_text(char *b, size_t n) {
                     "26 23 0:24 / /dev rw,nosuid - tmpfs tmpfs rw,mode=755\n"
                     "27 23 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n");
 }
+// ================= REAL /proc process table (top/htop/ps) =====================================
+// dd's process model: every guest process is its OWN host (macOS) process running this DBT; the
+// container init is guest pid 1 (g_init_hostpid<->1), children keep their host pid as the guest pid
+// (getpid() returns exactly that). macOS has no /proc, and one DBT process cannot see another's
+// address space, so we (1) keep a tiny on-disk REGISTRY where each container process publishes its
+// guest identity (comm + full argv), keyed by a per-container tmp dir, and (2) read LIVE per-process
+// stats (rss, cpu time, state, ppid) from the host kernel via libproc (proc_pidinfo). The union --
+// registry identity + libproc liveness -- lets any process (e.g. `ps`) enumerate the whole container
+// and synthesize /proc/<pid>/{stat,status,cmdline,comm} for its peers, with GUEST pids throughout.
+#include <libproc.h>
+#include <sys/proc_info.h>
+#include <sys/sysctl.h>
+#include <mach/mach_host.h>
+#include <mach/host_info.h>
+#include <mach/vm_statistics.h>
+#include <mach/machine.h>
+
+// The registry directory is keyed per-container (DD_NETNS / DD_HOSTNAME are set once by the daemon and
+// inherited across fork + survive guest execve), so two containers on the same host never collide; a
+// direct-mode run with neither falls back to the host session id. All peers compute the SAME key.
+static void proc_reg_key(char *out, size_t n) {
+    const char *k = getenv("DD_NETNS");
+    if (!k || !k[0]) k = getenv("DD_HOSTNAME");
+    if (k && k[0]) {
+        char s[48];
+        int o = 0;
+        for (const char *p = k; *p && o < 47; p++)
+            if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')) s[o++] = *p;
+        s[o] = 0;
+        if (o) {
+            snprintf(out, n, "/tmp/.ddpids.%s", s);
+            return;
+        }
+    }
+    snprintf(out, n, "/tmp/.ddpids.s%d", (int)getsid(0));
+}
+// This process's own registry file (unlinked on exit; the exit_group path calls proc_reg_unlink since
+// _exit bypasses atexit). Stale files from a crash are pruned lazily by the enumerator (dead-pid check).
+static char g_reg_file[128];
+static void proc_reg_unlink(void) {
+    if (g_reg_file[0]) {
+        unlink(g_reg_file);
+        g_reg_file[0] = 0;
+    }
+}
+// Publish THIS process's guest identity: "<comm>\n" then the full argv NUL-separated. Written to a temp
+// name + renamed for an atomic publish. Called at startup and after each guest execve (comm changes).
+static void proc_reg_publish(const char *exe, int argc, char *const argv[]) {
+    if (!g_init_hostpid) return; // process table is a container feature
+    char dir[80];
+    proc_reg_key(dir, sizeof dir);
+    mkdir(dir, 0777);
+    static int reg = 0;
+    if (!reg) {
+        atexit(proc_reg_unlink);
+        reg = 1;
+    }
+    char comm[16];
+    const char *b = (exe && exe[0]) ? exe : "init";
+    const char *s = strrchr(b, '/');
+    if (s) b = s + 1;
+    snprintf(comm, sizeof comm, "%.15s", b[0] ? b : "init");
+    char buf[4096];
+    int o = snprintf(buf, sizeof buf, "%s\n", comm), wrote = 0;
+    if (argv)
+        for (int i = 0; i < argc && argv[i] && o < (int)sizeof buf - 1; i++) {
+            int L = (int)strlen(argv[i]);
+            if (o + L + 1 > (int)sizeof buf) break;
+            memcpy(buf + o, argv[i], (size_t)L);
+            o += L;
+            buf[o++] = 0;
+            wrote = 1;
+        }
+    if (!wrote) { // no argv retained -> the exe path is the single cmdline arg (matches proc_cmdline_text)
+        const char *e = (exe && exe[0]) ? exe : "init";
+        int L = (int)strlen(e);
+        if (o + L + 1 <= (int)sizeof buf) {
+            memcpy(buf + o, e, (size_t)L);
+            o += L;
+            buf[o++] = 0;
+        }
+    }
+    char tmp[144];
+    snprintf(tmp, sizeof tmp, "%s/.t%d", dir, (int)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    if (write(fd, buf, (size_t)o) < 0) {}
+    close(fd);
+    char final[128];
+    snprintf(final, sizeof final, "%s/%d", dir, (int)getpid());
+    if (rename(tmp, final) == 0) snprintf(g_reg_file, sizeof g_reg_file, "%s", final);
+    else unlink(tmp);
+}
+// Read back a peer's published identity by host pid. Returns 1 + fills comm and the NUL-separated
+// cmdline (cmdlen bytes); 0 if no record. The comm line is stripped from the returned cmdline.
+static int proc_reg_read(int hostpid, char *comm, size_t csz, char *cmd, size_t cmdsz, int *cmdlen) {
+    char dir[80], path[128];
+    proc_reg_key(dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/%d", dir, hostpid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[4096];
+    int nr = (int)read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (nr <= 0) return 0;
+    buf[nr] = 0;
+    char *nl = memchr(buf, '\n', (size_t)nr);
+    int cl = nl ? (int)(nl - buf) : 0;
+    if (cl >= (int)csz) cl = (int)csz - 1;
+    memcpy(comm, buf, (size_t)cl);
+    comm[cl] = 0;
+    int off = nl ? (int)(nl - buf + 1) : nr, rem = nr - off;
+    if (rem < 0) rem = 0;
+    if (rem > (int)cmdsz) rem = (int)cmdsz;
+    memcpy(cmd, buf + off, (size_t)rem);
+    *cmdlen = rem;
+    return 1;
+}
+// Live per-process stats from the host kernel (libproc). rss/cpu-times/state are REAL (coarse beats
+// zero); comm here is the HOST comm (the DBT binary) -- the guest comm comes from the registry instead.
+struct dd_procinfo {
+    int ppid_host, pgid_host, nthreads;
+    char state;
+    unsigned long long rss, vsize, utime_ns, stime_ns;
+    long start_sec;
+    char hostcomm[32];
+};
+static int dd_get_procinfo(int pid, struct dd_procinfo *pi) {
+    struct proc_bsdinfo bsd;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, sizeof bsd) != (int)sizeof bsd) return 0;
+    pi->ppid_host = (int)bsd.pbi_ppid;
+    pi->pgid_host = (int)bsd.pbi_pgid;
+    pi->start_sec = (long)bsd.pbi_start_tvsec;
+    snprintf(pi->hostcomm, sizeof pi->hostcomm, "%s", bsd.pbi_comm);
+    switch (bsd.pbi_status) { // SIDL=1 SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5
+    case 2: pi->state = 'R'; break;
+    case 4: pi->state = 'T'; break;
+    case 5: pi->state = 'Z'; break;
+    default: pi->state = 'S'; break;
+    }
+    struct proc_taskinfo ti;
+    if (proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, sizeof ti) == (int)sizeof ti) {
+        pi->rss = ti.pti_resident_size;
+        pi->vsize = ti.pti_virtual_size;
+        pi->utime_ns = ti.pti_total_user;
+        pi->stime_ns = ti.pti_total_system;
+        pi->nthreads = ti.pti_threadnum > 0 ? ti.pti_threadnum : 1;
+    } else {
+        pi->rss = pi->vsize = pi->utime_ns = pi->stime_ns = 0;
+        pi->nthreads = 1;
+    }
+    return 1;
+}
+// Host boot epoch (seconds) -- the base for /proc/<pid> starttime and /proc/uptime. Cached.
+static long host_btime(void) {
+    static long bt = 0;
+    if (bt) return bt;
+    struct timeval tv;
+    size_t len = sizeof tv;
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    bt = (sysctl(mib, 2, &tv, &len, NULL, 0) == 0 && tv.tv_sec) ? tv.tv_sec : time(NULL);
+    return bt;
+}
+// Aggregate host CPU jiffies (user, system, idle, nice) -- monotonically increasing, so htop/top meters
+// move. HOST_CPU_LOAD_INFO ticks are already in USER_HZ and summed across cores.
+static void host_cpu_ticks(unsigned long long t[4]) {
+    host_cpu_load_info_data_t info;
+    mach_msg_type_number_t cnt = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&info, &cnt) == KERN_SUCCESS) {
+        t[0] = info.cpu_ticks[CPU_STATE_USER];
+        t[1] = info.cpu_ticks[CPU_STATE_SYSTEM];
+        t[2] = info.cpu_ticks[CPU_STATE_IDLE];
+        t[3] = info.cpu_ticks[CPU_STATE_NICE];
+    } else {
+        t[0] = t[1] = t[2] = t[3] = 0;
+    }
+}
+// Real host memory picture (kB): total from hw.memsize, free/available/cached from the Mach VM stats.
+static void host_mem(unsigned long long *total, unsigned long long *fre, unsigned long long *avail,
+                     unsigned long long *cached) {
+    uint64_t memsize = 0;
+    size_t len = sizeof memsize;
+    sysctlbyname("hw.memsize", &memsize, &len, NULL, 0);
+    *total = memsize / 1024;
+    vm_size_t pgsz = 4096;
+    host_page_size(mach_host_self(), &pgsz);
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info_t)&vm, &cnt) == KERN_SUCCESS) {
+        unsigned long long freep = (unsigned long long)vm.free_count * pgsz;
+        unsigned long long inact = (unsigned long long)vm.inactive_count * pgsz;
+        unsigned long long spec = (unsigned long long)vm.speculative_count * pgsz;
+        *fre = (freep + spec) / 1024;
+        *cached = inact / 1024;
+        *avail = (freep + inact + spec) / 1024;
+    } else {
+        *fre = *avail = *total / 4;
+        *cached = 0;
+    }
+}
+// Count the live container processes (registry entries whose pid is still alive).
+static int proc_reg_count(void) {
+    char dir[80];
+    proc_reg_key(dir, sizeof dir);
+    DIR *d = opendir(dir);
+    if (!d) return 1;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        if (kill(atoi(e->d_name), 0) == 0 || errno != ESRCH) n++;
+    }
+    closedir(d);
+    return n ? n : 1;
+}
+// Parse "/proc/<digits>/<leaf>" for ANY pid (unlike proc_self_leaf, which matches only our own). Returns
+// the <leaf> and fills *pid, or NULL.
+static const char *proc_any_leaf(const char *rp, int *pid) {
+    if (strncmp(rp, "/proc/", 6)) return NULL;
+    const char *q = rp + 6;
+    int i = 0;
+    while (q[i] >= '0' && q[i] <= '9' && i < 15)
+        i++;
+    if (i == 0 || q[i] != '/') return NULL;
+    char num[16];
+    memcpy(num, q, (size_t)i);
+    num[i] = 0;
+    *pid = atoi(num);
+    return q + i + 1;
+}
+// Is guest pid `gp` a live member of this container? Fills *hostout with its host pid (gp==1 -> init).
+static int proc_pid_member(int gp, int *hostout) {
+    int host = (gp == 1 && g_init_hostpid) ? g_init_hostpid : gp;
+    *hostout = host;
+    if (host == (int)getpid()) return 1;
+    if (host <= 0) return 0;
+    char dir[80], path[128];
+    proc_reg_key(dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/%d", dir, host);
+    if (access(path, F_OK) == 0 && !(kill(host, 0) != 0 && errno == ESRCH)) return 1;
+    return kill(host, 0) == 0 && getsid(host) == getsid(0); // registry may lag; accept a live session peer
+}
+// /proc/<pid>/stat for a peer -- the 52-field line with GUEST pid/ppid and REAL rss/cpu/state/starttime.
+static int proc_stat_pid_text(char *b, size_t n, int gp, int host) {
+    struct dd_procinfo pi;
+    int ok = dd_get_procinfo(host, &pi);
+    char comm[32], cmd[4096];
+    int cl;
+    if (!proc_reg_read(host, comm, sizeof comm, cmd, sizeof cmd, &cl))
+        snprintf(comm, sizeof comm, "%.15s", ok ? pi.hostcomm : "proc");
+    char state = ok ? pi.state : 'S';
+    int ppid = 0;
+    if (gp != 1 && ok) {
+        int hp;
+        if (pi.ppid_host == g_init_hostpid) ppid = 1;
+        else if (proc_pid_member(pi.ppid_host, &hp)) ppid = pi.ppid_host;
+    }
+    int pgrp = ok ? (pi.pgid_host == g_init_hostpid ? 1 : pi.pgid_host) : gp;
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) hz = 100;
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long long utime = ok ? pi.utime_ns * (unsigned long long)hz / 1000000000ULL : 0;
+    unsigned long long stime = ok ? pi.stime_ns * (unsigned long long)hz / 1000000000ULL : 0;
+    unsigned long rss_pg = ok ? (unsigned long)(pi.rss / pgsz) : 0;
+    // The host virtual size is the whole DBT process (code cache + big anon reservations) -> tens of GB,
+    // which makes top's VSZ/%VSZ nonsensical. Report a bounded, believable footprint (rss + a modest
+    // overhead) instead; there is no visibility into a PEER's true guest vsize from another process.
+    unsigned long long vsize = (unsigned long long)rss_pg * pgsz + (128ULL << 20);
+    long long since = ok ? (long long)pi.start_sec - host_btime() : 0;
+    unsigned long long start_ticks = since > 0 ? (unsigned long long)since * (unsigned long long)hz : 0;
+    int nthreads = ok ? pi.nthreads : 1;
+    return snprintf(b, n,
+                    "%d (%s) %c %d %d %d 0 -1 4194560 0 0 0 0 %llu %llu 0 0 20 0 %d 0 %llu %llu %lu "
+                    "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                    gp, comm, state, ppid, pgrp, gp, utime, stime, nthreads, start_ticks, vsize, rss_pg);
+}
+// /proc/<pid>/status for a peer -- the key:value form with GUEST Pid/PPid and REAL VmRSS.
+static int proc_status_pid_text(char *b, size_t n, int gp, int host) {
+    struct dd_procinfo pi;
+    int ok = dd_get_procinfo(host, &pi);
+    char comm[32], cmd[4096];
+    int cl;
+    if (!proc_reg_read(host, comm, sizeof comm, cmd, sizeof cmd, &cl))
+        snprintf(comm, sizeof comm, "%.15s", ok ? pi.hostcomm : "proc");
+    int ppid = 0;
+    if (gp != 1 && ok) {
+        int hp;
+        if (pi.ppid_host == g_init_hostpid) ppid = 1;
+        else if (proc_pid_member(pi.ppid_host, &hp)) ppid = pi.ppid_host;
+    }
+    unsigned long rss = ok ? (unsigned long)(pi.rss / 1024) : 0;
+    unsigned long vsz = rss + (128UL << 10); // bounded footprint, not the huge host DBT vsize (see stat text)
+    return snprintf(b, n,
+                    "Name:\t%s\nUmask:\t0022\nState:\t%c\nTgid:\t%d\nNgid:\t0\nPid:\t%d\nPPid:\t%d\n"
+                    "TracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\n"
+                    "VmPeak:\t%8lu kB\nVmSize:\t%8lu kB\nVmLck:\t       0 kB\nVmHWM:\t%8lu kB\nVmRSS:\t%8lu kB\n"
+                    "VmData:\t%8lu kB\nVmStk:\t     132 kB\nVmExe:\t     512 kB\nVmLib:\t    2048 kB\nVmPTE:\t      32 kB\n"
+                    "VmSwap:\t       0 kB\nThreads:\t%d\nSigQ:\t0/31000\nSigPnd:\t0000000000000000\n"
+                    "SigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\t0000000000000000\n"
+                    "Cpus_allowed:\t1\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t1\n"
+                    "nonvoluntary_ctxt_switches:\t0\n",
+                    comm, ok ? pi.state : 'S', gp, gp, ppid, vsz, vsz, rss, rss, rss, ok ? pi.nthreads : 1);
+}
+// /proc/<pid>/cmdline for a peer -- the published NUL-separated argv (fallback: the comm).
+static int proc_cmdline_pid_text(char *b, size_t n, int host) {
+    char comm[32], cmd[4096];
+    int cl;
+    if (proc_reg_read(host, comm, sizeof comm, cmd, sizeof cmd, &cl) && cl > 0) {
+        int L = cl > (int)n ? (int)n : cl;
+        memcpy(b, cmd, (size_t)L);
+        if (L == 0 || b[L - 1] != 0) {
+            if (L < (int)n) b[L++] = 0;
+            else b[L - 1] = 0;
+        }
+        return L;
+    }
+    struct dd_procinfo pi;
+    const char *c = dd_get_procinfo(host, &pi) ? pi.hostcomm : "proc";
+    int L = (int)strlen(c);
+    if (L + 1 > (int)n) L = (int)n - 1;
+    memcpy(b, c, (size_t)L);
+    b[L] = 0;
+    return L + 1;
+}
+// /proc/<pid>/comm for a peer.
+static int proc_comm_pid_text(char *b, size_t n, int host) {
+    char comm[32], cmd[4096];
+    int cl;
+    if (!proc_reg_read(host, comm, sizeof comm, cmd, sizeof cmd, &cl)) {
+        struct dd_procinfo pi;
+        snprintf(comm, sizeof comm, "%.15s", dd_get_procinfo(host, &pi) ? pi.hostcomm : "proc");
+    }
+    return snprintf(b, n, "%s\n", comm);
+}
+// Materialize /proc as a real temp directory of entries (static files + one numeric name per live
+// container process) so the guest's ordinary opendir/getdents enumerates it. Entries are empty regular
+// files -- ps/top/htop identify pids by digit-name and then open /proc/<pid>/stat BY PATH (served by
+// proc_open), so the entry type is irrelevant; empty files keep cleanup trivial (procfd_dir_rm). The
+// dir is reaped when the guest closes the fd (shared g_procfd_dirs machinery). Returns the fd or -1.
+static int proc_root_dir_open(void) {
+    static int registered = 0;
+    if (!registered) {
+        atexit(procfd_dirs_atexit);
+        registered = 1;
+    }
+    procfd_dirs_reap(0);
+    char tmpl[] = "/tmp/.ddprootXXXXXX";
+    if (!mkdtemp(tmpl)) return -1;
+    // ONLY names proc_open()/synth_stat actually serve -- listing an unserved name makes `ls /proc` stat it
+    // and print "No such file or directory". "self" is the magic symlink (handled in synth_stat).
+    static const char *const st[] = {"meminfo", "stat",   "cpuinfo", "uptime", "loadavg",
+                                     "version", "mounts", "self",    0};
+    for (int i = 0; st[i]; i++) {
+        char p[96];
+        snprintf(p, sizeof p, "%s/%s", tmpl, st[i]);
+        int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+        if (f >= 0) close(f);
+    }
+    char dir[80];
+    proc_reg_key(dir, sizeof dir);
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+            int host = atoi(e->d_name);
+            if (kill(host, 0) != 0 && errno == ESRCH) { // dead -> prune the stale registry record
+                char rp[144];
+                snprintf(rp, sizeof rp, "%s/%s", dir, e->d_name);
+                unlink(rp);
+                continue;
+            }
+            int guest = (g_init_hostpid && host == g_init_hostpid) ? 1 : host;
+            char p[96];
+            snprintf(p, sizeof p, "%s/%d", tmpl, guest);
+            int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+            if (f >= 0) close(f);
+        }
+        closedir(d);
+    }
+    { // always list ourselves (our registry write may have lagged the first `ps`)
+        char p[96];
+        snprintf(p, sizeof p, "%s/%d", tmpl, container_pid());
+        int f = open(p, O_WRONLY | O_CREAT, 0444);
+        if (f >= 0) close(f);
+    }
+    int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        procfd_dir_rm(tmpl);
+        return -1;
+    }
+    for (int i = 0; i < 64; i++)
+        if (!g_procfd_dirs[i].path[0]) {
+            g_procfd_dirs[i].fd = fd;
+            snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
+            break;
+        }
+    return fd;
+}
 // Real macOS stat -> Linux struct stat (the fake S_IFCHR version corrupted libc buffering).
 // fill_linux_stat (the guest struct-stat layout) is per-arch -> frontend/<arch>/fill_stat.c
 // Synthesize the common /proc files Linux programs read (macOS has no /proc). Returns an fd
@@ -902,6 +1302,23 @@ static int proc_open(const char *rp) {
         else if (!strcmp(leaf, "mountinfo")) n = proc_mountinfo_text(buf, sizeof buf);
         if (n >= 0) return proc_text_fd(buf, n);
     }
+    // A PEER container process: /proc/<otherpid>/{stat,status,cmdline,comm}. proc_self_leaf matched only
+    // our own pid above, so a numeric pid reaching here is a peer -- synthesize from the registry (guest
+    // comm/argv) + libproc (live rss/cpu/state). This is what makes ps/top/htop show the whole container.
+    {
+        int gp2;
+        const char *fl = proc_any_leaf(rp, &gp2);
+        if (fl && gp2 > 0) {
+            int host;
+            if (proc_pid_member(gp2, &host)) {
+                if (!strcmp(fl, "stat")) n = proc_stat_pid_text(buf, sizeof buf, gp2, host);
+                else if (!strcmp(fl, "status")) n = proc_status_pid_text(buf, sizeof buf, gp2, host);
+                else if (!strcmp(fl, "cmdline")) n = proc_cmdline_pid_text(buf, sizeof buf, host);
+                else if (!strcmp(fl, "comm")) n = proc_comm_pid_text(buf, sizeof buf, host);
+                if (n >= 0) return proc_text_fd(buf, n);
+            }
+        }
+    }
     if (!strcmp(rp, "/proc/cpuinfo")) {
         int nc = (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (nc < 1) nc = 1;
@@ -913,17 +1330,40 @@ static int proc_open(const char *rp) {
                           "CPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n\n",
                           i);
     } else if (!strcmp(rp, "/proc/meminfo")) {
-        // reflect cgroup memory.max
-        unsigned long long tot = g_mem_max ? g_mem_max / 1024 : 8388608;
-        unsigned long long used = (unsigned long long)atomic_load(&g_mem_charged) / 1024;
-        unsigned long long fre = tot > used ? tot - used : 0;
+        // Real-ish figures: a cgroup memory.max caps MemTotal (used = the tracked anon charge); otherwise
+        // report the host machine's memory (total from hw.memsize, free/available/cached from the Mach VM
+        // stats) so htop's memory meter reflects a believable, non-zero footprint instead of "0K used".
+        unsigned long long tot, fre, avail, cached;
+        if (g_mem_max) {
+            tot = g_mem_max / 1024;
+            unsigned long long used = (unsigned long long)atomic_load(&g_mem_charged) / 1024;
+            fre = tot > used ? tot - used : 0;
+            avail = fre;
+            cached = 0;
+        } else {
+            host_mem(&tot, &fre, &avail, &cached);
+        }
         n = snprintf(buf, sizeof buf,
                      "MemTotal:    %11llu kB\nMemFree:     %11llu kB\n"
-                     "MemAvailable:%11llu kB\nBuffers:               0 kB\nCached:                0 kB\n"
-                     "SwapTotal:             0 kB\nSwapFree:              0 kB\n",
-                     tot, fre, fre);
+                     "MemAvailable:%11llu kB\nBuffers:               0 kB\nCached:      %11llu kB\n"
+                     "SwapTotal:             0 kB\nSwapFree:              0 kB\n"
+                     "Shmem:                 0 kB\nSReclaimable:          0 kB\n",
+                     tot, fre, avail, cached);
     } else if (!strcmp(rp, "/proc/stat")) {
-        n = snprintf(buf, sizeof buf, "cpu  0 0 0 0 0 0 0 0 0 0\nbtime 1700000000\nprocesses 1\n");
+        // Real host CPU jiffies -> the cpu line increments between reads, so htop/top meters move. Emit an
+        // aggregate `cpu` line plus one per online CPU (aggregate split evenly) so per-core meters populate.
+        unsigned long long t[4];
+        host_cpu_ticks(t);
+        int nc = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (nc < 1) nc = 1;
+        if (nc > 64) nc = 64;
+        n = snprintf(buf, sizeof buf, "cpu  %llu %llu %llu %llu 0 0 0 0 0 0\n", t[0], t[3], t[1], t[2]);
+        for (int i = 0; i < nc; i++)
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "cpu%d %llu %llu %llu %llu 0 0 0 0 0 0\n", i,
+                          t[0] / (unsigned)nc, t[3] / (unsigned)nc, t[1] / (unsigned)nc, t[2] / (unsigned)nc);
+        n += snprintf(buf + n, sizeof buf - (size_t)n,
+                      "intr 0\nctxt 0\nbtime %ld\nprocesses %d\nprocs_running 1\nprocs_blocked 0\n",
+                      host_btime(), proc_reg_count());
     } else if (!strcmp(rp, "/proc/mounts") || !strcmp(rp, "/proc/self/mounts")) {
         // The fstab-style mount table (mirror of mountinfo). Name the root mount "overlay", not the legacy
         // "rootfs": busybox/util-linux df filters out a pseudo "rootfs" entry, leaving df unable to find the
@@ -934,9 +1374,17 @@ static int proc_open(const char *rp) {
                      "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
                      "tmpfs /dev tmpfs rw,nosuid 0 0\n");
     } else if (!strcmp(rp, "/proc/uptime")) {
-        n = snprintf(buf, sizeof buf, "12345.00 12345.00\n");
+        unsigned long long t[4];
+        host_cpu_ticks(t);
+        long hz = sysconf(_SC_CLK_TCK);
+        if (hz <= 0) hz = 100;
+        double up = (double)(time(NULL) - host_btime());
+        n = snprintf(buf, sizeof buf, "%.2f %.2f\n", up > 0 ? up : 0.0, (double)t[2] / (double)hz);
     } else if (!strcmp(rp, "/proc/loadavg")) {
-        n = snprintf(buf, sizeof buf, "0.00 0.00 0.00 1/1 1\n");
+        double la[3] = {0, 0, 0};
+        getloadavg(la, 3);
+        n = snprintf(buf, sizeof buf, "%.2f %.2f %.2f 1/%d %d\n", la[0], la[1], la[2], proc_reg_count(),
+                     container_pid());
     } else if (!strcmp(rp, "/proc/sys/vm/overcommit_memory")) {
         n = snprintf(buf, sizeof buf, "0\n");
     } else if (!strcmp(rp, "/proc/sys/kernel/hostname")) {
@@ -1007,8 +1455,10 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
         for (const char *t = q; *t && isnum; t++)
             if (*t < '0' || *t > '9') isnum = 0;
         if (isnum) {
-            int pid = atoi(q);
-            if (pid == (int)getpid() || pid == container_pid() || pid == 1) {
+            int pid = atoi(q), host;
+            // our own pid / the init "1", OR any live PEER container process -> a /proc/<pid> directory,
+            // so `ps`/htop can descend into a peer it saw in the /proc listing.
+            if (pid == (int)getpid() || pid == container_pid() || pid == 1 || proc_pid_member(pid, &host)) {
                 memset(s, 0, sizeof *s);
                 s->st_mode = S_IFDIR | 0555;
                 s->st_nlink = 8;

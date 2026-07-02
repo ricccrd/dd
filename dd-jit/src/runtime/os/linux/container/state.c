@@ -69,6 +69,64 @@ static int chown_xattr_get(const char *hostpath, int fd, int *uid, int *gid) {
     }
     return (*uid >= 0 || *gid >= 0);
 }
+// ---- runtime credential overlay (USER ns) -- defined here (BEFORE fs.c AND proc.c in the unity TU) --
+// cuid()/cgid() give the container's CONFIGURED identity (default 0=root); a privileged guest may drop
+// to an unprivileged id at runtime (apt forks /usr/lib/apt/methods/http, switching to `_apt`; gosu
+// switches postgres to uid 70) and then VERIFIES the drop took -- and that it can NOT regain root. We
+// track real/effective/saved uid+gid and honour the Linux permission model (a euid==0 task is
+// privileged; otherwise a new id must already be one of its three) so both the drop AND the
+// regain-must-fail check behave as on Linux. The base is cuid()/cgid() (fork inherits the copy, exec
+// re-seeds from the container default). The set*id syscall HANDLERS live in proc.c and mutate these.
+static int g_cred_init = 0;
+static int g_ruid, g_euid, g_suid; // real / effective / saved-set uid
+static int g_rgid, g_egid, g_sgid; // real / effective / saved-set gid
+static void cred_init(void) {
+    if (g_cred_init) return;
+    g_ruid = g_euid = g_suid = cuid();
+    g_rgid = g_egid = g_sgid = cgid();
+    g_cred_init = 1;
+}
+static int cred_euid(void) {
+    cred_init();
+    return g_euid;
+}
+static int cred_egid(void) {
+    cred_init();
+    return g_egid;
+}
+// An unprivileged task (euid != 0) may only set an id it already holds (real/effective/saved). -1 means
+// "leave unchanged". Returns 1 if id is permitted, 0 -> EPERM.
+static int uid_permitted(int id) {
+    return id == -1 || g_euid == 0 || id == g_ruid || id == g_euid || id == g_suid;
+}
+static int gid_permitted(int id) {
+    return id == -1 || g_euid == 0 || id == g_rgid || id == g_egid || id == g_sgid;
+}
+// ---- BUG #255: new-file ownership stamp (runtime setuid/setgid drop) ----------------------------
+// A guest that drops privilege at runtime (setuid/setresuid/setfsuid -> gosu's postgres) and then
+// CREATES a file/dir must have the new inode owned by its CURRENT effective fsuid/fsgid, NOT the
+// cuid/cgid container default that fill_linux_stat applies to host-owned files. #181 tracked only
+// EXPLICIT chown(2); a plain create left no xattr, so a new file re-appeared as the container id (0),
+// which broke initdb ("data directory has wrong ownership"). fsuid/fsgid follow the overlay's
+// euid/egid unless setfsuid/setfsgid override them (g_fs*_ovr >= 0); any subsequent set*id resets the
+// override (POSIX: fsuid tracks euid). We persist the intended owner as the SAME dd.uid/gid xattr the
+// chown path uses, so a later stat reports it. The create sites in fs.c call the helpers below.
+static int g_fsuid_ovr = -1, g_fsgid_ovr = -1; // -1 = follow euid/egid
+static int newfile_uid(void) { return g_fsuid_ovr >= 0 ? g_fsuid_ovr : cred_euid(); }
+static int newfile_gid(void) { return g_fsgid_ovr >= 0 ? g_fsgid_ovr : cred_egid(); }
+// True only when a runtime cred drop makes the new-file owner differ from the cuid/cgid default -- the
+// create paths gate their pre-existence probe + stamp on this so the common (no-drop) case is free.
+static int newfile_stamp_wanted(void) { return newfile_uid() != cuid() || newfile_gid() != cgid(); }
+// Stamp a freshly-created inode's owner, but only the id(s) that differ from the default (so a
+// root-created file stays xattr-free). fd form for openat(O_CREAT); path form for mkdir/mknod.
+static void newfile_stamp_fd(int fd) {
+    int u = newfile_uid(), g = newfile_gid();
+    chown_xattr_set_fd(fd, u != cuid() ? u : -1, g != cgid() ? g : -1);
+}
+static void newfile_stamp_path(const char *hostpath, int nofollow) {
+    int u = newfile_uid(), g = newfile_gid();
+    chown_xattr_set_path(hostpath, u != cuid() ? u : -1, g != cgid() ? g : -1, nofollow);
+}
 // ---- NET ns Phase 1: port-map (docker run -p H:C). bind(:C) actually binds the host port :H;
 // getsockname reports :C back so the guest sees the port it asked for. {cport->hport} table.
 static struct {

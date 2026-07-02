@@ -294,6 +294,7 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
 
     s1_calibrate(); // S1: anchor CNTVCT vs host REALTIME/MONOTONIC for the inline time fast path
                     // (also honors DDJIT_NOFASTSYS=1 kill-switch -> byte-identical old syscall path)
+    proc_reg_publish(g_exe_path, argc, argv); // publish this process into the /proc table
     if (g_untrusted) sentry_init(); // fork the host-authority sentry + (optionally) confine the worker
     run_guest(&c);
     if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
