@@ -19,6 +19,16 @@ pub fn scenarios() -> Vec<Scenario> {
         scen("languages/node-add-18-alpine", "node:18-alpine")
             .run(&["node", "-e", "console.log(1+2+3)"])
             .has("6"),
+        // #252: libuv's event loop must exit cleanly. setTimeout drives one epoll_wait(-1) cycle then the
+        // loop drains -- a spurious 0-return from epoll_wait(-1) trips `assert(timeout != -1)` in uv__io_poll
+        // and node aborts. Must print TICK and exit 0.
+        scen("languages/node-settimeout-22-alpine", "node:22-alpine")
+            .run(&["node", "-e", "setTimeout(()=>console.log('TICK'),50)"])
+            .has("TICK"),
+        // #252: even a purely-synchronous script tripped the same assert at loop teardown. Must exit 0.
+        scen("languages/node-sync-22-alpine", "node:22-alpine")
+            .run(&["node", "-e", "console.log(1+1)"])
+            .has("2"),
         scen("languages/node-sort-20-alpine", "node:20-alpine")
             .run(&["node", "-e", "console.log([3,1,2].sort().join(','))"])
             .has("1,2,3"),

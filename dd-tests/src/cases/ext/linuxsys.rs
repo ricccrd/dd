@@ -20,6 +20,9 @@ fn epoll() -> Group {
         src("epoll-mod", "ext_linuxsys/epoll_mod.c").oracle(),
         src("epoll-oneshot", "ext_linuxsys/epoll_oneshot.c").oracle(),
         src("epoll-pwait", "ext_linuxsys/epoll_pwait.c").oracle(),
+        // #252: a cross-thread epoll_ctl must not make a blocked epoll_wait(-1) spuriously return 0.
+        src("epoll-reblock-inf", "ext_linuxsys/epoll_reblock_inf.c").has("DELIVERED_OK"),
+        src("epoll-reblock-fin", "ext_linuxsys/epoll_reblock_fin.c").has("FINITE_OK"),
     ])
 }
 
