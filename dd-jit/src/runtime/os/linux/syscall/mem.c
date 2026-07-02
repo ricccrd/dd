@@ -455,12 +455,37 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (adv == 4 && a1) {
             int aprot = anon_prot_if_contained(a0, (size_t)a1);
             if (aprot >= 0) {
-                void *r = mmap((void *)a0, (size_t)a1, aprot, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-                if (r != MAP_FAILED) {
+                // BUG #201: emulate Linux MADV_DONTNEED (range reads back ZERO) WITHOUT corrupting a live
+                // neighbour that shares a host page. The guest uses 4 KB pages; Apple Silicon uses 16 KB.
+                // A plain `mmap(a0, a1, MAP_FIXED|ANON)` rounds a partial head/tail host page OUT to the full
+                // 16 KB, so a guest DONTNEED of a free 4/8 KB span silently unmaps+zeros a LIVE object in the
+                // rest of that host page (Go's scavenger DONTNEEDs a free 8 KB span whose 16 KB host page also
+                // holds a live tiny string span -> the "heap corruption"). Fix: MAP_FIXED-remap only the
+                // host-page-aligned INTERIOR (safe physical release + zero); zero the partial edge host pages
+                // with memset over EXACTLY the requested bytes, never remapping a page shared with a neighbour.
+                size_t hp = (size_t)getpagesize();
+                uint64_t lo = a0, hi = a0 + a1;
+                uint64_t ilo = (lo + hp - 1) & ~((uint64_t)hp - 1); // first fully-covered host page
+                uint64_t ihi = hi & ~((uint64_t)hp - 1);            // end of last fully-covered host page
+                int done = 1;
+                if (ilo < ihi) { // release the fully-covered interior (drop physical + fault back zero)
+                    if (mmap((void *)ilo, (size_t)(ihi - ilo), aprot, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) ==
+                        MAP_FAILED)
+                        done = 0;
+                }
+                if (done && (aprot & PROT_WRITE)) { // zero the partial edges in place -- neighbours untouched
+                    uint64_t he = ilo < hi ? ilo : hi;
+                    if (lo < he) memset((void *)lo, 0, (size_t)(he - lo));
+                    uint64_t tl = ihi > lo ? ihi : lo;
+                    if (tl < hi) memset((void *)tl, 0, (size_t)(hi - tl));
                     G_RET(c) = 0;
                     break;
                 }
-                // remap failed (e.g. unaligned) -> never fail the guest; fall through to advisory
+                if (done && ilo < ihi) { // interior released; edges not writable -> best effort, don't fail
+                    G_RET(c) = 0;
+                    break;
+                }
+                // could not satisfy exactly -> never fail the guest; fall through to advisory
             }
         }
         if (adv >= 0 && adv <= 4)
