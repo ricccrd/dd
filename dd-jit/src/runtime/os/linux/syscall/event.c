@@ -50,6 +50,58 @@ static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
         ep_prime_push(ep, (uintptr_t)fd, filt, udata);
 }
 
+// --- cross-thread readiness wakeup (EVFILT_USER) --------------------------------------------------
+// A Go netpoller (and node's worker-thread pool) shares ONE epoll instance across several OS threads
+// (Go Ms): one M blocks in epoll_wait while ANOTHER M accepts a connection and registers it on the same
+// instance (epoll_ctl). That connection usually already has its request bytes buffered, so on Linux the
+// EPOLLET registration edge wakes the blocked epoll_wait at once. Two things defeat that emulation here:
+// (1) the W3E fast path DEFERS the kevent registration to the next epoll_wait on the SAME thread, so a
+// peer M already blocked in kevent() never sees it; (2) an already-ready fd armed EV_CLEAR produces no
+// kqueue edge, so its readiness is stashed in g_ep_prime and only consulted when THIS thread next waits.
+// Either way the readiness is stranded on the registering thread and the connection is accepted but never
+// serviced. Fix: give every epoll kqueue an EVFILT_USER "wake" knote; when a thread registers interest
+// while the process is multi-threaded, flush the pending changelist to the kernel (so the fd is visible
+// to a blocked peer) and NOTE_TRIGGER the knote (so the peer returns from kevent and re-scans primes).
+// A single mutex serializes the W3E per-instance state (changelist/prime/armed maps) whenever guest
+// threads exist; the single-threaded path is untouched (g_threaded == 0 -> no lock, no wake, no change).
+#define EP_WAKE_IDENT ((uintptr_t)0x7fffffe0u) // EVFILT_USER ident, disjoint from any real fd number
+static uint8_t g_ep_wake_armed[1024];          // per epoll fd: EVFILT_USER wake knote installed on its kqueue
+static pthread_mutex_t g_ep_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// Capture g_threaded into the returned token so lock/unlock stay balanced even if a peer thread flips
+// g_threaded (0->1 on its first clone) between the two calls. Single-threaded (token 0) takes no lock.
+static inline int ep_lock(void) { int lk = g_threaded; if (lk) pthread_mutex_lock(&g_ep_mtx); return lk; }
+static inline void ep_unlock(int lk) { if (lk) pthread_mutex_unlock(&g_ep_mtx); }
+
+// Install the one-shot self-wake knote on `ep`'s kqueue (idempotent). EV_CLEAR: a NOTE_TRIGGER is
+// auto-consumed on delivery, so a trigger raised while no peer is blocked simply makes that peer's next
+// kevent() return immediately -- it re-scans primes and re-blocks, so no wakeup is ever lost.
+static void ep_wake_arm(int ep) {
+    if (ep < 0 || ep >= 1024 || g_ep_wake_armed[ep]) return;
+    struct kevent kv;
+    EV_SET(&kv, EP_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(ep, &kv, 1, NULL, 0, NULL) == 0) g_ep_wake_armed[ep] = 1;
+}
+
+// Push the deferred changelist to the kernel now (so an fd registered/removed on this thread becomes
+// visible to a peer M already blocked in kevent) and, when `wake` is set (interest was added/modified),
+// NOTE_TRIGGER the wake knote so that blocked peer returns and re-scans primes for an already-ready fd.
+// Caller holds g_ep_mtx. Only used when g_threaded, so the W3E batching still applies single-threaded.
+static void ep_flush(int ep, int wake) {
+    if (ep < 0 || ep >= 1024) return;
+    if (g_ep_chgn[ep] > 0) {
+        kevent(ep, g_ep_chg[ep], g_ep_chgn[ep], NULL, 0, NULL); // registrations only; ignore EV_ERROR echoes
+        ep_count();
+        g_ep_chgn[ep] = 0;
+    }
+    if (!wake) return;
+    ep_wake_arm(ep);
+    struct kevent trig;
+    EV_SET(&trig, EP_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    kevent(ep, &trig, 1, NULL, 0, NULL);
+    ep_count();
+}
+
 // macOS does NOT inherit kqueue() descriptors across fork(2) (unlike Linux epoll/timer/inotify fds, which
 // are), so every epoll/timerfd/inotify fd the engine emulates with a kqueue is DEAD in a freshly forked
 // child. A guest that then closes or re-arms it sees EBADF -- e.g. Ruby's post-fork timer-thread reset
@@ -77,6 +129,8 @@ static void kqueue_rebuild_after_fork(void) {
     memset(g_ep_rd, 0, sizeof g_ep_rd);
     memset(g_ep_wr, 0, sizeof g_ep_wr);
     memset(g_ep_os, 0, sizeof g_ep_os);
+    // the rebuilt kqueues carry no EVFILT_USER wake knote either -> re-arm lazily on next epoll op
+    memset(g_ep_wake_armed, 0, sizeof g_ep_wake_armed);
 }
 
 static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
@@ -118,8 +172,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         int r = kqueue();
         // EPOLL_CLOEXEC
         if (r >= 0 && (a0 & 0x80000)) fcntl(r, F_SETFD, FD_CLOEXEC);
-        // a reused fd number must start with an empty prime buffer (close() doesn't clear ours)
-        if (r >= 0 && r < 1024) { g_ep_primen[r] = 0; g_epoll[r] = 1; }
+        // a reused fd number must start with an empty prime buffer + no stale wake knote (close() doesn't clear ours)
+        if (r >= 0 && r < 1024) { g_ep_primen[r] = 0; g_ep_wake_armed[r] = 0; g_epoll[r] = 1; }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -140,6 +194,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (epopt_on() && (int)a0 >= 0 && (int)a0 < 1024 && fd >= 0 && fd < 1024) {
             // W3E fast path: track armed filters, defer the change to the next epoll_wait kevent().
             int ep = (int)a0;
+            int lk = ep_lock();
             if (want_rd) {
                 ep_push(ep, fd, EVFILT_READ, EV_ADD | xf, (void *)data);
                 g_ep_rd[fd] = 1;
@@ -157,6 +212,12 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 g_ep_wr[fd] = 0;
             }
             g_ep_os[fd] = (op != 2 && (ev & 0x40000000u)) ? 1 : 0;
+            // Multi-threaded guest: a peer M may be blocked in epoll_wait on this instance right now, so the
+            // deferred registration/prime must reach it -- flush the changelist to the kernel and (when we
+            // added/modified interest) wake the peer to re-scan primes. No-op single-threaded, where the same
+            // thread issues the next epoll_wait and consumes the changelist itself.
+            if (lk) ep_flush(ep, op != 2);
+            ep_unlock(lk);
             G_RET(c) = 0;
             break;
         }
@@ -205,10 +266,19 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // A pending edge-prime means some fd is ready *now*; don't sleep waiting for a fresh kqueue edge
         // (a Go server's epoll_wait blocks with an infinite timeout) -- poll kqueue and merge the prime in.
         struct timespec zts = {0, 0};
+        // Multi-threaded guest: serialize against peer Ms doing epoll_ctl on this instance. Arm the wake
+        // knote and push any deferred changelist to the kernel BEFORE we block, so a peer's registration is
+        // kernel-visible to us and its NOTE_TRIGGER can wake us. We then block on a pure wait (no changelist)
+        // with the lock released, so epoll_ctl on another M is never blocked behind our sleep. Single-threaded
+        // (lk == 0) keeps the classic one-syscall ctl+wait batching, unchanged.
+        int lk = opt ? ep_lock() : 0;
+        if (lk) { ep_wake_arm(ep); ep_flush(ep, 0); }
         if (ep >= 0 && ep < 1024 && g_ep_primen[ep] > 0) tp = &zts;
-        // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall.
-        struct kevent *chg = opt ? g_ep_chg[ep] : NULL;
-        int nchg = opt ? g_ep_chgn[ep] : 0;
+        // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall (single-threaded);
+        // threaded already flushed it above and waits with no changelist.
+        struct kevent *chg = (opt && !lk) ? g_ep_chg[ep] : NULL;
+        int nchg = (opt && !lk) ? g_ep_chgn[ep] : 0;
+        if (lk) ep_unlock(lk);
         int r;
         // #146: epoll_wait is never restarted by a handler -- re-wait only on a SPURIOUS EINTR (nothing to
         // deliver); the moment a guest handler is runnable we return -EINTR and let the dispatcher run it.
@@ -219,13 +289,16 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             chg = NULL;
             nchg = 0;
         } while (r < 0 && svc_poll_retry(c));
-        if (opt) g_ep_chgn[ep] = 0; // consumed
+        if (opt && !lk) g_ep_chgn[ep] = 0; // consumed (threaded flushed it under the lock already)
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
+        lk = opt ? ep_lock() : 0; // re-acquire to guard the armed-map updates + prime scan below
         int oi = 0;
         for (int i = 0; i < r && oi < maxev; i++) {
+            // The EVFILT_USER self-wake knote is an internal cross-thread nudge, not a guest event -- drop it.
+            if (kv[i].filter == EVFILT_USER) continue;
             // An EV_ERROR entry is a *changelist* processing result (errno in .data), NOT a readiness
             // event. With correct armed-state tracking these do not occur; skip them if they do.
             if (opt && (kv[i].flags & EV_ERROR)) continue;
@@ -251,10 +324,12 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             int r2 = kevent(ep, NULL, 0, kv, maxev, tp);
             ep_count();
             if (r2 < 0) {
+                ep_unlock(lk);
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
             for (int i = 0; i < r2 && oi < maxev; i++) {
+                if (kv[i].filter == EVFILT_USER) continue;
                 if (kv[i].flags & EV_ERROR) continue;
                 uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
                 if (kv[i].flags & EV_EOF) ev |= 0x10u;
@@ -291,6 +366,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
             g_ep_primen[ep] = kept;
         }
+        ep_unlock(lk);
         G_RET(c) = (uint64_t)oi;
         break;
     }
