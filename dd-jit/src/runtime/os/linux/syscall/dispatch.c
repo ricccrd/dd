@@ -36,6 +36,7 @@ int g_rwx_guest;
 #include "signal.c"
 #include "time.c"
 #include "io.c"
+#include "aio.c"
 #include "net.c"
 #include "event.c"
 #include "misc.c"
@@ -467,6 +468,7 @@ static void service_local(struct cpu *c) {
     if (svc_signal(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_time(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_io(c, nr, a0, a1, a2, a3, a4, a5)) return;
+    if (svc_aio(c, nr, a0, a1, a2, a3, a4, a5)) return; // kernel-AIO/libaio (canonical 0-4): nginx/innodb file-AIO
     if (svc_fs(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_proc(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_net(c, nr, a0, a1, a2, a3, a4, a5)) return;

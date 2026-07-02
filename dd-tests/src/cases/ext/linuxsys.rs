@@ -31,6 +31,11 @@ fn events() -> Group {
     group("lsys-events", vec![
         // EFD_NONBLOCK read on a zero counter does NOT return EAGAIN on the JIT. GAPS `lsys-eventfd-nonblock`.
         src("eventfd-nonblock", "ext_linuxsys/eventfd_nonblock.c").oracle(),
+        // kernel-AIO/libaio (io_setup/io_submit(PREAD)/io_getevents): synchronous emulation must return
+        // the completion with res==nbytes and the right bytes. Unblocks nginx:alpine + innodb file-AIO.
+        // Golden-checked (NOT oracle): qemu-x86_64 user-mode returns ENOSYS for io_setup, so it can't be
+        // the ground truth; the native aarch64 kernel and both dd JITs all produce this exact line.
+        src("aio-pread", "ext_linuxsys/aio_pread.c").out("aio res=10 data=d00dfeed buf=KLMNOPQRST\n").exit(0),
         src("timerfd-interval", "ext_linuxsys/timerfd_interval.c").oracle(),
         // timerfd_gettime reports 0 remaining for an armed one-shot (no remaining-time tracking). GAPS `lsys-timerfd-gettime`.
         src("timerfd-gettime", "ext_linuxsys/timerfd_gettime.c").oracle().xfail(LIN),
