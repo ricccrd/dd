@@ -663,18 +663,26 @@ static const char *proc_self_leaf(const char *rp) {
 }
 // One /proc/.../maps line for [lo,hi), plus the per-region smaps fields when `smaps` is set. The smaps
 // fields are what redis's COW self-test parses; rss/dirty are reported equal to the region size (a
-// resident private mapping) so any field a parser looks up is present and consistent. Returns the length.
+// resident mapping) so any field a parser looks up is present and consistent. Returns the length.
+//
+// The resident dirty bytes are reported under Shared_Dirty (not Private_Dirty): redis'
+// checkLinuxMadvFreeForkBug forks and, in the CHILD, reads /proc/self/smaps Shared_Dirty for its
+// MADV_FREE'd + rewritten private-anon page -- a value of 0 there is exactly its "buggy arm64 kernel"
+// signature ("data corruption during background save", then it exits). A just-forked dirty COW page IS
+// Shared_Dirty on real Linux (parent+child map it until COW breaks), so reporting the dirty bytes there
+// both matches Linux for that query and clears the false positive. Rss stays == Shared_Clean +
+// Shared_Dirty + Private_Clean + Private_Dirty (the kernel's invariant), so a summing parser is consistent.
 static int proc_map_region(char *b, size_t n, unsigned long lo, unsigned long hi, const char *name, int smaps) {
     unsigned long kb = (hi - lo) / 1024;
     int m = snprintf(b, n, "%012lx-%012lx rw-p 00000000 00:00 0 %*s%s\n", lo, hi, name[0] ? 20 : 0, "", name);
     if (smaps)
         m += snprintf(b + m, (size_t)n - (size_t)m,
                       "Size:%15lu kB\nKernelPageSize:%6d kB\nMMUPageSize:%9d kB\n"
-                      "Rss:%16lu kB\nPss:%16lu kB\nShared_Clean:%7d kB\nShared_Dirty:%7d kB\n"
+                      "Rss:%16lu kB\nPss:%16lu kB\nShared_Clean:%7d kB\nShared_Dirty:%7lu kB\n"
                       "Private_Clean:%6d kB\nPrivate_Dirty:%6lu kB\nReferenced:%9lu kB\n"
                       "Anonymous:%10lu kB\nAnonHugePages:%6d kB\nSwap:%15d kB\nLocked:%13d kB\n"
                       "VmFlags: rd wr mr mw me ac\n",
-                      kb, 4, 4, kb, kb, 0, 0, 0, kb, kb, kb, 0, 0, 0);
+                      kb, 4, 4, kb, kb, 0, kb, 0, 0UL, kb, kb, 0, 0, 0);
     return m;
 }
 // Synthesize /proc/[pid]/maps (smaps=0) or /proc/[pid]/smaps (smaps=1) from the tracked guest mappings
