@@ -857,13 +857,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             // device nodes -> host devices (rootfs has no real /dev)
             if (rp && !strncmp(rp, "/dev/", 5)) {
-                const char *hd = !strcmp(rp, "/dev/null")      ? "/dev/null"
-                                 : !strcmp(rp, "/dev/zero")    ? "/dev/zero"
-                                 : !strcmp(rp, "/dev/full")    ? "/dev/null"
-                                 : !strcmp(rp, "/dev/random")  ? "/dev/random"
-                                 : !strcmp(rp, "/dev/urandom") ? "/dev/urandom"
-                                 : !strcmp(rp, "/dev/tty")     ? "/dev/tty"
-                                                               : NULL;
+                const char *hd = dev_node_hostpath(rp);
                 if (hd) {
                     int d = open(hd, mf);
                     G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
@@ -1452,6 +1446,17 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int r = access(hp, (int)a2);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
+        }
+        // pseudo /dev char devices (open() backs them with a host node) must also test as present: e.g.
+        // libgcrypt probes access("/dev/urandom",R_OK) to pick its RNG module -- an ENOENT there aborts
+        // gpgv and breaks `apt-get update`. Test the host device with the requested mode.
+        {
+            const char *hd = dev_node_hostpath((const char *)a1);
+            if (hd) {
+                int r = access(hd, (int)a2);
+                G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+                break;
+            }
         }
         // faccessat
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);

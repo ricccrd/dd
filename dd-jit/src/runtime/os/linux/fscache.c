@@ -464,12 +464,14 @@ static void fc_evict_at(int pfd, const char *name) {
 // macOS errno -> Linux errno. They agree on 1..10 and 12..34 but diverge at 11 (EDEADLK<->EAGAIN)
 // and everything >=35 (macOS EAGAIN=35 vs Linux 11, ENOSYS=78 vs 38, ELOOP=62 vs 40, ...). Every
 // syscall that returns a host errno is translated at the boundary (QEMU-style). Identity outside.
+// macOS ENOATTR(93) and ENODATA(96) both mean "no such attribute" -> Linux ENODATA(61): a wrong map
+// here surfaces as ENOLINK ("Link has been severed") from getxattr and breaks cp -a / apt-key(gpgv).
 static int m2l_errno(int m) {
     static const short T[107] = {0,   1,   2,   3,   4,   5,   6,   7,   8,  9,  10,  35,  12, 13,  14,  15,  16,  17,
                                  18,  19,  20,  21,  22,  23,  24,  25,  26, 27, 28,  29,  30, 31,  32,  33,  34,  11,
                                  115, 114, 88,  89,  90,  91,  92,  93,  94, 95, 96,  97,  98, 99,  100, 101, 102, 103,
                                  104, 105, 106, 107, 108, 109, 110, 111, 40, 36, 112, 113, 39, 22,  87,  122, 116, 66,
                                  22,  22,  22,  22,  22,  37,  38,  22,  22, 22, 22,  75,  22, 22,  22,  22,  125, 43,
-                                 42,  84,  61,  74,  72,  61,  67,  63,  60, 71, 62,  95,  22, 131, 130, 122};
+                                 42,  84,  61,  61,  72,  61,  61,  63,  60, 71, 62,  95,  22, 131, 130, 122};
     return (m >= 0 && m < 107) ? T[m] : m;
 }

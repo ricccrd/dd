@@ -961,8 +961,25 @@ static int proc_open(const char *rp) {
 // Linux-layout stat for a synthesized /proc or /sys file (so stat()/access() see it -- find, du,
 // container runtimes that stat /etc/mtab -> /proc/mounts, JVM that stats cgroup files, etc.).
 static void fill_linux_stat(uint8_t *d, const struct stat *s, const char *hostpath, int fd);
+// The pseudo /dev nodes the rootfs lacks but open() (fs.c) backs with a real host device. Returns the
+// host path open() would use, else NULL. stat()/access() consult this so the nodes report as EXISTING
+// character devices -- e.g. libgcrypt detects its RNG via access("/dev/urandom",R_OK); an ENOENT there
+// makes it abort ("no entropy gathering module detected"), which breaks gpgv and thus `apt-get update`.
+static const char *dev_node_hostpath(const char *gp) {
+    if (!gp) return NULL;
+    return !strcmp(gp, "/dev/null")     ? "/dev/null"
+           : !strcmp(gp, "/dev/zero")    ? "/dev/zero"
+           : !strcmp(gp, "/dev/full")    ? "/dev/null" // macOS has no /dev/full -> back it with /dev/null
+           : !strcmp(gp, "/dev/random")  ? "/dev/random"
+           : !strcmp(gp, "/dev/urandom") ? "/dev/urandom"
+           : !strcmp(gp, "/dev/tty")     ? "/dev/tty"
+                                         : NULL;
+}
 // -> macOS struct stat for a synth file
 static int synth_stat_raw(const char *gp, struct stat *s) {
+    // Pseudo /dev char devices: stat the host node so type/existence agree with open().
+    const char *dev = dev_node_hostpath(gp);
+    if (dev) return stat(dev, s) == 0;
     if (!gp || (strncmp(gp, "/proc/", 6) && strncmp(gp, "/sys/fs/cgroup/", 15))) return 0;
     // A bare /proc/self (the magic symlink) or /proc/<pid> directory for an introspectable pid (this
     // process, the container init "1", or our container pid): report the right type so stat()/opendir()
