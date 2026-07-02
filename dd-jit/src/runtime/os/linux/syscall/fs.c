@@ -942,7 +942,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int r = open(host, mf | ((lf & G_O_NOFOLLOW) ? O_NOFOLLOW : 0), (mode_t)a3);
             if (r >= 0) {
                 char gpa[4200];
-                if (fcntl(r, F_GETPATH, gpa) == 0) {
+                int have_canon = fcntl(r, F_GETPATH, gpa) == 0;
+                if (have_canon) {
                     fd_setpath(r, gpa);
                     if (isw) {
                         mc_evict(gpa);
@@ -950,10 +951,19 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         ac_evict(gpa);
                     }
                 }
-                // remember guest path for merged getdents -- but NOT for a bind-mount volume: a volume is
-                // its own jail (not in the upper/lowers), so its dir must list via plain readdir of the
-                // host fd; tagging it overlay -> overlay_readdir misses it -> an empty `ls` on the mount.
-                if (r < 1024 && !jail_is_vol(gp)) snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gp);
+                // Remember the guest dir for merged getdents. Derive it from the fd's CANONICAL host path
+                // (F_GETPATH already resolved `.`/`..`/symlinks per component) rather than the raw guest
+                // arg: a `..` out of a nested bind mount (e.g. `/mnt/..`) keeps a mount-point component that
+                // lives ONLY in the writable upper, so re-resolving the raw path per layer finds it in no
+                // lower and enumerates the upper alone -- the merged root listing then dropped every
+                // lower-only entry (bin, lib, usr...). The canonical path folds `/mnt/..` back to the rootfs
+                // root, so overlay_readdir enumerates every layer. NOT for a bind-mount volume dir (its own
+                // jail, in no layer): it must list via plain readdir of the host fd; tagging it overlay ->
+                // overlay_readdir misses it -> an empty `ls` on the mount.
+                char gdir[4200];
+                if (have_canon) guest_from_host(gpa, gdir, sizeof gdir);
+                else snprintf(gdir, sizeof gdir, "%s", gp);
+                if (r < 1024 && !jail_is_vol(gdir)) snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gdir);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
             break;
