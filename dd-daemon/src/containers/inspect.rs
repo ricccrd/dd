@@ -448,6 +448,9 @@ fn human_status(c: &Container) -> String {
         else { format!("{} days", secs / 86400) };
     if c.status == "running" || c.status == "paused" {
         format!("Up {dur}")
+    } else if c.status == "created" {
+        // A created-but-never-started container shows a bare "Created" (no elapsed time), matching docker.
+        "Created".to_string()
     } else {
         format!("Exited ({}) {dur} ago", c.exit_code)
     }
@@ -475,7 +478,7 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
     // expensive). Gather the matching containers, release the lock, THEN walk the disk so the daemon
     // lock isn't held across the (synchronous) `du`.
     let want_size = q_truthy(&q.size);
-    let matched: Vec<Container> = {
+    let mut matched: Vec<Container> = {
         let g = a.inner.lock().await;
         // `before=`/`since=` name a reference container (by id-prefix or name); resolve each to that
         // container's `created` time so ps_match can compare create-order against it.
@@ -498,6 +501,10 @@ pub(crate) async fn containers_json(State(a): State<App>, Query(q): Query<PsQ>) 
             })
             .cloned().collect()
     };
+    // Docker lists containers newest-first (by creation time); our container map is unordered, so a raw
+    // walk yields an arbitrary order and `docker ps`/`ps -q` would return IDs in an unpredictable order.
+    // Sort descending by `created` (tie-break on `started_at`) to match docker's ordering.
+    matched.sort_by(|a, b| b.created.cmp(&a.created).then(b.started_at.cmp(&a.started_at)));
     let v: Vec<Value> = matched.iter().map(|c| {
         let mut entry = json!({
         "Id": c.id, "Image": c.image, "Command": c.cmd.join(" "), "Created": c.created,

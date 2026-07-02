@@ -126,7 +126,18 @@ fcid="$(d run -d --name filt-me alpine sh -c 'sleep 3')"
 has "ps-filter-name"   "$(d ps --filter name=filt-me --format '{{.Names}}' 2>&1)" "filt-me"
 has "ps-filter-status" "$(d ps --filter status=running --format '{{.Names}}' 2>&1)" "filt-me"
 has "ps-quiet"         "$(d ps -q 2>&1 | head -c 4)" "$(echo "$fcid" | head -c 4)"
-d rm -f "$fcid" >/dev/null
+# `-aq` and `--format {{.ID}}` list the same truncated id `-q` does.
+has "ps-aq"            "$(d ps -aq 2>&1 | head -c 4)" "$(echo "$fcid" | head -c 4)"
+has "ps-format-id"     "$(d ps --format '{{.ID}}' 2>&1 | head -c 4)" "$(echo "$fcid" | head -c 4)"
+# docker lists newest-first: a container created after filt-me must sort ahead of it, so it is the
+# first line of both `ps` and `ps -q` (dd walked an unordered map before, giving an arbitrary order).
+sleep 1; ncid="$(d run -d --name filt-new alpine sh -c 'sleep 3')"
+ok  "ps-order-newest"  "$(d ps --format '{{.Names}}' 2>&1 | head -1)" "filt-new"
+ok  "ps-order-quiet"   "$(d ps -q 2>&1 | head -1)" "$(echo "$ncid" | head -c 12)"
+# a created-but-never-started container reports Status "Created" (not "Exited (0) ...").
+crid="$(d create --name filt-created alpine sh -c 'sleep 3')"
+ok  "ps-created-status" "$(d ps -a --filter name=filt-created --format '{{.Status}}' 2>&1)" "Created"
+d rm -f "$fcid" "$ncid" "$crid" >/dev/null
 
 echo "== prune verbs (container / image / volume / network / system) =="
 prc="$(d run -d alpine sh -c 'echo done')"; d wait "$prc" >/dev/null
